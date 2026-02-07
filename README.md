@@ -40,7 +40,7 @@ The file format stays 100% compatible with existing `.sqlite` databases in Compa
 | Data races | Possible (careful C) | Impossible (Rust ownership) |
 | File format | SQLite 3.x | Identical (Compatibility mode) or ECS (Native mode) |
 | Self-healing storage | No | Yes (RaptorQ repair symbols) |
-| Page-level encryption | No (commercial SEE extension) | AES-256-GCM with Argon2id key derivation |
+| Page-level encryption | No (commercial SEE extension) | XChaCha20-Poly1305 (DEK/KEK envelope, Argon2id KEK derivation) |
 | SQL dialect | Full | Full (same parser coverage) |
 | Extensions | FTS3/4/5, R-tree, JSON1, etc. | All the same, compiled in |
 | Cross-process MVCC | No | Yes (shared-memory coordination) |
@@ -1218,17 +1218,20 @@ On systems where shared memory is unavailable or restricted, FrankenSQLite falls
 
 ## Page-Level Encryption
 
-FrankenSQLite provides AES-256-GCM page-level encryption as a built-in feature, replacing the need for SQLite's commercial Encryption Extension (SEE).
+FrankenSQLite provides page-level encryption as a built-in feature, replacing the need for SQLite's commercial Encryption Extension (SEE).
 
 | Property | Value |
 |----------|-------|
-| Cipher | AES-256-GCM |
-| Key derivation | Argon2id from passphrase |
-| Nonce | 12 bytes, derived from `(page_number, write_counter)` |
-| Authentication tag | 16 bytes, stored in the page's reserved space |
+| Cipher | XChaCha20-Poly1305 (AEAD) |
+| Data key (DEK) | Random 256-bit key generated at database creation |
+| Key-encryption key (KEK) | Argon2id(passphrase, per-database random salt) |
+| Rekey | O(1): re-wrap DEK (`PRAGMA rekey = 'new_passphrase'`) |
+| Nonce | 24 bytes, random per page write |
+| Authentication tag | 16 bytes (Poly1305), stored in the page's reserved space |
+| Reserved bytes | `reserved_bytes >= 40` (24B nonce + 16B tag) |
 | Key management API | `PRAGMA key = 'passphrase'` / `PRAGMA rekey = 'new_passphrase'` |
 
-The nonce is derived deterministically from the page number and a per-page write counter, ensuring uniqueness without additional storage overhead. The 16-byte GCM authentication tag fits in the reserved-bytes-per-page field from the database header.
+This is envelope encryption: pages are encrypted with the DEK; the DEK is wrapped with the KEK derived from `PRAGMA key`. Random nonces eliminate global counters and remain safe under VM snapshot reverts, crashes, forks, and distributed writers.
 
 In Native mode, encryption applies before RaptorQ encoding (encrypt-then-code). An attacker who corrupts encrypted ECS symbols cannot forge valid ciphertext; RaptorQ repairs the corruption, then decryption proceeds as normal.
 
@@ -2119,7 +2122,7 @@ Every ambitious project has risks. Here they are, along with the mitigations tha
 | Isolation level | Serializable (by serializing) | SSI (true serializable concurrency) | Snapshot | Snapshot | Snapshot |
 | Memory safety | Manual | Compile-time guaranteed | Manual (C) | Manual (C++) | Compile-time guaranteed |
 | File format | SQLite 3.x | SQLite 3.x (Compat) or ECS (Native) | SQLite 3.x (compatible) | Own format | SQLite 3.x (compatible) |
-| Page encryption | Commercial (SEE) | AES-256-GCM built-in | No | No | No |
+| Page encryption | Commercial (SEE) | XChaCha20-Poly1305 built-in | No | No | No |
 | Self-healing storage | No | RaptorQ repair symbols | No | No | No |
 | Cross-process MVCC | No | Shared-memory coordination | No | Yes | No |
 | Embeddable | Yes | Yes | Yes | Yes | Yes |
@@ -2197,7 +2200,7 @@ cargo bench --bench parser_throughput
 - **No WASM target yet.** The VFS trait abstracts all OS operations, and a `WasmVfs` implementation is planned but not yet built. Browser/edge deployment via WebAssembly is a future goal.
 - **MVCC adds memory overhead.** Multiple page versions consume more RAM than single-version SQLite. ARC eviction and GC mitigate this but introduce background work.
 - **No row-level locking.** Two transactions modifying different rows on the same page still conflict at the page level. Algebraic write merging reduces false conflicts by 30-50% when enabled, but does not eliminate them entirely. This is a deliberate tradeoff for file format compatibility.
-- **Encryption adds per-page overhead.** The 16-byte GCM tag consumes reserved space in each page. Databases created with encryption cannot be read without the key, even by C SQLite.
+- **Encryption adds per-page overhead.** The per-page 24-byte nonce and 16-byte tag (40 bytes total) consume reserved space in each page. Databases created with encryption cannot be read without the key, even by C SQLite.
 - **Native mode databases are not directly readable by C SQLite.** The ECS commit stream format is FrankenSQLite-specific. Compatibility export (`compat/foo.db`) materializes a standard SQLite file on demand.
 
 ---
@@ -2238,7 +2241,7 @@ A: Three things. (1) Self-healing after torn writes: WAL frames carry repair sym
 A: Compatibility mode stores data in a standard SQLite `.db` file readable by C SQLite. Native mode stores data as an append-only stream of content-addressed, erasure-coded objects (ECS) for maximum durability and cross-process concurrency. Both modes expose the same SQL dialect and API. Switch with `PRAGMA fsqlite.mode = compatibility | native`.
 
 **Q: How does encryption work?**
-A: `PRAGMA key = 'passphrase'` derives a 256-bit key via Argon2id and encrypts every page with AES-256-GCM. The 12-byte nonce comes from the page number and a write counter; the 16-byte authentication tag is stored in the page's reserved space. In Native mode, encryption happens before RaptorQ encoding (encrypt-then-code).
+A: `PRAGMA key = 'passphrase'` derives a KEK via Argon2id and unwraps a per-database random DEK. Pages are encrypted with XChaCha20-Poly1305 using a fresh random 24-byte nonce per page write; the nonce and 16-byte tag are stored in each page's reserved bytes. `PRAGMA rekey = 'new_passphrase'` re-wraps the DEK in O(1). In Native mode, encryption happens before RaptorQ encoding (encrypt-then-code).
 
 **Q: Does FrankenSQLite support Windows?**
 A: Yes. The `WindowsVfs` implements the same `Vfs` trait as `UnixVfs`, using `LockFileEx`/`UnlockFileEx` for file locking and `CreateFileMapping` for shared memory. Platform-specific code is isolated behind `#[cfg(target_os)]` gates. OS/2, VxWorks, and Windows CE are excluded.

@@ -214,8 +214,15 @@ patterns. The following constraints are non-negotiable for hot-path code:
   x86/ARM native order for zero-cost decode).
 
 - **Cache-line awareness.** The MVCC `PageLockTable` shards (Section 5.8)
-  and `SireadTable` shards MUST be padded to 64-byte cache-line boundaries
-  to prevent false sharing between concurrent writers.
+  and hot-plane witness index buckets (Section 5.6.4.5) MUST be padded to
+  64-byte cache-line boundaries to prevent false sharing between concurrent
+  writers.
+
+- **Systematic fast-path reads.** When persisting ECS objects, writers MUST
+  pre-position systematic symbols (ESI 0..K-1) as contiguous runs in the local
+  symbol store when possible (Section 3.5.2). This enables a "happy path" read
+  that concatenates systematic symbol payloads without invoking the GF(256)
+  decoder (matrix multiply is only needed for repair).
 
 - **Prefetch hints.** B-tree descent SHOULD issue prefetch hints for child
   pages when the next page number is known (via `std::arch::x86_64::_mm_prefetch`
@@ -2200,6 +2207,7 @@ SymbolRecord := {
     esi         : u32,          -- Encoding Symbol Identifier (which symbol this is)
     symbol_size : u32,          -- T: symbol size in bytes
     symbol_data : [u8; T],      -- the actual RaptorQ encoding symbol
+    flags       : u8,           -- bitflags (see below)
     frame_xxh3  : u64,          -- xxhash3 of all preceding fields (fast integrity)
     auth_tag    : [u8; 16],     -- Optional: HMAC/Poly1305 for authenticated transport
 }
@@ -2214,6 +2222,34 @@ OTI := {
 ```
 
 **Self-describing property:** A symbol record contains everything needed to decode it: the ObjectId identifies which object this symbol belongs to, the OTI provides the RaptorQ parameters, and the ESI identifies which encoding symbol this is. A decoder collecting K' symbols with the same ObjectId can reconstruct the original object without any external metadata.
+
+**Flags (normative):**
+
+- `0x01 = SYSTEMATIC_RUN_START`: This record is the first source symbol (`esi = 0`)
+  and the writer attempted to place the entire systematic run (`esi = 0..K_source-1`)
+  contiguously in the local symbol log.
+
+The local symbol store MAY define additional flags, but they MUST be treated as
+advisory optimization hints. Correctness never depends on them.
+
+**Systematic read fast path (hybrid decode):**
+
+RaptorQ is systematic: the first `K_source` symbols are (a padded form of) the
+original bytes. Therefore, for local reads, the engine SHOULD attempt:
+
+1. Locate `SYSTEMATIC_RUN_START` for the object (via object locator / index).
+2. Read `K_source = ceil(F / T)` symbol records sequentially.
+3. Verify per-record `frame_xxh3` (and `auth_tag` if enabled).
+4. Concatenate `symbol_data` payloads and truncate to `F` bytes.
+
+If all checks pass, decoding is complete **without** invoking GF(256) matrix
+solve. If any record is missing/corrupt, fall back to the general fountain-code
+decoder (collect any `K'` symbols including repairs; decode; optionally produce
+`DecodeProof`).
+
+This design ensures:
+- Happy-path reads are "read + checksum" (low latency).
+- Repair-path reads are "decode + proof" (self-healing, auditable).
 
 **Symbol record sizing:** For a given object, the symbol size `T` is chosen based on the object type:
 - **CommitCapsules:** Small symbols (T ≈ 256 bytes) for low-latency commit. Typical capsule is 1-4 KB, encoded as 4-16 source symbols + repair.
@@ -2291,8 +2327,9 @@ RootManifest := {
     current_commit  : ObjectId,    -- ObjectId of the latest CommitMarker
     commit_seq      : u64,         -- latest commit sequence number
     schema_snapshot : ObjectId,    -- ObjectId of current schema ECS object
+    schema_epoch    : u64,         -- monotonic schema epoch (bumps on DDL/VACUUM)
     checkpoint_base : ObjectId,    -- ObjectId of last full checkpoint
-    gc_horizon      : TxnId,      -- oldest TxnId that may still be needed
+    gc_horizon      : u64,         -- safe GC horizon commit sequence (min active begin_seq)
     created_at      : u64,         -- Unix timestamp
     updated_at      : u64,         -- Unix timestamp
     checksum        : u64,         -- xxhash3 of all preceding fields
@@ -2436,6 +2473,66 @@ tuning:
 
 All sizing is versioned in `RootManifest` so replicas decode correctly.
 Benchmarks MUST drive tuning decisions; these defaults are starting points.
+
+#### 3.5.11 Tiered Storage ("Bottomless", Native Mode)
+
+Native mode's ECS design naturally produces an immutable history of
+content-addressed objects (CommitCapsules, index segments, witness evidence).
+Tiered storage makes this history effectively "bottomless" by offloading cold
+objects to remote storage while preserving correctness and predictability.
+
+**Tiers (normative):**
+
+1. **L1 (hot):** in-memory caches (ARC for decoded objects + hot pages).
+2. **L2 (warm):** local append-only symbol logs under `ecs/symbols/` and
+   `ecs/markers/` (default source of truth on a single machine).
+3. **L3 (cold):** remote object storage (S3/R2/Blob) keyed by `ObjectId` (and
+   optionally by `(ObjectId, ESI)` for symbol-addressable fetch).
+
+**Remote durability modes:**
+
+- `PRAGMA durability = local`: L2 is sufficient for the durability contract.
+  L3 is optional (purely archival / time-travel enabling).
+- `PRAGMA durability = quorum(M)`: L3 (or replica peers) participate in the
+  durability contract; commit is not successful until the configured quorum
+  acknowledges enough symbols to make decode succeed.
+
+**Eviction policy (normative):**
+
+- Local symbol logs are immutable once rotated. Eviction operates at the
+  granularity of rotated log segments, not individual objects.
+- A local segment MAY be evicted from L2 only if:
+  1. Every object referenced by any `CommitMarker` that is still reachable under
+     the configured retention/time-travel policy is retrievable from L3 (or
+     other replicas) with enough symbols to satisfy decode, and
+  2. The segment is not needed for any in-flight read/repair operation (tracked
+     via asupersync-style obligations / leases).
+- Eviction MUST be cancel-safe: if cancellation occurs during segment upload or
+  bookkeeping, the system MUST either (a) keep the segment locally, or (b) prove
+  the segment is fully retrievable remotely before deleting local bytes.
+
+**Fetch-on-demand read path:**
+
+When decoding an object and L2 does not contain enough valid symbols:
+
+1. Attempt local systematic fast path (§3.5.2) if systematic run placement was
+   successful.
+2. Otherwise request missing symbols from L3 (or peers) under a `Cx` budget:
+   - Fetch source symbols first (`esi = 0..K_source-1`), then repairs as needed.
+   - Prefer range reads that return contiguous systematic runs when the remote
+     store supports it (reduces request count and tail latency).
+3. Decode and (in lab/debug) emit `DecodeProof` (§3.5.8).
+4. Populate L1 and (optionally) write back repaired symbols into L2 as a
+   self-healing cache fill.
+
+**Retention interaction:**
+
+Tiered storage is orthogonal to GC horizons:
+- MVCC/witness GC horizons (§5.6.4.8) control what must be kept for correctness
+  of *current* operations.
+- Retention policy controls how much historical state is kept for time travel,
+  audit, and forensic replay (Section 12.17). Default policy in V1 is:
+  retain full commit history, with cold history eligible for L3-only residence.
 
 ### 3.6 Native Indexing: RaptorQ-Coded Index Segments
 
@@ -3532,17 +3629,28 @@ isolation level analysis, checksum performance, and multi-process semantics.
 
 ```
 TxnId       := u64                          -- monotonically increasing, AtomicU64
+SchemaEpoch := u64                          -- increments on schema/layout changes (DDL, VACUUM, etc.)
 PageNumber  := NonZeroU32                   -- 1-based page number
 PageData    := Vec<u8>                      -- page content, length = page_size
 
 Snapshot := {
     high_water_mark : TxnId,               -- all txn_ids <= this are "potentially committed"
+    schema_epoch    : SchemaEpoch,          -- schema version at BEGIN (prevents intent replay across schema changes)
     in_flight       : ActiveTxnSet,         -- active txns at snapshot creation.
                                             -- Adaptive structure:
                                             --   Small case: Sorted SmallVec<TxnId> (very fast iteration)
                                             --   Large case: RoaringBitmap (fast set ops, compression)
                                             -- Optimizes for the common case of few concurrent writers.
 }
+
+-- Schema epoch discipline:
+-- - `schema_epoch` increments on any committed schema or physical-layout change
+--   (DDL, VACUUM, etc.).
+-- - A transaction MUST NOT perform intent-log replay / rebase merge if its
+--   `snapshot.schema_epoch` differs from the current schema epoch.
+-- - A write transaction that reaches COMMIT with a stale schema epoch MUST
+--   abort with `SQLITE_SCHEMA` (caller must reprepare/retry under the new
+--   schema).
 
 PageVersion := {
     pgno       : PageNumber,
@@ -4299,7 +4407,8 @@ SharedMemoryLayout := {
                                        -- Exceeding capacity returns SQLITE_BUSY (not silent failure).
     next_txn_id      : AtomicU64,      -- global TxnId counter (fetch_add)
     commit_seq       : AtomicU64,      -- global commit sequence counter
-    gc_horizon       : AtomicU64,      -- min(active txn_ids) across all processes
+    schema_epoch     : AtomicU64,      -- monotonic schema epoch (mirror of RootManifest.schema_epoch)
+    gc_horizon       : AtomicU64,      -- safe GC horizon commit_seq (min active begin_seq) across all processes
     lock_table_offset: u64,            -- byte offset to PageLockTable region
     witness_offset   : u64,            -- byte offset to SSI witness plane (HotWitnessIndex)
     txn_slot_offset  : u64,            -- byte offset to TxnSlot array
@@ -4625,19 +4734,19 @@ This yields bounded memory and bounded per-operation cost without per-txn clears
 
 #### 5.6.5 GC Coordination
 
-The `gc_horizon` in shared memory is updated by each process:
+The `gc_horizon` in shared memory is advanced by the commit sequencer:
 
 ```
 update_gc_horizon():
-    local_min = min(txn_id for active local transactions)
-    loop:
-        current = shm.gc_horizon.load()
-        // Only lower the horizon (never raise it without consensus)
-        if local_min < current:
-            shm.gc_horizon.compare_exchange(current, local_min)
-            break
-        else:
-            break
+    // NOTE: `gc_horizon` is a monotonically *increasing* safe-point in CommitSeq
+    // space: `min(begin_seq)` across all active transactions. Since `begin_seq`
+    // is derived from the monotonically increasing `commit_seq` counter, this
+    // horizon never decreases.
+    //
+    // To avoid races and partial views across processes, `gc_horizon` is
+    // authoritative only when advanced by the commit sequencer (below). Other
+    // processes treat it as read-only state.
+    return
 ```
 
 **GC scheduling policy (Alien-Artifact Discipline):**
@@ -4663,8 +4772,13 @@ updated `gc_horizon` on their next read.
 
 ```
 raise_gc_horizon():
-    global_min = min(slot.txn_id for slot in txn_slots where slot.txn_id != 0)
-    shm.gc_horizon.store(global_min)
+    // Default: if no active transactions exist, the safe point is the latest
+    // commit sequence number.
+    global_min_begin_seq = shm.commit_seq.load()
+    for slot in txn_slots:
+        if slot.txn_id != 0:
+            global_min_begin_seq = min(global_min_begin_seq, slot.begin_seq.load())
+    shm.gc_horizon.store(global_min_begin_seq)
 ```
 
 #### 5.6.6 Compatibility: Falling Back to File Locks
@@ -5322,8 +5436,85 @@ and will be visible to future snapshots that see both commits.
 
 ### 5.9 Write Coordinator Detail
 
-The write coordinator is a single background task that serializes the commit
-pipeline: validation, WAL append, version publishing, and commit log insertion.
+The write coordinator is a single background task that serializes the **commit
+sequencing** critical section. Its responsibilities differ by operating mode:
+
+- **Compatibility mode (WAL path):** The coordinator serializes validation,
+  WAL append, fsync/group-commit, version publishing, and commit-log insertion.
+- **Native mode (ECS path):** The coordinator is a **tiny-marker sequencer**:
+  it never moves page payload bytes. Writers persist `CommitCapsule` objects
+  (bulk I/O) concurrently; the coordinator validates, allocates `commit_seq`,
+  persists a small `CommitProof`, and appends a tiny `CommitMarker` (§7.11).
+
+This split is structural: it prevents "one sequencing thread moves all bytes"
+from becoming the scalability ceiling on modern NVMe.
+
+#### 5.9.1 Native Mode Sequencer (Tiny Marker Path)
+
+**State machine (native mode):**
+
+```
+                     +-------+
+            +------->| Idle  |<----------+
+            |        +-------+           |
+            |            |               |
+            |  recv(PublishRequest)      |
+            |            |               |
+            |            v               |
+            |      +-----------+         |
+            |      | Validate  |         |
+            |      +-----------+         |
+            |        |       |           |
+            |   pass |       | fail      |
+            |        v       v           |
+            |  +-----------+  +-------+  |
+            |  | Seq+Proof |  | Abort |--+
+            |  +-----------+  +-------+
+            |        |
+            |  +-----------+
+            |  | Marker IO |
+            |  +-----------+
+            |        |
+            |  respond(Ok)
+            |        |
+            +--------+
+
+Validate:   First-committer-wins + any global constraints using write-set summaries
+Seq+Proof:  Allocate commit_seq; publish CommitProof (small ECS object)
+Marker IO:  Append CommitMarker (tiny) to marker stream (atomic visibility point)
+```
+
+**PublishRequest (native mode):**
+
+```rust
+pub struct PublishRequest {
+    pub txn: TxnToken,
+    pub begin_seq: u64,
+    pub capsule_object_id: ObjectId,
+    pub capsule_digest: [u8; 32],        // e.g., BLAKE3-256 of capsule bytes (audit/sanity)
+    pub write_set_summary: RoaringBitmap<u32>, // page numbers (no false negatives)
+    pub read_witnesses: Vec<ObjectId>,
+    pub write_witnesses: Vec<ObjectId>,
+    pub edge_ids: Vec<ObjectId>,
+    pub merge_witnesses: Vec<ObjectId>,
+    pub abort_policy: AbortPolicy,
+    pub response_tx: oneshot::Sender<PublishResponse>,
+}
+
+pub enum PublishResponse {
+    Ok { commit_seq: u64, marker_object_id: ObjectId },
+    Conflict { conflicting_pages: Vec<PageNumber>, conflicting_commit_seq: u64 },
+    Aborted { code: ErrorCode }, // e.g., SQLITE_BUSY_SNAPSHOT, SQLITE_INTERRUPT
+    IoError { error: FrankenError },
+}
+```
+
+**Critical rule:** In native mode the coordinator MUST NOT decode the full
+capsule during validation; it operates on `write_set_summary` and coordinator
+indexes. This is required for scalability and for keeping the serialized
+section "tiny."
+
+#### 5.9.2 Compatibility Mode Coordinator (WAL Path)
 
 **Full state machine for the coordinator:**
 
@@ -5363,10 +5554,10 @@ States:
   Abort:      Notifying the requester of failure; cleaning up partial state.
 ```
 
-**CommitRequest and CommitResponse types:**
+**Compatibility-mode CommitRequest and CommitResponse types:**
 
 ```rust
-/// Sent by a committing transaction to the write coordinator.
+/// Sent by a committing transaction to the write coordinator (compatibility/WAL path).
 pub struct CommitRequest {
     /// Transaction ID of the committing transaction.
     pub txn_id: TxnId,
@@ -5390,7 +5581,7 @@ pub struct CommitRequest {
     pub response_tx: oneshot::Sender<CommitResponse>,
 }
 
-/// Sent by the write coordinator back to the committing transaction.
+/// Sent by the write coordinator back to the committing transaction (compatibility/WAL path).
 pub enum CommitResponse {
     /// Commit succeeded. All versions published, WAL synced.
     Ok {
@@ -5545,7 +5736,14 @@ Each writing transaction records an `intent_log: Vec<IntentOp>` alongside its
 materialized page deltas. Intent operations are:
 
 ```
-IntentOp ::=
+IntentOp := {
+  // The schema epoch captured at transaction begin. This prevents replaying
+  // semantic intents against a different schema/physical layout.
+  schema_epoch: u64,
+  op: IntentOpKind,
+}
+
+IntentOpKind ::=
   | Insert { table: TableId, key: RowId, record: Vec<u8> }
   | Delete { table: TableId, key: RowId }
   | Update { table: TableId, key: RowId, new_record: Vec<u8> }
@@ -5557,18 +5755,26 @@ Intent logs are *small* (typically tens of entries) and encode/replicate
 efficiently as ECS objects. They are the preferred merge substrate because
 they carry semantic information that byte-level patches lack.
 
+`schema_epoch` is captured at `BEGIN` from `RootManifest.schema_epoch` (or the
+shared-memory mirror `SharedMemoryLayout.schema_epoch`) and stored in the
+transaction snapshot. Every `IntentOp` MUST carry that snapshot epoch. Any
+attempt to replay semantic intents across a schema epoch boundary MUST abort
+with `SQLITE_SCHEMA` (see §5.10.4).
+
 #### 5.10.2 Deterministic Rebase (The Big Win)
 
 When a txn `U` reaches commit and discovers a page in `write_set(U)` has been
 updated since its snapshot, we attempt **deterministic rebase**:
 
-1. **Detect base drift:** `base_version(pgno)` for U's write set changed since
+1. **Schema epoch check (required):** If `current_schema_epoch != U.snapshot.schema_epoch`,
+   abort with `SQLITE_SCHEMA` (cannot rebase across DDL/VACUUM).
+2. **Detect base drift:** `base_version(pgno)` for U's write set changed since
    its snapshot.
-2. **Attempt rebase:** Take U's intent log and replay it against the *current*
+3. **Attempt rebase:** Take U's intent log and replay it against the *current*
    committed snapshot, producing new page deltas.
-3. **If replay succeeds** without violating B-tree invariants or constraints:
+4. **If replay succeeds** without violating B-tree invariants or constraints:
    commit proceeds with the rebased page deltas.
-4. **If replay fails** (true conflict, constraint violation): abort/retry.
+5. **If replay fails** (true conflict, constraint violation): abort/retry.
 
 This is "merge by re-execution", not "merge by bytes". It gives us *row-level
 concurrency effects* without storing row-level MVCC metadata.
@@ -5616,10 +5822,12 @@ When txn `U` reaches commit, for each page in `write_set(U)`:
 
 1. If base unchanged since snapshot → OK (no merge needed).
 2. Else, attempt merge in strict priority order:
-   a. **Deterministic rebase replay** (preferred: semantic, highest success rate)
-   b. **Structured page patch merge** (if ops are cell-disjoint)
-   c. **Sparse XOR merge** (only if ranges are declared merge-safe)
-   d. **Abort/retry** (no safe merge found)
+   a. **Schema epoch check (required):** If `current_schema_epoch != U.snapshot.schema_epoch`,
+      abort with `SQLITE_SCHEMA` (merging across DDL/VACUUM boundaries is forbidden).
+   b. **Deterministic rebase replay** (preferred: semantic, highest success rate)
+   c. **Structured page patch merge** (if ops are cell-disjoint)
+   d. **Sparse XOR merge** (only if ranges are declared merge-safe)
+   e. **Abort/retry** (no safe merge found)
 
 This yields a strict safety ladder: we only take merges we can justify.
 
@@ -6442,7 +6650,9 @@ verifiability:
   (Commit ordering is provided by the marker stream; the capsule does not embed
   `commit_seq` so content addressing is not polluted by an ordering artifact.)
 - CommitMarker is the atomic "this commit exists" record: `commit_seq`,
-  `capsule_object_id`, `proof_object_id`, `prev_marker`, `integrity_hash`.
+  `commit_time_unix_ns`, `capsule_object_id`, `proof_object_id`, `prev_marker`,
+  `integrity_hash`. `commit_time_unix_ns` MUST be monotonic non-decreasing with
+  `commit_seq` (see §12.17).
 - **Atomicity rule:** A commit is committed iff its marker is durable. Recovery
   ignores any capsule without a committed marker.
 - Checkpointing materializes a canonical `.db` for compatibility export, but
@@ -6455,37 +6665,73 @@ compatibility). Applications can switch modes between connections.
 
 ### 7.11 Native Mode Commit Protocol (High-Concurrency Path)
 
-Writers prepare in parallel; only the minimal "publish commit" step is
-serialized:
+The Native-mode commit protocol decouples **Bulk Durability** (payload bytes)
+from **Ordering** (the marker stream):
 
-1. **Finalize & validate (SSI):** Finalize the write set and run SSI validation
-   using the witness plane (§5.7). This phase MAY emit `DependencyEdge` objects
-   and MAY perform the merge escape hatch (§5.10), producing `MergeWitness`
-   objects when successful.
-2. **Publish witness evidence (pre-marker):** Publish `ReadWitness` /
+- Writers persist `CommitCapsule` payloads concurrently (bulk I/O off the
+  critical section).
+- A single sequencer (WriteCoordinator) serializes only the tiny ordering step:
+  validation + `commit_seq` allocation + `CommitMarker` append.
+
+This avoids a structural bottleneck where one thread must move every byte of
+every transaction while also sequencing commits. The serialized section MUST
+never be responsible for writing page payloads; it operates on ObjectIds,
+digests, and compact write-set summaries.
+
+#### 7.11.1 Writer Path (Concurrent, Bulk I/O)
+
+1. **Finalize (local):** Finalize the write set (pages and/or intent log).
+2. **Validate (SSI, local):** Run SSI validation using the witness plane (§5.7).
+   This phase MAY emit `DependencyEdge` objects and MAY perform merge (§5.10),
+   producing `MergeWitness` objects when successful. If SSI aborts, publish
+   `AbortWitness` and return `SQLITE_BUSY_SNAPSHOT`.
+3. **Publish witness evidence (pre-marker):** Publish `ReadWitness` /
    `WriteWitness` objects, emitted `DependencyEdge` objects, and any
    `MergeWitness` objects using the cancel-safe two-phase publication protocol
    (§5.6.4.7). These objects are not considered "committed" until referenced by
    a committed marker, but publication MUST occur before marker publication.
-3. **Build capsule:** Construct `CommitCapsuleBytes(T)` deterministically from
+4. **Build capsule:** Construct `CommitCapsuleBytes(T)` deterministically from
    intent log, page deltas, snapshot basis, and the witness-plane ObjectId
-   references from step (2).
-4. **Encode:** RaptorQ-encode capsule bytes into symbols using
-   `asupersync::raptorq::RaptorQSender`.
-5. **Persist capsule symbols:** Write symbols to local symbol logs (and
-   optionally stream to replicas) until the durability policy is satisfied:
+   references from step (3).
+5. **Encode:** RaptorQ-encode capsule bytes into symbols (systematic + repair).
+6. **Persist capsule symbols (CONCURRENT I/O):** The committing transaction
+   writes symbols to local symbol logs (and optionally streams to replicas)
+   until the durability policy is satisfied. This happens **before** acquiring
+   the commit sequencing critical section:
    - Local: persist ≥ `K_total + margin` symbols.
    - Quorum: persist/ack ≥ `K_total + margin` symbols across M replicas.
-6. **Allocate commit_seq:** This is the serialization point. `commit_seq` is
-   assigned only after capsule durability is confirmed.
-7. **Build and persist CommitProof:** Create and publish a `CommitProof` ECS
-   object containing `commit_seq`, witness references, and emitted edge ids.
-   Record its `proof_object_id`.
-8. **Build and persist marker:** Create `CommitMarkerBytes(commit_seq,
-   capsule_object_id, proof_object_id, prev_marker, integrity)`. Encode/persist
-   as an ECS object. Append to marker stream.
-9. **Return success** to the client.
-10. **Background:** Index segments and caches update asynchronously.
+7. **Submit to WriteCoordinator:** Send a tiny publish request over a two-phase
+   MPSC channel (§4.5) containing:
+   - `capsule_object_id` (16B)
+   - `capsule_digest` (for sanity-checking / audit)
+   - `write_set_summary` (page numbers / witness keys sufficient for FCW validation; no false negatives)
+   - `witness_refs`: the `ReadWitness`/`WriteWitness` ids
+   - `edge_ids` and `merge_witness_ids`
+   - `txn_token`, `begin_seq`, and abort-policy metadata
+   Then await the coordinator response.
+
+#### 7.11.2 WriteCoordinator Loop (Serialized, Tiny I/O)
+
+For each publish request:
+
+1. **Validation (FCW):** Perform First-Committer-Wins validation using
+   `write_set_summary` against the coordinator's commit index (or equivalent).
+   Validation MUST NOT require decoding the entire capsule.
+2. **Allocate `commit_seq`:** Assign the next commit sequence number.
+   Also assign `commit_time_unix_ns` as a monotonic timestamp:
+   `commit_time_unix_ns := max(now_unix_ns(), last_commit_time_unix_ns + 1)`.
+3. **Persist `CommitProof` (small):** Build and publish a `CommitProof` ECS
+   object containing `commit_seq` and evidence references. Record its
+   `proof_object_id`.
+4. **Persist marker (tiny):** Append `CommitMarkerBytes(commit_seq,
+   commit_time_unix_ns, capsule_object_id, proof_object_id, prev_marker,
+   integrity)` to the marker stream. This is the atomic "this commit exists"
+   step (≈ 72–88 bytes).
+5. **Respond:** Notify the client of success (or conflict/abort).
+
+#### 7.11.3 Background Work (Not in Critical Section)
+
+- Index segments and caches update asynchronously.
 
 **Critical ordering:** Marker publication MUST happen AFTER capsule durability
 and AFTER `CommitProof` durability is satisfied. If the marker is durable but
@@ -8704,6 +8950,50 @@ Five affinities: TEXT, NUMERIC, INTEGER, REAL, BLOB.
   TEXT affinity
 - Otherwise, no affinity applied (BLOB comparison)
 
+### 12.17 Time Travel Queries (Native Mode Extension)
+
+Native mode persists an immutable commit stream (capsules + markers). This
+enables **time travel** queries that evaluate reads against a historical commit
+sequence.
+
+**Syntax (extension):**
+
+Time travel is expressed on table references:
+
+```sql
+SELECT ... FROM my_table FOR SYSTEM_TIME AS OF '2023-10-27 10:00:00';
+SELECT ... FROM my_table FOR SYSTEM_TIME AS OF COMMITSEQ 1234567;
+```
+
+**Semantics (normative):**
+
+1. Determine `target_commit_seq`:
+   - If `AS OF COMMITSEQ N`, then `target_commit_seq := N`.
+   - Otherwise parse the `time-string` using SQLite-compatible datetime rules
+     (same inputs accepted by `unixepoch(...)`) and convert to
+     `target_time_unix_ns`.
+     Then binary-search the CommitMarker stream for the greatest marker with:
+     `marker.commit_time_unix_ns <= target_time_unix_ns`, and set
+     `target_commit_seq := marker.commit_seq`.
+2. Create a synthetic read-only snapshot `S` with `S.high = target_commit_seq`.
+3. Execute the query using the normal MVCC resolution rules:
+   `resolve(P, S)` returns the newest committed version with
+   `version.commit_seq <= S.high` (§3.6, §5).
+
+**Restrictions (V1):**
+
+- Time travel is read-only. Any attempt to execute `INSERT/UPDATE/DELETE/DDL`
+  in a time-travel context MUST fail with `SQLITE_ERROR` (or a more specific
+  SQLite-compatible error code when applicable).
+
+**Retention and tiered storage:**
+
+- If the retention policy has pruned the requested historical state, time
+  travel MUST fail with an explicit error indicating "history not retained".
+- With tiered storage enabled (§3.5.11), older commit capsules and index
+  segments MAY reside only in remote storage; the engine MUST fetch symbols on
+  demand under `Cx` budgets and decode/repair as usual.
+
 ---
 
 ## 13. Built-in Functions
@@ -9563,34 +9853,41 @@ Modern filesystems do not have these limitations. Excluded.
 **SEE (SQLite Encryption Extension).** C SQLite's commercial encryption
 extension is not ported. Instead, FrankenSQLite provides page-level
 encryption using the reserved-space-per-page field in the database header:
-- `PRAGMA key = 'passphrase'` derives a 256-bit key via Argon2id.
-- Each page is encrypted with AES-256-GCM. The 12-byte nonce is derived from
-  `(page_number, write_counter)` to ensure uniqueness without storage overhead.
-  **Nonce construction:** The 12-byte nonce is `page_number (4 bytes, big-endian)
-  || write_counter (8 bytes, big-endian)`. The `write_counter` is a per-database
-  monotonic u64 stored durably in the database header (byte offset 92, within the
-  reserved header space). It is incremented atomically on every WAL frame write.
-  **Nonce exhaustion analysis (Alien-Artifact Discipline):** With 64-bit
-  write_counter, nonce space is 2^64 per page_number. At 100,000 writes/sec
-  sustained, nonce exhaustion takes 2^64 / 10^5 ≈ 5.8 * 10^13 seconds ≈ 1.8
-  million years. GCM security degrades after 2^32 encryptions with the same key
-  (birthday bound on counter-mode blocks). Since each page encryption uses a
-  unique nonce, the 2^32 limit applies to total blocks across all pages with
-  the same key: for 4KB pages (256 AES blocks each), the limit is
-  2^32 / 256 ≈ 16.7 million page encryptions per key. PRAGMA rekey MUST be
-  recommended (logged as a warning) after 10 million page writes with the same
-  key. This is a hard security constraint, not a performance optimization.
-  **Concurrency safety:** Under MVCC, concurrent writers encrypt different pages
-  or the same page with different write_counter values (the counter is incremented
-  under the WAL write lock). Nonce uniqueness is guaranteed by the monotonicity
-  of write_counter combined with the uniqueness of page_number.
-- The 16-byte GCM authentication tag is stored in the page's reserved space.
-- `PRAGMA rekey = 'new_passphrase'` re-encrypts all pages (and resets
-  write_counter to 0, refreshing the nonce space).
-- Key management uses the standard SQLite Encryption Extension API for
-  compatibility with existing tooling.
-- Encryption is orthogonal to ECS: encrypted pages are encoded as ECS symbols
-  with encryption applied before RaptorQ encoding (encrypt-then-code).
+- **Envelope encryption (DEK/KEK):**
+  - On database creation, generate a random 256-bit **Data Encryption Key**
+    `DEK` (requires `Cx` random capability).
+  - `PRAGMA key = 'passphrase'` derives a **Key Encryption Key** `KEK` via
+    Argon2id with a per-database random salt and explicit parameters recorded in
+    metadata.
+  - Store `wrap(DEK, KEK)` as durable metadata:
+    - Native mode: in ECS metadata (e.g., `RootManifest`-reachable object).
+    - Compatibility mode: in the `.fsqlite/` sidecar directory (SQLite file
+      format is not a crypto keystore; do not overload unrelated header bytes).
+  - **Instant rekey (O(1)):** `PRAGMA rekey = 'new_passphrase'` re-derives `KEK'`
+    and rewrites only `wrap(DEK, KEK')`. Bulk page data is not re-encrypted.
+
+- **Page algorithm:** Pages are encrypted with **XChaCha20-Poly1305** using the
+  `DEK` (AEAD).
+
+- **Nonce:** A fresh 24-byte random nonce is generated for every page write.
+  Random nonces eliminate global counters and remain safe under VM snapshot
+  reverts, process crashes, forks, and distributed writers. Collision
+  probability is negligible at any realistic write volume.
+
+- **Storage in reserved bytes:** The per-page nonce (24B) and Poly1305 tag (16B)
+  are stored in the page reserved space (requires `reserved_bytes >= 40`).
+
+- **AAD (swap resistance):** AEAD additional authenticated data MUST include
+  `(page_number, database_id, page_type_tag)` so ciphertext cannot be replayed or
+  swapped across pages or databases without detection.
+
+- **Key management API:** Retain the familiar SQLite-style API surface:
+  `PRAGMA key` / `PRAGMA rekey`. The underlying scheme is not SEE-compatible
+  byte-for-byte; it is compatible at the SQL interface level.
+
+- **Encrypt-then-code:** Encryption is orthogonal to ECS: encrypted pages are
+  encoded as ECS symbols with encryption applied before RaptorQ encoding
+  (encrypt-then-code).
 
 ---
 
@@ -10704,7 +11001,7 @@ from spec, never translate line-by-line).
 
 **R1. SSI abort rate too high (Page-SSI is conservative).**
 Mitigations:
-- Refine SIREAD keys from page → (page, range/cell tag) to reduce false positives.
+- Refine witness keys from page → (page, range/cell tag) to reduce false positives.
 - Add safe snapshot optimizations for read-only transactions.
 - Intent-level rebase (Section 5.10.2) turns page conflicts into merges,
   reducing effective conflict rate by 30-60%.
@@ -10722,8 +11019,8 @@ Mitigations:
 **R3. Append-only storage grows without bound.**
 Mitigations:
 - Checkpoint and compaction are first-class (Section 7.9).
-- Enforce budgets for MVCC history, SIREAD table, symbol caches.
-- GC horizon = min(active_txn_ids) bounds version chain length (Theorem 5).
+- Enforce budgets for MVCC history, SSI witness plane, symbol caches.
+- Safe GC horizon = min(active `begin_seq`) bounds version chain length (Theorem 5).
 
 **R4. Bootstrapping chicken-and-egg (need index to find symbols, need symbols
 to decode index).**
@@ -10767,7 +11064,7 @@ concurrent writes?
 *Answer plan:* Implement shared-memory coordination (Section 5.6.1); benchmark
 contention vs in-process baseline; tune TxnSlot count and lease intervals.
 
-**Q2. How far do we go with range/cell refinement for SIREAD?**
+**Q2. How far do we go with range/cell refinement for SSI witness keys?**
 *Answer plan:* Start page-only; collect abort witnesses; refine only when
 abort rate is proven unacceptable by benchmark.
 
@@ -10872,6 +11169,27 @@ Section 3.4.6 fully specifies erasure-coded page storage. Implementation notes:
 - Read path: attempt source page first, fall back to erasure recovery
 - Group size selection: benchmark G=32, G=64, G=128 to find the optimal
   balance of space overhead vs recovery capability per workload
+
+### 21.10 Time Travel Queries and Tiered Symbol Storage (Future)
+
+Native mode's source of truth is an immutable commit stream (`CommitCapsule` +
+`CommitMarker`). Exposing historical reads ("time travel") and pushing cold
+history to remote object storage are natural extensions, but they require
+explicit policy and careful latency control.
+
+- **Retention policy:** Time travel is only meaningful within a configured
+  history window. GC/compaction MUST remain free to drop old history unless a
+  retention policy pins it.
+- **Addressing:** The stable history coordinate is `commit_seq`. Timestamp-based
+  APIs require persisting `commit_time` metadata per commit and an index to map
+  time → `commit_seq` (under `LabRuntime`, this uses deterministic virtual time).
+- **SQL surface:** Prefer SQLite-style extensions (e.g.,
+  `PRAGMA fsqlite.as_of_commit_seq = N`) over adopting SQL:2011
+  `FOR SYSTEM_TIME AS OF`, to avoid grammar drift and compatibility surprises.
+- **Tiered SymbolStore:** `SymbolStore` SHOULD remain pluggable with an optional
+  cold backend (object storage). Remote fetch MUST require an explicit capability
+  (no silent network I/O in arbitrary code paths) and MUST be paired with caching
+  and prefetching so query latency remains predictable.
 
 ---
 
