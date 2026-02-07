@@ -846,15 +846,29 @@ A (L x L matrix):
     LT   |   LT_MATRIX     |   0        |   0        |  K' rows
 ```
 
-**LDPC rows (0..S-1):** Each LDPC row has exactly ceil(K'/S) + 2 non-zero
-entries in the leftmost K' columns, plus a 1 on the diagonal of the S x S
-identity block. These constraints are sparse (typically ~7 non-zero entries
-per row for typical K' values) and binary (over GF(2)).
+**LDPC rows (0..S-1):** Each LDPC row has approximately `3 * ceil(K'/S)`
+non-zero entries in the leftmost K' columns, plus a 1 on the diagonal of
+the S x S identity block. These constraints are sparse and binary (over
+GF(2)).
 
-The LDPC constraint for row i (0 <= i < S) sets the following positions to 1:
-- For j = 0, 1, ..., W-2: if (i == (j % S)): set column j to 1
-- Two additional columns determined by Rand(j, i, S) for specific j values
-- Column K' + i is set to 1 (the identity block)
+The LDPC constraints are generated per RFC 6330 §5.3.3.3. For each source
+column j (0 <= j < K'), three LDPC rows are updated using a stride
+`a = 1 + floor(j / S)`:
+
+```
+For j = 0 to K'-1:
+    a = 1 + floor(j / S)
+    b = j % S
+    A[b][j] = 1
+    b = (b + a) % S
+    A[b][j] = 1
+    b = (b + a) % S
+    A[b][j] = 1
+```
+
+Additionally, column K' + i is set to 1 for row i (the S x S identity block).
+Each source column contributes exactly 3 nonzeros, so the total LDPC nonzeros
+are 3*K'. The average row has ~3*K'/S nonzeros from source columns.
 
 **HDPC rows (S..S+H-1):** These rows use GF(256) coefficients and are dense
 over the first K' + S columns. The HDPC constraints are generated using:
@@ -1202,12 +1216,15 @@ WAL Commit (N pages):
 
 Recovery:
   If any frames are torn/corrupted (detected by checksum):
-    Collect surviving source frames from `.wal` that can be validated:
-      - frames before the first checksum mismatch validate via the cumulative chain (§7.5)
-      - frames at/after the mismatch validate via `.wal-fec` per-source `source_page_xxh3` hashes
-    Collect repair symbols from `.wal-fec` for that commit group
-    If |surviving_sources| + |repairs| >= N: RaptorQ-decode to recover missing source pages
-    Else: transaction is truly lost (requires catastrophic multi-frame loss)
+    Locate `.wal-fec` metadata for the affected commit group:
+      - If missing: fall back to SQLite semantics (truncate before the group).
+      - If present: attempt repair:
+        Collect surviving source frames from `.wal` that can be validated:
+          - frames before the first checksum mismatch validate via the cumulative chain (§7.5)
+          - frames at/after the mismatch validate via `.wal-fec` per-source `source_page_xxh3_128` hashes
+        Collect repair symbols from `.wal-fec` for that commit group
+        If |surviving_sources| + |repairs| >= N: RaptorQ-decode to recover missing source pages
+        Else: group is truly lost (requires catastrophic multi-frame loss)
 ```
 
 **Concrete WAL Commit Frame Layout (Compatibility Mode)**
@@ -1262,7 +1279,7 @@ WalFecGroupMeta := {
     //   frames i+1.. cannot be validated via the WAL format alone.
     // - These hashes allow random-access validation of "surviving" source frames
     //   (page payload bytes) so they can be safely fed into a RaptorQ decoder.
-    source_page_xxh3: Vec<u64>,  // length = K; xxh3_64(page_data) for ISI i (frame start_frame_no + i)
+    source_page_xxh3_128: Vec<[u8; 16]>,  // length = K; xxh3_128(page_data) for ISI i (frame start_frame_no + i)
     checksum       : u64,        // xxh3_64 of all preceding fields
 }
 ```
@@ -1270,7 +1287,7 @@ WalFecGroupMeta := {
 **WalFecGroupMeta invariants (normative):**
 - `k_source == end_frame_no - start_frame_no + 1`
 - `page_numbers.len() == k_source`
-- `source_page_xxh3.len() == k_source`
+- `source_page_xxh3_128.len() == k_source`
 - `end_frame_no` is the group's commit frame (the corresponding WAL frame has
   `db_size != 0` when fully intact), and `db_size_pages` MUST equal that commit
   frame's `db_size` field.
@@ -2649,11 +2666,24 @@ SymbolRecord := {
 OTI := {
     F  : u64,       -- transfer length (original object size in bytes)
     Al : u16,       -- symbol alignment (always 4 for FrankenSQLite)
-    T  : u16,       -- symbol size (derived from F, Al, and target symbol count)
+    T  : u32,       -- symbol size in bytes (see RFC 6330 OTI divergence note below)
     Z  : u32,       -- number of source blocks
     N  : u32,       -- number of sub-blocks per source block
 }
 ```
+
+**RFC 6330 OTI divergence (normative):** The FrankenSQLite OTI is an internal
+encoding, not the RFC 6330 Common FEC OTI wire format. Field widths are widened
+for implementation convenience: `F` is `u64` (RFC: 40-bit), `T` is `u32`
+(RFC: 16-bit), `Z` is `u32` (RFC: 12-bit), `N` is `u32` (RFC: 8-bit). The
+critical widening is `T`: RFC 6330 limits symbol size to 65,535 bytes, but
+SQLite allows `page_size = 65,536` (encoded as `1` in the file header because
+65,536 overflows `u16`). Since `PageHistory` objects use `T = page_size`,
+`OTI.T` MUST be `u32` to represent all valid SQLite page sizes.
+
+**Invariant (normative):** For a well-formed `SymbolRecord`,
+`symbol_size == OTI.T`. On mismatch, the record MUST be treated as corrupt
+(reject for decode, count as a corruption observation for §3.5.12).
 
 **Self-describing property:** A symbol record contains everything needed to decode it: the ObjectId identifies which object this symbol belongs to, the OTI provides the RaptorQ parameters, and the ESI identifies which encoding symbol this is. A decoder collecting K' symbols with the same ObjectId can reconstruct the original object without any external metadata.
 
@@ -2816,7 +2846,14 @@ foo.db.fsqlite/
   `ecs/`. Deleting `cache/` is always safe (costs a rebuild).
 - `ecs/symbols/*.log` are immutable once rotated.
 - `ecs/root` is the **ONLY** mutable file in the ECS directory. It is updated
-  atomically via `write-to-temp` + `rename`.
+  atomically via the following crash-safe sequence (normative):
+  1. Write new contents to a temp file in `ecs/` (e.g., `ecs/.root.tmp`).
+  2. `fsync` the temp file (ensures data is durable before rename).
+  3. `rename(temp, ecs/root)` (atomic within a filesystem).
+  4. `fsync` the `ecs/` directory (ensures the rename is durable).
+  Omitting step 2 risks the renamed file containing garbage after a crash.
+  Omitting step 4 risks the rename being lost after a crash (the old `root`
+  pointer remains, potentially pointing to a now-stale manifest).
 - `compat/` is an export target for compatibility mode. It is NOT the source
   of truth in Native mode.
 
@@ -6566,7 +6603,15 @@ const CLAIMING_TIMEOUT_SECS: u64 = 5;  // no valid Phase 1->Phase 2 takes 5s
 cleanup_orphaned_slots():
     now = unix_timestamp()
     for slot in txn_slots:
-        if slot.txn_id == TXN_ID_CLEANING:
+        // Snapshot txn_id ONCE per slot iteration. txn_id can change concurrently
+        // (e.g., another cleaner transitioning into TXN_ID_CLEANING). Branching on
+        // multiple unsynchronized reads can mis-handle sentinels and free a slot
+        // while another cleaner is still releasing locks.
+        tid = slot.txn_id.load(Acquire)
+        if tid == 0:
+            continue
+
+        if tid == TXN_ID_CLEANING:
             // Another process is resetting this slot. If it crashed mid-reset,
             // the slot can become permanently stuck. Treat this like CLAIMING:
             // if CLEANING persists beyond the timeout, reclaim and free.
@@ -6598,11 +6643,11 @@ cleanup_orphaned_slots():
                 slot.txn_id = 0  // Free the slot (Release ordering, LAST)
             continue
 
-            if slot.txn_id == TXN_ID_CLAIMING:
-                // Slot is being claimed by another process (Phase 1 of acquire).
-                //
-                // CRITICAL: If a process crashes between Phase 1 (CAS 0 ->
-                // TXN_ID_CLAIMING) and Phase 2 (write pid/lease_expiry), the
+        if tid == TXN_ID_CLAIMING:
+            // Slot is being claimed by another process (Phase 1 of acquire).
+            //
+            // CRITICAL: If a process crashes between Phase 1 (CAS 0 ->
+            // TXN_ID_CLAIMING) and Phase 2 (write pid/lease_expiry), the
             // slot's pid/pid_birth/lease_expiry fields are STALE (they
             // belong to the previous occupant, or are zero for a fresh slot).
             // We MUST NOT rely on those fields for CLAIMING-state cleanup.
@@ -6611,57 +6656,21 @@ cleanup_orphaned_slots():
             // CLAIMING state for longer than CLAIMING_TIMEOUT_SECS, the
             // claimer is presumed dead. 5 seconds is orders of magnitude
             // longer than any valid Phase 1 -> Phase 2 transition (~μs).
-                if slot.claiming_timestamp == 0:
-                    // The claimer writes claiming_timestamp after the CAS (§5.6.2).
-                    // If it crashed immediately after claiming, the timestamp may
-                    // still be 0. Seed the timeout clock without touching other fields.
-                    slot.claiming_timestamp.CAS(0, now)
-                    continue
-                if now - slot.claiming_timestamp > CLAIMING_TIMEOUT_SECS:
-                    // Transition to CLEANING before clearing fields so we do not race
-                    // with a new claimer that could otherwise observe/clobber state.
-                    if slot.txn_id.CAS(TXN_ID_CLAIMING, TXN_ID_CLEANING):
-                        // Entered CLEANING; stamp the sentinel-time so other cleaners
-                        // do not treat this slot as "stuck CLEANING" immediately.
-                        slot.claiming_timestamp = now
-                        // Clear snapshot/epoch fields as well: a future claimer must not
-                        // observe stale begin_seq/witness_epoch under TXN_ID_CLAIMING (§5.6.5, §5.6.4.8).
-                        slot.state = Free
-                        slot.mode = Serialized
-                        slot.commit_seq = 0
-                        slot.begin_seq = 0
-                        slot.snapshot_high = 0
-                        slot.witness_epoch = 0
-                        slot.has_in_rw = false
-                        slot.has_out_rw = false
-                        slot.marked_for_abort = false
-                        slot.write_set_pages = 0
-                        slot.pid = 0
-                        slot.pid_birth = 0
-                        slot.lease_expiry = 0
-                        slot.cleanup_txn_id = 0
-                        slot.claiming_timestamp = 0
-                        slot.txn_id = 0  // Free the slot (Release ordering, LAST)
-                    continue  // skip the lease/liveness check — fields are stale
-                continue  // CLAIMING recently; give the claimer time
-
-            if slot.txn_id != 0 AND slot.lease_expiry < now:
-                // Lease expired -- check whether the owning process still exists.
-                // IMPORTANT: PID reuse is real; liveness checks MUST defend against it.
-                if !process_alive(slot.pid, slot.pid_birth):
-                    // Process crashed. Abort its transaction.
-                    //
-                    // ATOMICITY: record the old TxnId for retryable cleanup, then
-                    // CAS txn_id to TXN_ID_CLEANING so only one cleaner proceeds.
-                    // If CAS fails, another process already claimed cleanup — skip it.
-                    old_txn_id = slot.txn_id.load()
-                    slot.cleanup_txn_id = old_txn_id  // MUST happen before sentinel overwrite (crash-safety)
-                    if !slot.txn_id.CAS(old_txn_id, TXN_ID_CLEANING):
-                        continue  // someone else is cleaning this slot (or slot changed)
-                    // Entered CLEANING; stamp the sentinel-time unconditionally. This
-                    // must overwrite any old "claim" timestamp left over from slot acquire.
+            if slot.claiming_timestamp == 0:
+                // The claimer writes claiming_timestamp after the CAS (§5.6.2).
+                // If it crashed immediately after claiming, the timestamp may
+                // still be 0. Seed the timeout clock without touching other fields.
+                slot.claiming_timestamp.CAS(0, now)
+                continue
+            if now - slot.claiming_timestamp > CLAIMING_TIMEOUT_SECS:
+                // Transition to CLEANING before clearing fields so we do not race
+                // with a new claimer that could otherwise observe/clobber state.
+                if slot.txn_id.CAS(TXN_ID_CLAIMING, TXN_ID_CLEANING):
+                    // Entered CLEANING; stamp the sentinel-time so other cleaners
+                    // do not treat this slot as "stuck CLEANING" immediately.
                     slot.claiming_timestamp = now
-                    release_page_locks_for(old_txn_id)
+                    // Clear snapshot/epoch fields as well: a future claimer must not
+                    // observe stale begin_seq/witness_epoch under TXN_ID_CLAIMING (§5.6.5, §5.6.4.8).
                     slot.state = Free
                     slot.mode = Serialized
                     slot.commit_seq = 0
@@ -6677,8 +6686,45 @@ cleanup_orphaned_slots():
                     slot.lease_expiry = 0
                     slot.cleanup_txn_id = 0
                     slot.claiming_timestamp = 0
-                    slot.txn_id = 0    // Free the slot (Release ordering, LAST)
-                    continue
+                    slot.txn_id = 0  // Free the slot (Release ordering, LAST)
+                continue  // skip the lease/liveness check — fields are stale
+            continue  // CLAIMING recently; give the claimer time
+
+        // At this point tid is a real TxnId (not a sentinel). Check lease expiry.
+        if slot.lease_expiry < now:
+            // Lease expired -- check whether the owning process still exists.
+            // IMPORTANT: PID reuse is real; liveness checks MUST defend against it.
+            if !process_alive(slot.pid, slot.pid_birth):
+                // Process crashed. Abort its transaction.
+                //
+                // ATOMICITY: record the old TxnId for retryable cleanup, then
+                // CAS txn_id to TXN_ID_CLEANING so only one cleaner proceeds.
+                // If CAS fails, another process already claimed cleanup — skip it.
+                old_txn_id = tid
+                slot.cleanup_txn_id = old_txn_id  // MUST happen before sentinel overwrite (crash-safety)
+                if !slot.txn_id.CAS(old_txn_id, TXN_ID_CLEANING):
+                    continue  // someone else is cleaning this slot (or slot changed)
+                // Entered CLEANING; stamp the sentinel-time unconditionally. This
+                // must overwrite any old "claim" timestamp left over from slot acquire.
+                slot.claiming_timestamp = now
+                release_page_locks_for(old_txn_id)
+                slot.state = Free
+                slot.mode = Serialized
+                slot.commit_seq = 0
+                slot.begin_seq = 0
+                slot.snapshot_high = 0
+                slot.witness_epoch = 0
+                slot.has_in_rw = false
+                slot.has_out_rw = false
+                slot.marked_for_abort = false
+                slot.write_set_pages = 0
+                slot.pid = 0
+                slot.pid_birth = 0
+                slot.lease_expiry = 0
+                slot.cleanup_txn_id = 0
+                slot.claiming_timestamp = 0
+                slot.txn_id = 0    // Free the slot (Release ordering, LAST)
+                continue
 ```
 
 The three-phase acquire protocol MUST set `claiming_timestamp` **after** the
@@ -8552,6 +8598,12 @@ append coordinator-only, Compatibility mode MUST support write-set spilling:
   and MUST NOT be used for crash recovery. It exists only to bound RAM usage.
 - The spill file MUST implement last-write-wins semantics per page number
   (via an in-memory index `pgno -> SpillLoc`).
+- Self-visibility MUST still hold: if a page's latest bytes were spilled, reads
+  of that page by the same transaction MUST load the bytes from the spill file.
+- Multi-process note (normative): when commit publication is routed across
+  processes (§5.6.7), the commit request transport MUST NOT attempt to carry
+  full page bytes. Implementations SHOULD therefore use `CommitWriteSet::Spilled`
+  for cross-process commit requests.
 - At commit time, the transaction sends a `CommitRequest` whose `write_set`
   is either `Inline(...)` or `Spilled(...)`. The coordinator performs WALAppend
   by reading page bytes from `CommitWriteSet` only after validation succeeds.
@@ -8853,17 +8905,19 @@ concurrent writers (and across processes when shared-memory MVCC is enabled).
 
 **Minimum semantics (V1):**
 - **Non-AUTOINCREMENT rowid tables:** Initialize the allocator (per schema epoch)
-  to `max_committed_rowid(table) + 1` (computed from the latest durable tip, not
-  the transaction snapshot), then allocate monotonically. Allocations are not
+  to `max_committed_rowid(table) + 1` (computed by seeking to the rightmost
+  committed row at the latest durable tip, not the transaction snapshot), then
+  allocate monotonically. Allocations are not
   rolled back on abort; gaps are permitted. (This is an intentional tradeoff in
   `BEGIN CONCURRENT` to enable commutative insert merges; exact C SQLite rowid
   reuse semantics remain in Layer 1 / Serialized mode.)
 - **AUTOINCREMENT tables:** Initialize to
-  `max(sqlite_sequence.seq, max_committed_rowid(table)) + 1` and treat the
-  allocator high-water mark as "highest ever committed rowid". The committing
-  transaction MUST persist the high-water mark by updating `sqlite_sequence` as
-  part of the transaction's write set. This update is mergeable because it is a
-  monotone max (encode as an `UpdateExpression` on the `sqlite_sequence` row:
+  `max(sqlite_sequence.seq, max_committed_rowid(table)) + 1`. The allocator MUST
+  ensure uniqueness across concurrent writers; allocations are not rolled back
+  on abort (gaps permitted). The committing transaction MUST persist
+  AUTOINCREMENT state by updating `sqlite_sequence` to at least the maximum rowid
+  actually inserted by that transaction. This update is mergeable because it is
+  a monotone max (encode as an `UpdateExpression` on the `sqlite_sequence` row:
   `seq = max(seq, inserted_rowid)` using the *scalar* `max(a,b)` function).
 
 **Bump-on-explicit-rowid (required):** If a statement inserts an explicit rowid
@@ -11927,8 +11981,13 @@ pub enum TokenType {
     Plus, Minus, Star, Slash, Percent,             // + - * / %
     Ampersand, Pipe, Tilde,                        // & | ~
     ShiftLeft, ShiftRight,                         // << >>
-    Eq, Ne, Lt, Le, Gt, Ge,                        // = != < <= > >=
-    EqEq, BangEq, LtGt,                           // == != <>
+    Eq, Lt, Le, Gt, Ge,                              // = < <= > >=
+    EqEq, Ne, LtGt,                                 // == != <>
+    // NOTE: In C SQLite, both `=` and `==` tokenize as TK_EQ, and both
+    // `!=` and `<>` tokenize as TK_NE. FrankenSQLite preserves the lexical
+    // distinction (Eq vs EqEq, Ne vs LtGt) for diagnostics and SQL
+    // pretty-printing, but the parser treats each pair identically.
+    // `Eq`/`EqEq` → equality; `Ne`/`LtGt` → not-equal.
     Dot, Comma, Semicolon,                         // . , ;
     LeftParen, RightParen,                         // ( )
     Arrow, DoubleArrow,                            // -> ->>
@@ -12031,19 +12090,26 @@ parse_statement()              -> Statement
 | 3 | NOT (prefix) | Right |
 | 4 | =, ==, !=, <>, IS, IS NOT, IN, LIKE, GLOB, BETWEEN, MATCH, REGEXP, ISNULL, NOTNULL, NOT NULL | Left |
 | 5 | <, <=, >, >= | Left |
-| 6 | ESCAPE | Right |
-| 7 | &, \|, <<, >> | Left |
-| 8 | +, - | Left |
-| 9 | *, /, % | Left |
-| 10 | \|\| (concat), ->, ->> (JSON) | Left |
-| 11 | COLLATE | Left |
-| 12 (highest) | ~ (bitwise not), + (unary), - (unary) | Right |
+| 6 | &, \|, <<, >> | Left |
+| 7 | +, - | Left |
+| 8 | *, /, % | Left |
+| 9 | \|\| (concat), ->, ->> (JSON) | Left |
+| 10 | COLLATE | Left |
+| 11 (highest) | ~ (bitwise not), + (unary), - (unary) | Right |
 
 **NOTE:** Equality/membership operators (level 4) and relational operators
 (level 5) are at SEPARATE precedence levels, matching C SQLite's `parse.y`
 (`%left IS MATCH LIKE_KW BETWEEN IN ... NE EQ` then `%left GT LE LT GE`).
 This means `a = b < c` parses as `a = (b < c)`, NOT `(a = b) < c`.
-ESCAPE is `%right` (not `%left`) per `parse.y`.
+
+**NOTE on ESCAPE:** C SQLite's `parse.y` declares `%right ESCAPE` between
+levels 5 and 6 for Lemon conflict resolution, but ESCAPE is NOT a standalone
+infix operator. It is an optional suffix of the LIKE/GLOB/MATCH production:
+`expr likeop expr ESCAPE expr [LIKE_KW]`. In FrankenSQLite's Pratt parser,
+ESCAPE is parsed as part of the LIKE/GLOB handler (after consuming the pattern
+expression, check for an optional `ESCAPE` keyword and parse the escape
+expression at the LIKE precedence level). It does NOT appear in the infix
+dispatch table.
 
 **Error recovery strategy:** On parse error, the parser:
 1. Records the error (token, expected alternatives, source span).
@@ -12097,14 +12163,21 @@ pub struct SelectBody {
     pub compounds: Vec<(CompoundOp, SelectCore)>,
 }
 
-pub struct SelectCore {
-    pub distinct: Distinct,
-    pub columns: Vec<ResultColumn>,
-    pub from: Option<TableRef>,
-    pub where_clause: Option<Expr>,
-    pub group_by: Option<Vec<Expr>>,
-    pub having: Option<Expr>,
-    pub windows: Vec<WindowDef>,
+/// A single SELECT or VALUES clause. VALUES (1,2),(3,4) is a first-class
+/// construct in SQLite (used standalone, as INSERT source, and in CTEs).
+/// In C SQLite, VALUES compiles through TK_VALUES into compound SELECTs
+/// internally, but the AST preserves the syntactic distinction.
+pub enum SelectCore {
+    Select {
+        distinct: Distinct,
+        columns: Vec<ResultColumn>,
+        from: Option<TableRef>,
+        where_clause: Option<Expr>,
+        group_by: Option<Vec<Expr>>,
+        having: Option<Expr>,
+        windows: Vec<WindowDef>,
+    },
+    Values(Vec<Vec<Expr>>),   // VALUES (expr, ...), (expr, ...), ...
 }
 
 pub enum Expr {
@@ -12162,7 +12235,7 @@ otherwise it falls back to heuristic estimates.
 ```
 Full table scan:              cost = N_pages(table)
 Index scan (range):           cost = log2(N_pages(index)) + selectivity * N_pages(index) + selectivity * N_pages(table)
-Index scan (equality):        cost = log2(N_pages(index)) + 1
+Index scan (equality):        cost = log2(N_pages(index)) + log2(N_pages(table))
 Covering index scan:          cost = log2(N_pages(index)) + selectivity * N_pages(index)
 Rowid lookup:                 cost = log2(N_pages(table))
 ```
@@ -12820,8 +12893,8 @@ Journal Page Records (repeated page_count times):
 where k is the smallest value `> 0` (strictly positive) in the arithmetic
 sequence. The loop condition is `while( i > 0 )`, so `data[0]` is **never**
 sampled (pager.c `pager_cksum()`). Each `data[i]` reads a single `u8` byte,
-accumulated into a `u32` sum. For 4096-byte pages: 19 bytes summed (offsets
-3896, 3696, ..., 296, 96).
+accumulated into a `u32` sum. For 4096-byte pages: 20 bytes summed (offsets
+3896, 3696, ..., 296, 96; count = (3896 - 96) / 200 + 1 = 20).
 
 **Hot journal recovery:** On open, if a journal file exists, is non-empty,
 and the database's reserved lock is not held, it is a "hot journal." Recovery
@@ -16880,6 +16953,6 @@ an embedded database engine can achieve.
 
 ---
 
-*Document version: 1.28 (Round 11 audit: ARC p-update online-learning framing added (research note; canonical ARC update remains normative); Round 10 audit: version-chain delta compression corrected: use sparse XOR deltas between adjacent page versions (RaptorQ remains the durability/repair layer for delta objects); prior rounds: forbid raw byte-disjoint XOR write merging for SQLite structured pages; specify safe merge ladder (intent-log deterministic rebase + structured patch parse/merge/repack + merge certificates); built-in function semantics audited/corrected (ceil/floor/trunc return types, NaN/Inf handling, octet_length bytes, substr negative length, COLLATE interaction, compileoption funcs); VFS trait examples corrected to include `&Cx`; risk register compaction cross-reference fixed.)*
+*Document version: 1.29 (Round 12 audit: Compatibility/WAL mode corrected: ARC eviction MUST NOT append to `.wal`; WAL append is coordinator-only; write-set spill to per-txn temp file specified (`CommitWriteSet::Spilled`) + `PRAGMA fsqlite.txn_write_set_mem_bytes`; Round 11 audit: ARC p-update online-learning framing added (research note; canonical ARC update remains normative); Round 10 audit: version-chain delta compression corrected: use sparse XOR deltas between adjacent page versions (RaptorQ remains the durability/repair layer for delta objects); prior rounds: forbid raw byte-disjoint XOR write merging for SQLite structured pages; specify safe merge ladder (intent-log deterministic rebase + structured patch parse/merge/repack + merge certificates); built-in function semantics audited/corrected (ceil/floor/trunc return types, NaN/Inf handling, octet_length bytes, substr negative length, COLLATE interaction, compileoption funcs); VFS trait examples corrected to include `&Cx`; risk register compaction cross-reference fixed.)*
 *Last updated: 2026-02-07*
 *Status: Authoritative Specification*
