@@ -2965,7 +2965,7 @@ fn create_mvcc_monitors() -> Vec<EProcess> {
         // INV-1: Monotonicity. Enforced by hardware atomics; any violation
         // is a catastrophic bug. p0 ~ 0, lambda maximal for instant detection.
         // Power: detects a single violation within 1 observation.
-        EProcess::new("INV-1: TxnId Monotonicity", EProcessConfig {
+        EProcess::new("INV-1: TxnId/CommitSeq Monotonicity", EProcessConfig {
             p0: 1e-9, lambda: 0.999, alpha: 1e-6, max_evalue: 1e18,
         }),
         // INV-2: Lock Exclusivity. CAS-enforced; violation = logic bug.
