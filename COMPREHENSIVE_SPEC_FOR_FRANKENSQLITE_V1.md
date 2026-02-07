@@ -2279,11 +2279,15 @@ This design ensures:
 - Happy-path reads are "read + checksum" (low latency).
 - Repair-path reads are "decode + proof" (self-healing, auditable).
 
-**Symbol record sizing:** For a given object, the symbol size `T` is chosen based on the object type:
-- **CommitCapsules:** Small symbols (T ≈ 256 bytes) for low-latency commit. Typical capsule is 1-4 KB, encoded as 4-16 source symbols + repair.
-- **Page snapshots:** T = page_size (4096 bytes). One source symbol per page.
-- **Index checkpoints:** Large symbols (T ≈ 4096-16384 bytes) for throughput.
-- **WAL segments:** T = WAL frame size for natural alignment.
+**Symbol record sizing:** The symbol size `T` is object-type-aware and is encoded
+in the object's OTI (self-describing). The default policy is specified in
+§3.5.10 (and is versioned in `RootManifest` so replicas decode correctly).
+Examples:
+- `PageHistory` and full page images typically use `T = page_size` (one source
+  symbol per page).
+- `CommitCapsule` defaults to `T = min(page_size, 4096)` to keep happy-path
+  reads "range read + checksum" while avoiding excessive symbol counts (`K_source`)
+  for medium/large capsules.
 
 #### 3.5.3 Deterministic Repair Symbol Generation
 
@@ -2303,9 +2307,25 @@ The repair symbol budget is controlled per-object-type:
 PRAGMA raptorq_overhead = <percent>    -- default: 20%
 ```
 
-This means: for every 100 source symbols, generate 20 repair symbols. The
-overhead-to-failure-tolerance relationship is approximately linear: 20%
-overhead tolerates ~20% symbol loss.
+This means: for `K_source` source symbols, budget
+`R = ceil(K_source * overhead_percent / 100)` deterministic repair symbols.
+
+**Important:** There are two distinct "overheads":
+- **Decode slack (additive):** the number of *extra* symbols beyond `K_source`
+  needed to make decode failure probability negligible (V1 targets `K_source+2`
+  per RFC 6330 Annex B; see §3.1.1).
+- **Loss budget (multiplicative):** how many symbols we can afford to lose to
+  erasures/corruption and still collect `K_source + slack` survivors.
+
+Therefore the tolerated erasure fraction without coordination is approximately:
+
+```
+loss_fraction_max ≈ max(0, (R - slack) / (K_source + R))
+```
+
+and for large `K_source` it approaches `R/(K_source+R) ≈ overhead/(100+overhead)`.
+Small objects (small `K_source`) are dominated by the additive slack; the
+implementation MUST clamp policies to avoid under-provisioning.
 
 #### 3.5.4 Local Physical Layout (Native Mode)
 
@@ -2408,7 +2428,7 @@ policy (K/R), and repair story.
 
 | Subsystem | ECS Object Type | Symbol Policy | Repair Story |
 |-----------|----------------|---------------|--------------|
-| Commits | `CommitCapsule` + `CommitMarker` | T ≈ 256B, R = 20% default | Decode from surviving symbols; `DecodeProof` in lab/debug |
+| Commits | `CommitCapsule` + `CommitMarker` | T = `min(page_size, 4096)`, R = 20% default | Decode from surviving symbols; `DecodeProof` in lab/debug |
 | Checkpoints | `CheckpointChunk` | T = 4096–65535B, R = policy-driven | Chunked snapshot objects; rebuild from marker stream if lost |
 | Indices | `IndexSegment` (Page, Object, Manifest) | T = 1280–4096B, R = 20% default | Decode or rebuild-from-marker-scan |
 | Page storage | `PageHistory` | T = page_size, R = per-group | Decode from group symbols; on-the-fly repair on read |
@@ -2970,6 +2990,34 @@ Under H_0, `E[X_t] = p_0`, so `E[E_t | E_{t-1}] = E_{t-1}` (martingale).
 Under the alternative H_1 (actual violation rate `p_1 > p_0`), the e-process
 grows exponentially at rate `KL(p_1 || p_0)` per observation, where KL is the
 Kullback-Leibler divergence.
+
+**Multiple invariants (family-wise error control):**
+
+FrankenSQLite runs *many* monitors (INV-1..INV-7, INV-SSI-FP, symbol survival,
+replication divergence, etc.). If each monitor independently alarms at level
+`alpha_i`, naive use can inflate the global false-alarm rate.
+
+E-values make global control simple and optional-stopping-safe:
+
+- **Alpha budget (union bound, simplest):** choose per-monitor levels `alpha_i`
+  such that `sum_i alpha_i <= alpha_total`. Each monitor rejects when
+  `E_i(t) >= 1/alpha_i`. Then the probability that *any* monitor ever rejects
+  under the global null is `<= alpha_total`.
+
+- **E-value aggregation (tighter, recommended):** choose weights `w_i >= 0`
+  with `sum_i w_i = 1` and define:
+
+  ```
+  E_global(t) := Π_i E_i(t)^{w_i}
+  ```
+
+  If each `E_i(t)` is an e-process under its null, then `E_global(t)` is also
+  an e-process under the global null. Alarm when `E_global(t) >= 1/alpha_total`.
+  The resulting certificate includes the top contributing monitors by
+  `log E_i(t)` share (an "evidence ledger").
+
+This gives rigorous "peek-anytime" monitoring *across the whole system* rather
+than per-invariant ad hoc thresholds.
 
 **Concrete e-process definitions for MVCC invariants:**
 
@@ -3887,6 +3935,45 @@ FrankenSQLite MUST surface asupersync-native diagnostics for production and lab:
 This is a direct consequence of the "no vibes" philosophy: if something times
 out or aborts, the system must be able to explain why with evidence.
 
+#### 4.16.1 Evidence Ledger (Galaxy-Brain Explainability, Deterministic)
+
+Asupersync supports emitting an **evidence ledger**: a bounded, deterministic
+record of *why* a cancellation/race/scheduler decision occurred (trace-backed,
+replay-stable). FrankenSQLite MUST leverage this to make core events
+explainable:
+
+- cancellation propagation (who cancelled whom, and why)
+- race/timeout/hedge winner selection (and loser drain proofs)
+- scheduler choices under deadlines/budgets (lane + tie-break)
+- commit/abort decisions (FCW conflicts, SSI pivot aborts, merge eligibility)
+
+**Minimum ledger entry schema (normative):**
+
+```text
+EvidenceEntry := {
+  decision_id : u64,
+  kind        : { cancel, race, scheduler, commit },
+  context     : { task_id: u64, region_id: u64, lane: {Cancel, Timed, Ready} },
+  candidates  : Vec<Candidate>,
+  constraints : Vec<Constraint>,
+  chosen      : CandidateId,
+  rationale   : Vec<Reason>,
+  witnesses   : Vec<TraceEventId>,
+}
+```
+
+**Determinism requirements:**
+- Field ordering MUST be deterministic.
+- Candidate ordering MUST be deterministic (stable by `(score desc, id asc)`).
+- Witness references MUST be stable under replay (trace event ids or hashes).
+- Ledger size MUST be bounded (ring buffer + spill-to-artifacts in lab mode).
+
+**Emission policy (required):**
+- **Lab:** evidence ledger MUST be emitted for any failing test, any SSI abort,
+  and any commit abort due to FCW/SSI/merge.
+- **Production:** evidence ledger SHOULD be sampleable and gated (PRAGMA or
+  env). It MUST NOT impose unbounded overhead or allocate on hot paths.
+
 ## 5. MVCC Formal Model (Revised)
 
 This section supersedes `MVCC_SPECIFICATION.md` with corrections for the
@@ -4785,14 +4872,24 @@ PageLockEntry := {
    - If `entries[idx].page_number == 0` (empty):
      - CAS `page_number` from 0 -> `page_number` to claim the slot.
        If CAS fails, continue probing (someone else raced).
-     - Then CAS `owner_txn` from 0 -> requesting TxnId (or store, since you own
-       the slot). If this CAS fails, another process raced and won; treat as
-       `SQLITE_BUSY` (correct) and continue/retry as policy.
+     - Then CAS `owner_txn` from 0 -> requesting TxnId.
+       **MUST NOT** `store()` here: after the key is published, another process
+       may observe `(page_number=P, owner_txn=0)` and acquire via CAS. A plain
+       store would clobber that winner.
+       If this CAS fails, another process raced and won; treat as `SQLITE_BUSY`
+       (correct) and continue/retry as policy.
    - If `entries[idx].page_number == TOMBSTONE`:
-     - Remember the first tombstone index and continue probing to ensure there
-       is no existing entry for `page_number`. When an empty slot is found (or
-       after a full probe), attempt to reuse the remembered tombstone by CAS
-       `page_number` from TOMBSTONE -> `page_number`, then claim `owner_txn`.
+     - Tombstones MAY transiently carry a nonzero `owner_txn` (e.g., a crash
+       between deletion steps). A tombstone slot is reusable only after its
+       `owner_txn` is 0.
+     - If `owner_txn != 0`, the probing process MAY "help" finalize deletion by
+       CASing `owner_txn` from the observed value -> 0, then continue probing.
+       (If the CAS fails, someone else is racing; continue probing.)
+     - If `owner_txn == 0`, remember the first such tombstone index and continue
+       probing to ensure there is no existing entry for `page_number`. When an
+       empty slot is found (or after a full probe), attempt to reuse the
+       remembered tombstone by CAS `page_number` from TOMBSTONE -> `page_number`,
+       then CAS `owner_txn` from 0 -> requesting TxnId.
    - Else: advance `idx = (idx + 1) & (capacity - 1)`.
 
 This insertion discipline is required: inserting by writing `owner_txn` alone
@@ -4805,7 +4902,9 @@ is incorrect because it would create entries with no discoverable key.
   the entry from the probe chain's perspective first. (Do NOT clear to 0;
   clearing to empty in a linear-probing table breaks probe chains and causes
   false negatives for entries hashed past this slot.)
-- **Step 2:** Store `owner_txn = 0` (Release ordering).
+- **Step 2:** Store `owner_txn = 0` (Release ordering). If the process crashes
+  after Step 1 but before Step 2, other processes will eventually encounter the
+  tombstone and may clear `owner_txn` to 0 (helping) as part of acquisition.
 
 **Why this order matters:** If we clear `owner_txn` first (to 0) before
 tombstoning, there is a race window where another process sees
@@ -5041,6 +5140,30 @@ The hot plane uses **bucket epochs**:
   resets its bitsets and sets `bucket_epoch` to current (epoch swap = O(1) clear).
 
 This yields bounded memory and bounded per-operation cost without per-txn clears.
+
+##### 5.6.4.9 Distributed Mode: Proof-Carrying Replication (Normative Hook)
+
+Because witness evidence (`ReadWitness`/`WriteWitness`/`DependencyEdge`) and
+validation summaries (`CommitProof`) are ECS objects, they are **replicable by
+symbols** just like pages and capsules.
+
+Normative replication hook:
+- Any replica that can receive/apply a `CommitMarker` MUST be able to fetch the
+  marker-referenced `CommitProof` and (transitively) the witness-plane objects
+  needed to replay validation.
+- Replicas MAY enforce a policy of **proof-carrying commits**: accept a remote
+  commit only if the referenced evidence objects decode and the local replay of
+  validation reaches the same conclusion under the same policy knobs.
+
+This does not require leaderless operation, but it removes "trust me" from the
+distributed story: commits can carry replayable evidence.
+
+##### 5.6.4.10 Deterministic Verification Gates (Required)
+
+The witness plane MUST be verified under cancellation/crash/loss using
+asupersync LabRuntime:
+- deterministic scenarios: §17.4.1
+- no-false-negatives property tests: §17.4.2
 
 #### 5.6.5 GC Coordination
 
@@ -6076,13 +6199,18 @@ updated since its snapshot, we attempt **deterministic rebase**:
    commit proceeds with the rebased page deltas.
 5. **If replay fails** (true conflict, constraint violation): abort/retry.
 
-**Limitation (Blind Writes):** The `IntentOp` structure currently captures the
-*result* of an update (`new_record`), not the expression logic. Therefore,
-deterministic rebase effectively merges **blind writes** (e.g., two users updating
-different columns, or inserting different rows) but cannot automatically merge
-arithmetic read-modify-write operations (e.g., `SET c = c + 1`) if the base value
-changed. Such conflicts will be detected and aborted. Future work may add
-`IntentOp::UpdateExpression` to enable AST-based merge logic.
+**Safety Constraint (Read-Dependency Check):** Rebase MUST NOT proceed if the
+transaction has any SSI read-dependency on the page/key being modified, UNLESS
+the `IntentOp` is explicitly marked as "independent of read state" (V1 does not
+support this marking). Replaying a write that depended on a previous read
+against a *different* base version creates a Lost Update (Write Skew).
+
+**Limitation (Blind Writes):** Consequently, V1 rebase is strictly limited to
+**pure blind writes** where the transaction did not read the target page/row.
+Arithmetic read-modify-write operations (e.g., `SET c = c + 1`) or conditional
+updates based on read values cannot be merged. Future work may add
+`IntentOp::UpdateExpression` to enable AST-based merge logic that re-evaluates
+reads against the new base.
 
 This is "merge by re-execution", not "merge by bytes". It gives us *row-level
 concurrency effects* without storing row-level MVCC metadata.
@@ -6132,7 +6260,9 @@ When txn `U` reaches commit, for each page in `write_set(U)`:
 2. Else, attempt merge in strict priority order:
    a. **Schema epoch check (required):** If `current_schema_epoch != U.snapshot.schema_epoch`,
       abort with `SQLITE_SCHEMA` (merging across DDL/VACUUM boundaries is forbidden).
-   b. **Deterministic rebase replay** (preferred: semantic, highest success rate)
+   b. **Deterministic rebase replay** (preferred, but restricted):
+      - MUST verify `U` has no `ReadWitness` covering this page/key (see §5.10.2).
+      - If safe, replay `IntentOp` against current base.
    c. **Structured page patch merge** (if ops are cell-disjoint)
    d. **Sparse XOR merge** (only if ranges are declared merge-safe)
    e. **Abort/retry** (no safe merge found)
@@ -6286,12 +6416,28 @@ target key was found in B2.
 ```
 REPLACE(cache, target_key):
   // target_key is the page that triggered this replacement (for tie-breaking)
+  rotations = 0
   loop:
+    // Safety valve (MUST be checked FIRST, before branching into T1/T2).
+    // If we have rotated through ALL entries in both T1 and T2 and every
+    // page is pinned, we are overcommitted. Allow temporary growth beyond
+    // capacity rather than deadlock.
+    //
+    // CRITICAL: This check was previously placed AFTER the T1/T2 branches
+    // as dead code -- both branches `return` on successful eviction or
+    // `continue` on pinned pages, so control never reached the old
+    // position. With all pages pinned, the loop would spin forever in
+    // whichever branch was selected, never reaching the safety valve.
+    if rotations >= |T1| + |T2|:
+      capacity_overflow += 1
+      return  // caller inserts without evicting
+
     if |T1| > 0 AND (|T1| > p OR (|T1| == p AND target_key IN B2)):
       // Evict the LRU page of T1 (recency list)
       candidate = T1.front()
       if candidate.ref_count > 0:
         T1.rotate_front_to_back()  // skip pinned; try next
+        rotations += 1
         continue
       if candidate.dirty:
         flush_to_wal(candidate)    // must persist before eviction
@@ -6305,6 +6451,7 @@ REPLACE(cache, target_key):
       candidate = T2.front()
       if candidate.ref_count > 0:
         T2.rotate_front_to_back()
+        rotations += 1
         continue
       if candidate.dirty:
         flush_to_wal(candidate)
@@ -6312,13 +6459,6 @@ REPLACE(cache, target_key):
       B2.push_back(evicted_key)
       total_bytes -= evicted_page.byte_size
       return
-
-    // Safety: if we have rotated through ALL entries in both T1 and T2
-    // and every page is pinned, we are overcommitted. Allow temporary
-    // growth beyond capacity rather than deadlock.
-    if rotations >= |T1| + |T2|:
-      capacity_overflow += 1
-      return  // caller inserts without evicting
 ```
 
 ### 6.4 Full ARC Algorithm: REQUEST Subroutine
@@ -6634,8 +6774,15 @@ pub fn wal_checksum(
 ```
 
 **Endianness determination from WAL magic:**
-- `0x377f0682`: big-endian word order within each 8-byte chunk
-- `0x377f0683`: little-endian word order within each 8-byte chunk
+- `0x377f0682` (bit 0 = 0): little-endian word order within each 8-byte chunk
+  (created on a little-endian machine; `bigEndCksum = 0`)
+- `0x377f0683` (bit 0 = 1): big-endian word order within each 8-byte chunk
+  (created on a big-endian machine; `bigEndCksum = 1`)
+
+The magic is always read via big-endian `u32` decoding (matching SQLite's
+`sqlite3Get4byte`). `native_cksum = (bigEndCksum == SQLITE_BIGENDIAN)`:
+on a machine whose endianness matches the WAL creator, no byte-swapping
+is needed.
 
 FrankenSQLite writes WAL files using native byte order for performance.
 
@@ -6823,9 +6970,12 @@ commit group are reconstructed if sufficient repair symbols survive.
 
 ### 7.7 PRAGMA integrity_check Implementation
 
-**Level 1 -- Page-level:** Read every page. Verify page type flag is valid
-(0x02, 0x05, 0x0A, 0x0D). Verify header fields are in range. If page
-checksums enabled, verify XXH3.
+**Level 1 -- Page-level:** Read every page. For pages identified as B-tree
+pages (via Level 4 cross-reference), verify page type flag is valid (0x02,
+0x05, 0x0A, 0x0D) and verify header fields are in range. Overflow pages,
+freelist trunk/leaf pages, lock-byte pages, and pointer map pages have
+different structures and MUST NOT be checked against B-tree type flags.
+If page checksums enabled, verify XXH3 for all page types.
 
 **Level 2 -- B-tree structural:** Cell pointers within bounds and non-
 overlapping. Cell content within cell content area. Interior child pointers
@@ -6857,8 +7007,9 @@ Log page number, expected hash, actual hash. Evict page from cache. If page
 exists in WAL, retry from WAL. Otherwise corruption is persistent.
 
 **CRC-32C mismatch (RaptorQ symbol):** Exclude corrupted symbol from decoding
-set. If `|surviving| >= K` source symbols, decoding proceeds. Otherwise the
-commit group is unrecoverable.
+set. If `|surviving| >= K` total symbols (source + repair combined, where K
+is the source symbol count), decoding proceeds. Otherwise the commit group
+is unrecoverable.
 
 **Database file corruption (found by integrity_check):** Reported as diagnostic
 text. If WAL version exists, it supersedes the corrupt page. Otherwise
@@ -6940,7 +7091,11 @@ verifiability:
   validates behavior, not internal format.
 
 **Mode selection:** `PRAGMA fsqlite.mode = compatibility | native` (default:
-compatibility). Applications can switch modes between connections.
+compatibility). Mode is per-database, not per-connection. Switching from
+Compatibility to Native requires building an initial commit stream from the
+existing `.db` + WAL state. Switching from Native to Compatibility requires
+materializing a checkpoint `.db` from the commit stream. Both conversions
+are explicit operations (not automatic on reconnect).
 
 ### 7.11 Native Mode Commit Protocol (High-Concurrency Path)
 
@@ -6998,6 +7153,14 @@ For each publish request:
    Validation MUST NOT require decoding the entire capsule.
    This step is cancellable: if the database is shutting down, the coordinator
    MAY respond `Aborted { SQLITE_INTERRUPT }` before entering the commit section.
+
+   **SSI Re-validation (Race Protection):** If `request.mode == Concurrent`,
+   the coordinator MUST re-check the `TxnSlot.has_in_rw` and `TxnSlot.has_out_rw`
+   flags (or `SSI_Epoch`) for the requesting transaction. A concurrent commit
+   could have created a Dangerous Structure after the writer's local validation.
+   If `has_in_rw && has_out_rw` (and `request.abort_policy != Custom`), the
+   coordinator MUST abort with `SQLITE_BUSY_SNAPSHOT`.
+
 2. **Allocate `commit_seq`:** Assign the next commit sequence number.
    Also assign `commit_time_unix_ns` as a monotonic timestamp:
    `commit_time_unix_ns := max(now_unix_ns(), last_commit_time_unix_ns + 1)`.
@@ -7063,6 +7226,41 @@ optimal batch size derivation (§4.5) already accounts for `t_fsync`.
 MUST eventually be able to decode the capsule (within configured budgets), or
 else it MUST surface a "durability contract violated" diagnostic with decode
 proofs attached (lab/debug builds).
+
+### 7.13 ECS Storage Reclamation (Compaction)
+
+Native Mode's append-only symbol logs (`ecs/symbols/*.log`) grow indefinitely.
+To reclaim storage, the system runs a **Mark-and-Compact** process.
+
+**Compaction Triggers:**
+- **Space amplification:** `total_log_size / live_data_size > 2.0` (configurable).
+- **Time interval:** `PRAGMA fsqlite.auto_compact_interval`.
+- **Manual:** `PRAGMA fsqlite.compact`.
+
+**Compaction Algorithm (Background E-Process):**
+
+1.  **Mark Phase (Identify Live Symbols):**
+    -   Start from `RootManifest` and active `CommitMarker` stream.
+    -   Trace all reachable `CommitCapsule` objects.
+    -   From capsules, trace all reachable `PageHistory` objects (up to GC horizon).
+    -   From witness plane, trace reachable `ReadWitness`/`WriteWitness`/`IndexSegment` objects.
+    -   Build a `BloomFilter` of live `ObjectId`s.
+
+2.  **Compact Phase (Rewrite Logs):**
+    -   Create new symbol log segment(s).
+    -   Scan old symbol logs. For each symbol record:
+        -   If `ObjectId` is in live set (check Bloom + exact check): copy to new log.
+        -   Else: discard (dead object).
+    -   Update `object_locator.cache` to point to new offsets.
+
+3.  **Atomic Swap (Metadata Update):**
+    -   The `object_locator` update is atomic in memory.
+    -   Old log files are unlinked (deleted) once all active readers have released their handles (Unix refcounting handles this; Windows requires explicit handle closure).
+
+**Safety:** Compaction is concurrent with readers/writers. It never modifies
+existing log files; it only creates new ones and deletes old ones. Readers
+holding open handles to deleted logs continue reading safely until they close
+the handle.
 
 ---
 
@@ -10917,6 +11115,40 @@ The Mazurkiewicz trace explorer generates all non-equivalent orderings
 invariants for each. This is feasible for small scenarios and provides
 exhaustive coverage that random testing cannot guarantee.
 
+#### 17.4.1 SSI Witness Plane Deterministic Scenarios (Required)
+
+The harness MUST include deterministic lab scenarios that specifically stress
+SSI witness publication + candidate discovery under cancellation, crashes, and
+loss (the correctness posture is: false positives allowed, false negatives
+forbidden; §5.6.4.1).
+
+Required scenarios (minimum set):
+- **Two writers, disjoint pages:** both commit; no FCW/SSI aborts.
+- **Two writers, same page, disjoint cell tags / byte ranges:** merge path
+  succeeds (§5.10) and emits `MergeWitness`; SSI does not emit spurious edges
+  at refined granularity.
+- **Classic write skew:** must abort under default SSI (`BEGIN CONCURRENT`),
+  and must succeed under explicitly non-serializable mode (if enabled).
+- **Multi-process lease expiry + slot reuse:** reuse a TxnSlotId and validate
+  that `TxnEpoch` prevents stale hot-index bits from binding to a new txn.
+- **Missing/late symbol records during witness decode:** randomly drop/reorder
+  witness-plane symbol records and require decode recovery from repair symbols
+  (or an explicit "durability contract violated" error with `DecodeProof`).
+
+#### 17.4.2 No-False-Negatives Property Tests (Witness Plane)
+
+Property (normative):
+For any execution schedule, if transaction `R` read key `K` and an overlapping
+transaction `W` wrote key `K`, then during validation of either party, the
+witness plane MUST make it possible to discover `R` as a candidate for `K` at
+some configured index level (refinement may be required to confirm).
+
+The property test harness MUST:
+- randomly generate witness-key reads/writes across multiple RangeKey levels,
+- randomly drop symbol records (local and simulated network),
+- randomly crash/cancel publishers mid-stream (reserve/write without commit),
+- verify candidate discoverability still holds (no false negatives).
+
 ### 17.5 Runtime Invariant Monitoring (E-Processes)
 
 E-process configuration for MVCC invariants:
@@ -11080,17 +11312,179 @@ We operate under a strict loop: Baseline -> Profile -> Prove behavior unchanged 
 
 **Statistical methodology using asupersync's conformal calibration:**
 
-1. **Baseline establishment:** Run benchmark suite 100 times on reference
-   commit, record all measurements.
-2. **Candidate measurement:** Run benchmark suite 30 times on candidate commit.
-3. **Conformal p-value:** For each benchmark, compute the conformal p-value
-   testing H0: "candidate is no slower than baseline."
-4. **Threshold:** Flag as regression if p-value < 0.01 (1% significance).
-5. **Multiple testing correction:** Bonferroni correction across all
-   benchmarks to control family-wise error rate.
-6. **No distributional assumptions:** Conformal p-values are valid regardless
-   of the underlying distribution (important because database latencies are
-   typically heavy-tailed, not normal).
+We do not assume normality. We treat performance as heavy-tailed and
+schedule-sensitive, and we use distribution-free calibration and anytime-valid
+monitors from asupersync's lab toolkit.
+
+1. **Baseline establishment:** Run each benchmark scenario across
+   `N_base >= 30` deterministic schedule seeds and record the chosen statistic
+   (median/p95/p99 latency, throughput, alloc counts, syscall counts).
+2. **Split conformal "no regression" bound (distribution-free):** For each
+   metric, compute an upper prediction bound `U_alpha` from baseline samples
+   using split conformal quantiles (as in `asupersync::lab::conformal`):
+   under the exchangeability assumption across seeds, a fresh baseline run is
+   `<= U_alpha` with probability `>= 1 - alpha`.
+3. **Candidate measurement:** Run the same scenario across `N_cand >= 10`
+   schedule seeds and compute the same statistic.
+4. **Gate (normative):** A metric is a regression if `cand_stat > U_alpha`
+   (or if a ratio vs baseline median exceeds a declared budget). Budgets and
+   `alpha` MUST be recorded in the perf smoke report (§17.8.4).
+5. **Anytime-valid regression monitor (optional but canonical):** Define
+   per-run exceedance `X_i := 1[cand_i > U_alpha]` and wrap it in an e-process
+   monitor. This supports optional stopping while controlling false alarms
+   (Ville's inequality; asupersync `EProcess`).
+6. **Multiple testing policy (required):** Allocate `alpha_total` across
+   metrics using Bonferroni (`alpha = alpha_total / M`) or an alpha-investing
+   policy. The policy and `M` MUST be recorded alongside results.
+
+#### 17.8.1 Extreme Optimization Loop (Mandatory, Operational)
+
+All performance work MUST follow this loop (one lever per commit):
+
+1. **BASELINE:** capture p50/p95/p99 + throughput + alloc counts for a named scenario.
+2. **PROFILE:** CPU profile and (if relevant) allocation + syscall census.
+3. **PROVE:** golden outputs unchanged + isomorphism proof (Section 17.9).
+4. **IMPLEMENT:** one optimization lever only (no drive-by refactors).
+5. **VERIFY:** re-measure vs baseline; store artifacts; re-run golden checks.
+6. **REPEAT:** re-profile (hotspots move).
+
+The loop is strict because database performance is heavy-tailed and non-linear:
+optimizing the wrong 5% burns engineering time and typically regresses p99.
+
+#### 17.8.2 Deterministic Measurement Discipline (Seeds + Fingerprints)
+
+**Rule:** Every benchmark scenario MUST be reproducible:
+- fixed `seed`,
+- fixed scenario parameters,
+- recorded environment (at least `RUSTFLAGS`, feature flags, mode),
+- recorded `git_sha`.
+
+For concurrent scenarios, we additionally require a **schedule fingerprint**
+(Foata fingerprint / trace fingerprint when available) so a profile can be
+replayed and diffed without "it got a different interleaving".
+
+This is where asupersync buys real alpha: it turns perf debugging into a
+repeatable experiment rather than a noisy ritual.
+
+#### 17.8.3 Opportunity Matrix (Gate: Score >= 2.0)
+
+Before implementing any optimization, we MUST score it:
+
+| Hotspot (func:line) | Impact (1-5) | Confidence (1-5) | Effort (1-5) | Score |
+|---------------------|--------------|------------------|--------------|-------|
+| example             | 4            | 4                | 2            | 8.0   |
+
+`Score = (Impact * Confidence) / Effort`
+
+Only land changes with `Score >= 2.0`. If you cannot name the hotspot, your
+confidence is 0 and the score is 0.
+
+#### 17.8.4 Baseline Artifact Layout (Normative)
+
+FrankenSQLite MUST store perf artifacts under `baselines/` (git-tracked when
+small; otherwise stored as CI artifacts with a stable path):
+
+```
+baselines/
+  criterion/              # Criterion summary baselines (JSON)
+  hyperfine/              # CLI microbench baselines (JSON)
+  alloc_census/           # heaptrack/valgrind reports
+  syscalls/               # strace summaries
+  smoke/                  # end-to-end perf smoke reports (JSON)
+```
+
+Each artifact MUST include:
+- `generated_at` (ISO-8601),
+- `command`,
+- `seed`,
+- `git_sha`,
+- scenario id / config hash.
+
+This is the minimal discipline needed to make "it got slower" actionable.
+
+**Perf smoke report schema (required):**
+
+The perf smoke report in `baselines/smoke/` is the canonical manifest for a
+measurement run (it ties together baselines, environment, and statistical
+gates). Minimum schema:
+
+```json
+{
+  "generated_at": "2026-02-07T00:00:00Z",
+  "scenario_id": "mvcc_100_writers_zipf_s_0_99",
+  "command": "cargo bench --bench mvcc_stress",
+  "seed": "3735928559",
+  "trace_fingerprint": "sha256:...",
+  "git_sha": "deadbeef...",
+  "config_hash": "sha256:...",
+  "alpha_total": 0.01,
+  "alpha_policy": "bonferroni",
+  "metric_count": 12,
+  "artifacts": {
+    "criterion_dir": "target/criterion",
+    "baseline_path": "baselines/criterion/baseline_20260207_000000.json",
+    "latest_path": "baselines/criterion/baseline_latest.json"
+  },
+  "env": {
+    "RUSTFLAGS": "-C force-frame-pointers=yes"
+  },
+  "system": {
+    "os": "linux",
+    "arch": "x86_64",
+    "kernel": "Linux-6.x"
+  }
+}
+```
+
+#### 17.8.5 Profiling Cookbook (Copy/Paste, Required Fields)
+
+**CPU profiling (Linux):**
+```bash
+RUSTFLAGS="-C force-frame-pointers=yes" \
+cargo flamegraph --bench <bench_name> -- --bench
+```
+
+**CLI microbench baseline (hyperfine):**
+```bash
+hyperfine \
+  --warmup 3 \
+  --runs 10 \
+  --export-json baselines/hyperfine/<scenario>.json \
+  '<command>'
+```
+
+**Allocation profiling (heaptrack):**
+```bash
+heaptrack <binary_or_bench_invocation>
+```
+
+**Syscall census (strace):**
+```bash
+strace -f -c -o baselines/syscalls/<scenario>.txt <command>
+```
+
+**Mandatory metadata to record in perf notes / smoke report:**
+- `git rev-parse HEAD`
+- scenario id + parameters
+- seed(s)
+- `RUSTFLAGS` and feature flags
+- platform (`uname -a`)
+
+#### 17.8.6 Golden Checksums for Perf Changes (Behavior Lock)
+
+For any perf-only change, we MUST produce a quick behavior lock:
+
+```bash
+# Capture (baseline commit)
+sha256sum -b golden_outputs/* > golden_checksums.txt
+
+# Verify (candidate commit)
+sha256sum -c golden_checksums.txt
+```
+
+The golden outputs are the same ones used by the conformance harness
+(Section 17.7): query results, error codes, and any spec-required artifacts
+(`CommitMarker`/`CommitProof`/`AbortWitness`) for scenarios that exercise them.
 
 ### 17.9 Isomorphism Proof Template (Required For Optimizations)
 
@@ -11642,6 +12036,10 @@ Every phase must pass all applicable gates before proceeding to the next.
   same patterns succeed under PRAGMA fsqlite.serializable=OFF
 - SSI: no false negatives (no write skew anomaly escapes detection in
   3-transaction Mazurkiewicz trace exploration)
+- SSI witness plane: multi-process lease expiry + TxnSlot reuse does not cause
+  stale hot-index bits to bind to a new `TxnToken` (TxnEpoch validation holds)
+- SSI witness plane: witness objects/segments decode under injected symbol
+  loss/reordering (repair-path succeeds or emits explicit `DecodeProof`)
 - Snapshot isolation: verified via Mazurkiewicz trace exploration for
   3-transaction scenarios (all non-equivalent orderings)
 - E-process monitors: INV-1 through INV-7, zero violations over 1M operations
