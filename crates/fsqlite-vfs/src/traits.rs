@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use fsqlite_error::Result;
-use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 use fsqlite_types::LockLevel;
+use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 
 /// A virtual filesystem implementation.
 ///
@@ -15,7 +15,7 @@ pub trait Vfs: Send + Sync {
     type File: VfsFile;
 
     /// The name of this VFS (e.g., "unix", "memory").
-    fn name(&self) -> &str;
+    fn name(&self) -> &'static str;
 
     /// Open a file.
     ///
@@ -25,11 +25,7 @@ pub trait Vfs: Send + Sync {
     ///
     /// Returns the opened file and the flags that were actually used (the VFS
     /// may add flags like `READWRITE` when `CREATE` is specified).
-    fn open(
-        &self,
-        path: Option<&Path>,
-        flags: VfsOpenFlags,
-    ) -> Result<(Self::File, VfsOpenFlags)>;
+    fn open(&self, path: Option<&Path>, flags: VfsOpenFlags) -> Result<(Self::File, VfsOpenFlags)>;
 
     /// Delete a file.
     ///

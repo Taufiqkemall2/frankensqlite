@@ -8,8 +8,8 @@
 //! See: <https://www.sqlite.org/fileformat.html#record_format>
 
 use crate::serial_type::{
-    classify_serial_type, read_varint, serial_type_for_blob, serial_type_for_integer,
-    serial_type_for_text, serial_type_len, varint_len, write_varint, SerialTypeClass,
+    SerialTypeClass, classify_serial_type, read_varint, serial_type_for_blob,
+    serial_type_for_integer, serial_type_for_text, serial_type_len, varint_len, write_varint,
 };
 use crate::value::SqliteValue;
 
@@ -267,7 +267,11 @@ mod tests {
             let values = vec![SqliteValue::Integer(val)];
             let data = serialize_record(&values);
             let parsed = parse_record(&data).unwrap();
-            assert_eq!(parsed[0].as_integer(), Some(val), "roundtrip failed for {val}");
+            assert_eq!(
+                parsed[0].as_integer(),
+                Some(val),
+                "roundtrip failed for {val}"
+            );
         }
     }
 

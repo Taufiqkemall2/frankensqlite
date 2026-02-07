@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 use fsqlite_types::LockLevel;
+use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 
 use crate::traits::{Vfs, VfsFile};
 
@@ -40,30 +40,28 @@ impl MemoryVfs {
     }
 }
 
+fn lock_err() -> FrankenError {
+    FrankenError::internal("MemoryVfs lock poisoned")
+}
+
 impl Vfs for MemoryVfs {
     type File = MemoryFile;
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "memory"
     }
 
-    fn open(
-        &self,
-        path: Option<&Path>,
-        flags: VfsOpenFlags,
-    ) -> Result<(Self::File, VfsOpenFlags)> {
-        let mut inner = self.inner.lock().map_err(|_| {
-            FrankenError::internal("MemoryVfs lock poisoned")
-        })?;
+    #[allow(clippy::significant_drop_tightening)]
+    fn open(&self, path: Option<&Path>, flags: VfsOpenFlags) -> Result<(Self::File, VfsOpenFlags)> {
+        let mut inner = self.inner.lock().map_err(|_| lock_err())?;
 
-        let resolved_path = match path {
-            Some(p) => p.to_path_buf(),
-            None => {
-                // Generate a unique temporary filename.
-                let id = inner.next_temp_id;
-                inner.next_temp_id += 1;
-                PathBuf::from(format!("__temp_{id}__"))
-            }
+        let resolved_path = if let Some(p) = path {
+            p.to_path_buf()
+        } else {
+            // Generate a unique temporary filename.
+            let id = inner.next_temp_id;
+            inner.next_temp_id += 1;
+            PathBuf::from(format!("__temp_{id}__"))
         };
 
         let is_create = flags.contains(VfsOpenFlags::CREATE);
@@ -71,13 +69,17 @@ impl Vfs for MemoryVfs {
             Arc::clone(existing)
         } else if is_create {
             let storage = Arc::new(Mutex::new(FileStorage::default()));
-            inner.files.insert(resolved_path.clone(), Arc::clone(&storage));
+            inner
+                .files
+                .insert(resolved_path.clone(), Arc::clone(&storage));
             storage
         } else {
             return Err(FrankenError::CannotOpen {
                 path: resolved_path,
             });
         };
+
+        drop(inner);
 
         let file = MemoryFile {
             path: resolved_path,
@@ -96,23 +98,24 @@ impl Vfs for MemoryVfs {
     }
 
     fn delete(&self, path: &Path, _sync_dir: bool) -> Result<()> {
-        let mut inner = self.inner.lock().map_err(|_| {
-            FrankenError::internal("MemoryVfs lock poisoned")
-        })?;
-        inner.files.remove(path);
+        self.inner
+            .lock()
+            .map_err(|_| lock_err())?
+            .files
+            .remove(path);
         Ok(())
     }
 
     fn access(&self, path: &Path, _flags: AccessFlags) -> Result<bool> {
-        let inner = self.inner.lock().map_err(|_| {
-            FrankenError::internal("MemoryVfs lock poisoned")
-        })?;
-        Ok(inner.files.contains_key(path))
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| lock_err())?
+            .files
+            .contains_key(path))
     }
 
     fn full_pathname(&self, path: &Path) -> Result<PathBuf> {
-        // Memory VFS paths are already "absolute" in the sense that
-        // they're unique keys. Just return as-is or prefix with "/".
         if path.is_absolute() {
             Ok(path.to_path_buf())
         } else {
@@ -136,25 +139,25 @@ pub struct MemoryFile {
 impl VfsFile for MemoryFile {
     fn close(&mut self) -> Result<()> {
         if self.delete_on_close {
-            let mut inner = self.vfs.lock().map_err(|_| {
-                FrankenError::internal("MemoryVfs lock poisoned")
-            })?;
-            inner.files.remove(&self.path);
+            self.vfs
+                .lock()
+                .map_err(|_| lock_err())?
+                .files
+                .remove(&self.path);
         }
         self.lock_level = LockLevel::None;
         Ok(())
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn read(&mut self, buf: &mut [u8], offset: u64) -> Result<usize> {
-        let storage = self.storage.lock().map_err(|_| {
-            FrankenError::internal("MemoryFile lock poisoned")
-        })?;
+        let storage = self.storage.lock().map_err(|_| lock_err())?;
 
         let offset = offset as usize;
         let file_len = storage.data.len();
 
         if offset >= file_len {
-            // Reading past end of file: zero-fill.
+            drop(storage);
             buf.fill(0);
             return Ok(0);
         }
@@ -162,6 +165,7 @@ impl VfsFile for MemoryFile {
         let available = file_len - offset;
         let to_read = buf.len().min(available);
         buf[..to_read].copy_from_slice(&storage.data[offset..offset + to_read]);
+        drop(storage);
 
         // Zero-fill the rest if short read.
         if to_read < buf.len() {
@@ -171,15 +175,13 @@ impl VfsFile for MemoryFile {
         Ok(to_read)
     }
 
+    #[allow(clippy::cast_possible_truncation, clippy::significant_drop_tightening)]
     fn write(&mut self, buf: &[u8], offset: u64) -> Result<()> {
-        let mut storage = self.storage.lock().map_err(|_| {
-            FrankenError::internal("MemoryFile lock poisoned")
-        })?;
+        let mut storage = self.storage.lock().map_err(|_| lock_err())?;
 
         let offset = offset as usize;
         let end = offset + buf.len();
 
-        // Extend the file if necessary.
         if end > storage.data.len() {
             storage.data.resize(end, 0);
         }
@@ -188,28 +190,25 @@ impl VfsFile for MemoryFile {
         Ok(())
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn truncate(&mut self, size: u64) -> Result<()> {
-        let mut storage = self.storage.lock().map_err(|_| {
-            FrankenError::internal("MemoryFile lock poisoned")
-        })?;
-        storage.data.truncate(size as usize);
+        self.storage
+            .lock()
+            .map_err(|_| lock_err())?
+            .data
+            .truncate(size as usize);
         Ok(())
     }
 
     fn sync(&mut self, _flags: SyncFlags) -> Result<()> {
-        // No-op for in-memory files.
         Ok(())
     }
 
     fn file_size(&self) -> Result<u64> {
-        let storage = self.storage.lock().map_err(|_| {
-            FrankenError::internal("MemoryFile lock poisoned")
-        })?;
-        Ok(storage.data.len() as u64)
+        Ok(self.storage.lock().map_err(|_| lock_err())?.data.len() as u64)
     }
 
     fn lock(&mut self, level: LockLevel) -> Result<()> {
-        // Memory VFS: locks are always granted (single-process).
         self.lock_level = level;
         Ok(())
     }
@@ -222,7 +221,6 @@ impl VfsFile for MemoryFile {
     }
 
     fn check_reserved_lock(&self) -> Result<bool> {
-        // Memory VFS: no other process can hold locks.
         Ok(false)
     }
 }
@@ -244,11 +242,9 @@ mod tests {
 
         let (mut file, _) = vfs.open(Some(path), flags).unwrap();
 
-        // Write some data.
         file.write(b"hello", 0).unwrap();
         assert_eq!(file.file_size().unwrap(), 5);
 
-        // Read it back.
         let mut buf = [0u8; 5];
         let n = file.read(&mut buf, 0).unwrap();
         assert_eq!(n, 5);
@@ -264,7 +260,6 @@ mod tests {
         let (mut file, _) = vfs.open(Some(path), flags).unwrap();
         file.write(b"hi", 0).unwrap();
 
-        // Read more than available.
         let mut buf = [0xFFu8; 10];
         let n = file.read(&mut buf, 0).unwrap();
         assert_eq!(n, 2);
@@ -293,11 +288,9 @@ mod tests {
 
         let (mut file, _) = vfs.open(Some(Path::new("test.db")), flags).unwrap();
 
-        // Write at an offset past the current end.
         file.write(b"world", 10).unwrap();
         assert_eq!(file.file_size().unwrap(), 15);
 
-        // Bytes 0-9 should be zero.
         let mut buf = [0xFFu8; 15];
         file.read(&mut buf, 0).unwrap();
         assert!(buf[..10].iter().all(|&b| b == 0));
@@ -370,7 +363,6 @@ mod tests {
         let (mut file1, _) = vfs.open(None, flags).unwrap();
         let (mut file2, _) = vfs.open(None, flags).unwrap();
 
-        // Each temp file is independent.
         file1.write(b"file1", 0).unwrap();
         file2.write(b"file2", 0).unwrap();
 
@@ -388,11 +380,9 @@ mod tests {
         let path = Path::new("shared.db");
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
 
-        // First handle writes data.
         let (mut file1, _) = vfs.open(Some(path), flags).unwrap();
         file1.write(b"shared data", 0).unwrap();
 
-        // Second handle opens the same file and reads the data.
         let open_flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE;
         let (mut file2, _) = vfs.open(Some(path), open_flags).unwrap();
         let mut buf = [0u8; 11];
@@ -418,15 +408,12 @@ mod tests {
 
         let (mut file, _) = vfs.open(Some(Path::new("lock.db")), flags).unwrap();
 
-        // Lock escalation.
         file.lock(LockLevel::Shared).unwrap();
         file.lock(LockLevel::Reserved).unwrap();
         file.lock(LockLevel::Exclusive).unwrap();
 
-        // No other process, so no reserved lock check.
         assert!(!file.check_reserved_lock().unwrap());
 
-        // Unlock back down.
         file.unlock(LockLevel::Shared).unwrap();
         file.unlock(LockLevel::None).unwrap();
     }
@@ -463,8 +450,6 @@ mod tests {
     fn vfs_default_current_time() {
         let vfs = make_vfs();
         let time = vfs.current_time();
-        // Julian day for 2020-01-01 is ~2458849.5, for 2030 ~2462502.5
-        // Just verify it's a reasonable Julian day.
         assert!(time > 2_450_000.0);
         assert!(time < 2_500_000.0);
     }
@@ -476,8 +461,6 @@ mod tests {
         let mut buf2 = [0u8; 16];
         vfs.randomness(&mut buf1);
         vfs.randomness(&mut buf2);
-        // Both calls produce the same sequence (deterministic default).
-        // Real implementations override with OS randomness.
         assert_eq!(buf1, buf2);
     }
 
@@ -487,7 +470,6 @@ mod tests {
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
         let (mut file, _) = vfs.open(Some(Path::new("pages.db")), flags).unwrap();
 
-        // Simulate writing two 4096-byte pages.
         let page1 = vec![0xAA_u8; 4096];
         let page2 = vec![0xBB_u8; 4096];
 
@@ -495,7 +477,6 @@ mod tests {
         file.write(&page2, 4096).unwrap();
         assert_eq!(file.file_size().unwrap(), 8192);
 
-        // Read them back.
         let mut buf = vec![0u8; 4096];
         file.read(&mut buf, 0).unwrap();
         assert!(buf.iter().all(|&b| b == 0xAA));
