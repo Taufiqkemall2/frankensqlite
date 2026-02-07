@@ -1261,6 +1261,8 @@ On recovery, we scan the `.wal` file. If we encounter a torn write (invalid chec
 5.  If `valid_sources + valid_repairs >= K`:
     - Decode to recover missing/corrupted source pages.
     - Treat recovered pages as if they were successfully read from the WAL.
+    - The commit frame's `db_size` MUST be taken from `WalFecGroupMeta.db_size_pages`
+      (it is needed to apply truncation/extension semantics during WAL replay).
 6.  If `valid_sources + valid_repairs < K`:
     - The commit is lost (catastrophic failure). Truncate WAL before this group.
 
@@ -9094,6 +9096,16 @@ recover_wal(wal_file):
   // Only committed transactions (last frame has db_size > 0) are replayed
 ```
 
+**Critical implication (normative for self-healing):** Because the checksum is
+*cumulative*, once a mismatch occurs at frame `i` the WAL format alone cannot
+validate frames `i+1..` (their expected checksum depends on the checksum state
+after frame `i`). Therefore, any "self-healing WAL" design MUST provide an
+independent random-access validation mechanism for source frames. FrankenSQLite
+does this by storing per-source `xxh3_64(page_data)` hashes in `.wal-fec`
+(`WalFecGroupMeta.source_page_xxh3`; §3.4.1), which allows identifying which
+source symbols are safe to feed into a decoder even when the cumulative chain is
+broken.
+
 ### 7.6 Double-Write Prevention
 
 SQLite's WAL design prevents double-write corruption through:
@@ -9144,9 +9156,18 @@ found. Matches C SQLite behavior exactly.
 
 ### 7.8 Error Recovery by Checksum Type
 
-**WAL frame checksum mismatch:** Frame is at or beyond the valid WAL end.
-Truncate valid WAL at this point. Not an error (normal torn-write recovery).
-If RaptorQ repair symbols available, attempt reconstruction first.
+**WAL frame checksum mismatch:** Frame is at or beyond the valid WAL end under
+SQLite's cumulative checksum rule (§7.5). Normal recovery truncates the WAL at
+the first mismatch. FrankenSQLite MUST attempt repair first *if* a matching
+`.wal-fec` group exists:
+- Locate `WalFecGroupMeta` for the affected commit group (§3.4.1).
+- Validate candidate source frames using `source_page_xxh3` (random-access; does
+  not depend on the broken checksum chain).
+- Combine surviving sources + repair symbols and decode if `>= K`.
+- If repair succeeds, treat the group as committed and persist the repair by
+  checkpointing and resetting/truncating the WAL (so the corruption does not
+  require re-repair on every boot).
+- If repair fails, truncate the WAL before the damaged group (transaction lost).
 
 **XXH3 internal mismatch (buffer pool):** Return `SQLITE_CORRUPT` to caller.
 Log page number, expected hash, actual hash. Evict page from cache. If page
@@ -11227,7 +11248,10 @@ Offset  Size  Field                    Valid Values              FrankenSQLite D
  21       1   Max embed payload frac   64 (MUST be 64)           64
  22       1   Min embed payload frac   32 (MUST be 32)           32
  23       1   Leaf payload fraction    32 (MUST be 32)           32
- 24       4   File change counter      any u32                   Incremented on commit
+ 24       4   File change counter      any u32                   Incremented when the database header
+                                      (offset 24)                is written (rollback-journal commit;
+                                                                  checkpoint writing page 1). In WAL mode,
+                                                                  this is NOT forced on every commit.
  28       4   Database size (pages)    0 or actual count         Actual count
                                       (only valid when offset 92 == offset 24;
                                        otherwise compute from file size)
@@ -11243,7 +11267,8 @@ Offset  Size  Field                    Valid Values              FrankenSQLite D
  64       4   Incremental vacuum       0 or non-zero             0
  68       4   Application ID           any u32                   0
  72      20   Reserved                 all zeros                 All zeros
- 92       4   Version-valid-for        change counter value       Matches offset 24
+ 92       4   Version-valid-for        change counter value       Updated alongside offset 24; when equal,
+                                                                  header fields like "db size pages" are valid
  96       4   SQLite version number    X*1000000+Y*1000+Z        3052000 (3.52.0)
 ```
 
