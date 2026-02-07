@@ -183,7 +183,8 @@ model rather than a silent corruption or a "panic and pray" failure mode.
 
 ### 1.4 Constraints
 
-- **Edition 2024**, nightly toolchain required (see `rust-toolchain.toml`)
+- **Edition 2024**; nightly toolchain required (see `rust-toolchain.toml`) for
+  asupersync and other nightly-only APIs
 - **`unsafe_code = "forbid"`** -- no escape hatches
 - **Clippy pedantic + nursery at deny level** -- with specific documented allows
 - **23 crates** in workspace under `crates/`
@@ -269,8 +270,8 @@ memory (default: 5). It still allows only ONE writer at a time. The
 `WAL_WRITE_LOCK` (byte 120 of the WAL index shared memory) is an exclusive
 advisory lock. Any connection attempting to write while another holds this lock
 receives `SQLITE_BUSY` (or `SQLITE_BUSY_SNAPSHOT` when a reader-turned-writer
-discovers its snapshot has been invalidated by a WAL reset/rewind event, e.g.
-during checkpoint/restart).
+detects a WAL snapshot conflict: the wal-index header has changed since the
+read transaction started, so upgrading to a writer would create a fork).
 
 For applications with mixed read/write workloads across different tables or
 different regions of the same table, this is a needless bottleneck. Two users
@@ -3440,17 +3441,25 @@ E-values make global control simple and optional-stopping-safe:
   `E_i(t) >= 1/alpha_i`. Then the probability that *any* monitor ever rejects
   under the global null is `<= alpha_total`.
 
-- **E-value aggregation (tighter, recommended):** choose weights `w_i >= 0`
-  with `sum_i w_i = 1` and define:
+- **E-value aggregation (adaptive, recommended):** choose weights `w_i >= 0`
+  with `sum_i w_i = 1` and define the **arithmetic mean**:
 
   ```
-  E_global(t) := Π_i E_i(t)^{w_i}
+  E_global(t) := Σ_i w_i * E_i(t)
   ```
 
-  If each `E_i(t)` is an e-process under its null, then `E_global(t)` is also
-  an e-process under the global null. Alarm when `E_global(t) >= 1/alpha_total`.
-  The resulting certificate includes the top contributing monitors by
-  `log E_i(t)` share (an "evidence ledger").
+  By linearity of conditional expectation, `E_global(t)` is a valid e-process
+  (nonneg supermartingale with `E_global(0) = 1`) under the global null
+  **regardless of dependence** between monitors — no independence assumption
+  required (Vovk & Wang 2021, §4). This is critical because MVCC invariant
+  monitors observe the same transactions and are therefore correlated.
+  Alarm when `E_global(t) >= 1/alpha_total` (Ville's inequality; optional
+  stopping safe). The resulting certificate includes the top contributing
+  monitors by `w_i * E_i(t)` share (an "evidence ledger").
+
+  *Note:* The weighted geometric mean `Π_i E_i(t)^{w_i}` would be tighter
+  but requires conditional independence of the monitors, which does not hold
+  here. The arithmetic mean is the standard dependence-robust aggregation.
 
 This gives rigorous "peek-anytime" monitoring *across the whole system* rather
 than per-invariant ad hoc thresholds.
@@ -3478,8 +3487,8 @@ use asupersync::lab::oracle::eprocess::{EProcess, EProcessConfig};
 fn create_mvcc_monitors() -> Vec<EProcess> {
     vec![
         // INV-1: Monotonicity. Enforced by hardware atomics; any violation
-        // is a catastrophic bug. p0 ~ 0, lambda maximal for instant detection.
-        // Power: detects a single violation within 1 observation.
+        // is a catastrophic bug. Each violation roughly doubles E (factor ≈ 2.0);
+        // ~20 violations cross the 1/alpha = 1e6 threshold (log2(1e6) ≈ 20).
         EProcess::new("INV-1: TxnId/CommitSeq Monotonicity", EProcessConfig {
             p0: 1e-9, lambda: 0.999, alpha: 1e-6, max_evalue: 1e18,
         }),
@@ -3575,8 +3584,9 @@ After 1000 operations with no violations, `E_1000 ~ 1.0` (fluctuates around 1
 due to the martingale property). If a bug causes even a single violation, the
 e-value jumps by a factor of `(1 + lambda * (1 - p_0))`. For INV-2's actual
 config (lambda=0.999, p_0=1e-9, alpha=1e-6), this is approximately `2.0`,
-and the rejection threshold is `1/alpha = 1,000,000`. Even a single violation
-causes rapid e-value growth; a handful of violations crosses the threshold.
+and the rejection threshold is `1/alpha = 1,000,000`. Each violation roughly
+doubles the e-value; ~20 violations (log2(10^6) ≈ 20) are sufficient to
+cross the threshold, even intermixed with millions of non-violations.
 (Pedagogical shorthand: with lambda=0.5, p_0=0.001, alpha=0.05, the jump
 would be ~1.5 with threshold 20 -- but those are not the actual INV-2 params.)
 
@@ -6708,7 +6718,7 @@ which is exactly what the alien-artifact discipline demands: the conclusion
 should not depend on precise knowledge of hard-to-estimate quantities.
 
 **Why this matters beyond "just use the conservative rule":**
-1. It provides a formal framework for the Layer 3 refinement (Section 0.2,
+1. It provides a formal framework for the Layer 3 refinement (Section 2.4,
    bullet 4). When cell/byte-range witness refinement is added (i.e., witnesses
    include `Cell(page, cell_tag)` and/or `ByteRange(page, start, len)` keys),
    `P(anomaly|evidence)` drops for same-page-different-row conflicts, and the
@@ -10245,6 +10255,10 @@ exhaustive. N varies by join complexity (1 for simple, 5–18 for multi-table).
 The simpler exhaustive/greedy split here is FrankenSQLite's initial strategy.)
 
 ### 10.6 Code Generation
+
+The opcode traces below are **illustrative only**: the exact sequences vary by
+schema, indexes, triggers, and optimizer choices. They exist to convey shape,
+not to be byte-for-byte identical to C SQLite.
 
 **SELECT -> VDBE opcodes:**
 ```
@@ -13829,7 +13843,7 @@ from spec, never translate line-by-line).
 
 | File | Purpose | Lines | What to Extract |
 |------|---------|-------|-----------------|
-| `sqliteInt.h` | Main internal header | ~250KB | All struct definitions (Btree, BtCursor, Pager, Wal, Vdbe, Mem, Table, Index, Column, Expr, Select, etc.), all `#define` constants, all function prototypes. This is the Rosetta Stone. |
+| `sqliteInt.h` | Main internal header | ~19,000 | All struct definitions (Btree, BtCursor, Pager, Wal, Vdbe, Mem, Table, Index, Column, Expr, Select, etc.), all `#define` constants, all function prototypes. This is the Rosetta Stone. |
 | `btree.c` | B-tree engine | 11,568 | Page format parsing, cell format, cursor movement algorithms (moveToChild, moveToRoot, moveToLeftmost, moveToRightmost), insert/delete with rebalancing, overflow page management, freelist operations. Focus on `balance_nonroot` (~1,200 lines) as the most complex function. |
 | `pager.c` | Page cache | 7,834 | Pager state machine (OPEN, READER, WRITER_LOCKED, WRITER_CACHEMOD, WRITER_DBMOD, WRITER_FINISHED, ERROR), journal format, hot journal detection, page reference counting, cache eviction policy. |
 | `wal.c` | WAL subsystem | 4,621 | WAL header/frame format, checksum algorithm implementation, WAL index (wal-index) hash table structure, checkpoint algorithm, the critical `WAL_WRITE_LOCK` in `sqlite3WalBeginWriteTransaction` (line numbers shift by SQLite version) that FrankenSQLite replaces with MVCC. |
@@ -13894,9 +13908,9 @@ Mitigations:
 
 **R3. Append-only storage grows without bound.**
 Mitigations:
-- Checkpoint and compaction are first-class (Section 7.9).
+- Checkpoint and compaction are first-class (Section 5.5 for GC/version chain trimming, Section 7.9 for crash contract).
 - Enforce budgets for MVCC history, SSI witness plane, symbol caches.
-- Safe GC horizon = min(active `begin_seq`) bounds version chain length (Theorem 5).
+- Safe GC horizon = min(active `begin_seq`) (Theorem 4) bounds version chain length (Theorem 5).
 
 **R4. Bootstrapping chicken-and-egg (need index to find symbols, need symbols
 to decode index).**
@@ -13979,9 +13993,11 @@ frames across multiple files:
 - WAL file selected by `hash(page_number) % num_wal_files`
 - Each WAL file has its own checkpoint state
 - Commit requires atomic append to all WAL files touched by the transaction
-  (2PC across WAL files)
-- Potential 4-8x improvement in sustained write throughput on NVMe SSDs
-  with high queue depth
+  (2PC across WAL files; crash recovery replays prepared-but-uncommitted
+  entries using a global commit marker in the primary WAL)
+- Potential improvement in sustained write throughput on NVMe SSDs
+  with high queue depth (actual speedup depends on workload page
+  distribution and device parallelism; requires benchmarking)
 
 ### 21.4 Distributed Consensus Integration
 
@@ -14005,11 +14021,11 @@ RaptorQ encoding is CPU-bound. GPU acceleration via compute shaders:
 
 ### 21.6 Persistent Memory (PMEM) VFS
 
-Intel Optane and CXL-attached persistent memory enables byte-addressable
-persistent storage. A PMEM VFS would:
+CXL-attached persistent memory (and legacy Intel Optane DCPMM) enable
+byte-addressable persistent storage. A PMEM VFS would:
 - Memory-map the database file directly to PMEM
-- Eliminate the WAL entirely (direct in-place updates with 8-byte atomic
-  writes for crash consistency)
+- Eliminate the WAL entirely (copy-on-write page updates with 8-byte
+  atomic pointer swings for crash consistency)
 - Use `clflush`/`clwb` instructions for cache line persistence
 - MVCC version chains stored directly in PMEM with epoch-based reclamation
 - Expected latency reduction: 10-100x for small transactions (eliminate
@@ -14152,8 +14168,8 @@ Every phase must pass all applicable gates before proceeding to the next.
 **Phase 9 gates:**
 - Conformance: 95%+ pass rate across 1,000+ golden files
 - Benchmarks: single-writer within 3x of C SQLite
-- Benchmarks: no regression (conformal p-value > 0.01) compared to Phase 8
-- Replication: database replicates correctly under 10% packet loss within 1.2x of no-loss time (matches Phase 9 acceptance criteria §16.9)
+- Benchmarks: no regression (candidate statistic <= conformal upper bound U_alpha with alpha=0.01, per §17.8 methodology) compared to Phase 8
+- Replication: database replicates correctly under 10% packet loss within 1.2x of no-loss time (matches §16, Phase 9 acceptance criteria)
 
 ---
 
@@ -14212,7 +14228,10 @@ all extensions -- is memory-safe by construction.
 database files. It targets 95%+ conformance against golden-file tests
 comparing output with C sqlite3. The SQL dialect, type affinity system,
 VDBE instruction set, file format, and WAL format all match SQLite 3.52.0.
-It is a drop-in replacement for the sqlite3 CLI and library.
+It aims to be a near-drop-in replacement for the sqlite3 CLI and library,
+targeting 95%+ behavioral compatibility while deliberately omitting deprecated
+or security-sensitive features (loadable extensions, shared-cache mode, legacy
+schema formats 1-3; see §15).
 
 **6. Formal Verification Depth.** The MVCC system is specified with formal
 invariants (INV-1 through INV-7), safety proofs (deadlock freedom, snapshot
