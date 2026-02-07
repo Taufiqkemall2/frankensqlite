@@ -4514,7 +4514,7 @@ begin(manager, mode) -> Transaction:
     txn_id = manager.next_txn_id.fetch_add(1, SeqCst)
     txn_epoch = 0  // in-process; cross-process uses TxnSlot.epoch (Section 5.6.2)
     snapshot = Snapshot {
-        high: manager.commit_seq.load(),
+        high: manager.commit_seq.load(Acquire),
         schema_epoch: manager.schema_epoch.load(),
     }
     if mode == Serialized:
@@ -6707,6 +6707,22 @@ concurrency effects* without storing row-level MVCC metadata.
 given `(intent_log, base_snapshot)`. Under `LabRuntime`, identical inputs yield
 identical outputs across all seeds. No dependence on wall-clock, iteration
 order, or hash randomization.
+
+**Compatibility note (byte layout):** Rebase output pages MUST be valid SQLite
+file format and pass post-merge invariant checks. They are NOT required to be
+byte-identical to what C SQLite would have produced for the same logical
+operations. Conformance is defined on observable behavior (query results and
+integrity checks), not on matching legacy cell-placement heuristics (see risk
+R6, §21).
+
+**V1 scope restriction (normative):** Deterministic rebase is permitted only
+for a restricted, proven-safe subset of B-tree operations. In V1, a rebase
+attempt MUST reject (and fall back to the next merge ladder step, §5.10.4) if
+replay would require any of:
+- page split/merge/balance across multiple pages,
+- overflow allocation or overflow chain mutation,
+- freelist trunk/leaf mutation beyond the leaf page itself, or
+- any non-deterministic tie-breaking (HashMap iteration, wall-clock time).
 
 #### 5.10.3 Physical Merge: Structured Page Patches
 
