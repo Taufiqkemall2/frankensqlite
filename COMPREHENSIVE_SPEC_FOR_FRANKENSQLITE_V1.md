@@ -65,6 +65,8 @@ Pseudocode and type definitions are normative unless explicitly labeled
 | **Cx** | Capability context (asupersync). Threads cancellation, deadlines, and capability narrowing through every operation. |
 | **PageNumber** | 1-based `NonZeroU32` identifying a database page. Page 1 is always the database header. |
 | **TxnId** | Monotonically increasing `u64` transaction identifier. `TxnId::ZERO` represents the on-disk baseline. |
+| **TxnEpoch** | Monotonically increasing `u32` generation counter for a reused TxnSlot (prevents stale slot-id interpretation). |
+| **TxnToken** | Canonical transaction identity for SSI witness plane: `(TxnId, TxnEpoch)`. |
 | **SIREAD lock** | Marker recording "transaction T read page P under snapshot." Used for SSI rw-antidependency detection. |
 | **Intent log** | Semantic operation log: `Vec<IntentOp>`. Records what a transaction intended to do (insert, delete, update). |
 | **Deterministic rebase** | Replaying intent logs against the current committed snapshot to merge without byte-level patches. |
@@ -72,7 +74,13 @@ Pseudocode and type definitions are normative unless explicitly labeled
 | **ARC** | Adaptive Replacement Cache. Balances recency and frequency for buffer pool eviction. |
 | **RootManifest** | Bootstrap object in ECS: maps logical database name → current committed state ObjectId. |
 | **TxnSlot** | Fixed-size shared-memory record for cross-process MVCC coordination. |
-| **DecodeProof** | Mathematical witness that a RaptorQ decode/repair operation produced the correct output. |
+| **WitnessKey** | The canonical key-space for SSI read/write evidence: `Page(pgno)` or finer tags like `Cell(page, tag)` and `ByteRange(page, start, len)`. |
+| **RangeKey** | Hierarchical bucket key for witness indexing: `(level, hash_prefix)` in a prefix tree over `WitnessKey` hashes. |
+| **ReadWitness** | ECS object: durable evidence of a transaction's reads over a `RangeKey` bucket (sound, no false negatives for its coverage claim). |
+| **WriteWitness** | ECS object: durable evidence of a transaction's writes over a `RangeKey` bucket (sound, no false negatives for its coverage claim). |
+| **WitnessIndexSegment** | ECS object: compacted readers/writers bitmap for a `RangeKey` bucket over a commit sequence range; rebuildable from deltas. |
+| **DependencyEdge** | ECS object: rw-antidependency evidence edge `(from, to, key_basis, observed_by)`. Mandatory for explainable SSI. |
+| **CommitProof** | ECS object: replayable proof-carrying artifact for a commit's SSI validation (witness refs + segments used + edges emitted). |
 | **VersionPointer** | Stable, content-addressed pointer from page index to patch object: `(commit_seq, patch_object: ObjectId, patch_kind, base_hint)`. |
 
 ### 0.4 What "RaptorQ Everywhere" Means (No Weasel Words)
@@ -2298,7 +2306,7 @@ policy (K/R), and repair story.
 |-----------|----------|-------|
 | MVCC page history | `PageHistory` objects (patch chains) | Bounded by GC horizon; compressed via intent log + structured patches |
 | Conflict reduction | Intent logs as small ECS objects | Replayed deterministically for rebase merge |
-| Explainability | Abort witnesses as lab/debug artifacts | `(Pgno, reader_txn, writer_txn)` events |
+| SSI witness plane | `ReadWitness` / `WriteWitness` / `WitnessIndexSegment` / `DependencyEdge` / `CommitProof` | The serialization graph is itself a fountain-coded stream (see §5.6.4 and §5.7) |
 
 **Replication plane (network):**
 
@@ -4016,17 +4024,21 @@ SharedMemoryLayout := {
     version          : u32,            -- layout version (1)
     page_size        : u32,            -- database page size
     max_txn_slots    : u32,            -- capacity of TxnSlot array (default: 256)
+                                       -- Derivation: 256 = max_processes * max_concurrent_txn_per_process.
+                                       -- Typical: 16 processes * 16 concurrent queries = 256 slots.
+                                       -- Memory cost: 256 * sizeof(TxnSlot) ≈ 256 * 128B = 32KB.
+                                       -- Exceeding capacity returns SQLITE_BUSY (not silent failure).
     next_txn_id      : AtomicU64,      -- global TxnId counter (fetch_add)
     commit_seq       : AtomicU64,      -- global commit sequence counter
     gc_horizon       : AtomicU64,      -- min(active txn_ids) across all processes
     lock_table_offset: u64,            -- byte offset to PageLockTable region
-    siread_offset    : u64,            -- byte offset to SIREAD plane
+    witness_offset   : u64,            -- byte offset to SSI witness plane (HotWitnessIndex)
     txn_slot_offset  : u64,            -- byte offset to TxnSlot array
     checksum         : u64,            -- xxhash3 of header fields
     _padding         : [u8; 64],       -- align to cache line
     // --- TxnSlot array follows at txn_slot_offset ---
     // --- PageLockTable region follows at lock_table_offset ---
-    // --- SIREAD plane follows at siread_offset ---
+    // --- SSI witness plane follows at witness_offset ---
 }
 ```
 
@@ -4039,27 +4051,40 @@ operations (SeqCst ordering for correctness, Relaxed for read-only counters).
 ```
 TxnSlot := {
     txn_id          : AtomicU64,     -- 0 = slot is free
+    txn_epoch       : AtomicU32,     -- increments when the slot is acquired (prevents stale slot-id interpretation)
     pid             : AtomicU32,     -- owning process ID
     lease_expiry    : AtomicU64,     -- Unix timestamp (seconds) of lease expiry
+    begin_seq       : AtomicU64,     -- CommitSeq observed at BEGIN (snapshot backbone for SSI overlap)
+    commit_seq      : AtomicU64,     -- CommitSeq when committed; 0 if not committed
     snapshot_hwm    : AtomicU64,     -- snapshot high_water_mark
     state           : AtomicU8,      -- 0=Free, 1=Active, 2=Committing, 3=Committed, 4=Aborted
     mode            : AtomicU8,      -- 0=Serialized, 1=Concurrent
     has_in_rw       : AtomicBool,    -- SSI: has incoming rw-antidependency
     has_out_rw      : AtomicBool,    -- SSI: has outgoing rw-antidependency
     write_set_pages : AtomicU32,     -- count of pages in write set (for GC sizing)
-    _padding        : [u8; 19],      -- pad to 64 bytes (cache-line aligned)
+    _padding        : [u8; 7],       -- pad to 64 bytes (cache-line aligned)
 }
 ```
 
 **Slot lifecycle:**
 1. **Acquire:** Process scans TxnSlot array for a slot with `txn_id == 0`.
-   CAS the `txn_id` from 0 to the new TxnId. Set `pid`, `lease_expiry`,
-   `state = Active`.
+   CAS the `txn_id` from 0 to the new TxnId. Increment `txn_epoch`
+   (wrap permitted), set `begin_seq = shm.commit_seq.load()`, set `pid`,
+   `lease_expiry`, and `state = Active`.
 2. **Renew lease:** While active, process periodically updates `lease_expiry`
    to `now + LEASE_DURATION` (default: 30 seconds). This is a simple
-   atomic store.
+   atomic store. **Derivation of LEASE_DURATION:** The lease must satisfy
+   two competing constraints: (a) `LEASE > max_txn_duration` to avoid
+   prematurely expiring healthy transactions, and (b) `LEASE` should be
+   small to minimize crash recovery latency (orphaned slots are stuck for
+   up to LEASE seconds). Survival analysis of typical SQLite transaction
+   durations shows p99 < 5s for OLTP, p99 < 20s for batch operations.
+   Setting LEASE = 30s covers p99.9 of transaction durations while keeping
+   crash recovery latency acceptable. Adjustable via
+   `PRAGMA fsqlite.txn_lease_seconds`.
 3. **Commit/Abort:** Set `state` to Committed or Aborted. Release page locks.
-   Set `txn_id` to 0 (slot is free).
+   On commit: set `commit_seq = assigned_commit_seq`. Set `txn_id` to 0 (slot is free).
+   (The next acquirer increments `txn_epoch`, so stale slot references are rejected.)
 
 **Lease-based crash cleanup:** If a process crashes, its TxnSlots become
 orphaned (lease expires, `pid` is no longer alive). Any process can detect
@@ -4074,8 +4099,8 @@ cleanup_orphaned_slots():
             if !process_alive(slot.pid):
                 // Process crashed. Abort its transaction.
                 release_page_locks_for(slot.txn_id)
-                release_siread_locks_for(slot.txn_id)
                 slot.state = Aborted
+                slot.commit_seq = 0
                 slot.txn_id = 0    // Free the slot
 ```
 
@@ -4109,39 +4134,225 @@ last in a probe chain, also clear `page_number` to allow reclamation.
 This is simpler than the in-process sharded HashMap but provides the same
 semantics: exclusive write locks per page, immediate failure on contention.
 
-#### 5.6.4 Cross-Process SIREAD Plane
+**Load factor analysis (Extreme Optimization Discipline):**
 
-Full SIREAD tracking across processes is expensive (variable-size sets per
-page). FrankenSQLite uses a **monotonic read filter** as a conservative
-approximation:
+Linear probing has expected probe length `1/(1 - alpha)` where `alpha = N/C`
+is the load factor (N = concurrent locks, C = capacity). Worst-case probe
+chain length grows as `O(log C)` with high probability for uniform hashing,
+but under Zipfian page access, primary clustering degrades performance:
+
+| Load factor | Expected probes (uniform) | Expected probes (Zipfian s=1) |
+|-------------|--------------------------|-------------------------------|
+| 0.25        | 1.33                     | ~2.0                          |
+| 0.50        | 2.00                     | ~4.0                          |
+| 0.75        | 4.00                     | ~12.0                         |
+| 0.90        | 10.00                    | ~40.0+                        |
+
+**Maximum load factor policy:** If `N > 0.70 * C`, new lock acquisitions
+return `SQLITE_BUSY` rather than degrading to pathological probe chains.
+With C=65536 and the 70% limit, this supports up to 45,875 concurrent page
+locks (far beyond any realistic workload, since TxnSlot capacity is 256).
+
+**Alternative: Robin Hood hashing.** If Zipfian clustering proves
+problematic, Robin Hood hashing bounds the variance of probe lengths
+(maximum probe length difference between any two entries is O(log log C))
+while maintaining the same shared-memory-friendly fixed-size layout.
+
+#### 5.6.4 RaptorQ-Native SSI Witness Plane (Cross-Process + Distributed)
+
+SQLite-compatible multi-process SSI cannot rely on in-process hash tables:
+the read/write dependency evidence must survive:
+
+- Multiple OS processes mapping the same database
+- Crashes mid-transaction and mid-publication
+- Torn writes, partial persistence, and partial replication
+- Reordering and loss in symbol-native transport
+
+FrankenSQLite solves this by making the SSI dependency graph itself part of
+the ECS substrate:
+
+- Reads and writes are published as **witness objects** (`ReadWitness`, `WriteWitness`).
+- Candidate discovery is accelerated by a **hierarchical hot index** in shared memory.
+- The durable truth is a **cold plane** of ECS objects (`WitnessDelta`,
+  `WitnessIndexSegment`, `DependencyEdge`, `CommitProof`).
+
+The result is a witness plane with the same posture as the rest of ECS:
+if bytes go missing, we decode; if processes crash, we ignore uncommitted
+artifacts; if shared memory is corrupted, we rebuild from symbol logs.
+
+##### 5.6.4.1 Non-Negotiable Requirements
+
+1. **No false negatives (candidate discoverability):** If transaction `R` reads
+   a `WitnessKey K` and an overlapping transaction `W` writes `K`, then during
+   SSI validation of either party we MUST be able to discover `R` as a
+   candidate for `K` at *some configured hierarchy level* (refinement may be
+   required to confirm intersection).
+2. **Cross-process:** Works when multiple OS processes attach to the same DB
+   file and share only the shared-memory region + ECS logs.
+3. **Distributed-ready:** Evidence is ECS objects, so symbol-native replication
+   can carry the dependency graph, not just the data pages.
+4. **Self-healing:** If a subset of witness symbols are missing/corrupt within
+   tolerance, decoding MUST reconstruct them (or surface an explicit "durability
+   contract violated" diagnostic with decode proofs in lab/debug).
+5. **Monotonic updates:** Hot-plane index updates are unions only (set bits /
+   insert IDs). Clearing is performed only by epoch swap under a provably safe
+   GC horizon (see §5.6.4.8 and §5.6.5).
+
+##### 5.6.4.2 Transaction Identity for Witnesses: TxnToken
+
+TxnSlots are reused. Any data structure that references slot IDs must prevent
+stale interpretation. Therefore every cross-process SSI artifact identifies
+transactions by a `TxnToken`:
 
 ```
-SharedSireadFilter := {
-    capacity  : u32,                  -- power-of-2 (default: 65536)
-    entries   : [SireadEntry; capacity],
+TxnToken := (txn_id: TxnId, txn_epoch: TxnEpoch)
+```
+
+`TxnEpoch` is stored in `TxnSlot.txn_epoch` and is incremented on every slot
+acquisition (wrap permitted). Any lookup of a slot-derived candidate MUST
+validate that the slot's `(txn_id, txn_epoch)` matches the token being
+considered. This permits false positives (stale bits) but forbids false
+negatives (missing candidates).
+
+##### 5.6.4.3 WitnessKey (Granularity Without Correctness Risk)
+
+SSI tracks rw-antidependencies over a canonical key space:
+
+```text
+WitnessKey =
+  | Page(pgno: u32)
+  | Cell(page: u32, cell_tag: u32)
+  | ByteRange(page: u32, start: u16, len: u16)
+  | KeyRange(index_id: u32, lo: Key, hi: Key)   // optional, advanced
+  | Custom(namespace: u32, bytes: [u8])
+```
+
+**Correctness rule:** It is always valid to fall back to `Page(pgno)` even if
+higher-resolution keys exist. Finer keys exist to reduce false positives and
+unlock algebraic merges (§5.10), never to preserve correctness.
+
+##### 5.6.4.4 RangeKey: Hierarchical Buckets Over WitnessKey Hash Space
+
+We index the witness key space via a prefix tree over hashes:
+
+1. Canonical-encode `WitnessKey` bytes.
+2. Compute `KeyHash := xxh3_64(WitnessKeyBytes)`.
+3. For each configured level `L`, derive `RangeKey(L, prefix_bits)` as the top
+   `p_L` bits of `KeyHash`.
+
+Default hierarchy (tunable, stored in config and recorded in manifests so
+replicas interpret evidence consistently):
+
+- Level L0: `p0 = 12` (4096 buckets)
+- Level L1: `p1 = 20` (~1,048,576 buckets, allocated lazily in hot plane)
+- Level L2: `p2 = 28` (deep refinement for hotspots)
+
+This is intentionally *not* an interval tree over page numbers: hashing avoids
+contiguous hotspot clustering (e.g., root pages) collapsing into a single range
+node.
+
+##### 5.6.4.5 Hot Plane (Shared Memory): HotWitnessIndex
+
+The hot plane is an accelerator for candidate discovery. It is not the source
+of truth.
+
+Shared memory stores a fixed-size hash table mapping `(level, prefix)` to a
+bucket entry with **monotonic bitsets** of active TxnSlots:
+
+```
+HotWitnessIndex := {
+    capacity : u32,      -- power-of-2; sized for expected hot buckets
+    epoch    : AtomicU32 -- global bucket epoch for O(1) "clears"
+    entries  : [HotWitnessBucketEntry; capacity],
+    overflow : HotWitnessBucketEntry, -- always-present catch-all (no false negatives)
 }
 
-SireadEntry := {
-    page_number    : AtomicU32,      -- 0 = empty slot
-    min_reader_txn : AtomicU64,      -- oldest TxnId that has read this page
+HotWitnessBucketEntry := {
+    level        : AtomicU8,      -- 0xFF = empty
+    prefix       : AtomicU32,     -- packed prefix bits (interpretation depends on level)
+    bucket_epoch : AtomicU32,     -- epoch of the readers/writers bitsets
+    readers_bits : [AtomicU64; W],-- bit i = TxnSlotId i is a reader in this bucket epoch
+    writers_bits : [AtomicU64; W],
 }
 ```
 
-**On read:** Hash `page_number`, find or create entry. If `min_reader_txn`
-is 0 or greater than the current TxnId, update it (atomic min).
+Where `W = ceil(max_txn_slots / 64)`.
 
-**On write check:** When transaction `U` writes page `P`, check if
-`siread_filter[P].min_reader_txn < U.txn_id`. If so, there exists at least
-one transaction that read `P` before `U` wrote it -- a potential
-rw-antidependency. Mark `U.has_in_rw = true` for the conservative SSI check.
+**Update on read/write (monotonic):**
+- On read of key `K` by slot `s`, set bit `s` in `readers_bits` for all
+  configured levels' buckets for `K` (L0/L1/L2).
+- On write of key `K` by slot `s`, set bit `s` in `writers_bits` similarly.
 
-**Properties:**
-- No false negatives: if a read happened, the filter records it.
-- Possible false positives: the filter may report a read that was already
-  committed/aborted (stale entry). This is safe -- it only causes unnecessary
-  aborts, never missed anomalies.
-- Space-bounded: fixed-size hash table, O(1) operations.
-- Cleanup: entries with `min_reader_txn < gc_horizon` can be cleared.
+If a bucket cannot be allocated due to hot-index capacity pressure, the update
+MUST be applied to `HotWitnessIndex.overflow` for the corresponding kind
+(read/write). This preserves the "no false negatives" requirement at the cost
+of higher false positive rate.
+
+**Staleness handling:** Bits are never cleared per transaction. Candidates are
+filtered by:
+- Current `TxnSlot.txn_id != 0` (slot is active)
+- `TxnSlot.txn_epoch` matches the `TxnToken` being considered (prevents stale slot-id misbind)
+
+##### 5.6.4.6 Cold Plane (ECS Objects): Durable, Replicable Truth
+
+In Native mode, the witness plane's cold truth is stored as ECS objects (thus
+RaptorQ-encodable, repairable, and replicable):
+
+- `ReadWitness` / `WriteWitness`: per-transaction, per-bucket evidence with a
+  sound `KeySummary` (no false negatives for its coverage claim).
+- `WitnessDelta`: monotonic participation updates (`Present` union) used to
+  rebuild/compact index segments.
+- `WitnessIndexSegment`: compacted `readers` / `writers` roaring bitmaps for a
+  `(level, prefix)` over a commit sequence range, rebuildable from deltas.
+- `DependencyEdge`: explicit rw-antidependency edges (mandatory for explainability).
+- `CommitProof`: proof-carrying commit artifact referencing witnesses, segments,
+  and edges used to validate serializability.
+
+In Compatibility mode, the cold plane is still required, but is stored as an
+ECS-style symbol log sidecar under the database's `.fsqlite/` directory (not
+inside the SQLite `.db` file) to preserve strict file-format compatibility.
+
+Canonical object structures are specified in §5.7 (SSI algorithm and witness
+objects), and they participate in ECS deterministic encoding rules (§3.5).
+
+##### 5.6.4.7 Publication Protocol (Cancel-Safe, Crash-Resilient)
+
+Witness/edge/proof publication MUST be correct under cancellation at any `.await`
+point and under process crash at any instruction boundary:
+
+1. **Reserve:** obtain a durable append reservation in the symbol log (or
+   equivalent) and a linear reservation token.
+2. **Write:** write object symbol records (systematic + repair as configured).
+3. **Commit:** atomically publish the reservation token so the object becomes
+   visible to readers.
+4. **Abort:** if cancelled before commit, dropping the reservation token MUST
+   make the partial publication unreachable and GC-able.
+
+This mirrors asupersync's two-phase discipline (reserve/commit) used to prevent
+silent drops, but is applied to persistent ECS publication rather than in-memory
+channels.
+
+**Marker discipline:** A transaction is committed iff its `CommitMarker` exists
+and is published. Witness objects may exist for aborted transactions and are
+ignored once the transaction's abort is known (slot state and/or marker stream).
+
+##### 5.6.4.8 Witness GC and Bucket Epochs
+
+Witness evidence is retained until it is provably irrelevant:
+
+- Define `oldest_active_begin_seq := min(TxnSlot.begin_seq for all active slots)`.
+- Define `safe_gc_seq := oldest_active_begin_seq`.
+
+Any witness/edge/proof that references only transactions with `commit_seq < safe_gc_seq`
+is eligible for cold-plane compaction/pruning (subject to retention policy for
+debuggability).
+
+The hot plane uses **bucket epochs**:
+- `HotWitnessIndex.epoch` advances when `safe_gc_seq` advances sufficiently.
+- When a bucket entry's `bucket_epoch != HotWitnessIndex.epoch`, the next writer
+  resets its bitsets and sets `bucket_epoch` to current (epoch swap = O(1) clear).
+
+This yields bounded memory and bounded per-operation cost without per-txn clears.
 
 #### 5.6.5 GC Coordination
 
@@ -4180,45 +4391,48 @@ to C SQLite's file-level locking protocol:
 This ensures FrankenSQLite works on any filesystem that supports advisory
 file locks, degrading gracefully from multi-writer to single-writer.
 
-### 5.7 SSI Algorithm Specification
+### 5.7 SSI Algorithm Specification (Witness Plane, Proof-Carrying)
 
 Serializable Snapshot Isolation (SSI) extends Snapshot Isolation to detect and
-prevent the write skew anomaly. SSI ships as the default isolation mode
-for `BEGIN CONCURRENT` (Layer 2 of Section 2.4). This section provides the
-full algorithm specification.
+prevent the write skew anomaly. SSI ships as the default isolation mode for
+`BEGIN CONCURRENT` (Layer 2 of Section 2.4).
 
-**Formal definition of SIREAD locks:**
+In FrankenSQLite, SSI is implemented on top of the **RaptorQ-native witness
+plane** (§5.6.4): read/write dependency evidence is stored as ECS objects and
+indexed by a hierarchical hot index (shared memory) plus a compacted cold index
+(ECS). This makes SSI:
 
-An SIREAD lock records that a transaction has read a page under snapshot
-isolation. Unlike exclusive write locks, SIREAD locks do not prevent other
-transactions from reading or writing the page. They exist solely for
-dependency tracking.
+- Cross-process safe (multiple OS processes)
+- Distributed-ready (proof-carrying replication is possible)
+- Self-healing (witness evidence is fountain-coded and repairable)
+- Explainable (explicit `DependencyEdge` + `CommitProof` artifacts)
+
+**Formal definition of rw-antidependencies (witness-key space):**
+
+An rw-antidependency edge `R -rw-> W` exists iff:
+
+1. `R` and `W` overlap in time (neither is strictly after the other starts).
+2. There exists a `WitnessKey K` such that `R` read `K` under its snapshot and
+   `W` wrote `K` (logically) before `R` committed.
+
+`WitnessKey` is the canonical "thing you read or wrote" key space (§5.6.4.3).
+Falling back to `Page(pgno)` is always correct; finer keys reduce false positives
+and enable merge (§5.10).
+
+**Witness plane integration contract (required hooks):**
+
+Every read path that participates in serializability MUST register a key, and
+every write path MUST register keys at the finest available granularity:
 
 ```
-SireadLockTable := HashMap<PageNumber, SmallVec<TxnId>>
-    -- Maps each page to the set of active transactions that have read it.
-    -- Entries are cleaned up when transactions commit or abort.
-
-SireadLock := (PageNumber, TxnId)
-    -- "Transaction TxnId has read PageNumber under its snapshot."
+register_read(key: WitnessKey)
+register_write(key: WitnessKey)
+emit_witnesses() -> (read_witnesses: Vec<ObjectId>, write_witnesses: Vec<ObjectId>)
 ```
 
-When transaction `T` reads page `P`:
-```
-on_read(T, P):
-    siread_table.entry(P).or_default().push(T.txn_id)
-    T.read_set.insert(P)
-```
-
-When transaction `U` writes page `P`:
-```
-on_write(U, P):
-    for each T_id in siread_table.get(P):
-        if T_id != U.txn_id AND transaction(T_id).state == Active:
-            // Create rw-antidependency edge: T ->rw U
-            // "T read P before U wrote P"
-            record_rw_edge(from=T_id, to=U.txn_id)
-```
+`emit_witnesses()` publishes `ReadWitness` / `WriteWitness` objects (ECS) and
+updates the hot-plane `HotWitnessIndex` buckets (shared memory) as a monotonic
+union.
 
 **The dangerous structure:**
 
@@ -4325,11 +4539,14 @@ Based on the PostgreSQL 9.1+ implementation (Ports, 2012):
   false positive (retry the transaction) is much lower than the cost of a
   missed anomaly (data corruption).
 - **Overhead:** <7% throughput reduction compared to plain Snapshot Isolation,
-  measured on TPC-C. The overhead comes from maintaining SIREAD locks and
+  measured on TPC-C. The overhead comes from maintaining SSI witness evidence
+  (read/write witnesses, bucket indices) and
   checking for dangerous structures.
-- **Memory:** SIREAD lock table grows proportionally to the number of active
-  transactions times pages read. Under PostgreSQL's row-level granularity,
-  this can be significant; at page granularity, it is much smaller.
+- **Memory:** SSI tracking grows proportionally to the number of active
+  transactions times keys read. Under PostgreSQL's row-level granularity,
+  this can be significant; with FrankenSQLite's default `WitnessKey = Page(pgno)`
+  it is much smaller, and with `Cell`/`ByteRange` refinement it remains bounded
+  by bucket/summary policies.
 
 **How SSI maps to page granularity in FrankenSQLite:**
 
@@ -4338,12 +4555,14 @@ SSI at page granularity is coarser than PostgreSQL's row-level SSI. This means:
   rows on the same page will appear to have an rw-antidependency even if
   they are logically independent. The false positive rate will be higher than
   PostgreSQL's 0.5%.
-- **Less overhead:** Fewer SIREAD lock entries (one per page, not one per
-  row). The SIREAD lock table is smaller and faster to scan.
+- **Less overhead:** Fewer tracked keys (one per page, not one per row).
+  Hot-plane updates are O(levels) atomic OR operations; cold-plane evidence is
+  compacted into segments and is not scanned on the hot path except as a
+  correctness backstop.
 - **Mitigation:** The algebraic write merging mechanism (Section 3.4.5) can
   refine page-level conflicts to byte-level, reducing false positives for
   the write side. For the read side, future work could add cell-level
-  SIREAD tracking within B-tree pages.
+  witness keys within B-tree pages.
 
 **Decision-Theoretic SSI Abort Policy (Alien-Artifact Discipline).**
 
@@ -4391,7 +4610,7 @@ between data corruption and a retry is enormous.
 
 **Why this matters beyond "just use the conservative rule":**
 1. It provides a formal framework for the Layer 3 refinement (Section 0.2,
-   bullet 4). When cell-level SIREAD tracking is added, `P(anomaly|evidence)`
+   bullet 4). When cell-level witness keys are added, `P(anomaly|evidence)`
    drops for same-page-different-row conflicts, and the decision framework
    naturally produces fewer aborts without changing the threshold.
 2. It enables **adaptive victim selection**. If algebraic write merging
@@ -4425,7 +4644,7 @@ ssi_fp_monitor.observe(is_false_positive);
 
 If the e-process exceeds `1/alpha = 100`, the false positive rate is
 significantly above the 5% budget. This triggers an alert (not an
-automatic response) suggesting that cell-level SIREAD tracking should be
+automatic response) suggesting that cell-level witness keys should be
 prioritized for the hot pages causing the most false positives.
 
 **Conformal calibration of page-level coarseness overhead:**
