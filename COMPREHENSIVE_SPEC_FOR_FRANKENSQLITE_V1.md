@@ -5472,7 +5472,8 @@ asupersync LabRuntime:
 
 The `gc_horizon` in shared memory is a monotonically *increasing* safe-point
 in CommitSeq space: `min(begin_seq)` across all active transactions. Since
-`begin_seq` is derived from the monotonically increasing `commit_seq` counter,
+`begin_seq` is derived from the monotonically increasing published `commit_seq`
+high-water mark (§5.6.1),
 this horizon never decreases. To avoid races and partial views across
 processes, `gc_horizon` is authoritative only when advanced by the commit
 sequencer. Other processes treat it as read-only state.
@@ -5513,7 +5514,45 @@ raise_gc_horizon():
     shm.gc_horizon.store(global_min_begin_seq)
 ```
 
-#### 5.6.6 Compatibility: Falling Back to File Locks
+#### 5.6.6 Compatibility: Legacy Interop and File-Lock Fallback
+
+Legacy SQLite processes do not understand `foo.db.fsqlite-shm`. They coordinate
+only via the standard SQLite lock regime (`foo.db-shm` WAL-index locks and
+database-file byte locks). This creates a strict interop boundary:
+
+- **Serialized mode** MAY interoperate with legacy writers (it uses the standard
+  WAL write-lock protocol and single-writer semantics).
+- **Concurrent mode** MUST exclude legacy writers, because a legacy writer would
+  bypass the `.fsqlite-shm` page lock table and SSI witness plane, undermining
+  correctness assumptions.
+
+##### 5.6.6.1 Legacy Writer Exclusion (Required for Concurrent Mode)
+
+**Problem:** If a legacy writer can acquire SQLite's standard write locks while
+any `BEGIN CONCURRENT` transaction is active, it can write pages without
+participating in page-level exclusion or witness registration.
+
+**Rule (normative):** In Compatibility mode, while **any** Concurrent-mode
+transaction exists for a database, the system MUST hold a legacy-writer
+exclusion lock that prevents a standard SQLite process from becoming a writer.
+
+**WAL mode (required for Compatibility+Concurrent):**
+- The exclusion lock MUST be `WAL_WRITE_LOCK` on the legacy WAL-index shared
+  memory (`foo.db-shm`).
+- The lock MUST be held continuously for the duration of the Concurrent epoch
+  (until no Concurrent txns remain).
+- Legacy readers remain permitted: `WAL_WRITE_LOCK` blocks writers, not readers.
+
+**Coordinator note (multi-process):** Because `WAL_WRITE_LOCK` is exclusive,
+Compatibility+Concurrent requires a single cross-process commit sequencer while
+the exclusion lock is held. In multi-process deployments, other processes MUST
+route commit publication through the sequencer (shared-memory two-phase queue)
+so the lock is not released to legacy writers between commits.
+
+If the exclusion lock cannot be acquired, `BEGIN CONCURRENT` MUST fail with
+`SQLITE_BUSY` (or wait per busy-timeout).
+
+##### 5.6.6.2 No-SHM Fallback (File Locks Only)
 
 When shared-memory coordination is not available (e.g., `foo.db.fsqlite-shm`
 cannot be created due to filesystem restrictions), FrankenSQLite falls back
@@ -5525,6 +5564,58 @@ to C SQLite's file-level locking protocol:
 
 This ensures FrankenSQLite works on any filesystem that supports advisory
 file locks, degrading gracefully from multi-writer to single-writer.
+
+#### 5.6.7 Compatibility Mode: Hybrid SHM Coordination Protocol
+
+**Problem statement:** Compatibility Mode (§2.4 Layer 1) produces standard
+SQLite database and WAL files readable by C SQLite. But FrankenSQLite uses
+`foo.db.fsqlite-shm` (the `FSQLSHM` layout, §5.6.1) for MVCC coordination,
+while C SQLite uses `foo.db-shm` (standard WAL-index, §11.10). Without a
+bridging protocol, two failures arise:
+
+1. **Legacy readers cannot find new frames.** C SQLite locates WAL frames
+   via hash tables in `foo.db-shm`. If FrankenSQLite only updates
+   `foo.db.fsqlite-shm`, a C SQLite reader's `mxFrame` is stale.
+
+2. **Legacy writers corrupt data.** Nothing prevents C SQLite from acquiring
+   `WAL_WRITE_LOCK` on `foo.db-shm` and writing concurrently, since
+   FrankenSQLite's coordinator uses a different lock domain. Two
+   uncoordinated writers appending to the same WAL = silent corruption.
+
+**Normative protocol (MUST for Compatibility Mode):**
+
+When `foo.db.fsqlite-shm` is in use, the Write Coordinator MUST also
+maintain the standard `foo.db-shm` WAL-index:
+
+1. **Exclude legacy writers (startup).** Acquire `WAL_WRITE_LOCK` (byte 120
+   of `foo.db-shm`, §2.1) and hold it for the coordinator's lifetime. This
+   prevents C SQLite from entering WAL-write mode. The lock MUST be held
+   even when no FrankenSQLite transaction is active — releasing creates a
+   window for a legacy writer.
+
+2. **Update WAL-index hash tables (on commit).** After appending WAL frames
+   (§5.9.2 `WALAppend`), the coordinator MUST update `foo.db-shm`:
+   - Insert each frame's `(page_number, frame_index)` into the hash table.
+   - Update `mxFrame` in both `WalIndexHdr` copies.
+   - Update `aFrameCksum`, `aSalt`, `aCksum` in both header copies.
+   - Use the dual-copy protocol (write copy 1, then copy 2) so lock-free
+     readers see a consistent snapshot.
+
+3. **Maintain reader marks.** FrankenSQLite readers MUST also write an
+   `aReadMark` in the standard WAL-index corresponding to their snapshot
+   frame. This prevents a C SQLite checkpointer from overwriting frames
+   that FrankenSQLite readers still need.
+
+4. **Checkpoint coordination.** Checkpoint logic (§7.5) MUST update
+   `nBackfill` in the standard `WalCkptInfo` during backfill.
+
+**Ordering:** The standard WAL-index update (step 2) MUST happen after
+`wal.sync()` and before `publish_versions()` in the group commit sequence.
+If a C SQLite reader sees a new `mxFrame`, the frames must already be
+durable on disk.
+
+**Native Mode:** This protocol does NOT apply to Native Mode (§2.4 Layer 3),
+which uses ECS-based commit streams, not standard WAL files.
 
 ### 5.7 SSI Algorithm Specification (Witness Plane, Proof-Carrying)
 
@@ -6247,6 +6338,12 @@ check this indicator before acquiring page locks.
 This design avoids a correctness pitfall where a Serialized writer could modify
 pages without participating in page-level exclusion, which would undermine
 First-Committer-Wins and make conflict behavior timing-dependent.
+
+**External interop hook (Compatibility mode):** Concurrent-mode exclusion is
+meaningless if a legacy SQLite writer can bypass `.fsqlite-shm` entirely.
+Therefore, in Compatibility mode, `BEGIN CONCURRENT` MUST also activate the
+legacy writer exclusion lock (§5.6.6.1). It is forbidden to run Concurrent mode
+without excluding legacy writers.
 
 ### 5.9 Write Coordinator Detail
 
