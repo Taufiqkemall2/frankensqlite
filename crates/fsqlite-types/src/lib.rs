@@ -1,6 +1,7 @@
 pub mod flags;
 pub mod limits;
 pub mod opcode;
+pub mod record;
 pub mod serial_type;
 pub mod value;
 
