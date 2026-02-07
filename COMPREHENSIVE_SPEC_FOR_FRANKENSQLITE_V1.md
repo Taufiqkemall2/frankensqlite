@@ -73,7 +73,7 @@ Pseudocode and type definitions are normative unless explicitly labeled
 | **Saga** | Structured multi-step operation with deterministic compensations; used for compaction and tier eviction so cancellation never leaves partial state. |
 | **Region** | Asupersync structured concurrency scope: a tree of owned tasks. Region close implies quiescence (no live children, all finalizers run, all obligations resolved). |
 | **PageNumber** | 1-based `NonZeroU32` identifying a database page. Page 1 is always the database header. |
-| **TxnId** | Monotonically increasing `u64` transaction begin identifier (allocated at `BEGIN`). `TxnSlot.txn_id = 0` is reserved to mean "free slot", so real TxnIds are non-zero. |
+| **TxnId** | Monotonically increasing `u64` transaction begin identifier (allocated at `BEGIN`). `TxnSlot.txn_id = 0` is reserved to mean "free slot", so real TxnIds are non-zero. Additionally, the shared-memory protocol reserves `u64::MAX` and `u64::MAX-1` as sentinel values (§5.6.2); TxnId allocation MUST never produce those values. |
 | **TxnEpoch** | Monotonically increasing `u32` generation counter for a reused TxnSlot (prevents stale slot-id interpretation). |
 | **TxnToken** | Canonical transaction identity for SSI witness plane: `(TxnId, TxnEpoch)`. |
 | **SchemaEpoch** | Monotonically increasing `u64` epoch for schema/physical-layout changes (DDL/VACUUM). Captured at `BEGIN` and carried through intent logs to forbid replay/merge across schema boundaries. |
@@ -5710,7 +5710,11 @@ begin(manager, begin_kind) -> Transaction:
     // `TxnId=0` is reserved as a shared-memory sentinel (slot free). `fetch_add`
     // returns the previous value, so we shift the domain by +1.
     raw = manager.next_txn_id.fetch_add(1, SeqCst)
-    txn_id = raw + 1
+    candidate = raw + 1
+    if candidate == TXN_ID_CLEANING OR candidate == TXN_ID_CLAIMING:
+        // Reserved shared-memory sentinels (§5.6.2). This means the TxnId space is exhausted.
+        abort(FATAL_TXN_ID_OVERFLOW)
+    txn_id = candidate
     txn_epoch = 0  // in-process; cross-process uses TxnSlot.epoch (Section 5.6.2)
     snapshot = Snapshot {
         high: manager.commit_seq.load(Acquire),
