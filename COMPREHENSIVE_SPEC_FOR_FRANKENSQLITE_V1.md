@@ -1633,24 +1633,26 @@ zero overhead.
 **Problem:** Version chains store full copies of each page version. For pages
 where only a few bytes change per transaction, this wastes memory.
 
-**Solution:** Store diffs as RaptorQ repair symbols:
+**Solution (normative):** Store diffs as **XOR deltas** (optionally sparse-encoded)
+between adjacent versions in the chain. Deltas are *compression*, not erasure
+coding. RaptorQ applies at the ECS object level for durability of delta objects
+just like any other object.
 
 ```
 Version chain for page P:
   V3 (newest): full page data (4096 bytes)
-  V2: RaptorQ repair symbol set that, combined with V3's data,
-      can reconstruct V2's full page
-  V1: RaptorQ repair symbol set relative to V2
+  V2 delta: XOR(V2, V3)  (sparse encoding)
+  V1 delta: XOR(V1, V2)  (sparse encoding)
 
 Reconstruction of V1:
   Start from V3 (full data)
-  Apply V2's repair symbols to recover V2
-  Apply V1's repair symbols to recover V1
+  V2 = V3 XOR delta(V2,V3)
+  V1 = V2 XOR delta(V1,V2)
 
 Space savings:
   If delta between versions is D bytes out of 4096:
   Full copy: 4096 bytes per version
-  RaptorQ delta: ~D bytes per version (near-optimal; bounded by entropy of diff)
+  Sparse XOR delta: ~D bytes per version (plus small header/indices)
 ```
 
 **Worked Example with Actual Byte Values**
@@ -1730,11 +1732,11 @@ use_delta(old_page, new_page) -> bool:
     delta = old_page XOR new_page
     nonzero_bytes = count_nonzero(delta)
 
-    // Fixed overhead: delta header (8 bytes) + RaptorQ metadata
+    // Fixed overhead: delta header (8 bytes) + sparse encoding overhead
     OVERHEAD = 16
 
-    // RaptorQ delta size is approximately nonzero_bytes * 1.05
-    // (the 5% accounts for RaptorQ encoding overhead for small symbol counts)
+    // Sparse delta size is approximately nonzero_bytes * 1.05
+    // (the 5% accounts for run headers/varints/padding for small deltas)
     estimated_delta_size = OVERHEAD + (nonzero_bytes as f64 * 1.05) as usize
 
     // COST MODEL (Extreme Optimization Discipline):
@@ -4894,7 +4896,7 @@ PageVersion := {
     pgno       : PageNumber,
     commit_seq : CommitSeq,                 -- 0 for uncommitted/private versions (only in a txn write_set)
     created_by : TxnToken,                  -- creator identity (debug/audit); not used for visibility
-    data       : PageData,                  -- or RaptorQ delta (Section 3.4.4)
+    data       : PageData,                  -- or sparse XOR delta (Section 3.4.4)
     prev_idx   : Option<VersionIdx>,        -- index into VersionArena (NOT Box pointer)
 }
 
@@ -8764,8 +8766,8 @@ We do not accept unbounded growth of ANY of the following:
 **Cache-specific accounting:**
 
 The cache tracks total byte consumption, not just page count, because MVCC
-version chain compression (RaptorQ deltas, Section 3.4.4) produces
-variable-size entries. A full page = 4096 bytes; a RaptorQ delta may be 200.
+version chain compression (sparse XOR deltas, Section 3.4.4) produces
+variable-size entries. A full page = 4096 bytes; a sparse delta may be ~200.
 
 **Dual eviction trigger:** Eviction fires when EITHER page count exceeds
 capacity OR `total_bytes` exceeds `max_bytes`. This prevents memory exhaustion
@@ -13634,7 +13636,7 @@ raptorq integration: 2,000, encryption: 2,000).
   O(active_transactions * pages_per_transaction), not O(total_transactions)
 - GC: Version chain length never exceeds active transaction count + 1
 - Version chain compression: Pages with small diffs (< 10% changed) use
-  RaptorQ delta encoding, space savings > 80%
+  sparse XOR delta encoding, space savings > 80%
 - SSI: Write skew pattern (two txns read overlapping data, write disjoint
   pages based on reads) -- at least one txn aborted under default mode
 - SSI: PRAGMA fsqlite.serializable=OFF allows both to commit (SI mode)
@@ -15256,6 +15258,6 @@ an embedded database engine can achieve.
 
 ---
 
-*Document version: 1.26 (Round 9 audit: forbid raw byte-disjoint XOR write merging for SQLite structured pages; specify safe merge ladder (intent-log deterministic rebase + structured patch parse/merge/repack + merge certificates); built-in function semantics audited/corrected (ceil/floor/trunc return types, NaN/Inf handling, octet_length bytes, substr negative length, COLLATE interaction, compileoption funcs); VFS trait examples corrected to include `&Cx`; risk register compaction cross-reference fixed.)*
+*Document version: 1.27 (Round 10 audit: version-chain delta compression corrected: use sparse XOR deltas between adjacent page versions (RaptorQ remains the durability/repair layer for delta objects); prior rounds: forbid raw byte-disjoint XOR write merging for SQLite structured pages; specify safe merge ladder (intent-log deterministic rebase + structured patch parse/merge/repack + merge certificates); built-in function semantics audited/corrected (ceil/floor/trunc return types, NaN/Inf handling, octet_length bytes, substr negative length, COLLATE interaction, compileoption funcs); VFS trait examples corrected to include `&Cx`; risk register compaction cross-reference fixed.)*
 *Last updated: 2026-02-07*
 *Status: Authoritative Specification*
