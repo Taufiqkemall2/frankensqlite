@@ -14413,6 +14413,9 @@ encryption using the reserved-space-per-page field in the database header:
   pages or databases without detection.
   - `page_number`: the logical SQLite page number (1-based).
   - `database_id`: the database's stable `DatabaseId` (above).
+  - **Canonical AAD bytes (normative):** `aad = be_u32(page_number) || database_id_bytes`
+    where `database_id_bytes` is the 16 raw bytes of `DatabaseId`. Implementations
+    MUST NOT use native-endian integer encoding here (cross-endian open must work).
   - **No circular dependencies (normative):** Implementations MUST NOT derive any
     AAD component from encrypted page bytes (e.g., B-tree page-type flags at byte
     0). AAD inputs MUST be known before decryption.
