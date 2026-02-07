@@ -914,7 +914,7 @@ This is the key step. We need to find intermediate symbols C[0], ..., C[L-1]
 such that A * C = D. Since A is L x L and invertible (by construction for
 valid K'), this is a standard linear system solve over GF(256).
 
-The solve uses Gaussian elimination with partial pivoting. The matrix A has
+The solve uses Gaussian elimination with nonzero pivot selection. The matrix A has
 been carefully designed so that its structure (sparse LDPC + dense HDPC +
 sparse LT) is amenable to efficient elimination. In particular, the
 inactivation decoding algorithm (Section 3.2.4) exploits this structure.
@@ -1348,8 +1348,8 @@ On recovery, we scan the `.wal` file. If we encounter a torn write (invalid chec
 2.  Locate the corresponding `WalFecGroupMeta` in `.wal-fec` (matching `group_id`).
 3.  Collect **validated** source frames from `.wal`:
     - For each source ISI `i ∈ [0, K)` (frame `f = start_frame_no + i`), read the
-      frame's `page_data` bytes and compute `xxh3_64(page_data)`.
-    - If the hash matches `WalFecGroupMeta.source_page_xxh3[i]`, the source symbol
+      frame's `page_data` bytes and compute `xxh3_128(page_data)`.
+    - If the hash matches `WalFecGroupMeta.source_page_xxh3_128[i]`, the source symbol
       is valid and MAY be used for decoding.
     - Otherwise, treat the source as missing/corrupt (do not feed it to the decoder).
     This step is required because the WAL checksum chain is cumulative (§7.5); once
@@ -10261,8 +10261,8 @@ recover_wal(wal_file):
 validate frames `i+1..` (their expected checksum depends on the checksum state
 after frame `i`). Therefore, any "self-healing WAL" design MUST provide an
 independent random-access validation mechanism for source frames. FrankenSQLite
-does this by storing per-source `xxh3_64(page_data)` hashes in `.wal-fec`
-(`WalFecGroupMeta.source_page_xxh3`; §3.4.1), which allows identifying which
+does this by storing per-source `xxh3_128(page_data)` hashes in `.wal-fec`
+(`WalFecGroupMeta.source_page_xxh3_128`; §3.4.1), which allows identifying which
 source symbols are safe to feed into a decoder even when the cumulative chain is
 broken.
 
@@ -10321,7 +10321,7 @@ SQLite's cumulative checksum rule (§7.5). Normal recovery truncates the WAL at
 the first mismatch. FrankenSQLite MUST attempt repair first *if* a matching
 `.wal-fec` group exists:
 - Locate `WalFecGroupMeta` for the affected commit group (§3.4.1).
-- Validate candidate source frames using `source_page_xxh3` (random-access; does
+- Validate candidate source frames using `source_page_xxh3_128` (random-access; does
   not depend on the broken checksum chain).
 - Combine surviving sources + repair symbols and decode if `>= K`.
 - If repair succeeds, treat the group as committed and persist the repair by
