@@ -4684,7 +4684,7 @@ Formally, the dangerous structure exists when:
 ```
 exists T1, T2, T3 :
     rw_edge(T1, T2) AND rw_edge(T2, T3)
-    AND T2.has_in_rw AND T2.has_out_rw
+    AND T2.has_incoming_rw AND T2.has_outgoing_rw
     AND (T1 committed OR T3 committed)
 ```
 
@@ -4695,70 +4695,48 @@ exists T1, T2, T3 :
 ```
 Transaction (SSI extensions) := {
     ...existing fields...
-    has_in_rw        : bool,         -- some other transaction created a rw edge TO this txn
-    has_out_rw       : bool,         -- some other transaction created a rw edge FROM this txn
-    rw_in_from       : Vec<TxnToken>,-- (in-process) sources of incoming rw edges
-    rw_out_to        : Vec<TxnToken>,-- (in-process) targets of outgoing rw edges
-    edges_emitted    : Vec<ObjectId>,-- emitted `DependencyEdge` objects (always persisted as ECS)
-    marked_for_abort : bool,         -- optional: eager abort optimization
+    has_incoming_rw : bool,   -- some other transaction created a rw edge TO this txn
+    has_outgoing_rw : bool,   -- some other transaction created a rw edge FROM this txn
+    rw_in_from      : HashSet<TxnId>,  -- transactions that have rw edges to this txn
+    rw_out_to       : HashSet<TxnId>,  -- transactions that this txn has rw edges to
 }
 ```
 
-Cross-process note: in shared memory we keep only the boolean flags
-(`TxnSlot.has_in_rw` / `TxnSlot.has_out_rw`) plus ordering (`begin_seq`,
-`commit_seq`). The full edge sets are persisted as `DependencyEdge` ECS objects
-and referenced from `CommitProof` / `AbortWitness`.
-
-**Commit-time detection + proof emission pseudocode (witness plane):**
+**Detection algorithm pseudocode:**
 
 ```
 on_commit(T):
-    // A monotonic ordering stamp for edges/proofs. This is an observation of the commit clock;
-    // it is not required to equal T.commit_seq (which exists only if T commits).
-    obs_seq = shm.commit_seq.load()
+    // T is about to commit. Check if T is a pivot in a dangerous structure.
+    if T.has_incoming_rw AND T.has_outgoing_rw:
+        // T is the pivot (T2 in T1 -rw-> T2 -rw-> T3).
+        // Check if any T1 (source of incoming rw) and T3 (target of outgoing rw)
+        // form a genuine dangerous structure.
+        for T1_id in T.rw_in_from:
+            T1 = transaction(T1_id)
+            if T1.state == Committed OR T1.state == Active:
+                for T3_id in T.rw_out_to:
+                    T3 = transaction(T3_id)
+                    if T3.state == Committed:
+                        // Dangerous structure confirmed: T1 -rw-> T -rw-> T3
+                        // T3 committed, T1 committed or still active.
+                        // Must abort to prevent anomaly.
+                        abort(T)
+                        return Err(SQLITE_BUSY_SNAPSHOT)
 
-    // Phase A: publish witnesses (sound evidence) + hot-plane unions.
-    (read_witnesses, write_witnesses) = emit_witnesses(T)
+    // Also check: is T the T3 in someone else's dangerous structure?
+    // When T commits, it might complete a dangerous structure where
+    // some active pivot T2 now has both incoming and outgoing rw edges
+    // with committed endpoints.
+    for T2_id in T.rw_in_from:
+        T2 = transaction(T2_id)
+        if T2.state == Active AND T2.has_incoming_rw AND T2.has_outgoing_rw:
+            // T2 might be a pivot. But we only abort T2 at T2's commit time.
+            // Mark T2 for eager abort (optimization: abort early rather than
+            // waiting for T2 to attempt commit).
+            T2.marked_for_abort = true
 
-    // Phase B: candidate discovery + refinement (hot plane + cold backstop).
-    T.has_in_rw = false
-    T.has_out_rw = false
-    T.rw_in_from = []
-    T.rw_out_to = []
-    T.edges_emitted = []
-
-    for each write_bucket in write_witnesses:
-        for each candidate_reader R in candidates_from_hot_or_cold(readers, write_bucket):
-            if intersects(refine(R.read_witness_for(write_bucket)), T.write_keys_for(write_bucket)):
-                edge_id = emit DependencyEdge { from=R, to=T, key_basis=write_bucket, observed_by=T, observation_seq=obs_seq }
-                T.edges_emitted.push(edge_id)
-                T.rw_in_from.push(R)
-                T.has_in_rw = true
-
-    for each read_bucket in read_witnesses:
-        for each candidate_writer W in candidates_from_hot_or_cold(writers, read_bucket):
-            if intersects(T.read_keys_for(read_bucket), refine(W.write_witness_for(read_bucket))):
-                edge_id = emit DependencyEdge { from=T, to=W, key_basis=read_bucket, observed_by=T, observation_seq=obs_seq }
-                T.edges_emitted.push(edge_id)
-                T.rw_out_to.push(W)
-                T.has_out_rw = true
-
-    // Phase C: merge escape hatch may tighten keys and eliminate spurious edges.
-    try_merge_escape_hatch(T)  // see §5.10
-
-    // Phase D: dangerous structure rule (conservative pivot abort).
-    if T.has_in_rw AND T.has_out_rw:
-        // Conservative: abort pivot if there exists a committed endpoint on either side.
-        // (Exact policy may be refined later; correctness first.)
-        if exists R in T.rw_in_from where state(R) in {Active, Committed}
-           AND exists W in T.rw_out_to where state(W) == Committed:
-            emit AbortWitness(T, evidence = {read_witnesses, write_witnesses, edges_emitted, ...})
-            abort(T)
-            return Err(SQLITE_BUSY_SNAPSHOT)
-
-    // Phase E: commit succeeds. Emit proof-carrying record.
-    commit(T)
-    emit CommitProof(T, evidence = {read_witnesses, write_witnesses, edges_emitted, ...})
+    // Passed SSI check. Proceed with normal commit.
+    proceed_with_commit(T)
 ```
 
 **When to abort T2 (the pivot) vs T3 (the unsafe): Decision-Theoretic Policy**
