@@ -1139,7 +1139,9 @@ WAL Commit (N pages):
 
 Recovery:
   If any frames are torn/corrupted (detected by checksum):
-    Collect surviving source frames from `.wal`
+    Collect surviving source frames from `.wal` that can be validated:
+      - frames before the first checksum mismatch validate via the cumulative chain (§7.5)
+      - frames at/after the mismatch validate via `.wal-fec` per-source `source_page_xxh3` hashes
     Collect repair symbols from `.wal-fec` for that commit group
     If |surviving_sources| + |repairs| >= N: RaptorQ-decode to recover missing source pages
     Else: transaction is truly lost (requires catastrophic multi-frame loss)
@@ -1184,12 +1186,20 @@ WalFecGroupMeta := {
     wal_salt2      : u32,
     start_frame_no : u32,        // inclusive, 1-based frame numbering within the WAL
     end_frame_no   : u32,        // inclusive; commit frame
+    db_size_pages  : u32,        // commit frame db_size (pages) after this commit
     page_size      : u32,
     k_source       : u32,        // K
     r_repair       : u32,        // R
     oti            : OTI,        // decoding params (symbol size, block partitioning)
     object_id      : [u8; 16],   // ObjectId of CompatWalCommitGroup (content-addressed)
-    page_numbers   : Vec<u32>,   // length = K; maps ISI 0..K-1 -> Pgno
+    page_numbers   : Vec<u32>,   // length = K; maps ISI 0..K-1 -> Pgno (frame order; duplicates permitted)
+
+    // Independent per-source validation to break the cumulative-checksum catch-22 (§7.5):
+    // - SQLite's WAL checksums are cumulative, so once the chain breaks at frame i,
+    //   frames i+1.. cannot be validated via the WAL format alone.
+    // - These hashes allow random-access validation of "surviving" source frames
+    //   (page payload bytes) so they can be safely fed into a RaptorQ decoder.
+    source_page_xxh3: Vec<u64>,  // length = K; xxh3_64(page_data) for ISI i (frame start_frame_no + i)
     checksum       : u64,        // xxh3_64 of all preceding fields
 }
 ```
@@ -1238,11 +1248,20 @@ On recovery, we scan the `.wal` file. If we encounter a torn write (invalid chec
 
 1.  Identify the damaged commit group in the `.wal`.
 2.  Locate the corresponding `WalFecGroupMeta` in `.wal-fec` (matching `group_id`).
-3.  Collect valid source frames from `.wal` and repair `SymbolRecord`s from `.wal-fec`.
-4.  If `valid_sources + valid_repairs >= K`:
+3.  Collect **validated** source frames from `.wal`:
+    - For each source ISI `i ∈ [0, K)` (frame `f = start_frame_no + i`), read the
+      frame's `page_data` bytes and compute `xxh3_64(page_data)`.
+    - If the hash matches `WalFecGroupMeta.source_page_xxh3[i]`, the source symbol
+      is valid and MAY be used for decoding.
+    - Otherwise, treat the source as missing/corrupt (do not feed it to the decoder).
+    This step is required because the WAL checksum chain is cumulative (§7.5); once
+    the chain breaks, frames cannot be validated via the WAL format alone.
+4.  Collect repair `SymbolRecord`s from `.wal-fec` for this group, verifying each
+    record's `frame_xxh3` (and `auth_tag` if enabled).
+5.  If `valid_sources + valid_repairs >= K`:
     - Decode to recover missing/corrupted source pages.
     - Treat recovered pages as if they were successfully read from the WAL.
-5.  If `valid_sources + valid_repairs < K`:
+6.  If `valid_sources + valid_repairs < K`:
     - The commit is lost (catastrophic failure). Truncate WAL before this group.
 
 **PRAGMA raptorq_repair_symbols Semantics**
