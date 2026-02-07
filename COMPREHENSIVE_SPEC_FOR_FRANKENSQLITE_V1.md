@@ -1370,13 +1370,19 @@ ENCODING:
           NOTE: `ChangesetId` is a RaptorQ object identifier for this replication stream.
           It is NOT the ECS `ObjectId` (§3.5.1), which uses a different domain-separated
           construction for durable objects.
+        - **Deterministic seed (required):** To match asupersync's deterministic RaptorQ
+          construction, both sender and receiver MUST derive the block seed from the
+          identifier:
+          `seed = xxh3_64(changeset_id_bytes)` (same rule as §3.5.9 but applied to ChangesetId).
+          All repair-symbol generation for this changeset MUST be derived from this seed
+          (and per-symbol mixing, e.g. `(seed, sbn, esi)`).
         - Choose a transport symbol size `T_replication` (bytes per encoding
           symbol on the wire). `T_replication` is independent of the SQLite
           page size; it is chosen to respect the transport's constraints (MTU,
           fragmentation tolerance, etc.).
         - Create a RaptorQ encoder for `changeset_bytes` using symbol size
-          `T_replication`, yielding `K_source = ceil(F / T_replication)` source
-          symbols for the block.
+          `T_replication` and `seed`, yielding `K_source = ceil(F / T_replication)`
+          source symbols for the block.
         - **Block-size limit (normative):** If `K_source > 56,403` (RFC 6330 Table 2),
           the sender MUST shard the transfer into multiple independent changeset objects
           (each with its own `changeset_bytes` and `changeset_id`) such that
@@ -1512,6 +1518,7 @@ COLLECTING:
           decoder    : RaptorQDecoder,
           k_source   : u32,
           symbol_size: u32,   // T_replication (inferred from packet length)
+          seed       : u64,   // derived from `changeset_id` (required; see ENCODING)
         }
     Action (on each packet):
         - Parse packet header (changeset_id, source_block, ISI, K_source).
@@ -1519,7 +1526,9 @@ COLLECTING:
         - **V1 rule:** If `source_block != 0`, reject (multi-block changesets are not used in V1; sharding uses multiple `changeset_id`s).
         - Validate: `1 <= K_source <= 56,403` (RFC 6330 Table 2). Reject on violation.
         - Get or create decoder state for `changeset_id`:
-          - If missing: create `RaptorQDecoder(K_source, symbol_size)` and store `(k_source, symbol_size)`.
+          - If missing:
+            - Derive `seed = xxh3_64(changeset_id_bytes)`.
+            - Create `RaptorQDecoder(K_source, symbol_size, seed)` and store `(k_source, symbol_size, seed)`.
           - If present: reject if `K_source != state.k_source` or `symbol_size != state.symbol_size`.
         - Add symbol to decoder: `accepted = state.decoder.add_symbol(ISI, symbol_data)` (MUST deduplicate by ISI)
         - If `accepted`: increment `received_counts[changeset_id]`
