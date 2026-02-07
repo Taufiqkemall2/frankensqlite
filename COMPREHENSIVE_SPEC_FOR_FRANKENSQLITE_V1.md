@@ -5934,12 +5934,12 @@ WRITE:              No page lock needed          try_acquire page lock
                     (mutex provides exclusion)   Return SQLITE_BUSY if held
                     Add to write_set             Add to write_set
 
-COMMIT:             No validation needed         SSI check: abort if pivot
+COMMIT:             FCW freshness validation     SSI check: abort if pivot
                     (no merge; abort on         First-committer-wins check
                      snapshot conflict)          FCW check + merge ladder (§5.10)
-                    WAL append                   FCW check + merge ladder (§5.10)
-                    Release global_write_mutex   WAL append
-                    (if held)                    Release page locks
+                    WAL append                   WAL append
+                    Release global_write_mutex   Release page locks
+                    (if held)
 
 ABORT:              Release global_write_mutex   Release all page locks
                     (if held)
@@ -6182,15 +6182,18 @@ finite time, assuming:
 **Proof:** We show that every transaction makes progress through its lifecycle
 without unbounded blocking.
 
-**Begin:** `fetch_add` on an `AtomicU64` completes in O(1). Snapshot capture is
-O(1): it reads the current `commit_seq` and `schema_epoch` and stores them in
-the immutable `Snapshot` (INV-5). The capture MUST be self-consistent (see
-`load_consistent_snapshot()` in §5.4; it is still O(1), just two `commit_seq`
-loads). For `BeginKind::Immediate` / `Exclusive`,
-acquiring `global_write_mutex` may wait, but only for the duration of another
-Serialized writer, which by inductive hypothesis completes in finite time. For
-`BeginKind::Deferred`, no mutex is acquired at BEGIN; the mutex MAY be acquired
-later at the first write attempt under the same bound.
+**Begin:** TxnId allocation is a CAS loop on an `AtomicU64` (lock-free; each
+iteration O(1)). Snapshot capture is O(1): it reads the current `commit_seq` and
+`schema_epoch` and stores them in the immutable `Snapshot` (INV-5). The capture
+MUST be self-consistent (see `load_consistent_snapshot()` in §5.4; it is still
+O(1), just two `commit_seq` loads). For `BeginKind::Immediate` / `Exclusive`,
+acquiring Serialized writer exclusion may:
+- fail immediately with `SQLITE_BUSY` (or wait under busy-timeout) if Concurrent
+  writers are active (§5.8), and otherwise
+- wait for the duration of another Serialized writer holding the mutex, which by
+  inductive hypothesis completes in finite time.
+For `BeginKind::Deferred`, no mutex is acquired at BEGIN; writer exclusion MAY be
+acquired later at the first write attempt under the same bound.
 
 **Read:** `resolve()` walks the version chain, which has bounded length
 (Theorem 5). Each visibility check is O(1) (`commit_seq <= snapshot.high`). Total
@@ -6209,9 +6212,12 @@ Durability completes in finite time (assumption c) and the sequencer publishes
 the atomic commit marker/record. Lock release is O(page_locks_size). Total time
 is bounded.
 
-**Commit (Serialized mode):** No SSI/FCW validation is needed (serialization
-prevents concurrent writers). Durability and publication are the same atomic
-marker/record append as above. Mutex release is O(1). Total time is bounded.
+**Commit (Serialized mode):** No SSI validation is needed (Serialized writer
+exclusion prevents concurrent writers), but **FCW freshness validation** is
+still required: a reader-turned-writer with a stale snapshot MUST abort with
+`SQLITE_BUSY_SNAPSHOT` rather than overwrite newer commits (§5.4, §5.8).
+Durability and publication are the same atomic marker/record append as above.
+Mutex release is O(1). Total time is bounded.
 
 **Abort:** Discard write set O(write_set_size), release locks O(page_locks_size).
 Total time is bounded.
@@ -6293,6 +6299,13 @@ operations.
   durable commit clock tip:
   - **Native mode:** the physical marker stream tip (§3.5.4.1).
   - **Compatibility mode:** the durable WAL-visible state (WAL index + frames).
+- On database open, implementations MUST set `shm.schema_epoch` to the current
+  durable schema epoch:
+  - **Native mode:** `RootManifest.schema_epoch` (§3.5.5).
+  - **Compatibility mode:** the durable schema cookie value (SQLite header field
+    at offset 40; §11.1) as resolved at the durable WAL tip (reader algorithm;
+    §11.10). (Schema epoch is a logical monotone; a wrapped or decreasing value
+    indicates corruption or a broken open sequence and MUST fail closed.)
 - On database open (native mode), implementations MUST set `shm.ecs_epoch` from
   `RootManifest.ecs_epoch` so cross-process services share the same epoch-scoped
   remote/key policy configuration (§4.18). Loads/stores MUST use Acquire/Release.
@@ -6300,6 +6313,9 @@ operations.
   `shm.commit_seq` against the durable tip and MUST NOT allow `shm.commit_seq`
   to remain ahead of durable reality (that would make snapshots reference
   non-existent commits).
+- If the shared-memory file already exists, implementations MUST also reconcile
+  `shm.schema_epoch` against the durable schema epoch and MUST NOT allow it to
+  remain ahead of durable reality (mixed-schema snapshots are forbidden).
 
 #### 5.6.2 TxnSlot: Per-Transaction Cross-Process State
 
@@ -8493,9 +8509,14 @@ IntentOp := {
 }
 
 IntentFootprint := {
-  // Semantic reads that the correctness of this op depends on (e.g., predicate
-  // reads, uniqueness checks). Structural reads (B-tree descent, page layout)
-  // do not belong here; those are accounted for by `structural` (below).
+  // Semantic reads that the correctness of this op depends on AND that cannot be
+  // re-evaluated during deterministic rebase/merge (e.g., predicate reads, reads
+  // from other tables, SELECT-before-UPDATE decisions).
+  //
+  // IMPORTANT: Do NOT include uniqueness checks for keys that this op writes
+  // (e.g., INSERT key-existence probes). Those are re-validated against the
+  // rebased base snapshot during replay (§5.10.2) and therefore are not
+  // "blocking reads".
   reads : Vec<SemanticKeyRef>,
 
   // Semantic writes performed by this op (the logical keys it creates/updates/deletes).
@@ -8643,6 +8664,9 @@ distinguishing two categories of reads:
   creates a stale dependency on the snapshot base. If any `IntentOp.footprint.reads`
   is non-empty, rebase MUST NOT proceed (replaying against a different base creates
   a Lost Update / Write Skew).
+  Uniqueness checks for keys the op writes are NOT blocking reads and MUST NOT
+  be recorded in `footprint.reads`; they are re-validated against the rebased
+  base snapshot as part of normal constraint enforcement during replay.
 - **Expression reads:** Column reads embedded in `RebaseExpr` within an
   `UpdateExpression` intent. These are NOT recorded in `footprint.reads` because
   the read is captured in the expression AST itself. During rebase, the expression
@@ -8911,7 +8935,8 @@ Two intent ops `a, b` are independent (written `(a, b) in I_intent`) iff:
 For SAFE merges, an additional restriction applies:
 - `Reads(a)` and `Reads(b)` MUST both be empty. (For `UpdateExpression` ops, the
   implicit column reads are captured in `RebaseExpr` and are NOT in `footprint.reads`,
-  so this condition is satisfied.)
+  so this condition is satisfied. Uniqueness checks for keys being written are
+  re-validated during replay and likewise MUST NOT appear in `footprint.reads`.)
 
 **`UpdateExpression` commutativity refinement:** `SemanticKeyRef` is row-granularity,
 so two `UpdateExpression` ops on the same `(table, key)` have `Writes(a) ∩ Writes(b)
