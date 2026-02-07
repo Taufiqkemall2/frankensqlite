@@ -6312,8 +6312,11 @@ This is how MVCC avoids eating memory under real write concurrency.
 
 LRU fails catastrophically for database workloads: a single table scan evicts
 the entire working set. ARC (Adaptive Replacement Cache, Megiddo & Modha,
-FAST '03) auto-tunes between recency and frequency, maintaining a provable
-competitive ratio of 2 against OPT.
+FAST '03) auto-tunes between recency and frequency. The original paper proves
+that ARC(2c) contains both LRU(c) and LFU(c) as special cases, and dominates
+LRU across all tested workloads. (The competitive ratio of 2 against OPT is
+the Sleator-Tarjan result for LRU, not ARC; ARC's theoretical contribution is
+adaptive self-tuning, not a tighter worst-case bound.)
 
 ARC's advantage over LRU is not marginal -- it is structural. Consider three
 canonical database access patterns:
@@ -6762,26 +6765,39 @@ integrity. This must be implemented exactly for file format compatibility.
 
 ```rust
 /// Compute SQLite WAL checksum, chaining from (s1_init, s2_init).
-/// `native_cksum` is true if WAL magic matches 0x377f0682 in native byte order.
-/// If the read magic is 0x82067f37 (byte swapped), then `native_cksum` is false
-/// and the input data must be interpreted with non-native endianness.
+///
+/// `big_end_cksum` is `(magic & 1) != 0`, passed DIRECTLY from the WAL
+/// header magic value — NOT derived via `(bigEndCksum == SQLITE_BIGENDIAN)`.
+///
+/// C SQLite's walChecksumBytes(nativeCksum, ...) receives bigEndCksum as
+/// nativeCksum. Despite the misleading C parameter name, the semantics are:
+///   bigEndCksum=1 (magic 0x377F0683) → read u32 in native byte order
+///   bigEndCksum=0 (magic 0x377F0682) → BYTESWAP32 each u32 before accumulating
+///
+/// On little-endian (x86/ARM), the common case is magic 0x377F0682
+/// (bigEndCksum=0), so C ALWAYS byte-swaps. A previous version of this
+/// function used `native_cksum = (bigEndCksum == SQLITE_BIGENDIAN)` which
+/// INVERTED the swap/no-swap decision on LE — producing checksums
+/// incompatible with C SQLite.
 pub fn wal_checksum(
     data: &[u8],
     s1_init: u32,
     s2_init: u32,
-    native_cksum: bool,
+    big_end_cksum: bool,
 ) -> (u32, u32) {
     assert!(data.len() % 8 == 0);
     let mut s1 = s1_init;
     let mut s2 = s2_init;
 
     for chunk in data.chunks_exact(8) {
-        let (a, b) = if native_cksum {
+        let (a, b) = if big_end_cksum {
+            // bigEndCksum=1: C reads *aData (native u32, no swap)
             (
                 u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
                 u32::from_ne_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]),
             )
         } else {
+            // bigEndCksum=0: C does BYTESWAP32(*aData)
             (
                 u32::from_ne_bytes([chunk[3], chunk[2], chunk[1], chunk[0]]),
                 u32::from_ne_bytes([chunk[7], chunk[6], chunk[5], chunk[4]]),
@@ -6795,23 +6811,24 @@ pub fn wal_checksum(
 ```
 
 **Endianness determination from WAL magic:**
-- `0x377f0682` (bit 0 = 0): little-endian word order within each 8-byte chunk
-  (created on a little-endian machine; `bigEndCksum = 0`)
-- `0x377f0683` (bit 0 = 1): big-endian word order within each 8-byte chunk
-  (created on a big-endian machine; `bigEndCksum = 1`)
+- `0x377f0682` (bit 0 = 0): `bigEndCksum = 0`. Created on a little-endian
+  machine. C SQLite uses the BYTESWAP path (swaps each u32 from LE to BE
+  before accumulating). This is the common case on x86/ARM.
+- `0x377f0683` (bit 0 = 1): `bigEndCksum = 1`. Created on a big-endian
+  machine. C SQLite uses the native path (reads u32 as-is, already BE).
 
 The magic is always read via big-endian `u32` decoding (matching SQLite's
-`sqlite3Get4byte`). `native_cksum = (bigEndCksum == SQLITE_BIGENDIAN)`:
-on a machine whose endianness matches the WAL creator, no byte-swapping
-is needed.
+`sqlite3Get4byte`). The caller passes `big_end_cksum = (magic & 1) != 0`
+directly to this function. Do NOT use `(bigEndCksum == SQLITE_BIGENDIAN)` —
+the C code passes `bigEndCksum` verbatim as the `nativeCksum` parameter.
 
 FrankenSQLite writes WAL files using native byte order for performance.
 
 **Cumulative chaining:** Each frame's checksum chains from the previous:
 ```
-WAL header checksum = wal_checksum(header[0..24], 0, 0, native)
-Frame 0 checksum = wal_checksum(frame0_hdr[0..8] ++ page0_data, hdr_s1, hdr_s2, native)
-Frame N checksum = wal_checksum(frameN_hdr[0..8] ++ pageN_data, s1_{N-1}, s2_{N-1}, native)
+WAL header checksum = wal_checksum(header[0..24], 0, 0, big_end_cksum)
+Frame 0 checksum = wal_checksum(frame0_hdr[0..8] ++ page0_data, hdr_s1, hdr_s2, big_end_cksum)
+Frame N checksum = wal_checksum(frameN_hdr[0..8] ++ pageN_data, s1_{N-1}, s2_{N-1}, big_end_cksum)
 ```
 
 This creates a hash chain: modifying any frame invalidates all subsequent
@@ -9005,7 +9022,8 @@ Total: 22 bytes.
 
 ```
 Offset  Size  Description
-  0       4   Magic: 0x377F0682 (big-endian cksum) or 0x377F0683 (little-endian)
+  0       4   Magic: 0x377F0682 (bigEndCksum=0, LE machine) or
+              0x377F0683 (bigEndCksum=1, BE machine). See §7.1.
   4       4   Format version: 3007000 (constant for all WAL1 databases;
               indicates the WAL format introduced in SQLite 3.7.0)
   8       4   Page size
@@ -9036,28 +9054,26 @@ cannot be validated or written.
 
 ```rust
 /// Compute WAL checksum over `data` using the double-accumulator algorithm.
+/// See §7.1 for the canonical implementation and parameter semantics.
 ///
-/// `s0` and `s1` are the running accumulators (initialized from the
-/// previous frame's checksum, or from the WAL header checksum for the
-/// first frame). `native_byte_order` is true if the WAL magic is
-/// 0x377F0682 (big-endian on big-endian machines, little-endian on
-/// little-endian machines -- i.e., the checksum words are in the
-/// machine's native byte order). If 0x377F0683, use the opposite
-/// byte order.
+/// `big_end_cksum` = `(magic & 1) != 0`. Passed directly from the WAL
+/// header magic value. When true (magic 0x377F0683, created on BE machine),
+/// read u32s in native byte order. When false (magic 0x377F0682, created on
+/// LE machine — the common case on x86/ARM), BYTESWAP each u32.
 ///
 /// The data MUST be padded to a multiple of 8 bytes (zero-padded if
 /// necessary). This function processes the data in 8-byte chunks,
 /// treating each chunk as two 32-bit unsigned integers.
-fn wal_checksum(data: &[u8], mut s0: u32, mut s1: u32, native: bool) -> (u32, u32) {
+fn wal_checksum(data: &[u8], mut s0: u32, mut s1: u32, big_end_cksum: bool) -> (u32, u32) {
     assert!(data.len() % 8 == 0, "WAL checksum data must be 8-byte aligned");
     for chunk in data.chunks_exact(8) {
-        let (d0, d1) = if native {
-            // Native byte order: read as two u32 in platform endianness
+        let (d0, d1) = if big_end_cksum {
+            // bigEndCksum=1: C reads *aData (native u32, no swap)
             let d0 = u32::from_ne_bytes(chunk[0..4].try_into().unwrap());
             let d1 = u32::from_ne_bytes(chunk[4..8].try_into().unwrap());
             (d0, d1)
         } else {
-            // Opposite byte order
+            // bigEndCksum=0: C does BYTESWAP32(*aData)
             let d0 = u32::from_ne_bytes(chunk[0..4].try_into().unwrap()).swap_bytes();
             let d1 = u32::from_ne_bytes(chunk[4..8].try_into().unwrap()).swap_bytes();
             (d0, d1)
@@ -9070,9 +9086,9 @@ fn wal_checksum(data: &[u8], mut s0: u32, mut s1: u32, native: bool) -> (u32, u3
 ```
 
 **Checksum chain:**
-1. **WAL header checksum:** `wal_checksum(header_bytes[0..24], 0, 0, native)` →
+1. **WAL header checksum:** `wal_checksum(header_bytes[0..24], 0, 0, big_end_cksum)` →
    stored at header bytes 24..32.
-2. **First frame:** `wal_checksum(frame_header[0..8] ++ page_data, hdr_s0, hdr_s1, native)`
+2. **First frame:** `wal_checksum(frame_header[0..8] ++ page_data, hdr_s0, hdr_s1, big_end_cksum)`
    → stored at frame header bytes 16..24. (Note: only the first 8 bytes of
    the frame header are checksummed, NOT bytes 8..16 which contain the salt.)
 3. **Subsequent frames:** use the previous frame's `(s0, s1)` as the seed.
@@ -9096,7 +9112,10 @@ Header (136 bytes):
   [96..120]: WalCkptInfo (24 bytes):
                nBackfill(u32) at offset 96
                aReadMark[5](u32) at offsets 100-119 (5 reader marks, 20 bytes)
-  [120..136]: Lock bytes (16 bytes for SHM locking: 8 lock slots x 2 bytes)
+  [120..136]: Remaining WalCkptInfo fields (16 bytes):
+               aLock[8](u8) at offsets 120-127 (8 SHM lock slots, 1 byte each)
+               nBackfillAttempted(u32) at offset 128
+               notUsed0(u32) at offset 132
 
 Hash table segments (32 KB each):
   First segment:  covers up to 4062 frames (reduced by the 136-byte header).
@@ -9105,7 +9124,11 @@ Hash table segments (32 KB each):
   Subsequent:     covers up to 4096 frames (full 32 KB region).
                   [0..16384]:     Page number array: 4096 entries x 4 bytes
                   [16384..32768]: Hash table: 8192 slots x 2 bytes
-  Hash function: page_number % 8192, linear probing.
+  Hash function: (page_number * 383) & 8191, linear probing.
+  -- NOT simple modulo. The prime multiplier 383 (HASHTABLE_HASH_1 in C
+  -- SQLite) provides much better distribution for sequential page numbers.
+  -- Using `page_number % 8192` would produce a working but incompatible
+  -- wal-index when sharing SHM files with C SQLite in multi-process mode.
 ```
 
 **Reader marks:** Byte offsets 100-119 contain 5 reader marks (u32 each, 20 bytes total).
@@ -9154,6 +9177,38 @@ on Unicode code points regardless of encoding.
 - The value 1 at header offset 16-17 encodes 65536 (since 65536 > u16::MAX)
 - Page size is set at database creation and cannot be changed (except by VACUUM INTO)
 - FrankenSQLite default: 4096 (matches modern filesystem block size and SSD page size)
+
+### 11.14 Rollback Journal Format
+
+FrankenSQLite must support rollback journal mode for reading databases not
+in WAL mode. The rollback journal file (`<database>-journal`) format:
+
+```
+Journal Header (padded to sector boundary):
+  Offset  Size  Description
+    0       8   Magic: {0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7}
+    8       4   Page count (-1 means compute from file size)
+   12       4   Random nonce for checksum
+   16       4   Initial database size in pages (before this transaction)
+   20       4   Sector size (header padded to this boundary)
+   24       4   Page size
+
+Journal Page Records (repeated page_count times):
+  [4 bytes: page number (u32 BE)]
+  [page_size bytes: original page content before modification]
+  [4 bytes: checksum]
+```
+
+**Checksum:** `sum of every 200th byte of the page data, starting from
+byte offset (page_size - 200), wrapping around, plus the random nonce`.
+
+**Hot journal recovery:** On open, if a journal file exists, is non-empty,
+and the database's reserved lock is not held, it is a "hot journal." Recovery
+plays back original pages from the journal, then deletes it.
+
+**Journal modes:** DELETE (default), TRUNCATE, PERSIST, MEMORY, WAL, OFF.
+`PRAGMA journal_mode` switches modes. WAL-to-rollback: checkpoint all WAL
+frames, delete WAL and SHM files, update header bytes 18-19 from 2 to 1.
 
 ## 12. SQL Coverage
 
@@ -12409,6 +12464,6 @@ an embedded database engine can achieve.
 
 ---
 
-*Document version: 1.9 (Spec hardening: decoupled commit marker protocol; cross-process lock table CAS discipline; deterministic rebase safety constraints; ECS compaction; e-process family-wise control; symbol sizing + overhead clarity)*
+*Document version: 1.10 (Deep audit round 2: ARC REPLACE safety valve fix; NOT precedence fix; WAL checksum algorithm added; varint encoding added; crate dependency cycle broken (wal/pager); layer inversion fixed (mvcc moved to L3); VfsFile &Cx threading; AggregateFunction type-erasure fix; B-tree page header layout; WAL-index structure corrected; comparison affinity rules corrected; RawFd→FileExt; BOCPD summation; e-process hard-invariant guidance; pointer map types; index max_local math corrected (1003→1002); CTE UNION support; Database/Connection clarification; 30+ additional errata)*
 *Last updated: 2026-02-07*
 *Status: Authoritative Specification*
