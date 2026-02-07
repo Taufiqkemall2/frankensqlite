@@ -9269,7 +9269,7 @@ pub struct GhostStore<K> {
 ///   - T2 clock: same structure for frequency-favored pages.
 ///   - B1/B2: remain as HashSets of CacheKey (metadata only, small).
 ///
-	/// Why CAR over naive linked-list ARC:
+/// Why CAR over naive linked-list ARC:
 ///   - LinkedHashMap has 2 pointers per entry (prev/next) plus HashMap
 ///     overhead. For 2000-page cache: 32KB wasted on link pointers alone.
 ///   - Every ARC operation (insert, promote, evict) mutates linked list
@@ -9282,10 +9282,10 @@ pub struct GhostStore<K> {
 ///     Pinned pages are simply skipped by the clock hand (not removed
 ///     from the array, avoiding ABA problems).
 ///
-	/// The struct below names the LOGICAL ARC state variables. The physical
-	/// representation MAY differ (intrusive lists for exact ARC, clock buffers for
-	/// CAR) as long as the eviction constraints and adaptivity requirements are
-	/// satisfied.
+/// The struct below names the LOGICAL ARC state variables. The physical
+/// representation MAY differ (intrusive lists for exact ARC, clock buffers for
+/// CAR) as long as the eviction constraints and adaptivity requirements are
+/// satisfied.
 ///
 /// CONCURRENCY: All ArcCache operations (REQUEST, REPLACE, promote, evict)
 /// mutate multiple internal collections atomically. The cache MUST be
