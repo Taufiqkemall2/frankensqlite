@@ -1048,7 +1048,8 @@ elimination over GF(256):
 ```
 gaussian_solve(inactive_matrix, inactive_rhs):
     // inactive_matrix is approximately I x I where I ~ O(sqrt(K'))
-    // Standard GF(256) Gaussian elimination with partial pivoting:
+    // Standard GF(256) Gaussian elimination (nonzero pivot selection;
+    // "partial pivoting" is not needed over exact fields -- no rounding error):
     for col in 0..I:
         // Find pivot row
         pivot_row = find_row_with_nonzero_entry_in_column(col)
@@ -1539,6 +1540,13 @@ is unbounded.
 
 **UDP Packet Format**
 
+**Endianness note:** The UDP replication packet header uses big-endian (network
+byte order) for on-wire integer fields, following standard network protocol
+convention. This differs from the changeset payload encoding (§3.4.2 above),
+which uses little-endian per the canonical encoding rules (§3.5.1). The
+boundary is the `symbol_data` field: header fields before it are big-endian;
+the decoded changeset payload within it is little-endian.
+
 ```
 Replication Packet (variable size):
     Offset  Size    Field
@@ -1847,6 +1855,13 @@ where only a few bytes change per transaction, this wastes memory.
 between adjacent versions in the chain. Deltas are *compression*, not erasure
 coding. RaptorQ applies at the ECS object level for durability of delta objects
 just like any other object.
+
+**Reconstruction cost bound:** Reconstructing the oldest version in a chain of
+depth `L` requires `L-1` sequential delta applications starting from the newest
+(full) version. Theorem 5 (§5.5) bounds chain length to `R * D + 1` where `R`
+is the write rate and `D` is the duration above the GC horizon; the adaptive GC
+controller (§5.6.3) targets a chain depth of ~8. This ensures delta
+reconstruction cost remains bounded and predictable.
 
 ```
 Version chain for page P:
@@ -2824,7 +2839,7 @@ sequential write throughput (log-structured):
 foo.db.fsqlite/
 ├── ecs/
 │   ├── root              -- tiny mutable pointer file (atomic update)
-│   │                     -- contains: [latest_manifest_object_id (16B) | checksum (8B)]
+│   │                     -- contains: [magic (4B "FSRT") | version (4B) | manifest_object_id (16B) | checksum (8B)]
 │   ├── symbols/          -- append-only symbol record logs
 │   │   ├── segment-000000.log
 │   │   ├── segment-000001.log
