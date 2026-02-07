@@ -35,7 +35,7 @@ The file format stays 100% compatible with existing `.sqlite` databases in Compa
 |---------|----------|---------------|
 | Concurrent writers | 1 (file-level lock) | Many (page-level MVCC with SSI) |
 | Isolation level | SERIALIZABLE (by serializing) | SERIALIZABLE (SSI for concurrent mode) |
-| Concurrent readers | Unlimited (WAL mode) | Unlimited (no `aReadMark[5]` limit) |
+| Concurrent readers | Many (WAL; 5 read-mark slots by default) | Many (Compat: same 5 read-mark slots; Native: bounded by txn-slot capacity, no WAL-index cap) |
 | Memory safety | Manual (C) | Guaranteed (`#[forbid(unsafe_code)]`) |
 | Data races | Possible (careful C) | Impossible (Rust ownership) |
 | File format | SQLite 3.x | Identical (Compatibility mode) or ECS (Native mode) |
