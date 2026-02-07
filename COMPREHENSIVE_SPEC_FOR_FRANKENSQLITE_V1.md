@@ -282,6 +282,44 @@ patterns. The following constraints are non-negotiable for hot-path code:
   vectorize. Use optimized dependencies (`xxhash-rust`, `asupersync`) for
   heavy lifting rather than writing `unsafe` SIMD intrinsics manually.
 
+### 1.6 Critical Implementation Controls (Non-Negotiable)
+
+This specification is intentionally ambitious. To keep that ambition from
+collapsing into corruption, deadlocks, or "works in tests but fails in the wild",
+the following constraints are **non-negotiable** and are called out here as a
+cross-cutting checklist:
+
+- **Hybrid SHM interop must follow legacy lock protocol, not just layout.**
+  In Compatibility mode, FrankenSQLite readers MUST acquire `WAL_READ_LOCK(i)`
+  (EXCLUSIVE to update `aReadMark[i]`, then SHARED for the snapshot lifetime),
+  and writers MUST hold `WAL_WRITE_LOCK` for the coordinator lifetime (§5.6.7).
+
+- **Witnesses must be semantic and sub-page for point ops.**
+  The VDBE/B-tree MUST NOT register `WitnessKey::Page(pgno)` reads merely because
+  a cursor traversed a page during descent; point reads and negative reads MUST
+  use `WitnessKey::Cell(...)` (§5.6.4.3). Violating this collapses deterministic
+  rebase/safe merge back to abort-only behavior (§5.10.2).
+
+- **RaptorQ repair work must be off the commit critical path.**
+  Commit durability is satisfied after appending and syncing systematic symbols.
+  Repair symbols MUST be generated/append-synced asynchronously; commits may be
+  briefly "durable but not repairable" (§3.4.1).
+
+- **Lock table rebuild quiescence is "no lock holders", not "no transactions".**
+  Rebuild MUST drain to lock-quiescence (`forall entries: owner_txn==0`), and
+  read-only transactions MUST NOT block rebuild. If a transaction holds any page
+  locks and encounters rebuild-induced `SQLITE_BUSY`, it MUST abort/retry (no
+  busy-wait while holding locks) (§5.6.3.1).
+
+- **GC horizon must account for TxnSlot sentinel states.**
+  `raise_gc_horizon()` MUST treat `TXN_ID_CLAIMING/TXN_ID_CLEANING` as horizon
+  blockers (§5.6.5). Crash cleanup MUST preserve enough identity (`cleanup_txn_id`)
+  to make cleanup retryable without lock leaks (§5.6.2).
+
+- **Direct I/O is incompatible with SQLite WAL framing.**
+  Compatibility mode MUST NOT require `O_DIRECT` for `.wal` I/O because the
+  `24 + page_size` frame structure breaks sector alignment (§1.5).
+
 ---
 
 ## 2. Why Page-Level MVCC
@@ -6561,6 +6599,9 @@ cleanup_orphaned_slots():
                 // Transition to CLEANING before clearing fields so we do not race
                 // with a new claimer that could otherwise observe/clobber state.
                 if slot.txn_id.CAS(TXN_ID_CLAIMING, TXN_ID_CLEANING):
+                    // Entered CLEANING; stamp the sentinel-time so other cleaners
+                    // do not treat this slot as "stuck CLEANING" immediately.
+                    slot.claiming_timestamp = now
                     // Clear snapshot/epoch fields as well: a future claimer must not
                     // observe stale begin_seq/witness_epoch under TXN_ID_CLAIMING (§5.6.5, §5.6.4.8).
                     slot.state = Free
@@ -6596,8 +6637,9 @@ cleanup_orphaned_slots():
                     // Avoid leaking cleanup_txn_id into a non-cleaning slot.
                     slot.cleanup_txn_id = 0
                     continue  // someone else is cleaning this slot (or slot changed)
-                // Seed the timeout clock without overwriting a previously-seeded value.
-                slot.claiming_timestamp.CAS(0, now)
+                // Entered CLEANING; stamp the sentinel-time unconditionally. This
+                // must overwrite any old "claim" timestamp left over from slot acquire.
+                slot.claiming_timestamp = now
                 release_page_locks_for(old_txn_id)
                 slot.state = Free
                 slot.mode = Serialized
