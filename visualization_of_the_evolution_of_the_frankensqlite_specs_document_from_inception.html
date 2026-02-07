@@ -6139,6 +6139,7 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         renderBucketToggles();
         renderCharts(filtered);
         renderCommitList(filtered);
+        syncDockAndDoc();
 
         // Make sure code highlighting is applied to newly inserted excerpts
         requestAnimationFrame(() => {
@@ -6169,6 +6170,365 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         }
         // multi-label: require overlap
         return commit.labels.some((b) => enabled.has(b));
+      }
+
+      // -----------------------------
+      // Dock + Doc Evolution UI
+      // -----------------------------
+
+      const DOC_CURSOR = {
+        idx: 0,
+        lines: null,
+      };
+
+      function setDocTab(tab) {
+        DOC.tab = tab;
+        // Buttons
+        const btnSpec = document.getElementById("docTabSpec");
+        const btnDiff = document.getElementById("docTabDiff");
+        const btnMetrics = document.getElementById("docTabMetrics");
+        const on = "focus-ring rounded-2xl bg-slate-900 px-3 py-2 text-xs font-semibold text-white hover:bg-slate-800";
+        const off =
+          "focus-ring rounded-2xl border border-slate-900/10 bg-white/70 px-3 py-2 text-xs font-semibold text-slate-900 hover:bg-white";
+        if (btnSpec && btnDiff && btnMetrics) {
+          btnSpec.className = tab === "spec" ? on : off;
+          btnDiff.className = tab === "diff" ? on : off;
+          btnMetrics.className = tab === "metrics" ? on : off;
+        }
+        updateDocPanelVisibility();
+        // Re-render diff/spec if needed.
+        void updateDocUI();
+      }
+
+      function updateDocPanelVisibility() {
+        const spec = document.getElementById("docSpecView");
+        const diff = document.getElementById("docDiffView");
+        const metrics = document.getElementById("docMetricsView");
+        if (!spec || !diff || !metrics) return;
+        spec.classList.toggle("hidden", DOC.tab !== "spec");
+        diff.classList.toggle("hidden", DOC.tab !== "diff");
+        metrics.classList.toggle("hidden", DOC.tab !== "metrics");
+      }
+
+      function patchForIdx(idx) {
+        const d = DATASET.data;
+        if (!d || !Array.isArray(d.patches)) return "";
+        return d.patches[idx] || "";
+      }
+
+      function applyPatchLines(prevLines, patch) {
+        const hunks = parseUnifiedHunks(patch);
+        let out = prevLines.slice();
+        let offset = 0;
+        for (const h of hunks) {
+          let at = (h.oldStart - 1) + offset;
+          at = clamp(at, 0, out.length);
+          let cursor = at;
+          const next = [];
+          for (const hl of h.lines) {
+            if (!hl) continue;
+            const p = hl[0];
+            const content = hl.slice(1);
+            if (p === " ") {
+              next.push(content);
+              cursor += 1;
+            } else if (p === "-") {
+              cursor += 1;
+            } else if (p === "+") {
+              next.push(content);
+            } else {
+              // "\ No newline at end of file" or other metadata
+            }
+          }
+          out.splice(at, cursor - at, ...next);
+          offset += next.length - (cursor - at);
+        }
+        return out;
+      }
+
+      async function docTextAt(idx) {
+        const d = DATASET.data;
+        if (!d) return "";
+        if (idx <= 0) return String(d.base_doc || "");
+
+        const cached = DOC_CACHE.get(idx);
+        if (cached?.text) return cached.text;
+
+        // Fast path: sequential scrub.
+        if (DOC_CURSOR.lines && idx === DOC_CURSOR.idx + 1) {
+          const nextLines = applyPatchLines(DOC_CURSOR.lines, patchForIdx(idx));
+          DOC_CURSOR.idx = idx;
+          DOC_CURSOR.lines = nextLines;
+          const text = nextLines.join("\n");
+          DOC_CACHE.set(idx, { text });
+          return text;
+        }
+
+        // Rebuild from nearest cached anchor.
+        let anchor = 0;
+        for (let j = idx - 1; j > 0; j--) {
+          if (DOC_CACHE.has(j)) {
+            anchor = j;
+            break;
+          }
+        }
+
+        let lines = String(d.base_doc || "").split("\n");
+        if (anchor > 0) lines = String(DOC_CACHE.get(anchor)?.text || "").split("\n");
+
+        for (let k = Math.max(1, anchor + 1); k <= idx; k++) {
+          lines = applyPatchLines(lines, patchForIdx(k));
+          // Keep sparse anchors to accelerate non-linear scrubs.
+          if (k === idx || k % 10 === 0) DOC_CACHE.set(k, { text: lines.join("\n") });
+        }
+
+        DOC_CURSOR.idx = idx;
+        DOC_CURSOR.lines = lines;
+        return DOC_CACHE.get(idx)?.text || lines.join("\n");
+      }
+
+      async function levenshteinForPatch(patch) {
+        const hunks = parseUnifiedHunks(patch);
+        const enc = new TextEncoder();
+        let sum = 0;
+        for (const h of hunks) {
+          const oldLines = [];
+          const newLines = [];
+          for (const hl of h.lines) {
+            if (!hl) continue;
+            const p = hl[0];
+            const content = hl.slice(1);
+            if (p === "-") oldLines.push(content);
+            if (p === "+") newLines.push(content);
+          }
+          if (!oldLines.length && !newLines.length) continue;
+          const a = enc.encode(oldLines.join("\n"));
+          const b = enc.encode(newLines.join("\n"));
+          if (a.length > 20000 || b.length > 20000) {
+            // Worst-case guard: fallback to a cheap upper bound.
+            sum += a.length + b.length;
+          } else {
+            sum += await levenshteinBytes(a, b);
+          }
+        }
+        return sum;
+      }
+
+      function selectCommitIdx(idx, opts = {}) {
+        const max = Math.max(0, (ALL_COMMITS.length || 1) - 1);
+        const next = clamp(Number(idx || 0), 0, max);
+        DOC.idx = next;
+
+        const slider = document.getElementById("dockSlider");
+        if (slider) slider.value = String(next);
+
+        syncDockAndDoc();
+
+        if (opts.scrollToCommitList) {
+          const c = ALL_COMMITS[next];
+          const el = c ? document.getElementById(`commit-${c.hash}`) : null;
+          if (el) {
+            el.scrollIntoView({ behavior: "smooth", block: "start" });
+            el.open = true;
+          }
+        }
+      }
+
+      function initDockIfNeeded() {
+        if (DOCK_READY) return;
+        const slider = document.getElementById("dockSlider");
+        if (!slider || !ALL_COMMITS.length) return;
+        slider.min = "0";
+        slider.max = String(ALL_COMMITS.length - 1);
+        slider.step = "1";
+        document.getElementById("dockLeftLabel").textContent = ALL_COMMITS[0]?.short || "-";
+        document.getElementById("dockRightLabel").textContent = ALL_COMMITS[ALL_COMMITS.length - 1]?.short || "-";
+        DOCK_READY = true;
+      }
+
+      function drawDock() {
+        const canvas = document.getElementById("dockCanvas");
+        if (!canvas || !ALL_COMMITS.length) return;
+        const dpr = window.devicePixelRatio || 1;
+        const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+        const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+        if (canvas.width !== w || canvas.height !== h) {
+          canvas.width = w;
+          canvas.height = h;
+        }
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
+        ctx.clearRect(0, 0, w, h);
+
+        const maxImpact = Math.max(1, ...ALL_COMMITS.map((c) => Number(c.impact || 0)));
+        const barW = w / ALL_COMMITS.length;
+        const pad = 2 * dpr;
+
+        for (let i = 0; i < ALL_COMMITS.length; i++) {
+          const c = ALL_COMMITS[i];
+          const v = Number(c.impact || 0);
+          const t = Math.sqrt(v / maxImpact);
+          const bh = Math.max(1, (h - pad * 2) * t);
+          const x = i * barW;
+          const y = h - pad - bh;
+          ctx.globalAlpha = 0.9;
+          ctx.fillStyle = bucketById(c.primary).color;
+          ctx.fillRect(x, y, Math.max(1, barW), bh);
+        }
+
+        // Selected marker.
+        const sx = DOC.idx * barW;
+        ctx.globalAlpha = 1;
+        ctx.lineWidth = Math.max(1, dpr);
+        ctx.strokeStyle = "rgba(2,6,23,0.85)";
+        ctx.strokeRect(sx + 0.5, 0.5, Math.max(1, barW - 1), h - 1);
+
+        // Inset glow
+        ctx.globalAlpha = 1;
+        ctx.strokeStyle = "rgba(37,99,235,0.35)";
+        ctx.strokeRect(sx + 0.5, 1.5, Math.max(1, barW - 1), h - 3);
+      }
+
+      async function updateDocUI() {
+        const loading = document.getElementById("docLoading");
+        const main = document.getElementById("docMain");
+        if (!loading || !main) return;
+
+        if (!DATASET.loaded) {
+          loading.classList.remove("hidden");
+          main.classList.add("hidden");
+          loading.textContent = DATASET.error
+            ? `Spec evolution dataset unavailable: ${DATASET.error}`
+            : "Loading spec evolution dataset... (local gzip JSON; no GitHub API)";
+          return;
+        }
+
+        loading.classList.add("hidden");
+        main.classList.remove("hidden");
+        updateDocPanelVisibility();
+
+        const c = ALL_COMMITS[DOC.idx];
+        if (!c) return;
+
+        document.getElementById("dockTitle").textContent = `${c.short} · ${c.subject}`;
+
+        const title = document.getElementById("docCommitTitle");
+        const meta = document.getElementById("docCommitMeta");
+        const link = document.getElementById("docCommitLink");
+        if (title) title.textContent = c.subject;
+        if (meta) meta.textContent = `${c.short} · ${dayjs(c.dateIso).format("YYYY-MM-DD HH:mm:ss")} · +${fmtInt(c.add)} -${fmtInt(c.del)}`;
+        if (link) link.href = c.url;
+
+        // Summary box.
+        const sum = document.getElementById("docSummary");
+        const tok = METRICS.tokensChanged.get(c.hash);
+        const byt = METRICS.bytesChanged.get(c.hash);
+        const hn = METRICS.hunks.get(c.hash);
+        const lv = METRICS.lev.get(c.hash);
+        if (sum) {
+          sum.innerHTML = `
+            <div class="flex flex-wrap gap-2">
+              <span class="chip mono rounded-full px-2.5 py-1 text-[11px] text-slate-700">Impact ${fmtInt(c.impact)}</span>
+              <span class="chip mono rounded-full px-2.5 py-1 text-[11px] text-slate-700">Hunks ${fmtInt(hn ?? 0)}</span>
+              <span class="chip mono rounded-full px-2.5 py-1 text-[11px] text-slate-700">Tokens ${fmtInt(tok ?? 0)}</span>
+              <span class="chip mono rounded-full px-2.5 py-1 text-[11px] text-slate-700">Bytes ${fmtInt(byt ?? 0)}</span>
+              <span class="chip mono rounded-full px-2.5 py-1 text-[11px] text-slate-700">Lev ${lv == null ? "?" : fmtInt(lv)}</span>
+            </div>
+            <div class="mt-2 text-xs text-slate-600">Bucket: <span class="font-semibold">${escapeHtml(bucketById(c.primary).name)}</span></div>
+          `;
+        }
+
+        // Metrics cards
+        document.getElementById("mTokens").textContent = tok == null ? "-" : fmtInt(tok);
+        document.getElementById("mBytes").textContent = byt == null ? "-" : fmtInt(byt);
+        document.getElementById("mHunks").textContent = hn == null ? "-" : fmtInt(hn);
+        document.getElementById("mLev").textContent = lv == null ? "-" : fmtInt(lv);
+
+        const patch = patchForIdx(DOC.idx);
+
+        if (DOC.tab === "diff") {
+          const raw = document.getElementById("diffRaw");
+          const pretty = document.getElementById("diffPretty");
+          if (raw) raw.textContent = patch || "";
+
+          if (pretty) {
+            if (DOC.diffMode === "pretty") {
+              try {
+                pretty.innerHTML = Diff2Html.html(patch || "", {
+                  drawFileList: false,
+                  matching: "lines",
+                  outputFormat: "side-by-side",
+                });
+              } catch (e) {
+                pretty.innerHTML = `<div class="p-3 text-xs text-slate-700">Diff2Html failed: ${escapeHtml(String(e?.message || e))}</div>`;
+              }
+            } else {
+              pretty.innerHTML = "";
+            }
+          }
+
+          document.getElementById("diffPretty").classList.toggle("hidden", DOC.diffMode !== "pretty");
+          document.getElementById("diffRaw").classList.toggle("hidden", DOC.diffMode !== "raw");
+        }
+
+        if (DOC.tab === "spec") {
+          const raw = document.getElementById("docRaw");
+          const rendered = document.getElementById("docRendered");
+          const specView = document.getElementById("docSpecView");
+          if (specView) specView.classList.remove("hidden");
+
+          const text = await docTextAt(DOC.idx);
+          if (raw) raw.textContent = text;
+
+          if (rendered) {
+            const md = markdownit({
+              html: false,
+              linkify: true,
+              typographer: true,
+              highlight: (str, lang) => {
+                try {
+                  if (lang && hljs.getLanguage(lang)) {
+                    return `<pre class=\"hljs\"><code>${hljs.highlight(str, { language: lang }).value}</code></pre>`;
+                  }
+                  return `<pre class=\"hljs\"><code>${hljs.highlightAuto(str).value}</code></pre>`;
+                } catch {
+                  return `<pre class=\"hljs\"><code>${escapeHtml(str)}</code></pre>`;
+                }
+              },
+            });
+            const html = md.render(text || "");
+            rendered.innerHTML = DOMPurify.sanitize(html);
+          }
+
+          document.getElementById("docRendered").classList.toggle("hidden", DOC.rawSpec);
+          document.getElementById("docRaw").classList.toggle("hidden", !DOC.rawSpec);
+        }
+
+        // On-demand Levenshtein for selected commit.
+        if (DATASET.loaded && DOC.idx > 0 && !METRICS.lev.has(c.hash)) {
+          // Compute async, don't block UI.
+          void (async () => {
+            try {
+              const d = await levenshteinForPatch(patch);
+              METRICS.lev.set(c.hash, d);
+              // Update only if still selected.
+              if (ALL_COMMITS[DOC.idx]?.hash === c.hash) {
+                document.getElementById("mLev").textContent = fmtInt(d);
+                syncDockAndDoc();
+              }
+            } catch {
+              // ignore
+            }
+          })();
+        }
+      }
+
+      function syncDockAndDoc() {
+        if (!ALL_COMMITS.length) return;
+        DOC.idx = clamp(DOC.idx, 0, ALL_COMMITS.length - 1);
+        initDockIfNeeded();
+        drawDock();
+        void updateDocUI();
       }
 
       function renderBucketToggles() {
@@ -6224,13 +6584,12 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
 
         const timelineData = commits.map((c) => {
           return [
-            c.idx,
+            c.dateIso,
             c.impact,
             c.primary,
             c.short,
             c.subject,
             c.hash,
-            c.dateIso,
             c.author,
           ];
         });
@@ -6251,8 +6610,8 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
                   <div style="display:flex;align-items:center;gap:10px;">
                     <span style="width:10px;height:10px;border-radius:99px;background:${b.color};display:inline-block;"></span>
                     <div style="font-weight:700">${escapeHtml(d[3])}</div>
-                    <div style="margin-left:auto;font-size:11px;color:rgba(2,6,23,.62)">${dayjs(d[6]).format(
-                      "HH:mm:ss",
+                    <div style="margin-left:auto;font-size:11px;color:rgba(2,6,23,.62)">${dayjs(d[0]).format(
+                      "YYYY-MM-DD HH:mm:ss",
                     )}</div>
                   </div>
                   <div style="margin-top:6px;font-size:12px;color:rgba(2,6,23,.8)">${escapeHtml(d[4])}</div>
@@ -6264,8 +6623,8 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
             },
           },
           xAxis: {
-            type: "value",
-            name: "commit index",
+            type: "time",
+            name: "time",
             nameTextStyle: { color: "rgba(2,6,23,.55)" },
             axisLabel: { color: "rgba(2,6,23,.55)" },
             axisLine: { lineStyle: { color: "rgba(2,6,23,.12)" } },
@@ -6296,6 +6655,8 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         chartTimeline.off("click");
         chartTimeline.on("click", (p) => {
           const hash = p.data[5];
+          const idx = ALL_COMMITS.findIndex((c) => c.hash === hash);
+          if (idx >= 0) selectCommitIdx(idx);
           const el = document.getElementById(`commit-${hash}`);
           if (el) {
             el.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -6303,33 +6664,103 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
           }
         });
 
-	        // Stacked bucket counts by commit index (primary or multi)
-	        const x = commits.map((c) => c.short);
-	        const countsByBucket = new Map(BUCKETS.map((b) => [b.id, new Array(commits.length).fill(0)]));
-	        for (let i = 0; i < commits.length; i++) {
-	          const c = commits[i];
-	          if (STATE.bucketMode === "primary") {
-	            for (const g of c.changeGroups) {
-	              const a = countsByBucket.get(g.primary);
-	              if (a) a[i] += 1;
-	            }
-	          } else {
-	            for (const g of c.changeGroups) {
-	              for (const b of g.labels) {
-	                const a = countsByBucket.get(b);
-	                if (a) a[i] += 1;
-	              }
-	            }
-	          }
-	        }
+        // Stacked buckets by time bin (commit/day/hour/15m/5m)
+        const resSel = document.getElementById("stackResolution");
+        const metricSel = document.getElementById("stackMetric");
+        const resolution = resSel?.value || "commit";
+        const metric = metricSel?.value || "groups";
+
+        const binLabels = [];
+        const binCommits = [];
+        const binIdx = new Map();
+
+        const fmt2 = (n) => String(n).padStart(2, "0");
+        const binKey = (c) => {
+          if (resolution === "commit") return c.short;
+          const t = dayjs(c.dateIso);
+          if (resolution === "day") return t.format("YYYY-MM-DD");
+          if (resolution === "hour") return t.format("YYYY-MM-DD HH:00");
+          if (resolution === "15m") {
+            const m = Math.floor(t.minute() / 15) * 15;
+            return `${t.format("YYYY-MM-DD HH")}:${fmt2(m)}`;
+          }
+          if (resolution === "5m") {
+            const m = Math.floor(t.minute() / 5) * 5;
+            return `${t.format("YYYY-MM-DD HH")}:${fmt2(m)}`;
+          }
+          return t.format();
+        };
+
+        for (const c of commits) {
+          const k = binKey(c);
+          let j = binIdx.get(k);
+          if (j == null) {
+            j = binLabels.length;
+            binIdx.set(k, j);
+            binLabels.push(k);
+            binCommits.push([]);
+          }
+          binCommits[j].push(c);
+        }
+
+        const valuesByBucket = new Map(BUCKETS.map((b) => [b.id, new Array(binLabels.length).fill(0)]));
+
+        const metricForCommit = (c) => {
+          if (metric === "groups") return 1; // handled per-group
+          if (metric === "lines") return Number(c.impact || 0);
+          if (metric === "tokens") return Number(METRICS.tokensChanged.get(c.hash) || 0);
+          if (metric === "lev") return Number(METRICS.lev.get(c.hash) || 0);
+          return 0;
+        };
+
+        for (let bi = 0; bi < binCommits.length; bi++) {
+          for (const c of binCommits[bi]) {
+            if (metric === "groups") {
+              if (STATE.bucketMode === "primary") {
+                for (const g of c.changeGroups) {
+                  const a = valuesByBucket.get(g.primary);
+                  if (a) a[bi] += 1;
+                }
+              } else {
+                for (const g of c.changeGroups) {
+                  for (const b of g.labels) {
+                    const a = valuesByBucket.get(b);
+                    if (a) a[bi] += 1;
+                  }
+                }
+              }
+              continue;
+            }
+
+            const v = metricForCommit(c);
+            const groups = c.changeGroups.length || 1;
+            const perGroup = v / groups;
+
+            if (STATE.bucketMode === "primary") {
+              for (const g of c.changeGroups) {
+                const a = valuesByBucket.get(g.primary);
+                if (a) a[bi] += perGroup;
+              }
+            } else {
+              for (const g of c.changeGroups) {
+                const labels = g.labels?.length ? g.labels : [10];
+                const perLabel = perGroup / labels.length;
+                for (const b of labels) {
+                  const a = valuesByBucket.get(b);
+                  if (a) a[bi] += perLabel;
+                }
+              }
+            }
+          }
+        }
 
         chartStack.setOption({
           grid: { left: 44, right: 18, top: 18, bottom: 60 },
           tooltip: { trigger: "axis" },
           xAxis: {
             type: "category",
-            data: x,
-            axisLabel: { color: "rgba(2,6,23,.55)", rotate: 45 },
+            data: binLabels,
+            axisLabel: { color: "rgba(2,6,23,.55)", rotate: resolution === "day" ? 0 : 45 },
             axisLine: { lineStyle: { color: "rgba(2,6,23,.12)" } },
           },
           yAxis: {
@@ -6350,7 +6781,7 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
               barWidth: "60%",
               emphasis: { focus: "series" },
               itemStyle: { color: b.color, opacity: 0.9 },
-              data: countsByBucket.get(b.id),
+              data: valuesByBucket.get(b.id),
             };
           }),
         });
@@ -6624,6 +7055,10 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
                 .join("")}
             </div>
           `;
+
+          details.addEventListener("toggle", () => {
+            if (details.open) selectCommitIdx(c.idx);
+          });
 
           wrap.appendChild(details);
         }
