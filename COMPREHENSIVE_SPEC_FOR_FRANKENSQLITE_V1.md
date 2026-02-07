@@ -6208,6 +6208,11 @@ sequencer is unavailable, but only one rebuild may be in progress.
 2. Freeze new acquisitions: while rebuild lease is active, `try_acquire` MUST
    fail with `SQLITE_BUSY` (non-blocking; busy-timeout is a caller policy).
    `release` MUST continue to function.
+   **Deadlock avoidance (normative):** If a transaction already holds one or
+   more page locks, it MUST NOT busy-wait/spin on this `SQLITE_BUSY` while
+   continuing to hold those locks. It MUST abort/retry (releasing its locks)
+   so the drain can reach lock-quiescence. Busy-timeout waiting is permitted
+   only for transactions that currently hold **zero** page locks.
 3. Drain to **lock-quiescence**: wait until there are no outstanding lock
    holders in the PageLockTable, i.e., until:
    - `forall entry in entries: entry.owner_txn == 0`.
@@ -8658,6 +8663,26 @@ REQUEST(cache, key: CacheKey) -> Result<Arc<CachedPage>>:
 and B2): 2 × 2000 entries × ~40 bytes = ~160 KB total ghost list overhead —
 still negligible compared to page data
 (~8 MiB for a 2000-page cache).
+
+#### 6.4.1 Optional: p-Update as Online Learning (Research Note)
+
+The ghost-hit signal (`key ∈ B1` vs `key ∈ B2`) is a signed feedback signal
+about whether recency (`T1`) or frequency (`T2`) is undersized. This can be
+framed as an online learning / optimal control problem: choose `p_t` over time
+to minimize cache miss loss under non-stationary workloads.
+
+A simple OCO-style controller would update:
+
+```
+p_{t+1} = clamp(p_t + η_t * s_t, 0, capacity)
+s_t = +1 for B1 hit, -1 for B2 hit
+```
+
+With standard assumptions, diminishing `η_t` yields a no-regret guarantee in
+the abstract OCO model. However, ARC/CAR's known properties rely on the
+canonical update rules above. Any alternative `p` controller therefore MUST be
+treated as a harness experiment until it is proven to preserve ARC invariants
+and performance dominance.
 
 ### 6.5 MVCC Adaptation: (PageNumber, CommitSeq) Keying with Ghost Lists
 
@@ -15302,6 +15327,6 @@ an embedded database engine can achieve.
 
 ---
 
-*Document version: 1.27 (Round 10 audit: version-chain delta compression corrected: use sparse XOR deltas between adjacent page versions (RaptorQ remains the durability/repair layer for delta objects); prior rounds: forbid raw byte-disjoint XOR write merging for SQLite structured pages; specify safe merge ladder (intent-log deterministic rebase + structured patch parse/merge/repack + merge certificates); built-in function semantics audited/corrected (ceil/floor/trunc return types, NaN/Inf handling, octet_length bytes, substr negative length, COLLATE interaction, compileoption funcs); VFS trait examples corrected to include `&Cx`; risk register compaction cross-reference fixed.)*
+*Document version: 1.28 (Round 11 audit: ARC p-update online-learning framing added (research note; canonical ARC update remains normative); Round 10 audit: version-chain delta compression corrected: use sparse XOR deltas between adjacent page versions (RaptorQ remains the durability/repair layer for delta objects); prior rounds: forbid raw byte-disjoint XOR write merging for SQLite structured pages; specify safe merge ladder (intent-log deterministic rebase + structured patch parse/merge/repack + merge certificates); built-in function semantics audited/corrected (ceil/floor/trunc return types, NaN/Inf handling, octet_length bytes, substr negative length, COLLATE interaction, compileoption funcs); VFS trait examples corrected to include `&Cx`; risk register compaction cross-reference fixed.)*
 *Last updated: 2026-02-07*
 *Status: Authoritative Specification*
