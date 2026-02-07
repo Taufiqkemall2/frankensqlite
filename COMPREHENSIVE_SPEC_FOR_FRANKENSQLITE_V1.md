@@ -5221,11 +5221,13 @@ semantics: exclusive write locks per page, immediate failure on contention.
 ##### 5.6.3.1 Table Rebuild (Lease + Quiescence Barrier)
 
 The shared-memory lock table is fixed-capacity in V1; "rebuild" means "clear
-tombstones by resetting the table", not "resize".
+the table to empty", not "resize".
 
-**Why rebuild is needed:** Linear probing performance degrades with tombstones
-(primary clustering). Tombstones are correctness-required, but they are
-performance poison under long-running churn.
+**Why rebuild is needed:** Because keys are not deleted during normal operation
+(§5.6.3), the number of distinct pages ever locked since the last rebuild can
+approach `capacity`, causing long probe chains and eventually making insertion
+for new page numbers impossible. Rebuild resets the load factor and restores
+short probe lengths.
 
 **Who rebuilds:** To avoid a thundering herd, rebuild SHOULD be initiated by
 the commit sequencer (the process that currently sequences commit publication
@@ -5233,7 +5235,7 @@ and advances `gc_horizon`; §5.6.5). Any process MAY initiate rebuild if the
 sequencer is unavailable, but only one rebuild may be in progress.
 
 **Trigger conditions (any are sufficient):**
-- `N/C > 0.70` where `N` counts occupied slots + tombstones, OR
+- `N/C > 0.70` where `N` counts `page_number != 0` entries, OR
 - repeated `SQLITE_BUSY` due to the load-factor guard for >100ms, OR
 - (optional) an e-process monitor over probe lengths rejects a configured budget.
 
@@ -5265,7 +5267,7 @@ and the table is not left partially cleared.
 **Load factor analysis (Extreme Optimization Discipline):**
 
 Linear probing has expected probe length `1/(1 - alpha)` where `alpha = N/C`
-is the load factor (N = occupied slots including tombstones, C = capacity).
+is the load factor (N = `page_number != 0` entries, C = capacity).
 Worst-case probe
 chain length grows as `O(log C)` with high probability for uniform hashing,
 but under Zipfian page access, primary clustering degrades performance:
@@ -5279,8 +5281,9 @@ but under Zipfian page access, primary clustering degrades performance:
 
 **Maximum load factor policy:** If `N > 0.70 * C`, new lock acquisitions
 return `SQLITE_BUSY` rather than degrading to pathological probe chains.
-With C=65536 and the 70% limit, this supports up to 45,875 concurrent page
-locks (far beyond any realistic workload, since TxnSlot capacity is 256).
+With C=65536 and the 70% limit, this allows up to 45,875 distinct page numbers
+in the table before requiring rebuild. This is a capacity budget, not a limit
+on concurrent transactions; a single transaction can touch many pages.
 
 **Alternative: Robin Hood hashing.** If Zipfian clustering proves
 problematic, Robin Hood hashing bounds the variance of probe lengths
@@ -9482,11 +9485,15 @@ Offset  Size  Field                    Valid Values              FrankenSQLite D
  18       1   Write version            1=journal, 2=WAL          2 (WAL mode default)
  19       1   Read version             1=journal, 2=WAL          2
  20       1   Reserved space/page      0..255                    0 (or 16 if page_checksum=ON)
+                                      (constraint: usable_size = page_size -
+                                       reserved_space must be >= 480)
  21       1   Max embed payload frac   64 (MUST be 64)           64
  22       1   Min embed payload frac   32 (MUST be 32)           32
  23       1   Leaf payload fraction    32 (MUST be 32)           32
  24       4   File change counter      any u32                   Incremented on commit
  28       4   Database size (pages)    0 or actual count         Actual count
+                                      (only valid when offset 92 == offset 24;
+                                       otherwise compute from file size)
  32       4   First freelist trunk     0 or page number          0 (empty freelist initially)
  36       4   Total freelist pages     count                     0
  40       4   Schema cookie            any u32                   Incremented on schema change
