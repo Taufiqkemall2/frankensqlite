@@ -1384,6 +1384,32 @@ COMPLETE:
     Transition -> IDLE
 ```
 
+**Changeset encoding (normative):** `changeset_bytes` MUST be self-delimiting and
+unambiguously parseable even when the RaptorQ symbol stream includes zero-padding
+in the final symbol. A recommended canonical encoding is:
+
+```
+ChangesetHeader := {
+  magic      : [u8; 4],   -- "FSRP"
+  version    : u16,       -- 1
+  page_size  : u32,
+  n_pages    : u32,
+  total_len  : u64,       -- total changeset byte length (including header), before padding
+}
+
+PageEntry := {
+  page_number: u32,
+  page_xxh3  : u64,       -- xxh3_64(page_bytes) for corruption detection
+  page_bytes : [u8; page_size],
+}
+```
+
+All integer fields are encoded little-endian.
+
+`PageEntry`s MUST be sorted by `page_number` ascending. Receivers MUST validate
+`page_xxh3` for every page before applying it; on mismatch, the changeset MUST
+be rejected (or repaired via additional symbols if possible).
+
 **UDP Packet Format**
 
 ```
