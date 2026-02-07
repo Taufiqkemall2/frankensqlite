@@ -7370,10 +7370,32 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         chartStack?.resize();
         chartDonut?.resize();
         chartBocpd?.resize();
+        drawDock();
       });
 
       wireUI();
-      render();
+      (async function boot() {
+        await loadEvolutionDataset();
+
+        if (DATASET.loaded) {
+          // Precompute cheap per-commit metrics from unified patches.
+          const d = DATASET.data;
+          for (let i = 0; i < d.commits.length; i++) {
+            const c = d.commits[i];
+            const qm = quickMetricsFromPatch(d.patches[i]);
+            METRICS.tokensChanged.set(c.hash, qm.tokensChanged);
+            METRICS.bytesChanged.set(c.hash, qm.bytesChanged);
+            METRICS.hunks.set(c.hash, qm.hunks);
+          }
+
+          // Start at the latest commit (most interesting view).
+          DOC.idx = Math.max(0, d.commits.length - 1);
+        }
+
+        // Default tabs.
+        setDocTab("spec");
+        render();
+      })();
     </script>
   </body>
 </html>
