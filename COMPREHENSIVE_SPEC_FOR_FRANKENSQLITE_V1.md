@@ -5387,32 +5387,32 @@ PageVersion := {
 
 ARENA_CHUNK := 4096  -- power-of-two recommended (fast div/mod; cache-friendly)
 
-	VersionArena := {
-	    chunks    : Vec<Vec<PageVersion>>, -- each chunk reserves ARENA_CHUNK and never grows beyond it
-	    free_list : Vec<VersionIdx>,       -- recycled slots from GC
-	    high_water: VersionIdx,            -- bump pointer for new allocations
-	}
+VersionArena := {
+    chunks    : Vec<Vec<PageVersion>>, -- each chunk reserves ARENA_CHUNK and never grows beyond it
+    free_list : Vec<VersionIdx>,       -- recycled slots from GC
+    high_water: VersionIdx,            -- bump pointer for new allocations
+}
 
-	-- MULTI-PROCESS NOTE (normative): `VersionArena` and the in-memory page
-	-- version chains are **per-process caches**. They are not shared across OS
-	-- processes. Cross-process snapshot isolation is preserved because the
-	-- committed page bytes and their publication order are durable:
-	-- - Compatibility mode: WAL frames + WAL index (§11).
-	-- - Native mode: CommitCapsules/CommitProofs + marker stream (§7.11, §3.5.4.1).
-	-- Therefore `resolve(pgno, snapshot)` MUST be able to materialize the newest
-	-- committed version with `commit_seq <= snapshot.high` by consulting the
-	-- durable store, even if the version was created by another process.
+-- MULTI-PROCESS NOTE (normative): `VersionArena` and the in-memory page
+-- version chains are **per-process caches**. They are not shared across OS
+-- processes. Cross-process snapshot isolation is preserved because the
+-- committed page bytes and their publication order are durable:
+-- - Compatibility mode: WAL frames + WAL index (§11).
+-- - Native mode: CommitCapsules/CommitProofs + marker stream (§7.11, §3.5.4.1).
+-- Therefore `resolve(pgno, snapshot)` MUST be able to materialize the newest
+-- committed version with `commit_seq <= snapshot.high` by consulting the
+-- durable store, even if the version was created by another process.
 
-	PageLockTable := (SharedPageLockTable in shm; §5.6.3)  -- exclusive page write locks (Concurrent mode)
-	    -- Cross-process correctness requires a shared-memory lock table. The
-	    -- shared-memory `SharedPageLockTable` (§5.6.3) is the single source of
-	    -- truth when more than one process may attach to the same database.
+PageLockTable := (SharedPageLockTable in shm; §5.6.3)  -- exclusive page write locks (Concurrent mode)
+    -- Cross-process correctness requires a shared-memory lock table. The
+    -- shared-memory `SharedPageLockTable` (§5.6.3) is the single source of
+    -- truth when more than one process may attach to the same database.
 
-	InProcessPageLockTable := ShardedHashMap<PageNumber, TxnId>  -- exclusive write locks (single-process only)
-	    -- Sharded by PageNumber hash into N shards (N = 64 default).
-	    -- Each shard is a parking_lot::Mutex<HashMap<PageNumber, TxnId>>.
-	    -- Shard count is a power of two for fast modular arithmetic (pgno & (N-1)).
-	    --
+InProcessPageLockTable := ShardedHashMap<PageNumber, TxnId>  -- exclusive write locks (single-process only)
+    -- Sharded by PageNumber hash into N shards (N = 64 default).
+    -- Each shard is a parking_lot::Mutex<HashMap<PageNumber, TxnId>>.
+    -- Shard count is a power of two for fast modular arithmetic (pgno & (N-1)).
+    --
     -- CONTENTION MODEL (Alien-Artifact Discipline):
     -- With W concurrent writers and S shards, the probability that at least
     -- two writers contend on the same shard follows the birthday problem:
@@ -8782,8 +8782,15 @@ MUST ensure this invariant (see codegen rules below).
 For each `UpdateExpression { table, key, column_updates }` in the intent log during
 rebase replay:
 1. Read the target row from the new committed base by `key` (rowid lookup).
-2. If the row was deleted in the new base → abort (true conflict; the row no longer
-   exists and the expression cannot be evaluated).
+2. If the key is not found in the new base → abort (true conflict; there is no
+   target row to evaluate against).
+   **Note (rowid reuse; normative semantics):** SQLite rowids may be reused unless
+   `AUTOINCREMENT` is used. Deterministic rebase is "merge by re-execution" and is
+   defined on the **semantic key** (`rowid`/integer primary key), not a hidden
+   physical-row identity. Therefore, if a concurrent commit deletes a row and a
+   later insert reuses the same rowid, replay will update the current row at that
+   key. This matches the semantics of executing the UPDATE at the commit-time base
+   snapshot; it is not a corruption bug.
 3. For each `(col_idx, rebase_expr)` in `column_updates`: evaluate `rebase_expr`
    against the new base row's column values. `ColumnRef(i)` resolves to column `i`
    of the new base row, not the original snapshot row.
@@ -9231,31 +9238,31 @@ pub struct GhostStore<K> {
     _phantom: std::marker::PhantomData<K>,
 }
 
-	/// The MVCC-aware ARC cache.
-	///
-	/// IMPLEMENTATION NOTE (Extreme Optimization Discipline):
-	/// The Megiddo & Modha (FAST '03) ARC algorithm is specified here as the
-	/// POLICY model (T1/T2/B1/B2/p state and transitions in §6.3–§6.4).
-	///
-	/// Physical implementations:
-	/// - **Exact ARC (recommended baseline):** implement §6.3–§6.4 literally, but
-	///   DO NOT use pointer-heavy `LinkedHashMap` in the hot path. Prefer:
-	///   `HashMap<CacheKey, NodeIdx> + slab-allocated intrusive doubly-linked lists`
-	///   for T1/T2 to preserve exact LRU semantics with good locality.
-	/// - **CAR (optional optimization):** the Clock with Adaptive Replacement
-	///   variant by Bansal & Modha (FAST '04). CAR is a CLOCK approximation of ARC's
-	///   recency ordering inside T1/T2 using reference bits and clock hands. It
-	///   reduces pointer churn and improves cache locality, but it is a DIFFERENT
-	///   algorithm: hits set reference bits rather than moving nodes to MRU.
-	///
-	/// If CAR is used, implementations MUST implement CAR explicitly (not by
-	/// transliterating the LRU list operations in §6.3–§6.4) and MUST validate that
-	/// its hit/miss behavior is within an acceptable envelope on canonical DB
-	/// workloads (scan+hotset, Zipfian, mixed OLTP+scan; §6.11).
-	///
-	/// CAR physical layout sketch (one possible implementation):
-	/// - Two circular clock buffers for T1 and T2 with per-slot reference bits.
-	/// - B1/B2 remain as hash sets of CacheKey (metadata only).
+/// The MVCC-aware ARC cache.
+///
+/// IMPLEMENTATION NOTE (Extreme Optimization Discipline):
+/// The Megiddo & Modha (FAST '03) ARC algorithm is specified here as the
+/// POLICY model (T1/T2/B1/B2/p state and transitions in §6.3–§6.4).
+///
+/// Physical implementations:
+/// - **Exact ARC (recommended baseline):** implement §6.3–§6.4 literally, but
+///   DO NOT use pointer-heavy `LinkedHashMap` in the hot path. Prefer:
+///   `HashMap<CacheKey, NodeIdx> + slab-allocated intrusive doubly-linked lists`
+///   for T1/T2 to preserve exact LRU semantics with good locality.
+/// - **CAR (optional optimization):** the Clock with Adaptive Replacement
+///   variant by Bansal & Modha (FAST '04). CAR is a CLOCK approximation of ARC's
+///   recency ordering inside T1/T2 using reference bits and clock hands. It
+///   reduces pointer churn and improves cache locality, but it is a DIFFERENT
+///   algorithm: hits set reference bits rather than moving nodes to MRU.
+///
+/// If CAR is used, implementations MUST implement CAR explicitly (not by
+/// transliterating the LRU list operations in §6.3–§6.4) and MUST validate that
+/// its hit/miss behavior is within an acceptable envelope on canonical DB
+/// workloads (scan+hotset, Zipfian, mixed OLTP+scan; §6.11).
+///
+/// CAR physical layout sketch (one possible implementation):
+/// - Two circular clock buffers for T1 and T2 with per-slot reference bits.
+/// - B1/B2 remain as hash sets of CacheKey (metadata only).
 ///
 ///   - T1 clock: contiguous array of CachedPage slots with reference bits.
 ///     Scanning for eviction is a sequential memory sweep (cache-friendly).
@@ -10018,8 +10025,8 @@ Page layout: [data: page_size - 16 bytes] [xxh3: 16 bytes]
 Header byte offset 20 set to 16 (reserved space = 16).
 ```
 
-This is compatible with C SQLite (reserved space is opaque to it). Default is
-OFF for maximum compatibility.
+C SQLite can read databases with reserved-space checksums (reserved bytes are
+opaque). Default is OFF for maximum interoperability.
 
 **Interoperability Warning:** While C SQLite can *read* databases with reserved
 space checksums (it ignores the bytes), it will *write* zeros (or preserved garbage)
@@ -14393,9 +14400,23 @@ encryption using the reserved-space-per-page field in the database header:
 - **Storage in reserved bytes:** The per-page nonce (24B) and Poly1305 tag (16B)
   are stored in the page reserved space (requires `reserved_bytes >= 40`).
 
+- **DatabaseId (required):** On database creation, generate a random 128-bit
+  `DatabaseId` and store it durably alongside `wrap(DEK, KEK)`. `DatabaseId` MUST
+  be stable for the lifetime of the database (including across `PRAGMA rekey`).
+
 - **AAD (swap resistance):** AEAD additional authenticated data MUST include
-  `(page_number, database_id, page_type_tag)` so ciphertext cannot be replayed or
-  swapped across pages or databases without detection.
+  `(page_number, database_id)` so ciphertext cannot be replayed or swapped across
+  pages or databases without detection.
+  - `page_number`: the logical SQLite page number (1-based).
+  - `database_id`: the database's stable `DatabaseId` (above).
+  - **No circular dependencies (normative):** Implementations MUST NOT derive any
+    AAD component from encrypted page bytes (e.g., B-tree page-type flags at byte
+    0). AAD inputs MUST be known before decryption.
+  - **Optional defense-in-depth:** Implementations MAY also include a
+    caller-supplied `page_context_tag` in AAD *only if* the tag is known before
+    decryption (for example: `Btree`, `Freelist`, `PointerMap`). If unknown, a
+    fixed constant MUST be used. The encrypt and decrypt paths MUST use identical
+    AAD bytes for the same page image.
 
 - **Key management API:** Retain the familiar SQLite-style API surface:
   `PRAGMA key` / `PRAGMA rekey`. The underlying scheme is not SEE-compatible
