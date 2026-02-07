@@ -45,6 +45,9 @@ fuzz/artifacts/
 # Snapshot testing review artifacts
 *.snap.new
 
+# Source PNGs (webp versions are committed)
+*.png
+
 # Claude Code / AI agent ephemeral files
 .claude/
 
