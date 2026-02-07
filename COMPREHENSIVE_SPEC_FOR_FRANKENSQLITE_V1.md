@@ -4804,6 +4804,61 @@ compensations). This is required for:
 Sagas are deterministic and replayable: given the same inputs, the same sequence
 of steps and compensations occurs, and evidence is recorded for debugging.
 
+#### 4.19.6 Networking Stack (Asupersync net) + Deterministic VirtualTcp (Required)
+
+When remote effects are enabled, FrankenSQLite MUST use asupersync's cancel-safe
+network stack (TCP + TLS + HTTP/2 where applicable) so that:
+
+- cancellation is not a "drop the future" footgun (losers drain; obligations resolve),
+- deadlines/budgets bound network I/O and handshake time,
+- transport behavior is deterministic in lab mode.
+
+**Production transport requirements:**
+
+- **TLS by default:** Remote effects over the network SHOULD use TLS via rustls.
+  Plaintext transport is permitted only when explicitly configured for local
+  development and MUST be gated by an explicit capability/config knob.
+- **Handshake + protocol timeouts:** Remote handshakes and protocol parsing MUST
+  be budgeted and time-bounded (deadline or explicit timeouts).
+- **HTTP/2 hard limits (if HTTP/2 is used):**
+  - `max_concurrent_streams = 256` (default),
+  - `max_header_list_size = 65536` (64 KiB),
+  - `continuation_timeout_ms = 5000`,
+  - absolute header fragment cap `256 KiB`.
+  These prevent stream exhaustion and header-compression bombs from turning
+  tiered storage into a DoS vector.
+- **Message size caps:** Any remote RPC framing MUST enforce max send/recv sizes
+  (default: 4 MiB) and reject larger messages deterministically.
+
+**Deterministic network testing requirements:**
+
+- In lab tests, the remote transport MUST be swappable to `VirtualTcp` (in-memory,
+  deterministic, no kernel sockets). This is required to make replication and
+  tiered-storage behaviors reproducible and DPOR-explorable under `LabRuntime`.
+- The harness MUST provide a "drop/reorder/corrupt" virtual network shim to
+  simulate lossy replication while preserving deterministic replay (loss patterns
+  derive from the lab seed and are trace-visible).
+
+### 4.20 Scheduler Priority Lanes (Cancel / Timed / Ready) -- Tail Latency Control
+
+Asupersync's scheduler is lane-aware: cancellation work should run immediately;
+deadline work should respect EDF; background work should not steal p99 latency.
+
+FrankenSQLite MUST map its work to lanes via `Cx` budgets and task labeling:
+
+- **Cancel lane (highest priority):** cancellation/drain/finalizers, obligation
+  completion, rollback/cleanup, and coordinator responses to cancellations.
+  These tasks MUST not be starved by background work.
+- **Timed lane (EDF):** user queries with explicit deadlines, commit publication
+  (marker append + response), and tiered-storage reads required for foreground
+  queries.
+- **Ready lane:** background GC, compaction, checkpointing, anti-entropy, and
+  statistics updates (these MUST be `rate_limit`ed / `bulkhead`ed; §4.15).
+
+**Normative rule:** any long-running loop in foreground work MUST checkpoint
+frequently and SHOULD call `cx.set_task_type("...")` once at task start so
+deadline monitors and perf dashboards can bucket behavior by task class.
+
 ## 5. MVCC Formal Model (Revised)
 
 This section supersedes `MVCC_SPECIFICATION.md` with corrections for the
@@ -15201,6 +15256,6 @@ an embedded database engine can achieve.
 
 ---
 
-*Document version: 1.25 (Round 8 audit: conformal control for group-commit batch sizing; durability "living bounds" (Bayes posterior + conservative p_upper) integrated into the durability contract; TxnSlot lease semantics corrected (heartbeat, not txn deadline) + `txn_max_duration` derived via survival analysis for Theorem 5; retry policy reframed as optimal stopping / Gittins-index threshold; workload-adaptive compaction policy via MDP; online Zipf s estimation added; PAC-Bayes harness bound for page-level SSI false positives; PolicyController VOI budgeting clarified.)*
+*Document version: 1.26 (Round 9 audit: forbid raw byte-disjoint XOR write merging for SQLite structured pages; specify safe merge ladder (intent-log deterministic rebase + structured patch parse/merge/repack + merge certificates); built-in function semantics audited/corrected (ceil/floor/trunc return types, NaN/Inf handling, octet_length bytes, substr negative length, COLLATE interaction, compileoption funcs); VFS trait examples corrected to include `&Cx`; risk register compaction cross-reference fixed.)*
 *Last updated: 2026-02-07*
 *Status: Authoritative Specification*
