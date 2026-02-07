@@ -6189,10 +6189,14 @@ verifiability:
 - Purpose: Maximum concurrency + durability + replication.
 - Primary durable state is an ECS commit stream (CommitCapsule objects encoded
   as RaptorQ symbols).
-- CommitCapsule contains: `commit_seq`, `snapshot_basis`, `intent_log` and/or
-  `page_deltas`, `read_set_digest`, `write_set_digest`, SSI witnesses.
+- CommitCapsule contains: `snapshot_basis`, `intent_log` and/or `page_deltas`,
+  `read_set_digest`, `write_set_digest`, plus **SSI witness-plane evidence
+  references** (§5.7): `ReadWitness`/`WriteWitness` ObjectIds, emitted
+  `DependencyEdge` ObjectIds, and optional `MergeWitness` ObjectIds.
+  (Commit ordering is provided by the marker stream; the capsule does not embed
+  `commit_seq` so content addressing is not polluted by an ordering artifact.)
 - CommitMarker is the atomic "this commit exists" record: `commit_seq`,
-  `capsule_object_id`, `prev_marker`, `integrity_hash`.
+  `capsule_object_id`, `proof_object_id`, `prev_marker`, `integrity_hash`.
 - **Atomicity rule:** A commit is committed iff its marker is durable. Recovery
   ignores any capsule without a committed marker.
 - Checkpointing materializes a canonical `.db` for compatibility export, but
@@ -6208,25 +6212,38 @@ compatibility). Applications can switch modes between connections.
 Writers prepare in parallel; only the minimal "publish commit" step is
 serialized:
 
-1. **Build capsule:** Construct `CommitCapsuleBytes(T)` deterministically from
-   intent log, page deltas, SSI witnesses, and snapshot basis.
-2. **Encode:** RaptorQ-encode capsule bytes into symbols using
+1. **Finalize & validate (SSI):** Finalize the write set and run SSI validation
+   using the witness plane (§5.7). This phase MAY emit `DependencyEdge` objects
+   and MAY perform the merge escape hatch (§5.10), producing `MergeWitness`
+   objects when successful.
+2. **Publish witness evidence (pre-marker):** Publish `ReadWitness` /
+   `WriteWitness` objects, emitted `DependencyEdge` objects, and any
+   `MergeWitness` objects using the cancel-safe two-phase publication protocol
+   (§5.6.4.7). These objects are not considered "committed" until referenced by
+   a committed marker, but publication MUST occur before marker publication.
+3. **Build capsule:** Construct `CommitCapsuleBytes(T)` deterministically from
+   intent log, page deltas, snapshot basis, and the witness-plane ObjectId
+   references from step (2).
+4. **Encode:** RaptorQ-encode capsule bytes into symbols using
    `asupersync::raptorq::RaptorQSender`.
-3. **Persist symbols:** Write symbols to local symbol logs (and optionally
-   stream to replicas) until durability policy is satisfied:
+5. **Persist capsule symbols:** Write symbols to local symbol logs (and
+   optionally stream to replicas) until the durability policy is satisfied:
    - Local: persist ≥ `K_total + margin` symbols.
    - Quorum: persist/ack ≥ `K_total + margin` symbols across M replicas.
-4. **Allocate commit_seq:** This is the serialization point. `commit_seq` is
+6. **Allocate commit_seq:** This is the serialization point. `commit_seq` is
    assigned only after capsule durability is confirmed.
-5. **Build and persist marker:** Create `CommitMarkerBytes(commit_seq,
-   capsule_object_id, prev_marker, integrity)`. Encode/persist as an ECS
-   object. Append to marker stream.
-6. **Return success** to the client.
-7. **Background:** Index segments and caches update asynchronously.
+7. **Build and persist CommitProof:** Create and publish a `CommitProof` ECS
+   object containing `commit_seq`, witness references, and emitted edge ids.
+   Record its `proof_object_id`.
+8. **Build and persist marker:** Create `CommitMarkerBytes(commit_seq,
+   capsule_object_id, proof_object_id, prev_marker, integrity)`. Encode/persist
+   as an ECS object. Append to marker stream.
+9. **Return success** to the client.
+10. **Background:** Index segments and caches update asynchronously.
 
 **Critical ordering:** Marker publication MUST happen AFTER capsule durability
-is satisfied. If the marker is durable but the capsule is not decodable, the
-core durability contract is violated.
+and AFTER `CommitProof` durability is satisfied. If the marker is durable but
+the capsule or proof is not decodable, the core durability contract is violated.
 
 ### 7.12 Native Mode Recovery Algorithm
 
