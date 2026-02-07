@@ -4969,6 +4969,16 @@ operations.
   use `Acquire/Release` where required by invariants and `Relaxed` only for
   diagnostics counters.
 
+**Initialization and reconciliation (normative):**
+- On database open, implementations MUST set `shm.commit_seq` to the current
+  durable commit clock tip:
+  - **Native mode:** the physical marker stream tip (§3.5.4.1).
+  - **Compatibility mode:** the durable WAL-visible state (WAL index + frames).
+- If the shared-memory file already exists, implementations MUST reconcile
+  `shm.commit_seq` against the durable tip and MUST NOT allow `shm.commit_seq`
+  to remain ahead of durable reality (that would make snapshots reference
+  non-existent commits).
+
 #### 5.6.2 TxnSlot: Per-Transaction Cross-Process State
 
 ```
@@ -4986,7 +4996,7 @@ TxnSlot := {
                                    -- Intentionally redundant with begin_seq: this field exists for debug/audit
                                    -- diagnostics (inspect snapshot boundaries via shm tools without deriving
                                    -- from begin_seq). Implementations MUST populate it from the same
-                                   -- commit_seq.load() used for begin_seq to avoid GC safety issues.
+                                   -- commit_seq.load(Acquire) used for begin_seq to avoid GC safety issues.
     state           : AtomicU8,      -- 0=Free, 1=Active, 2=Committing, 3=Committed, 4=Aborted
     mode            : AtomicU8,      -- 0=Serialized, 1=Concurrent
     has_in_rw       : AtomicBool,    -- SSI: has incoming rw-antidependency
@@ -5120,8 +5130,12 @@ in-process sharded HashMap). It uses open addressing with linear probing:
 
 ```
 SharedPageLockTable := {
-    capacity : u32,                   -- power-of-2 (default: 65536)
-    entries  : [PageLockEntry; capacity],
+    capacity            : u32,        -- power-of-2 (default: 65536)
+    rebuild_pid         : AtomicU32,  -- 0 = no rebuild in progress
+    rebuild_pid_birth   : AtomicU64,  -- used to defend against PID reuse
+    rebuild_lease_expiry: AtomicU64,  -- unix timestamp (seconds); same semantics as TxnSlot lease
+    rebuild_epoch       : AtomicU32,  -- increments on successful rebuild (debug + stale detection)
+    entries             : [PageLockEntry; capacity],
 }
 
 PageLockEntry := {
@@ -5137,6 +5151,9 @@ PageLockEntry := {
 
 **Acquire (linear probing with atomic insertion):**
 
+0. If the table is under rebuild (`rebuild_lease_expiry >= now` AND owner is alive),
+   `try_acquire` MUST fail with `SQLITE_BUSY` (or wait per busy-timeout). `release`
+   MUST continue to function during rebuild drain (see §5.6.3.1).
 1. Start at `idx = hash(page_number) & (capacity - 1)`.
 2. Probe:
    - If `entries[idx].page_number == page_number`:
@@ -5192,6 +5209,50 @@ point (e.g., when no Active concurrent transactions exist).
 
 This is simpler than the in-process sharded HashMap but provides the same
 semantics: exclusive write locks per page, immediate failure on contention.
+
+##### 5.6.3.1 Tombstone Rebuild (Lease + Quiescence Barrier)
+
+The shared-memory lock table is fixed-capacity in V1; "rebuild" means "clear
+tombstones by resetting the table", not "resize".
+
+**Why rebuild is needed:** Linear probing performance degrades with tombstones
+(primary clustering). Tombstones are correctness-required, but they are
+performance poison under long-running churn.
+
+**Who rebuilds:** To avoid a thundering herd, rebuild SHOULD be initiated by
+the commit sequencer (the process that currently sequences commit publication
+and advances `gc_horizon`; §5.6.5). Any process MAY initiate rebuild if the
+sequencer is unavailable, but only one rebuild may be in progress.
+
+**Trigger conditions (any are sufficient):**
+- `N/C > 0.70` where `N` counts occupied slots + tombstones, OR
+- repeated `SQLITE_BUSY` due to the load-factor guard for >100ms, OR
+- (optional) an e-process monitor over probe lengths rejects a configured budget.
+
+**Rebuild lease acquisition (shared memory):**
+- A process acquires the rebuild lease by CASing `rebuild_pid` from 0 to its PID,
+  then writing `rebuild_pid_birth` and `rebuild_lease_expiry = now + T`.
+- If `rebuild_pid != 0` but `rebuild_lease_expiry < now` AND the owning process
+  is dead (PID + birth mismatch; §5.6.2), another process MAY steal the lease.
+- Lease duration `T` SHOULD be short (default 5s) and renewed while rebuilding.
+
+**Protocol (normative):**
+1. Acquire rebuild lease.
+2. Freeze new acquisitions: while rebuild lease is active, `try_acquire` MUST
+   fail with `SQLITE_BUSY` (or wait per busy-timeout). `release` MUST continue
+   to function.
+3. Drain to quiescence: wait until there are no TxnSlots with:
+   - `mode == Concurrent`, and
+   - `state` in {Active, Committing}, and
+   - `txn_id != 0` and `txn_id != TXN_ID_CLAIMING`.
+4. Clear table: set every entry to empty (`page_number = 0`, `owner_txn = 0`).
+   This is safe because no Concurrent transactions exist at this point, so no
+   lock operations can race with clearing.
+5. Increment `rebuild_epoch` and release the lease (`rebuild_pid = 0`).
+
+**Cancellation safety:** Once drain observes quiescence and clearing begins,
+the rebuild MUST run to completion (mask cancellation) so the lease is released
+and the table is not left partially cleared.
 
 **Load factor analysis (Extreme Optimization Discipline):**
 
@@ -5362,6 +5423,14 @@ Acquire load) cannot have its bit wiped by a delayed clear.
 Fast path: if `bucket_epoch == global_epoch`, no lock is needed; the updater
 sets the relevant bit using `fetch_or`.
 
+**`epoch_lock` acquisition (normative):**
+
+- Acquire with a CAS loop: `CAS(0 → 1, Acquire, Relaxed)` and bounded backoff.
+- Release with `store(0, Release)`.
+- Lock acquisition MUST be cancellation/budget-aware. If the updater cannot
+  acquire the lock within its budget, it MUST fall back to setting the bit in
+  `HotWitnessIndex.overflow` so candidate discoverability is preserved.
+
 If a bucket cannot be allocated due to hot-index capacity pressure, the update
 MUST be applied to `HotWitnessIndex.overflow` for the corresponding kind
 (read/write). This preserves the "no false negatives" requirement at the cost
@@ -5503,7 +5572,7 @@ updated `gc_horizon` on their next read.
 raise_gc_horizon():
     // Default: if no active transactions exist, the safe point is the latest
     // commit sequence number.
-    global_min_begin_seq = shm.commit_seq.load()
+    global_min_begin_seq = shm.commit_seq.load(Acquire)
     for slot in txn_slots:
         // Ignore free slots (0) and slots currently being acquired (CLAIMING).
         // A claiming slot has not yet published its begin_seq, so it cannot
@@ -6826,6 +6895,9 @@ LRU across all tested workloads. (The competitive ratio of 2 against OPT is
 the Sleator-Tarjan result for LRU, not ARC; ARC's theoretical contribution is
 adaptive self-tuning, not a tighter worst-case bound.)
 
+**Patent note:** The ARC patent (US 6981114) has expired, so implementing ARC
+and its practical variants (e.g., CAR) is legally safe.
+
 ARC's advantage over LRU is not marginal -- it is structural. Consider three
 canonical database access patterns:
 
@@ -7652,6 +7724,10 @@ verifiability:
 - Purpose: Prove SQL/API correctness against C SQLite 3.52.0.
 - DB file is standard SQLite format.
 - WAL frames are standard SQLite WAL frames.
+- Legacy SQLite readers MAY attach concurrently. Legacy writers MAY attach only
+  when FrankenSQLite is not in Concurrent mode. While any `BEGIN CONCURRENT`
+  transaction exists, Compatibility mode MUST exclude legacy writers using the
+  legacy-writer exclusion lock (§5.6.6.1).
 - We may write *extra* sidecars (`.wal-fec` for repair symbols, `.idx-fec`
   for index repair) but the core `.db` stays SQLite-compatible when
   checkpointed.
@@ -13121,6 +13197,6 @@ an embedded database engine can achieve.
 
 ---
 
-*Document version: 1.14 (Round 4 audit fixes: SSI T3 rule pseudocode bug fix (out_edges→in_edges, add has_out_rw set); dangerous structure informal description corrected; operator precedence table fixed (COLLATE/unary swap, ISNULL/NOTNULL/NOT NULL added); RETURNING clause timing corrected (pre-AFTER-trigger, not post-trigger); cross-process INV-6 visibility note; Theorem 5 burst caveat; savepoint SSI witness interaction; ~220 MiB precision fix)*
+*Document version: 1.16 (Round 6 audit fixes: shm commit_seq reconciliation on open; SharedPageLockTable tombstone rebuild lease + quiescence barrier; legacy-writer exclusion lock for Compatibility+Concurrent; HotWitnessIndex epoch swap locking; deterministic rebase clarified as observable-behavior (not byte layout) + V1 restrictions)*
 *Last updated: 2026-02-07*
 *Status: Authoritative Specification*

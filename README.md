@@ -2173,6 +2173,28 @@ cargo bench --bench parser_throughput
 
 ---
 
+## SQLite Behavioral Quirks
+
+SQLite has accumulated 24 years of behavioral nuances that applications depend on. FrankenSQLite replicates all of these faithfully. Knowing them is essential for understanding compatibility edge cases.
+
+**Type affinity is advisory, not enforced.** You can store a TEXT value in an INTEGER column. Affinity only affects coercion during comparison and storage, not rejection. Exception: `STRICT` tables (SQLite 3.37+) enforce column types at insert time.
+
+**NULL in UNIQUE constraints.** SQLite allows multiple NULL values in a UNIQUE column because `NULL != NULL`. This differs from PostgreSQL and SQL Server.
+
+**ORDER BY on compound SELECT.** `ORDER BY` at the end of a `UNION`/`EXCEPT`/`INTERSECT` uses column numbers or aliases from the *first* SELECT, not the last.
+
+**Integer overflow promotes to REAL.** Arithmetic expressions like `9223372036854775807 + 1` silently promote to floating point rather than wrapping. But `sum()` raises an error on overflow.
+
+**AUTOINCREMENT vs rowid reuse.** Without `AUTOINCREMENT`, deleted rowids can be reused — SQLite picks `max(rowid)+1` for new rows. With `AUTOINCREMENT`, rowids never decrease (tracked via `sqlite_sequence` table), but there's a small write overhead per insert.
+
+**LIKE is ASCII-only.** The built-in `LIKE` operator folds case for ASCII letters only. `'a' LIKE 'A'` is true, but `'ä' LIKE 'Ä'` is false without the ICU extension.
+
+**Empty string is not NULL.** `''` (empty string) is a zero-length TEXT value, not NULL. `length('')` returns 0. `'' IS NULL` is false. This catches people coming from Oracle, where empty strings are NULL.
+
+**Deterministic vs non-deterministic functions.** `random()`, `changes()`, and `last_insert_rowid()` are re-evaluated for each row. The query planner cannot factor them out of loops or cache their results.
+
+---
+
 ## FAQ
 
 **Q: Can I open an existing SQLite database with FrankenSQLite?**
