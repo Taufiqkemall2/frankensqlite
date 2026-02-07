@@ -13,6 +13,7 @@ fsqlite-error = { workspace = true }
 
 [dev-dependencies]
 asupersync = { path = "/dp/asupersync" }
+parking_lot = { workspace = true }
 proptest = { workspace = true }
 tempfile = { workspace = true }
 

@@ -303,6 +303,7 @@ dependencies = [
  "asupersync",
  "fsqlite",
  "fsqlite-error",
+ "parking_lot",
  "proptest",
  "tempfile",
 ]
@@ -316,6 +317,7 @@ dependencies = [
  "fsqlite-types",
  "fsqlite-wal",
  "parking_lot",
+ "serde",
 ]
 
 [[package]]
