@@ -226,7 +226,11 @@ patterns. The following constraints are non-negotiable for hot-path code:
   **Clarification:** "Zero-copy" here means *no additional heap allocations or
   userspace staging copies* in the hot path. It does **not** imply kernel-bypass
   I/O. Buffered I/O is still used where required (e.g., SQLite `.wal`), and
-  small stack buffers for fixed-size headers are permitted.
+  small stack buffers for fixed-size headers are permitted. It also does not
+  require transmuting variable-length page formats into typed structs via
+  `unsafe`: page structures are decoded with bounds-checked reads in safe Rust,
+  and complex mutations MAY construct a new canonical page image in an owned
+  pooled buffer (e.g., parse -> merge -> repack; §5.10.3).
 
 - **SIMD-friendly layouts.** Hot comparison paths (B-tree key comparison,
   checksum computation, RaptorQ GF(256) arithmetic) SHOULD use types whose
@@ -238,7 +242,7 @@ patterns. The following constraints are non-negotiable for hot-path code:
   cell formats, WAL frames, ECS symbol records) MUST have a single canonical
   byte encoding. Big-endian for SQLite-compatible structures (matching C
   SQLite), little-endian for FrankenSQLite-native ECS structures (matching
-  x86/ARM native order for zero-cost decode).
+  x86/ARM native order for low-cost decode).
 
 - **Cache-line awareness.** Hot shared-memory coordination structures
   (`TxnSlot`, §5.6.2; `SharedPageLockTable`, §5.6.3) and hot-plane witness index
@@ -1179,9 +1183,12 @@ RaptorQ permeates every layer of FrankenSQLite:
 
 #### 3.4.1 Self-Healing WAL (Erasure-Coded Durability)
 
-**Problem:** Traditional WAL relies on "hope nothing goes wrong during the
-write." A torn write (power loss mid-write) corrupts the frame. SQLite detects
-this via checksums and discards the frame, losing the transaction.
+**Problem:** SQLite WAL recovery is conservative: if any WAL frame that should
+be replayable is corrupted (checksum mismatch), recovery truncates at the first
+invalid frame. In practice this most often discards an in-flight (unacknowledged)
+tail transaction after a crash, but it can also discard committed history when
+corruption occurs within frames that were previously durable (media errors,
+latent sector corruption, device bugs, etc.).
 
 **Solution:** Each WAL commit group is RaptorQ-encoded.
 
@@ -1277,14 +1284,24 @@ WalFecGroupMeta := {
   only after its `.wal-fec` `WalFecGroupMeta` + `R` repair `SymbolRecord`s are
   appended and `fsync`'d.
 
-**Pipelined repair symbols (required):** GF(256) encoding work (RaptorQ repair
-symbols) MUST NOT occur inside the WAL write critical section. Instead, the
-coordinator MUST acknowledge commit durability after Phase 1 (`.wal` fsync) and
-enqueue a background job that generates and appends `.wal-fec` repair symbols
-for the just-committed group. If the process crashes before the `.wal-fec` job
-completes, the commit remains valid (durable) but may be temporarily
-non-repairable until catch-up regenerates repair symbols deterministically from
-the `.wal` frames.
+**Pipelined repair symbols (default, required):** GF(256) encoding work (RaptorQ
+repair symbols) MUST NOT occur inside the WAL write critical section. Instead,
+the coordinator MUST acknowledge commit durability after Phase 1 (`.wal` fsync)
+and enqueue a background job that generates and appends `.wal-fec` repair
+symbols for the just-committed group.
+
+This yields **eventual repairability**: a commit group is repairable only once
+its `.wal-fec` `WalFecGroupMeta` + `R` repair `SymbolRecord`s are durable. If the
+process crashes before the `.wal-fec` job completes, the commit remains valid
+(durable) but is not FEC-protected; recovery falls back to SQLite semantics for
+that group (truncate at first invalid frame). Catch-up MAY regenerate repair
+symbols deterministically only if the group's source frames remain readable and
+validatable.
+
+**Optional synchronous mode (MAY):** An implementation MAY provide an opt-in mode
+that waits for `.wal-fec` append + `fsync` before acknowledging COMMIT, making
+every acknowledged commit group repairable immediately. This increases commit
+latency and MUST be explicitly enabled (default remains pipelined).
 
 **Worked Example: Commit of 5 Pages with 2 Repair Symbols**
 
@@ -1356,10 +1373,15 @@ The PRAGMA is persistent.
   required by the file format.
 - **Native mode:** Persist the setting in the ECS `RootManifest` metadata.
 
-**Impact:** A commit of 10 pages with 2 repair symbols survives ANY 2 torn
-frames. The probability of losing a committed transaction drops from
-`P(any_torn_write)` to `P(more_than_R_torn_writes)`, which for R >= 2 is
-astronomically small. This eliminates the need for double-write journaling.
+**Impact (repairable groups):** Once a commit group is repairable (its `.wal-fec`
+records are durable), recovery can reconstruct the group's source frames as long
+as at most `R` frames within that group are missing/corrupt. This primarily
+protects **durable history** against post-commit corruption (bitrot, latent media
+errors, checksum-failing reads) and against checksum-chain breakage (since
+`.wal-fec` provides independent per-source validation). It does **not** resurrect
+a transaction that was never durable under SQLite semantics (crash mid-append
+before `.wal` `fsync`), and in pipelined mode it does not guarantee that the
+newest durable group is FEC-protected at the instant it becomes durable.
 
 **Configuration:** `PRAGMA raptorq_repair_symbols = N` (default: 2).
 Set to 0 for exact C SQLite behavior (no repair symbols).
@@ -5495,7 +5517,7 @@ Transaction := {
     txn_id      : TxnId,
     txn_epoch   : TxnEpoch,
     snapshot    : Snapshot,
-    write_set   : HashMap<PageNumber, PageVersion>, -- private versions (commit_seq = 0)
+    write_set   : HashMap<PageNumber, PageVersion>, -- private versions (commit_seq = 0); spillable page images in Compatibility mode (§5.9.2)
     intent_log  : Vec<IntentOp>,            -- semantic operation log for rebase merge
     page_locks  : HashSet<PageNumber>,
     state       : {Active, Committed{commit_seq}, Aborted{reason}},
@@ -6576,11 +6598,11 @@ cleanup_orphaned_slots():
                 slot.txn_id = 0  // Free the slot (Release ordering, LAST)
             continue
 
-	        if slot.txn_id == TXN_ID_CLAIMING:
-	            // Slot is being claimed by another process (Phase 1 of acquire).
-	            //
-	            // CRITICAL: If a process crashes between Phase 1 (CAS 0 ->
-	            // TXN_ID_CLAIMING) and Phase 2 (write pid/lease_expiry), the
+            if slot.txn_id == TXN_ID_CLAIMING:
+                // Slot is being claimed by another process (Phase 1 of acquire).
+                //
+                // CRITICAL: If a process crashes between Phase 1 (CAS 0 ->
+                // TXN_ID_CLAIMING) and Phase 2 (write pid/lease_expiry), the
             // slot's pid/pid_birth/lease_expiry fields are STALE (they
             // belong to the previous occupant, or are zero for a fresh slot).
             // We MUST NOT rely on those fields for CLAIMING-state cleanup.
@@ -6589,74 +6611,74 @@ cleanup_orphaned_slots():
             // CLAIMING state for longer than CLAIMING_TIMEOUT_SECS, the
             // claimer is presumed dead. 5 seconds is orders of magnitude
             // longer than any valid Phase 1 -> Phase 2 transition (~μs).
-	            if slot.claiming_timestamp == 0:
-	                // The claimer writes claiming_timestamp after the CAS (§5.6.2).
-	                // If it crashed immediately after claiming, the timestamp may
-	                // still be 0. Seed the timeout clock without touching other fields.
-	                slot.claiming_timestamp.CAS(0, now)
-	                continue
-	            if now - slot.claiming_timestamp > CLAIMING_TIMEOUT_SECS:
-	                // Transition to CLEANING before clearing fields so we do not race
-	                // with a new claimer that could otherwise observe/clobber state.
-	                if slot.txn_id.CAS(TXN_ID_CLAIMING, TXN_ID_CLEANING):
-	                    // Entered CLEANING; stamp the sentinel-time so other cleaners
-	                    // do not treat this slot as "stuck CLEANING" immediately.
-	                    slot.claiming_timestamp = now
-	                    // Clear snapshot/epoch fields as well: a future claimer must not
-	                    // observe stale begin_seq/witness_epoch under TXN_ID_CLAIMING (§5.6.5, §5.6.4.8).
-	                    slot.state = Free
-	                    slot.mode = Serialized
-	                    slot.commit_seq = 0
-	                    slot.begin_seq = 0
-	                    slot.snapshot_high = 0
-	                    slot.witness_epoch = 0
-	                    slot.has_in_rw = false
-	                    slot.has_out_rw = false
-	                    slot.marked_for_abort = false
-	                    slot.write_set_pages = 0
-	                    slot.pid = 0
-	                    slot.pid_birth = 0
-	                    slot.lease_expiry = 0
-	                    slot.cleanup_txn_id = 0
-	                    slot.claiming_timestamp = 0
-	                    slot.txn_id = 0  // Free the slot (Release ordering, LAST)
-	                continue  // skip the lease/liveness check — fields are stale
-	            continue  // CLAIMING recently; give the claimer time
+                if slot.claiming_timestamp == 0:
+                    // The claimer writes claiming_timestamp after the CAS (§5.6.2).
+                    // If it crashed immediately after claiming, the timestamp may
+                    // still be 0. Seed the timeout clock without touching other fields.
+                    slot.claiming_timestamp.CAS(0, now)
+                    continue
+                if now - slot.claiming_timestamp > CLAIMING_TIMEOUT_SECS:
+                    // Transition to CLEANING before clearing fields so we do not race
+                    // with a new claimer that could otherwise observe/clobber state.
+                    if slot.txn_id.CAS(TXN_ID_CLAIMING, TXN_ID_CLEANING):
+                        // Entered CLEANING; stamp the sentinel-time so other cleaners
+                        // do not treat this slot as "stuck CLEANING" immediately.
+                        slot.claiming_timestamp = now
+                        // Clear snapshot/epoch fields as well: a future claimer must not
+                        // observe stale begin_seq/witness_epoch under TXN_ID_CLAIMING (§5.6.5, §5.6.4.8).
+                        slot.state = Free
+                        slot.mode = Serialized
+                        slot.commit_seq = 0
+                        slot.begin_seq = 0
+                        slot.snapshot_high = 0
+                        slot.witness_epoch = 0
+                        slot.has_in_rw = false
+                        slot.has_out_rw = false
+                        slot.marked_for_abort = false
+                        slot.write_set_pages = 0
+                        slot.pid = 0
+                        slot.pid_birth = 0
+                        slot.lease_expiry = 0
+                        slot.cleanup_txn_id = 0
+                        slot.claiming_timestamp = 0
+                        slot.txn_id = 0  // Free the slot (Release ordering, LAST)
+                    continue  // skip the lease/liveness check — fields are stale
+                continue  // CLAIMING recently; give the claimer time
 
-	        if slot.txn_id != 0 AND slot.lease_expiry < now:
-	            // Lease expired -- check whether the owning process still exists.
-	            // IMPORTANT: PID reuse is real; liveness checks MUST defend against it.
-	            if !process_alive(slot.pid, slot.pid_birth):
-	                // Process crashed. Abort its transaction.
-	                //
-	                // ATOMICITY: record the old TxnId for retryable cleanup, then
-	                // CAS txn_id to TXN_ID_CLEANING so only one cleaner proceeds.
-	                // If CAS fails, another process already claimed cleanup — skip it.
-	                old_txn_id = slot.txn_id.load()
-	                slot.cleanup_txn_id = old_txn_id  // MUST happen before sentinel overwrite (crash-safety)
-	                if !slot.txn_id.CAS(old_txn_id, TXN_ID_CLEANING):
-	                    continue  // someone else is cleaning this slot (or slot changed)
-	                // Entered CLEANING; stamp the sentinel-time unconditionally. This
-	                // must overwrite any old "claim" timestamp left over from slot acquire.
-	                slot.claiming_timestamp = now
-	                release_page_locks_for(old_txn_id)
-	                slot.state = Free
-	                slot.mode = Serialized
-	                slot.commit_seq = 0
-	                slot.begin_seq = 0
-	                slot.snapshot_high = 0
-	                slot.witness_epoch = 0
-	                slot.has_in_rw = false
-	                slot.has_out_rw = false
-	                slot.marked_for_abort = false
-	                slot.write_set_pages = 0
-	                slot.pid = 0
-	                slot.pid_birth = 0
-	                slot.lease_expiry = 0
-	                slot.cleanup_txn_id = 0
-	                slot.claiming_timestamp = 0
-	                slot.txn_id = 0    // Free the slot (Release ordering, LAST)
-	                continue
+            if slot.txn_id != 0 AND slot.lease_expiry < now:
+                // Lease expired -- check whether the owning process still exists.
+                // IMPORTANT: PID reuse is real; liveness checks MUST defend against it.
+                if !process_alive(slot.pid, slot.pid_birth):
+                    // Process crashed. Abort its transaction.
+                    //
+                    // ATOMICITY: record the old TxnId for retryable cleanup, then
+                    // CAS txn_id to TXN_ID_CLEANING so only one cleaner proceeds.
+                    // If CAS fails, another process already claimed cleanup — skip it.
+                    old_txn_id = slot.txn_id.load()
+                    slot.cleanup_txn_id = old_txn_id  // MUST happen before sentinel overwrite (crash-safety)
+                    if !slot.txn_id.CAS(old_txn_id, TXN_ID_CLEANING):
+                        continue  // someone else is cleaning this slot (or slot changed)
+                    // Entered CLEANING; stamp the sentinel-time unconditionally. This
+                    // must overwrite any old "claim" timestamp left over from slot acquire.
+                    slot.claiming_timestamp = now
+                    release_page_locks_for(old_txn_id)
+                    slot.state = Free
+                    slot.mode = Serialized
+                    slot.commit_seq = 0
+                    slot.begin_seq = 0
+                    slot.snapshot_high = 0
+                    slot.witness_epoch = 0
+                    slot.has_in_rw = false
+                    slot.has_out_rw = false
+                    slot.marked_for_abort = false
+                    slot.write_set_pages = 0
+                    slot.pid = 0
+                    slot.pid_birth = 0
+                    slot.lease_expiry = 0
+                    slot.cleanup_txn_id = 0
+                    slot.claiming_timestamp = 0
+                    slot.txn_id = 0    // Free the slot (Release ordering, LAST)
+                    continue
 ```
 
 The three-phase acquire protocol MUST set `claiming_timestamp` **after** the
@@ -8434,8 +8456,9 @@ pub struct CommitRequest {
     pub txn_id: TxnId,
     /// Transaction mode (Serialized or Concurrent).
     pub mode: TxnMode,
-    /// Pages to be committed: page number -> new page data.
-    pub write_set: HashMap<PageNumber, PageData>,
+    /// Pages to be committed (page images). The coordinator reads page bytes
+    /// from this value during WALAppend.
+    pub write_set: CommitWriteSet,
     /// Intent log for audit/merge certificates (Section 5.10). Any deterministic
     /// rebase/merge MUST already have been applied by the sender to produce the
     /// final `write_set`; the coordinator MUST NOT interpret this log to perform
@@ -8477,7 +8500,73 @@ pub enum CommitResponse {
         error: FrankenError,
     },
 }
+
+/// How the write coordinator obtains page images for WAL append.
+pub enum CommitWriteSet {
+    /// Small transactions: page bytes are held in memory by the committing task
+    /// and transferred to the coordinator via the commit request.
+    Inline(HashMap<PageNumber, PageData>),
+
+    /// Large transactions: page bytes have been spilled to a private per-txn
+    /// spill file (NOT the shared WAL). The coordinator reads the bytes during
+    /// WALAppend using the provided locations.
+    ///
+    /// Spill is not durability and MUST NOT participate in crash recovery.
+    Spilled(SpilledWriteSet),
+}
+
+pub struct SpilledWriteSet {
+    /// Absolute path to the spill file, stable for the duration of the commit.
+    pub spill_path: std::path::PathBuf,
+    /// Page index: page number -> location in spill file (last-write wins).
+    pub pages: HashMap<PageNumber, SpillLoc>,
+}
+
+pub struct SpillLoc {
+    pub offset: u64,
+    /// In V1, len MUST equal the database page size (full-page images).
+    pub len: u32,
+    /// Integrity hash of the spilled page bytes.
+    pub xxh3: Xxh3Hash,
+}
 ```
+
+**Critical rule (normative): WAL append is privileged.**
+
+Only the write coordinator may append frames to `.wal` in Compatibility mode.
+This is required because legacy WAL visibility is defined by commit-frame
+boundaries (`db_size != 0`; §11.9) and wal-index frame indexing (§11.10), which
+assume each transaction's frames are appended contiguously. Any uncoordinated
+WAL append (e.g., from buffer pool eviction) can interleave uncommitted frames
+into the committed prefix and cause silent corruption. (§6.6)
+
+**Write-set spill (Compatibility mode; required):**
+
+To prevent out-of-memory failures for large transactions while keeping WAL
+append coordinator-only, Compatibility mode MUST support write-set spilling:
+
+- When the in-memory footprint of a transaction's write set page images exceeds
+  `PRAGMA fsqlite.txn_write_set_mem_bytes`, the transaction MUST spill page
+  images to a private per-txn spill file.
+- The spill file is a temporary artifact (e.g., `foo.db.fsqlite-tmp/txn-<TxnToken>.spill`)
+  and MUST NOT be used for crash recovery. It exists only to bound RAM usage.
+- The spill file MUST implement last-write-wins semantics per page number
+  (via an in-memory index `pgno -> SpillLoc`).
+- At commit time, the transaction sends a `CommitRequest` whose `write_set`
+  is either `Inline(...)` or `Spilled(...)`. The coordinator performs WALAppend
+  by reading page bytes from `CommitWriteSet` only after validation succeeds.
+- On abort (conflict or I/O), the spill file is discarded. On commit success,
+  the spill file is discarded after the coordinator responds `Ok`.
+
+**PRAGMA fsqlite.txn_write_set_mem_bytes:**
+
+```
+PRAGMA fsqlite.txn_write_set_mem_bytes;          -- Query current value
+PRAGMA fsqlite.txn_write_set_mem_bytes = N;      -- Set to N bytes (0 = auto)
+```
+
+- Default: `0` (auto).
+- Auto derivation (normative): `auto = clamp(4 * cache.max_bytes, 32 MiB, 512 MiB)`.
 
 **Throughput model with derivation:**
 
@@ -8742,6 +8831,50 @@ RebaseExpr ::=
       operands: Vec<RebaseExpr>,
   }
 ```
+
+##### 5.10.1.1 RowId Allocation in Concurrent Mode (Avoid the Pre-Binding Trap)
+
+C SQLite can implement `OP_NewRowid` as `max(rowid)+1` because writers are
+serialized by the WAL write lock. In `BEGIN CONCURRENT`, that is no longer true:
+two writers starting from the same snapshot would otherwise choose the same
+RowId, making `IntentOpKind::Insert { key: RowId, ... }` replay impossible
+(deterministic rebase would fail with `SQLITE_CONSTRAINT_PRIMARYKEY`).
+
+**Normative rule:** In Concurrent mode, any insert that requires an auto-generated
+rowid (no explicit INTEGER PRIMARY KEY / rowid value) MUST allocate its RowId
+from a snapshot-independent, global per-table allocator shared across all
+concurrent writers (and across processes when shared-memory MVCC is enabled).
+
+- The allocated RowId MUST be recorded as the concrete `key: RowId` in the
+  `Insert` intent op at statement execution time.
+- The allocated RowId MUST be stable for the lifetime of the statement/transaction:
+  commit-time deterministic rebase (§5.10.2) MUST NOT "change" rowids, because
+  that would retroactively invalidate `last_insert_rowid()` and RETURNING results.
+
+**Minimum semantics (V1):**
+- **Non-AUTOINCREMENT rowid tables:** Initialize the allocator (per schema epoch)
+  to `max_committed_rowid(table) + 1` (computed from the latest durable tip, not
+  the transaction snapshot), then allocate monotonically. Allocations are not
+  rolled back on abort; gaps are permitted. (This is an intentional tradeoff in
+  `BEGIN CONCURRENT` to enable commutative insert merges; exact C SQLite rowid
+  reuse semantics remain in Layer 1 / Serialized mode.)
+- **AUTOINCREMENT tables:** Initialize to
+  `max(sqlite_sequence.seq, max_committed_rowid(table)) + 1` and treat the
+  allocator high-water mark as "highest ever committed rowid". The committing
+  transaction MUST persist the high-water mark by updating `sqlite_sequence` as
+  part of the transaction's write set. This update is mergeable because it is a
+  monotone max (encode as an `UpdateExpression` on the `sqlite_sequence` row:
+  `seq = max(seq, inserted_rowid)` using the *scalar* `max(a,b)` function).
+
+**Bump-on-explicit-rowid (required):** If a statement inserts an explicit rowid
+(or explicit INTEGER PRIMARY KEY alias value) `r`, the engine MUST ensure the
+allocator's next value is at least `r+1` (atomic max). This preserves SQLite's
+`max(rowid)+1` behavior and AUTOINCREMENT's "highest ever" rule under mixed
+explicit/implicit inserts.
+
+**Range reservation (recommended):** To avoid an atomic op per row, connections
+SHOULD reserve small RowId ranges from the allocator (e.g., 32 or 64 at a time)
+and allocate locally within the range; unused values may be discarded on abort.
 
 **Expression safety analysis (normative):**
 
@@ -9246,13 +9379,16 @@ pub struct CacheKey {
     pub commit_seq: CommitSeq,
 }
 
+/// NOTE (normative): Transaction-private (uncommitted) page images are NOT ARC
+/// cache entries. They live in the owning transaction's `write_set` and may be
+/// spilled in Compatibility mode (§5.9.2). In the ARC cache, `commit_seq = 0`
+/// refers only to the on-disk baseline image.
+
 /// A cached page with metadata for eviction decisions.
 pub struct CachedPage {
     pub key: CacheKey,
     pub data: PageData,
     pub ref_count: AtomicU32,     // pinned by active operations
-    pub dirty: AtomicBool,        // modified but not yet flushed to WAL
-    pub flush_inflight: AtomicBool, // true while a flush is in progress; blocks eviction
     pub xxh3: Xxh3Hash,           // integrity hash of data at load time
     pub byte_size: usize,         // actual memory (for variable-size deltas)
     pub wal_frame: Option<u32>,   // WAL frame number if from WAL
@@ -9336,7 +9472,7 @@ pub struct GhostStore<K> {
 /// CONCURRENCY: All ArcCache operations (REQUEST, REPLACE, promote, evict)
 /// mutate multiple internal collections atomically. The cache MUST be
 /// protected by a `Mutex<ArcCache>` (or `parking_lot::Mutex` for fast
-/// uncontended paths). Individual CachedPage fields (ref_count, dirty, flush_inflight) use
+/// uncontended paths). Individual CachedPage fields (ref_count) use
 /// atomics for lock-free read-side access, but structural mutations to
 /// T1/T2/B1/B2/p/index require the mutex. With the CAR physical
 /// implementation, the mutex-held critical section is short (clock sweep
@@ -9386,7 +9522,7 @@ REPLACE(cache, target_key):
   loop:
     // Safety valve (MUST be checked FIRST).
     // If we have proven there is no evictable victim in either list (all pinned
-    // and/or unflushable), we are overcommitted. Allow temporary growth beyond
+    // and/or otherwise non-evictable), we are overcommitted. Allow temporary growth beyond
     // capacity rather than deadlock.
     //
     // CRITICAL: It is not sufficient to count rotations across (T1+T2) while
@@ -9399,7 +9535,7 @@ REPLACE(cache, target_key):
     prefer_t1 = |T1| > 0 AND (|T1| > p OR (|T1| == p AND target_key IN B2))
 
     // "prefer_t1" is a hint, not a mandate. If the preferred list is empty or
-    // exhausted (all pinned/unflushable candidates), we MUST fall back to the
+    // exhausted (all pinned/non-evictable candidates), we MUST fall back to the
     // other list to ensure termination and liveness.
     if prefer_t1:
       if rotations_t1 < |T1|:
@@ -9647,7 +9783,7 @@ correct: the cache prioritizes versions actively needed over breadth.
 ### 6.6 Eviction: Pinned Pages and Durability Boundaries
 
 **All pages pinned scenario.** If REPLACE scans all of T1 and T2 without
-finding an unpinned, clean page, the cache is overcommitted. Resolution:
+finding an unpinned page, the cache is overcommitted. Resolution:
 
 1. Temporarily grow capacity by 1 (`capacity_overflow += 1`).
 2. Log a warning: the application has too many concurrent pinned pages.
@@ -9740,7 +9876,7 @@ We do not accept unbounded growth of ANY of the following:
 | Subsystem | Budget Source | Reclamation Policy |
 |-----------|-------------|-------------------|
 | ARC page cache | `PRAGMA cache_size` | ARC eviction (§6.3–6.4) |
-| Transaction write sets (page images) | `PRAGMA fsqlite.txn_write_set_mem_bytes` | Spill to per-txn temp file (§5.9.2); abort if hard cap exceeded |
+| Transaction write sets (page images) | `PRAGMA fsqlite.txn_write_set_mem_bytes` | Spill to per-txn temp file (§5.9.2); abort if spill I/O fails |
 | MVCC page version chains | GC horizon (min active snapshot) | Coalescing + version drop (§6.7) |
 | SSI witness plane (hot index + evidence caches) | Hot: fixed SHM layout; Cold: fixed byte budgets | Hot: epoch swap (§5.6.4.8); Cold: LRU + rebuild from ECS; evidence GC by safe horizons |
 | Symbol caches (decoded objects) | Fixed byte budget, configurable | LRU eviction |
@@ -12096,6 +12232,12 @@ INSERT INTO table VALUES (?, ?)
   Halt       0, 0
   <end>:
 ```
+
+**Concurrent-mode note (normative):** In `BEGIN CONCURRENT`, `OP_NewRowid` MUST
+allocate via the snapshot-independent RowId allocator (§5.10.1.1), not by
+scanning the transaction's snapshot-visible `max(rowid)`. This is required for
+commutative insert merges and deterministic rebase to work for append-heavy
+workloads.
 
 **UPDATE -> VDBE opcodes:**
 ```
