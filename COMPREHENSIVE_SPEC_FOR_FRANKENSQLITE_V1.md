@@ -2694,7 +2694,7 @@ fn read_page(cx: &Cx<StorageCaps>, file: &mut impl VfsFile, pgno: PageNumber) ->
 **Cx flows through the full call stack:**
 
 ```
-Connection::execute(cx: &Cx<All>)
+Connection::execute(cx: &Cx<All>).await
   -> VDBE::run(cx: &Cx<All>)
     -> BtreeCursor::move_to(cx: &Cx<StorageCaps>)
       -> MvccPager::get_page(cx: &Cx<StorageCaps>)
@@ -3628,19 +3628,18 @@ isolation level analysis, checksum performance, and multi-process semantics.
 ### 5.1 Core Types
 
 ```
-TxnId       := u64                          -- monotonically increasing, AtomicU64
+TxnId       := u64                          -- monotonically increasing logical id allocated at BEGIN (AtomicU64)
+TxnEpoch    := u32                          -- increments when a TxnSlotId is reused (prevents stale slot interpretation)
+TxnToken    := (txn_id: TxnId, txn_epoch: TxnEpoch)
+
+CommitSeq   := u64                          -- monotonically increasing commit sequence (assigned at COMMIT by the sequencer)
 SchemaEpoch := u64                          -- increments on schema/layout changes (DDL, VACUUM, etc.)
 PageNumber  := NonZeroU32                   -- 1-based page number
 PageData    := Vec<u8>                      -- page content, length = page_size
 
 Snapshot := {
-    high_water_mark : TxnId,               -- all txn_ids <= this are "potentially committed"
+    high            : CommitSeq,            -- all commits with commit_seq <= high are visible
     schema_epoch    : SchemaEpoch,          -- schema version at BEGIN (prevents intent replay across schema changes)
-    in_flight       : ActiveTxnSet,         -- active txns at snapshot creation.
-                                            -- Adaptive structure:
-                                            --   Small case: Sorted SmallVec<TxnId> (very fast iteration)
-                                            --   Large case: RoaringBitmap (fast set ops, compression)
-                                            -- Optimizes for the common case of few concurrent writers.
 }
 
 -- Schema epoch discipline:
@@ -3654,7 +3653,8 @@ Snapshot := {
 
 PageVersion := {
     pgno       : PageNumber,
-    created_by : TxnId,
+    commit_seq : CommitSeq,                 -- 0 for uncommitted/private versions (only in a txn write_set)
+    created_by : TxnToken,                  -- creator identity (debug/audit); not used for visibility
     data       : PageData,                  -- or RaptorQ delta (Section 3.4.4)
     prev_idx   : Option<VersionIdx>,        -- index into VersionArena (NOT Box pointer)
 }
@@ -3713,68 +3713,56 @@ PageLockTable := ShardedHashMap<PageNumber, TxnId>  -- exclusive write locks
     -- Zipfian. For higher concurrency, increase S to 256 (via PRAGMA).
     -- Monitored at runtime via the BOCPD contention stream (Section 4.8).
 
-SireadTable := ShardedHashMap<PageNumber, SmallVec<TxnId>>
-    -- Maps each page to the set of active transactions that have read it.
-    -- Sharded like PageLockTable for concurrency. Entries cleaned up when
-    -- transactions commit or abort. Used by SSI to track rw-antidependencies.
-    -- Future refinement: key = (PageNumber, CellTag) for reduced false positives.
+SSIWitnessPlane := (see §5.6.4)
+    -- The RaptorQ-native witness plane replaces any ephemeral SIREAD lock table:
+    -- it captures read/write evidence as witness keys and publishes durable
+    -- ECS objects plus a shared-memory hot index (no false negatives).
 
 Transaction := {
     txn_id      : TxnId,
+    txn_epoch   : TxnEpoch,
     snapshot    : Snapshot,
-    write_set   : HashMap<PageNumber, PageVersion>,
-    read_set    : HashSet<PageNumber>,
+    write_set   : HashMap<PageNumber, PageVersion>, -- private versions (commit_seq = 0)
     intent_log  : Vec<IntentOp>,            -- semantic operation log for rebase merge
     page_locks  : HashSet<PageNumber>,
     state       : {Active, Committed{commit_seq}, Aborted{reason}},
     mode        : {Serialized, Concurrent},
 
-    -- SSI state (active for Concurrent mode):
+    -- Witness-plane SSI evidence (Section 5.6.4):
+    read_keys   : HashSet<WitnessKey>,
+    write_keys  : HashSet<WitnessKey>,
+
+    -- SSI state (computed at commit for Concurrent mode):
     has_in_rw   : bool,    -- some other txn read what this txn wrote (incoming rw edge)
     has_out_rw  : bool,    -- this txn read what some other txn later wrote (outgoing rw edge)
-    rw_in_from  : SmallVec<TxnId>,   -- txns that have rw edges TO this txn
-    rw_out_to   : SmallVec<TxnId>,   -- txns that this txn has rw edges TO
 }
 
-IntentOp := {
-    -- Semantic B-tree operations for deterministic rebase merge (Section 5.10)
-    Insert { table: TableId, key: RowId, record: Vec<u8> }
-  | Delete { table: TableId, key: RowId }
-  | Update { table: TableId, key: RowId, new_record: Vec<u8> }
-  | IndexInsert { index: IndexId, key: Vec<u8>, rowid: RowId }
-  | IndexDelete { index: IndexId, key: Vec<u8>, rowid: RowId }
-}
+IntentOp := (see §5.10.1)
 
-CommitLog := AppendOnlyVec<CommitRecord>
-    -- NOT BTreeMap. TxnIds are monotonically increasing (INV-1), so the
-    -- commit log is naturally sorted by insertion order. Append is O(1).
-    -- Lookup by TxnId: binary search on the dense array, O(log n).
-    -- Lookup for recent commits (the hot case during SSI validation):
-    --   offset = txn_id - base_txn_id, then direct index, O(1).
-    -- GC truncates the front when all transactions below the horizon
-    -- have been reclaimed, using a VecDeque or circular buffer.
-    -- BTreeMap would pay O(log n) insertion into the rightmost leaf
-    -- with poor cache behavior (tree node pointer chasing). A dense
-    -- array is strictly superior for monotonic keys.
-
-CommitRecord := {
-    txn_id    : TxnId,
-    pages     : SmallVec<[PageNumber; 8]>,  -- most commits touch few pages
-    timestamp : Instant,
-}
+CommitIndex := ShardedHashMap<PageNumber, CommitSeq>
+    -- Maps each page to the latest commit_seq that modified it.
+    -- Used by First-Committer-Wins validation without scanning commit history.
 ```
 
 ### 5.2 Invariants
 
-**INV-1 (Monotonicity):** TxnIds are strictly monotonically increasing.
+**INV-1 (Monotonicity):** TxnIds (begin ids) and `CommitSeq` (commit clock) are
+strictly monotonically increasing.
 
 ```
-Formal: forall T1, T2 : begin(T1) happens-before begin(T2) => T1.txn_id < T2.txn_id
+Formal (begin ids): forall T1, T2 :
+    begin(T1) happens-before begin(T2) => T1.txn_id < T2.txn_id
+
+Formal (commit clock): forall C1, C2 :
+    commit(C1) happens-before commit(C2) => commit_seq(C1) < commit_seq(C2)
 ```
 
 *Enforcement:* `TxnManager::next_txn_id` is an `AtomicU64` incremented with
 `fetch_add(1, SeqCst)`. Sequential consistency ordering guarantees that no two
 calls return the same value, and the values are strictly increasing.
+`CommitSeq` is assigned only by the commit sequencer via an `AtomicU64`
+`fetch_add(1, SeqCst)` (or an equivalent serialized allocator), so committed
+transactions have a strict total order.
 
 *Violation consequence:* If TxnIds are reused or non-monotone, snapshot
 visibility becomes undefined. A transaction could see a "future" version as
@@ -3807,19 +3795,19 @@ leading to lost updates.
 ---
 
 **INV-3 (Version Chain Order):** If `V.prev = Some(V')`, then
-`V.created_by > V'.created_by`.
+`V.commit_seq > V'.commit_seq`.
 
 ```
 Formal: forall P, V, V' :
     V in version_chain(P) AND V.prev = Some(V')
-    => V.created_by > V'.created_by
+    => V.commit_seq > V'.commit_seq
 ```
 
 *Enforcement:* Versions are published to the version store during commit, in
-the order of commit (newer transactions have higher TxnIds by INV-1). The
-`publish()` operation prepends the new version to the head of the chain,
-setting its `prev` to the current head. Since the committing transaction's
-TxnId is greater than all previously committed TxnIds, the ordering holds.
+the order of commit (`CommitSeq` is assigned by the sequencer at commit time).
+The `publish()` operation prepends the new version to the head of the chain,
+setting its `prev` to the current head. Since each committed transaction has a
+strictly increasing `commit_seq`, the ordering holds.
 
 *Violation consequence:* Version resolution walks the chain from newest to
 oldest, returning the first visible version. If the chain is mis-ordered,
@@ -3874,10 +3862,13 @@ Formal: forall T, S :
 
 *Enforcement:* Version publishing and commit log insertion happen while the
 coordinator holds the commit pipeline. All versions are published, then the
-commit record is inserted. The commit record is what makes the TxnId appear
-in `committed_txns`. Until the record is inserted, no snapshot considers the
-TxnId committed, so none of the versions are visible. Once inserted, all
-versions become visible simultaneously.
+commit marker is appended (Native mode) or the WAL commit record is appended
+(Compatibility mode). The marker/record is the atomic "this commit exists"
+visibility point:
+- Until the marker/record is durable, the commit is not considered committed,
+  so none of the transaction's versions are visible.
+- Once durable, the commit's versions share a single `commit_seq` and become
+  visible simultaneously to any snapshot with `snapshot.high >= commit_seq`.
 
 *Violation consequence:* Partial visibility means a reader could see some of
 a transaction's writes but not others, observing an inconsistent state. For
@@ -3912,78 +3903,43 @@ serialized.
 
 ```
 visible(V, S) :=
-    V.created_by <= S.high_water_mark
-    AND V.created_by NOT IN S.in_flight
-    AND V.created_by IN committed_txns
+    V.commit_seq != 0
+    AND V.commit_seq <= S.high
 
 resolve(P, S) :=
     first V in version_chain(P) where visible(V, S)
-    // Falls back to on-disk data (TxnId::ZERO) if no version found
+    // Falls back to on-disk baseline if no committed version found
 ```
 
-**Complete worked example with 5 transactions:**
+**Complete worked example (commit-seq snapshots):**
 
-Consider a database with page P1. Five transactions execute in the following
-order:
+Assume a database with one page `P1`. The global commit clock starts at
+`commit_seq = 0` (on-disk baseline).
 
 ```
 Time  Action
 ----  ------
-t0    T1 begins   (txn_id=1)
-t1    T2 begins   (txn_id=2)
-t2    T1 writes P1 (version V1, created_by=1)
-t3    T3 begins   (txn_id=3)
-t4    T1 commits  (V1 published)
-t5    T2 writes P1 -- FAILS: page locked by T1 (wait... T1 committed at t4, lock released)
-      T2 writes P1 (version V2, created_by=2) -- succeeds, lock now free
-t6    T4 begins   (txn_id=4)
-t7    T2 commits  (V2 published) -- but first-committer-wins check: T1 committed P1
-      after T2's snapshot. T2 must ABORT.
-t8    T5 begins   (txn_id=5)
-t9    T3 writes P1 (version V3, created_by=3)
-t10   T3 commits  (V3 published) -- first-committer-wins: T1 committed P1 after T3's
-      snapshot (T3.snapshot.hwm=2, T1.txn_id=1 <= 2, but T1 was NOT in T3.in_flight
-      since T1 committed before T3's snapshot was taken... wait, T3 began at t3,
-      T1 committed at t4, so T1 was in T3's in_flight set). Check: T1.txn_id=1,
-      T3.snapshot.hwm=2, T3.snapshot.in_flight={1,2}. T1 committed P1, T1.txn_id=1
-      is in in_flight, so from T3's perspective T1 was not committed at snapshot time.
-      Now at commit validation: any committed_txn with txn_id > T3.snapshot.hwm? None.
-      Any committed_txn in T3.snapshot.in_flight that committed P1? T1 (txn_id=1) is
-      in in_flight and committed P1. This is a conflict. T3 ABORTS.
-t11   T5 writes P1 (version V5, created_by=5)
-t12   T5 commits  (V5 published, no conflict: only T1 committed P1, and T5's
-      snapshot.hwm >= T1.txn_id and T1 not in T5.in_flight)
+t0    T1 begins   (txn_id=1, snapshot.high=0)
+t1    T2 begins   (txn_id=2, snapshot.high=0)
+t2    T1 writes P1 (private write_set version; not committed)
+t3    T3 begins   (txn_id=3, snapshot.high=0)
+t4    T1 commits  (commit_seq=1; publishes V1 with commit_seq=1)
+t5    T2 writes P1 (private write_set version)
+t6    T4 begins   (txn_id=4, snapshot.high=1)  -- sees V1
+t7    T2 commits  -> FAILS FCW: base_version(P1).commit_seq=1 > snapshot.high=0
+t8    T5 begins   (txn_id=5, snapshot.high=1)
+t9    T3 writes P1 (private write_set version)
+t10   T3 commits  -> FAILS FCW: base_version(P1).commit_seq=1 > snapshot.high=0
+t11   T5 writes P1 (private write_set version)
+t12   T5 commits  (commit_seq=2; publishes V2 with commit_seq=2)
 ```
 
-**Snapshot contents at each transaction's begin:**
+What each transaction sees when reading `P1`:
 
-| Transaction | txn_id | hwm | in_flight | Committed at begin |
-|-------------|--------|-----|-----------|-------------------|
-| T1 | 1 | 0 | {} | {} |
-| T2 | 2 | 1 | {1} | {} |
-| T3 | 3 | 2 | {1, 2} | {} |
-| T4 | 4 | 3 | {2, 3} | {1} |
-| T5 | 5 | 4 | {3} | {1} (T2 aborted) |
-
-**Visibility of P1 versions from each snapshot:**
-
-| Version | created_by | T1's snapshot | T2's snapshot | T3's snapshot | T4's snapshot | T5's snapshot |
-|---------|-----------|---------------|---------------|---------------|---------------|---------------|
-| V1 | 1 | No (self-vis only) | No (1 in in_flight) | No (1 in in_flight) | Yes (1 <= 3, not in {2,3}, committed) | Yes (1 <= 4, not in {3}, committed) |
-| V5 | 5 | No (5 > 0) | No (5 > 1) | No (5 > 2) | No (5 > 3) | No (self-vis only) |
-| on-disk (TxnId::ZERO) | 0 | Yes | Yes | Yes | No (V1 supersedes) | No (V1/V5 supersede) |
-
-What each transaction sees when reading P1 through its snapshot:
-
-| Transaction | resolve(P1, snapshot) |
-|-------------|----------------------|
-| T1 (before own write) | on-disk (TxnId::ZERO) |
-| T1 (after own write) | V1 (self-visibility) |
-| T2 | on-disk (T1 is in in_flight, not visible) |
-| T3 | on-disk (T1 is in in_flight, not visible) |
-| T4 | V1 (T1 committed and visible) |
-| T5 (before own write) | V1 (T1 committed and visible) |
-| T5 (after own write) | V5 (self-visibility) |
+- `T1` before own write: on-disk baseline; after own write: its private version.
+- `T2` sees only on-disk baseline throughout (snapshot.high=0), even after `T1` commits.
+- `T4` sees `V1` (snapshot.high=1).
+- `T5` sees `V1` before writing; then sees its private version after writing.
 
 ### 5.4 Transaction Lifecycle
 
@@ -3991,18 +3947,24 @@ What each transaction sees when reading P1 through its snapshot:
 ```
 begin(manager, mode) -> Transaction:
     txn_id = manager.next_txn_id.fetch_add(1, SeqCst)
-    snapshot = capture_snapshot(manager)
+    txn_epoch = 0  // in-process; cross-process uses TxnSlot.epoch (Section 5.6.2)
+    snapshot = Snapshot {
+        high: manager.commit_seq.load(),
+        schema_epoch: manager.schema_epoch.load(),
+    }
     if mode == Serialized:
         manager.global_write_mutex.lock()  // exact SQLite compat
-    return Transaction { txn_id, snapshot, mode, ... }
+    return Transaction { txn_id, txn_epoch, snapshot, mode, ... }
 ```
 
 **Read (both modes):**
 ```
 read_page(T, pgno) -> PageData:
-    T.read_set.insert(pgno)
     if T.mode == Concurrent:
-        siread_table.entry(pgno).or_default().push(T.txn_id)  // SSI tracking
+        // SSI witness-plane evidence (no SIREAD lock table).
+        key = WitnessKey::Page(pgno)
+        T.read_keys.insert(key)
+        witness_plane.register_read(key)  // hot index update; §5.6.4
     if pgno in T.write_set: return T.write_set[pgno].data
     return resolve(pgno, T.snapshot).data
 ```
@@ -4018,61 +3980,58 @@ write_page(T, pgno, new_data) -> Result<()>:
         if lock_result = AlreadyHeld(other): return Err(SQLITE_BUSY)
         T.page_locks.insert(pgno)
 
-        // SSI: update rw-antidependencies for readers of this page
-        for reader_id in siread_table.readers(pgno):
-            if reader_id != T.txn_id AND transaction(reader_id).state == Active:
-                // reader read this page, T is now writing it: reader ->rw T
-                transaction(reader_id).has_out_rw = true
-                T.has_in_rw = true
-                transaction(reader_id).rw_out_to.push(T.txn_id)
-                T.rw_in_from.push(reader_id)
+        // SSI witness-plane evidence (edges are discovered at commit time via
+        // hot-index candidate discovery + refinement; §5.7).
+        key = WitnessKey::Page(pgno)
+        T.write_keys.insert(key)
+        witness_plane.register_write(key)  // hot index update; §5.6.4
 
     base = resolve_for_txn(pgno, T)
-    T.write_set.insert(pgno, PageVersion { pgno, T.txn_id, new_data, base })
+    T.write_set.insert(pgno, PageVersion {
+        pgno,
+        commit_seq: 0,
+        created_by: (T.txn_id, T.txn_epoch),
+        data: new_data,
+        prev_idx: base,
+    })
     Ok(())
 ```
 
 **Commit:**
 ```
 commit(T) -> Result<()>:
+    // Schema epoch check (merge safety; see §5.10).
+    if current_schema_epoch() != T.snapshot.schema_epoch:
+        abort(T)
+        return Err(SQLITE_SCHEMA)
+
     if T.mode == Concurrent:
-        // Step 1: SSI validation (serializable by default)
-        if T.has_in_rw AND T.has_out_rw:
-            // T is a "pivot" in a dangerous structure (T1 ->rw T ->rw T3).
-            // Conservative rule: abort to prevent serialization cycle.
-            abort(T)
-            return Err(SQLITE_BUSY_SNAPSHOT)  // retryable
+        // Step 1: SSI validation (serializable by default).
+        // Witness-plane candidate discovery + refinement + pivot abort rule lives in §5.7.
+        // This procedure emits `DependencyEdge` / `AbortWitness` / `CommitProof` artifacts in Native mode.
+        ssi_validate_and_publish(T)?  // returns Err(SQLITE_BUSY_SNAPSHOT) if pivot
 
-        // Step 2: First-committer-wins validation + algebraic merge
+        // Step 2: First-committer-wins validation + algebraic merge (commit-seq snapshots).
         for pgno in T.write_set.keys():
-            for committed_txn in commit_log.range(T.snapshot.high_water_mark+1..):
-                if pgno in committed_txn.pages:
-                    // Attempt deterministic rebase merge (Section 5.10)
-                    if can_rebase_merge(T, committed_txn, pgno):
-                        perform_rebase_merge(T, committed_txn, pgno)
-                    // Fallback: try algebraic byte merge (Section 3.4.5)
-                    elif can_algebraic_merge(T, committed_txn, pgno):
-                        perform_algebraic_merge(T, committed_txn, pgno)
-                    else:
-                        abort(T)
-                        return Err(SERIALIZATION_FAILURE)
+            if commit_index.latest_commit_seq(pgno) > T.snapshot.high:
+                // Attempt deterministic rebase merge (Section 5.10).
+                if can_rebase_merge(T, pgno):
+                    perform_rebase_merge(T, pgno)
+                // Fallback: try algebraic byte merge (Section 5.10.3 / §3.4.5).
+                elif can_algebraic_merge(T, pgno):
+                    perform_algebraic_merge(T, pgno)
+                else:
+                    abort(T)
+                    return Err(SQLITE_BUSY_SNAPSHOT)  // retryable conflict
 
-    // WAL append (serialized via write coordinator channel)
-    coordinator.send(CommitRequest {
-        write_set: T.write_set,
-        repair_symbols: raptorq_encode(T.write_set),  // Section 3.4.1
-        response: oneshot_rx,
-    })
-    result = oneshot_rx.recv()
-
-    if result.is_ok():
-        // Publish versions, record in commit log, release locks
-        ...
-
+    // Step 3: Persist + publish using the selected commit protocol (Section 7).
+    // The commit sequencer assigns commit_seq and appends the atomic marker/record.
+    commit_seq = write_coordinator.publish(T)
+    T.state = Committed{commit_seq}
+    release_page_locks(T)
     if T.mode == Serialized:
         manager.global_write_mutex.unlock()
-
-    result
+    Ok(())
 ```
 
 **Transaction state machine:**
@@ -4090,7 +4049,7 @@ commit(T) -> Result<()>:
     +-----------+              +---------+
 
 State transitions:
-  Active -> Committed:  Only via successful commit validation + WAL append
+  Active -> Committed:  Only via successful commit validation + durable commit marker/record append
   Active -> Aborted:    Via explicit ROLLBACK, commit validation failure,
                         SQLITE_BUSY on page lock, or SQLITE_INTERRUPT
   Committed -> *:       Terminal state (no further transitions)
@@ -4182,58 +4141,34 @@ because the `try_acquire` operation is non-blocking by construction.
 transaction observes a consistent snapshot -- it never sees partial results
 of concurrent transactions.
 
-**Proof:** Let `T_r` be a reading transaction with snapshot `S_r`, and let
-`T_w` be any other transaction. We must show that `T_r` either sees ALL of
-`T_w`'s writes or NONE of them.
+**Proof:** Let `T_r` be a reading transaction with snapshot `S_r` and
+`S_r.high = h`. Let `T_w` be any other transaction that commits at
+`commit_seq(T_w) = c`.
 
-Define: `T_w`'s writes are the set of `PageVersion` entries
-`{V_1, V_2, ..., V_k}` where `V_i.created_by = T_w.txn_id` for all `i`.
+All versions produced by `T_w` share the same `commit_seq = c` (commit assigns
+a single sequence number for the transaction and publishes all its page
+versions under that number).
 
-For any version `V_i` created by `T_w`, the visibility predicate is:
+By the visibility predicate (§5.3), for any version `V_i` produced by `T_w`:
 
 ```
-visible(V_i, S_r) =
-    T_w.txn_id <= S_r.high_water_mark
-    AND T_w.txn_id NOT IN S_r.in_flight
-    AND T_w.txn_id IN committed_txns
+visible(V_i, S_r) = (c != 0) AND (c <= h)
 ```
 
-Crucially, all three conditions depend ONLY on `T_w.txn_id`, not on the
-specific page or version. Therefore, `visible(V_i, S_r)` has the same truth
-value for all `i in {1, ..., k}`.
-
-**Case 1:** `T_w.txn_id > S_r.high_water_mark`. Then
-`T_w.txn_id <= S_r.high_water_mark` is false for all versions. `T_r` sees
-NONE of `T_w`'s writes. This case covers transactions that began after
-`T_r`'s snapshot was captured.
-
-**Case 2:** `T_w.txn_id <= S_r.high_water_mark` AND `T_w.txn_id IN S_r.in_flight`.
-Then the `NOT IN S_r.in_flight` condition is false for all versions. `T_r`
-sees NONE of `T_w`'s writes. This case covers transactions that were active
-(but not yet committed) when `T_r`'s snapshot was captured.
-
-**Case 3:** `T_w.txn_id <= S_r.high_water_mark` AND `T_w.txn_id NOT IN S_r.in_flight`
-AND `T_w.txn_id NOT IN committed_txns`. Then the `IN committed_txns` condition
-is false for all versions. `T_r` sees NONE of `T_w`'s writes. This case covers
-transactions that were assigned a TxnId but later aborted.
-
-**Case 4:** `T_w.txn_id <= S_r.high_water_mark` AND `T_w.txn_id NOT IN S_r.in_flight`
-AND `T_w.txn_id IN committed_txns`. All three conditions are true for all
-versions. `T_r` sees ALL of `T_w`'s writes. This case covers transactions
-that were committed before `T_r`'s snapshot was captured.
-
-In no case does `T_r` see a strict subset of `T_w`'s writes.
-
-Furthermore, the snapshot `S_r` is immutable (INV-5), so the truth value of
-`visible(V_i, S_r)` does not change during `T_r`'s lifetime, even if `T_w`
-commits midway through `T_r`'s execution.
+This condition is identical for every `V_i` from `T_w`, so `T_r` sees either
+ALL of `T_w`'s committed writes or NONE of them. Since `S_r` is immutable
+(INV-5), this visibility decision does not change during `T_r`'s lifetime.
 
 QED.
 
 ---
 
-**Theorem 3 (First-Committer-Wins):** If two Concurrent-mode transactions
-`T_1`, `T_2` both write page P, at most one commits successfully.
+**Theorem 3 (No Lost Updates / FCW Safety):** If two Concurrent-mode
+transactions `T_1` and `T_2` both attempt to write the same page `P`, then the
+system either:
+1. aborts one transaction, or
+2. commits both via a deterministic merge/rebase such that the final state is
+   equivalent to some serial order.
 
 **Proof:** We consider two exhaustive sub-cases based on the temporal ordering
 of their page lock acquisitions.
@@ -4242,80 +4177,68 @@ of their page lock acquisitions.
 `write_page(P)` while both are Active. Without loss of generality, suppose
 `T_1` calls `try_acquire(P)` first and succeeds. When `T_2` subsequently
 calls `try_acquire(P)`, it finds the lock held by `T_1` and receives
-`Err(SQLITE_BUSY)`. `T_2` cannot write P at all. It either aborts entirely
-or proceeds without writing P (in which case it does not conflict on P).
+`Err(SQLITE_BUSY)`. `T_2` cannot write `P` at all and therefore cannot commit a
+conflicting write to `P`.
 
-**Case B (Sequential commits):** `T_1` acquires the lock on P, writes P,
-and commits first, releasing the lock. `T_2` then acquires the lock on P
-(now free) and writes P. When `T_2` attempts to commit, the commit validation
-phase scans the commit log for entries with `txn_id > T_2.snapshot.high_water_mark`
-(or entries whose `txn_id` was in `T_2.snapshot.in_flight`). Since `T_1`
-committed P, and `T_1`'s commit was either:
+**Case B (Sequential writes + snapshot conflict):** `T_1` acquires the lock on
+`P`, writes `P`, and commits first, releasing the lock. `T_2` then acquires the
+lock on `P` (now free) and writes `P`. Let `commit_seq(T_1) = c1` and let
+`T_2.snapshot.high = h2` (captured at `BEGIN`).
 
-- After `T_2`'s snapshot (so `T_1.txn_id > T_2.snapshot.hwm`), which is
-  caught by the range scan, OR
-- During `T_2`'s snapshot (`T_1.txn_id` was in `T_2.snapshot.in_flight`),
-  which is caught by checking in_flight members that subsequently committed
+- If `c1 <= h2`, then `T_2`'s snapshot already includes `T_1`'s commit. `T_2`
+  is effectively writing after `T_1` in serial order, so committing `T_2` does
+  not lose `T_1`'s update.
+- If `c1 > h2`, then `T_1` committed after `T_2`'s snapshot. The First-Committer-Wins
+  check detects `commit_index[P] = c1 > h2` and therefore requires either:
+  - a deterministic rebase/merge (§5.10) that incorporates `T_1`'s committed
+    state into `T_2`'s final deltas, or
+  - abort/retry of `T_2`.
 
-In either case, the validation finds that P was committed by `T_1` after
-`T_2`'s snapshot was taken. Unless algebraic merge is possible (Section 3.4.5),
-`T_2` must abort.
+In all cases, the system prevents "last writer wins" lost updates: either one
+transaction aborts, or both commit with an explicitly justified merge that is
+equivalent to serial execution.
 
-In both cases, at most one transaction's write to P survives. QED.
+QED.
 
 ---
 
 **Theorem 4 (GC Safety):** Garbage collection never removes a version that
 any active or future transaction could need.
 
-**Proof (by strong induction on the version chain):**
-
-Define `gc_horizon = min(T.txn_id : T in active_transactions)`. If there are
-no active transactions, `gc_horizon = latest_committed_txn_id`.
-
-**Reclaimability predicate:** A version `V` of page `P` is reclaimable iff:
+**Proof:** Define the safe GC horizon in commit-seq space:
 
 ```
-V.created_by < gc_horizon
-AND exists V' in version_chain(P) such that:
-    V'.created_by > V.created_by
-    AND V'.created_by <= gc_horizon
-    AND V'.created_by IN committed_txns
+safe_gc_seq := min(T.snapshot.high for all active transactions T)
+if no active transactions: safe_gc_seq := latest_commit_seq
 ```
 
-We must show: for any active transaction `T_a` and any future transaction
-`T_f` (one that has not yet started), if `V` is reclaimable, then neither
-`T_a` nor `T_f` will ever need `V`.
+Because `CommitSeq` is monotonic and snapshots are immutable (INV-5),
+`safe_gc_seq` is a correct global lower bound: every active transaction has
+`snapshot.high >= safe_gc_seq`.
 
-**For active transactions `T_a`:**
-- `T_a.snapshot.high_water_mark >= T_a.txn_id >= gc_horizon > V.created_by`
-  (by definition of gc_horizon).
-- The superseding version `V'` satisfies `V'.created_by <= gc_horizon`.
-- Since `V'.created_by <= gc_horizon <= T_a.txn_id`, and `V'` is committed,
-  we need to verify that `V'` is visible to `T_a`'s snapshot:
-  - `V'.created_by <= T_a.snapshot.high_water_mark` (since hwm >= txn_id >= gc_horizon >= V'.created_by)
-  - `V'.created_by NOT IN T_a.snapshot.in_flight` -- this holds because
-    `V'.created_by <= gc_horizon = min(active txn_ids)`, and the in_flight
-    set contains only txn_ids of transactions that were active at snapshot
-    time. Since `V'` is committed and `V'.created_by < T_a.txn_id`, `V'`
-    must have committed before `T_a` began (otherwise it would still be in
-    active_transactions, contradicting `V'.created_by <= gc_horizon`).
-    Therefore `V'.created_by NOT IN T_a.snapshot.in_flight`.
-  - `V'.created_by IN committed_txns` (given).
-- So `visible(V', T_a.snapshot) = true`. Since `V'.created_by > V.created_by`,
-  `V'` appears before `V` in the version chain (by INV-3). Therefore
-  `resolve(P, T_a.snapshot)` returns `V'` or something newer, never `V`.
-- `T_a` does not need `V`.
+**Reclaimability predicate:** A committed version `V` of page `P` with
+`V.commit_seq = c` is reclaimable iff there exists a newer committed version
+`V'` in the version chain such that:
 
-**For future transactions `T_f`:**
-- `T_f` has not yet started, so `T_f.txn_id > current_max_txn_id >= gc_horizon`.
-- `T_f.snapshot.high_water_mark >= gc_horizon`.
-- By the same argument as above, `V'` is visible to `T_f`'s snapshot (it is
-  committed and below `T_f`'s high water mark, and `V'`'s creating transaction
-  completed before `T_f` started, so it cannot be in `T_f`'s in_flight set).
-- `T_f` does not need `V`.
+```
+c < V'.commit_seq <= safe_gc_seq
+```
 
-Therefore, `V` is safe to reclaim. QED.
+That is: `V'` is at least as new as the newest version that the oldest active
+snapshot could ever see.
+
+For any active transaction `T_a`, since `V'.commit_seq <= safe_gc_seq <= T_a.snapshot.high`,
+`visible(V', T_a.snapshot)` is true (§5.3). Because the version chain is ordered
+by descending `commit_seq` (INV-3), `resolve(P, T_a.snapshot)` returns `V'` or a
+newer version, never `V`. Thus no active transaction can need `V`.
+
+For any future transaction `T_f`, `T_f.snapshot.high >= latest_commit_seq >= safe_gc_seq`,
+so the same argument applies: `V'` is visible and dominates `V` in the chain.
+
+Therefore, reclaiming `V` cannot affect the result of `resolve(P, S)` for any
+active or future snapshot.
+
+QED.
 
 ---
 
@@ -4323,14 +4246,16 @@ Therefore, `V` is safe to reclaim. QED.
 transaction duration `D` and commit rate `R` (commits per second), the
 maximum number of retained versions per page is bounded by `R * D + 1`.
 
-**Proof:** The GC horizon is `min(active txn_ids)`. Under steady state, the
-oldest active transaction started at most `D` seconds ago. In those `D`
-seconds, at most `R * D` transactions committed. Each committed transaction
-can create at most one version per page. The version chain for any page
-therefore contains at most `R * D` versions above the GC horizon, plus one
-version at or below the horizon (the one visible to the oldest transaction).
-All versions below this are reclaimable by GC Safety (Theorem 4) and will
-be collected by the next GC sweep. Total retained versions per page:
+**Proof:** Define `safe_gc_seq = min(active snapshot.high)` (Theorem 4).
+Under steady state, the oldest active transaction began at most `D` seconds
+ago, so `safe_gc_seq` lags the head of the commit clock by at most `R * D`
+commits (in `D` seconds, at most `R * D` commits can occur).
+
+Each committed transaction can create at most one version per page. Therefore
+the version chain for any page contains at most `R * D` versions with
+`commit_seq > safe_gc_seq`, plus one version at or below the horizon (the
+newest version visible to the oldest active snapshot). All older versions are
+reclaimable by GC Safety (Theorem 4). Total retained versions per page:
 `R * D + 1`. QED.
 
 **Practical implication:** With `D = 5s` (max transaction duration) and
@@ -4344,15 +4269,16 @@ transaction, so actual memory usage is much lower.
 finite time, assuming:
 (a) The application eventually calls COMMIT or ROLLBACK for every transaction.
 (b) The write coordinator processes requests in finite time.
-(c) WAL I/O completes in finite time.
+(c) Durable commit I/O completes in finite time (WAL I/O in Compatibility mode;
+    symbol-log + marker I/O in Native mode).
 
 **Proof:** We show that every transaction makes progress through its lifecycle
 without unbounded blocking.
 
-**Begin:** `fetch_add` on an `AtomicU64` completes in O(1). `capture_snapshot`
-acquires a read lock on `active_transactions` (finite, by assumption that no
-holder holds it forever). For Serialized mode, `global_write_mutex.lock()` may
-wait, but only for the duration of another Serialized transaction, which by
+**Begin:** `fetch_add` on an `AtomicU64` completes in O(1). Snapshot capture is
+O(1): it reads the current `commit_seq` and `schema_epoch` and stores them in
+the immutable `Snapshot` (INV-5). For Serialized mode, `global_write_mutex.lock()`
+may wait, but only for the duration of another Serialized transaction, which by
 inductive hypothesis completes in finite time.
 
 **Read:** `resolve()` walks the version chain, which has bounded length
@@ -4362,13 +4288,17 @@ time is bounded.
 **Write:** `try_acquire` is non-blocking (returns immediately with `Ok` or
 `Err`). Copy-on-write is O(page_size). Total time is bounded.
 
-**Commit (Concurrent mode):** Commit validation scans the commit log
-(bounded by `R * D` entries). WAL append completes in finite time (assumption c).
-Version publishing is O(write_set_size). Lock release is O(page_locks_size).
-Total time is bounded.
+**Commit (Concurrent mode):** Commit-time checks are bounded:
+- SSI witness-plane candidate discovery is O(#buckets + #candidates) (hot index
+  lookups + optional refinement; §5.7).
+- First-committer-wins checks consult `CommitIndex` in O(write_set_size).
+Durability completes in finite time (assumption c) and the sequencer publishes
+the atomic commit marker/record. Lock release is O(page_locks_size). Total time
+is bounded.
 
-**Commit (Serialized mode):** No validation needed. WAL append and version
-publishing same as above. Mutex release is O(1). Total time is bounded.
+**Commit (Serialized mode):** No SSI/FCW validation is needed (serialization
+prevents concurrent writers). Durability and publication are the same atomic
+marker/record append as above. Mutex release is O(1). Total time is bounded.
 
 **Abort:** Discard write set O(write_set_size), release locks O(page_locks_size).
 Total time is bounded.
@@ -5361,78 +5291,48 @@ transaction's write set was also modified by a transaction that committed
 after the snapshot was taken.
 
 ```
-validate_commit(T, commit_log) -> Result<()>:
-    // Determine which commits happened "after" our snapshot.
-    // A commit is "after" our snapshot if:
-    //   (a) its txn_id > our snapshot.high_water_mark, OR
-    //   (b) its txn_id was in our snapshot.in_flight (it was active when
-    //       we started but has since committed)
+validate_commit(T, commit_index) -> Result<()>:
+    // A commit is "after" our snapshot iff it has commit_seq > snapshot.high.
     //
-    // We must check both categories.
-
-    // Category (a): scan commit_log for entries above our high_water_mark
-    for (committed_txn_id, record) in commit_log.range(T.snapshot.hwm + 1 ..):
-        if pages_overlap(T.write_set.keys(), &record.pages):
-            let conflicting_page = find_overlap(T.write_set.keys(), &record.pages);
-            // Attempt algebraic merge
-            if algebraic_merge_possible(T, committed_txn_id, conflicting_page):
-                perform_merge(T, committed_txn_id, conflicting_page);
+    // Therefore FCW reduces to: for every page we wrote, ensure the latest
+    // committed writer of that page is not newer than our snapshot.
+    for pgno in T.write_set.keys():
+        if commit_index.latest_commit_seq(pgno) > T.snapshot.high:
+            // Attempt deterministic merge/rebase (Section 5.10).
+            if algebraic_merge_possible(T, pgno):
+                perform_merge(T, pgno)
             else:
-                return Err(SERIALIZATION_FAILURE)
-
-    // Category (b): check in_flight transactions that have since committed
-    for in_flight_txn_id in T.snapshot.in_flight:
-        if let Some(record) = commit_log.get(in_flight_txn_id):
-            // This transaction was active when we started but has since committed
-            if pages_overlap(T.write_set.keys(), &record.pages):
-                let conflicting_page = find_overlap(T.write_set.keys(), &record.pages);
-                if algebraic_merge_possible(T, in_flight_txn_id, conflicting_page):
-                    perform_merge(T, in_flight_txn_id, conflicting_page);
-                else:
-                    return Err(SERIALIZATION_FAILURE)
+                return Err(SQLITE_BUSY_SNAPSHOT)  // retryable conflict
 
     Ok(())  // no conflicts, commit proceeds
 ```
 
 **Interaction between Serialized and Concurrent mode transactions:**
 
-When a Serialized-mode transaction is active (holding the global write mutex),
-Concurrent-mode transactions can still:
-- **Begin:** Capturing a snapshot does not require the write mutex.
-- **Read:** Reads never require locks and proceed normally.
-- **Write (to their own write set):** Page lock acquisition proceeds normally.
-  The global write mutex does not interact with page locks.
-- **Commit:** Here is the interaction point. The commit pathway requires
-  sending a `CommitRequest` to the write coordinator and appending to the WAL.
-  The write coordinator processes requests sequentially. If the Serialized
-  transaction is currently in its commit phase (holding the coordinator's
-  attention), the Concurrent transaction's commit request waits in the MPSC
-  channel until the Serialized transaction's commit completes.
+Serialized mode exists for strict SQLite behavioral compatibility: it MUST
+provide single-writer semantics. Therefore, a Serialized-mode writer is
+exclusive with respect to Concurrent-mode writers.
 
-Conversely, when a Serialized-mode transaction attempts to begin while
-Concurrent-mode transactions hold page locks:
-- The Serialized transaction acquires the global write mutex (preventing other
-  Serialized transactions).
-- It does NOT wait for Concurrent transactions to release their page locks.
-- Instead, it proceeds with its own writes. Since Serialized mode does not
-  use page locks (it relies on the global mutex for exclusion against other
-  Serialized transactions), there is no direct conflict with Concurrent
-  transactions' page locks.
-- At commit time, both the Serialized and Concurrent transactions go through
-  the write coordinator. The coordinator serializes their WAL appends,
-  maintaining a consistent WAL.
+**Normative rules:**
 
-**What happens when a Serialized transaction and a Concurrent transaction
-write the same page:**
+- While a Serialized-mode transaction is Active (holding the global write mutex):
+  - Concurrent transactions MAY `BEGIN` and may read normally.
+  - Any Concurrent-mode attempt to acquire a page write lock MUST fail with
+    `SQLITE_BUSY` (or wait under the configured busy-timeout), because allowing
+    concurrent writers would violate the SQLite single-writer contract.
+- While any Concurrent-mode writer is Active (holds any page locks):
+  - `BEGIN` in Serialized mode MUST fail with `SQLITE_BUSY` (or wait under
+    busy-timeout). It MUST NOT proceed to write without excluding Concurrent
+    writers.
 
-The Serialized transaction does not acquire page locks, so no `SQLITE_BUSY`
-occurs during the write phase. The conflict is detected at Concurrent
-transaction's commit time via the first-committer-wins validation. If the
-Serialized transaction committed first, the Concurrent transaction sees the
-conflict and aborts. If the Concurrent transaction committed first, the
-Serialized transaction (which does not perform validation since it holds the
-global mutex) simply overwrites the page -- its version has a higher TxnId
-and will be visible to future snapshots that see both commits.
+**Implementation hook (cross-process):** The shared-memory coordination region
+maintains a single `serialized_writer` indicator (token + lease) that is set at
+`BEGIN SERIALIZED` and cleared at commit/abort. Concurrent-mode write paths must
+check this indicator before acquiring page locks.
+
+This design avoids a correctness pitfall where a Serialized writer could modify
+pages without participating in page-level exclusion, which would undermine
+First-Committer-Wins and make conflict behavior timing-dependent.
 
 ### 5.9 Write Coordinator Detail
 
@@ -6084,26 +5984,26 @@ REQUEST(cache, key: CacheKey) -> Result<Arc<CachedPage>>:
 only 12 bytes per entry (CacheKey), so maintaining them at `capacity` entries
 each has negligible memory overhead compared to the page data.
 
-### 6.5 MVCC Adaptation: (PageNumber, TxnId) Keying with Ghost Lists
+### 6.5 MVCC Adaptation: (PageNumber, CommitSeq) Keying with Ghost Lists
 
-**Ghost list semantics change.** When a ghost entry `(pgno, old_txn_id)` is
-in B1 and a request arrives for `(pgno, new_txn_id)`, this is NOT a ghost
+**Ghost list semantics change.** When a ghost entry `(pgno, old_commit_seq)` is
+in B1 and a request arrives for `(pgno, new_commit_seq)`, this is NOT a ghost
 hit -- it is a different version. Ghost hits only occur on exact
-`(pgno, txn_id)` match. This is correct because different versions have
+`(pgno, commit_seq)` match. This is correct because different versions have
 genuinely different access patterns.
 
 **Version coalescing in ghost lists.** Ghost lists may accumulate many entries
-for the same page number with different TxnId values. To bound ghost list size,
+for the same page number with different commit sequence values. To bound ghost list size,
 when the GC horizon advances, prune ghost entries whose version_id is below the
 new horizon:
 
 ```
-prune_ghosts(cache, gc_horizon: TxnId):
+prune_ghosts(cache, gc_horizon: CommitSeq):
   B1.retain(|k| k.version_id >= gc_horizon)
   B2.retain(|k| k.version_id >= gc_horizon)
 ```
 
-**Capacity accounting.** Each `(pgno, txn_id)` pair counts as one entry. A
+**Capacity accounting.** Each `(pgno, commit_seq)` pair counts as one entry. A
 heavily-versioned page consumes multiple cache slots. Under high write
 contention, the effective number of distinct pages cached decreases. This is
 correct: the cache prioritizes versions actively needed over breadth.
@@ -6172,64 +6072,24 @@ coalesce_versions(cache, pgno, gc_horizon):
           re_insert(key, page)  // pinned; try again later
 ```
 
-### 6.8 Bloom Filter Integration for Snapshot Visibility
+### 6.8 Snapshot Visibility (CommitSeq, O(1))
 
-Each `Snapshot` includes a Bloom filter over its `in_flight` set for O(1)
-amortized visibility checks during version chain traversal.
+FrankenSQLite uses commit-seq snapshots (§5): `Snapshot.high` is the latest
+committed `CommitSeq` visible to the transaction. Therefore version visibility
+checks during version-chain traversal are O(1) and do not require an `in_flight`
+set or Bloom filter.
 
-**Parameters:**
-
-```
-Given n = |in_flight|, target false positive rate epsilon = 0.01:
-    m = ceil(-n * ln(0.01) / (ln(2))^2) bits
-    k = round((m / n) * ln(2)) hash functions
-
-Concrete:
-    n=10:   m=96 bits (12 bytes),     k=7
-    n=50:   m=479 bits (60 bytes),    k=7
-    n=100:  m=959 bits (120 bytes),   k=7
-    n=500:  m=4793 bits (600 bytes),  k=7
-    n=1000: m=9586 bits (~1.2 KB),    k=7
-```
-
-**Hash function:** Kirsch-Mitzenmacher double hashing with XXH3:
-```
-h_i(x) = (xxh3_64(x, seed=0) + i * xxh3_64(x, seed=1)) mod m
-```
-
-**Skip threshold:** If `in_flight.len() < 8`, use direct binary search on the
-sorted `in_flight` vector instead of the Bloom filter. **Cost crossover
-derivation:** Binary search on n elements costs `ceil(log2(n))` comparisons
-at ~3ns each (branch-predicted). The Bloom filter with k=7 hash functions
-costs `7 * t_hash` where `t_hash ≈ 2ns` for XXH3 on a u64 = 14ns, plus ~7ns
-for 7 cache-line probes (assuming the filter fits in L1). Total Bloom cost:
-~21ns. Binary search cost at n=8: `3 * 3ns = 9ns`. Crossover occurs at
-`ceil(log2(n)) * 3ns = 21ns` → `n ≈ 2^7 = 128`. The threshold of 8 is
-conservative (favoring binary search well below the theoretical crossover)
-because: (a) binary search on SmallVec is branch-predictor-friendly for small
-n, (b) it avoids the Bloom filter's false positive cost (an unnecessary
-confirmation lookup), and (c) in_flight sets of size <= 8 represent low
-concurrency where every nanosecond on the visibility path matters less.
-The threshold is not performance-critical and need not be tuned.
-
-**Visibility fast path:**
+**Visibility fast path (committed versions only):**
 
 ```rust
-fn is_visible(&self, version_id: TxnId, snapshot: &Snapshot) -> bool {
-    if version_id > snapshot.high_water_mark {
-        return false;
-    }
-    let maybe_in_flight = if snapshot.in_flight.len() < 8 {
-        snapshot.in_flight.binary_search(&version_id).is_ok()
-    } else if snapshot.bloom.might_contain(version_id) {
-        // Bloom positive (could be false positive); do exact check
-        snapshot.in_flight.binary_search(&version_id).is_ok()
-    } else {
-        false  // Bloom negative: definitely not in-flight
-    };
-    !maybe_in_flight && self.commit_log.is_committed(version_id)
+fn is_visible(version_commit_seq: CommitSeq, snapshot: &Snapshot) -> bool {
+    version_commit_seq != 0 && version_commit_seq <= snapshot.high
 }
 ```
+
+Uncommitted/private versions (`commit_seq = 0`) are never visible through MVCC
+resolution; they are visible only via the owning transaction's private
+`write_set` (self-visibility).
 
 ### 6.9 Memory Accounting (System-Wide, No Surprise OOM)
 
@@ -7098,7 +6958,7 @@ pub use fsqlite_vfs::{Vfs, VfsFile, MemoryVfs};
 ```
 
 Adds convenience methods: `Connection::open()`, `Connection::open_in_memory()`,
-`Connection::execute()`, `Connection::query_row()`.
+`Connection::execute(cx, sql).await`, `Connection::query_row(cx, sql).await`.
 
 **`fsqlite-cli`** (~2,000 LOC estimated)
 Interactive shell using frankentui. Dot-commands (.tables, .schema, .mode, .import,
@@ -7222,6 +7082,30 @@ first parameter. This enables:
 The `Cx` parameter appears in VFS, MvccPager, and any async-capable method.
 Pure computation (e.g., `CollationFunction::compare`, `ScalarFunction::call`
 for CPU-only work) does not take `Cx`. When in doubt, include `Cx`.
+
+**Sealed trait discipline (internal invariants):**
+
+Some traits are *implementation-internal* interfaces that encode MVCC safety
+invariants and layering constraints. These traits MUST be **sealed** so
+downstream crates cannot provide alternate implementations that violate
+invariants or bypass required checks.
+
+- **Open extension points (user-implementable):** `Vfs`, `VfsFile`,
+  `ScalarFunction`, `AggregateFunction`, `WindowFunction`, `VirtualTable`,
+  `VirtualTableCursor`, `CollationFunction`, `Authorizer`.
+- **Internal-only (sealed):** `MvccPager`, `BtreeCursorOps` (and any similar
+  trait whose implementations must preserve engine invariants).
+
+**Sealing pattern (Rust):**
+```rust
+mod sealed { pub trait Sealed {} } // private to the defining crate
+
+pub trait MvccPager: sealed::Sealed + Send + Sync { /* ... */ }
+```
+
+Because the `sealed` module is private, only the defining crate can implement
+the trait. Test mocks for sealed traits live alongside the trait definition
+(and are exported as values/types for other crates to use in tests).
 
 ### 9.1 Storage Traits
 
@@ -7354,7 +7238,9 @@ pub trait VfsFile: Send + Sync {
 /// # Lifetime Relationships
 /// The MvccPager outlives all Transactions it creates. Transaction holds
 /// a reference (via Arc) to the MvccPager's internal state.
-pub trait MvccPager: Send + Sync {
+mod sealed { pub trait Sealed {} } // private to the defining crate
+
+pub trait MvccPager: sealed::Sealed + Send + Sync {
     /// Begin a new transaction with the specified mode.
     /// Serialized mode acquires the global write mutex immediately.
     /// Concurrent mode does not acquire any locks until write_page().
@@ -7397,7 +7283,7 @@ pub trait MvccPager: Send + Sync {
 /// NOT Send or Sync. A cursor is bound to a single transaction and
 /// should only be used from one thread at a time. The VDBE execution
 /// loop is single-threaded per statement.
-pub trait BtreeCursorOps {
+pub trait BtreeCursorOps: sealed::Sealed {
     /// Position the cursor at or near the given key.
     /// Returns the cursor's final position relative to the key.
     fn move_to(&mut self, key: &[u8]) -> Result<CursorPosition>;
@@ -7711,6 +7597,10 @@ Each trait has a mock implementation for unit testing:
   Used in B-tree tests to isolate from MVCC.
 - `MockBtreeCursor`: Returns pre-configured rows. Used in VDBE tests.
 - `MockScalarFunction`: Returns a fixed value. Used in codegen tests.
+
+For sealed internal traits (e.g., `MvccPager`), mocks MUST live in the defining
+crate (the one that defines the private `sealed` supertrait). Other crates use
+the exported mock types/values rather than implementing the trait themselves.
 
 ---
 
@@ -9326,6 +9216,10 @@ Each extension resides in its own crate under `crates/fsqlite-ext-*` and is
 independently feature-gated. Extensions are compiled in (not dynamically
 loaded), controlled by Cargo features on the `fsqlite` facade crate.
 
+This is intentional: extensions carry different optional dependency sets
+(sometimes heavy), and separate crates improve dependency isolation and
+incremental builds (changing JSON should not force rebuilding FTS5, ICU, etc.).
+
 ### 14.1 JSON1 (`fsqlite-ext-json`)
 
 JSON1 provides comprehensive JSON manipulation within SQL. SQLite 3.45+
@@ -10127,10 +10021,10 @@ raptorq integration: 2,000).
 
 **Deliverables:**
 - `crates/fsqlite-mvcc/src/txn.rs`: Transaction type with TxnId, Snapshot,
-  write_set, read_set, intent_log, page_locks, mode (Serialized/Concurrent),
-  SSI state (has_in_rw, has_out_rw, rw_in_from, rw_out_to)
-- `crates/fsqlite-mvcc/src/snapshot.rs`: Snapshot capture, Roaring Bitmap
-  for in_flight set (replacing Bloom filter), visibility predicate
+  TxnEpoch, write_set, intent_log, page_locks, mode (Serialized/Concurrent),
+  witness-key sets (read_keys/write_keys), SSI state (has_in_rw/has_out_rw)
+- `crates/fsqlite-mvcc/src/snapshot.rs`: Snapshot capture (`high = commit_seq at BEGIN`,
+  `schema_epoch` at BEGIN), visibility predicate (`commit_seq <= snapshot.high`)
 - `crates/fsqlite-mvcc/src/version_chain.rs`: Page version chains, GF(256)
   delta encoding via RaptorQ (Section 3.4.4)
 - `crates/fsqlite-mvcc/src/lock_table.rs`: Sharded PageLockTable (64 shards)
@@ -10150,7 +10044,7 @@ raptorq integration: 2,000).
   bucket epoch advance (§5.6.4.8), memory bound enforcement
 - `crates/fsqlite-mvcc/src/coordinator.rs`: Write coordinator using
   asupersync two-phase MPSC channel, commit serialization for WAL append
-- `crates/fsqlite-mvcc/src/arc_cache.rs`: ARC cache with (PageNumber, TxnId)
+- `crates/fsqlite-mvcc/src/arc_cache.rs`: ARC cache with (PageNumber, CommitSeq)
   keys, eviction constraints (pinned, dirty, superseded)
 - `crates/fsqlite-pager/src/mvcc_pager.rs`: MvccPager trait implementation
   bridging B-tree layer to MVCC layer, Cx threading
