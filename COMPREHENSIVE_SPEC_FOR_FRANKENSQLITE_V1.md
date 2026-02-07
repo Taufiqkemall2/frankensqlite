@@ -2069,22 +2069,118 @@ redundantly store:
 - a digest binding it to the target `foo.db` generation (so stale sidecars are
   detected and ignored)
 
+**`foo.db-fec` header record (required):**
+
+The `.db-fec` header is a small fixed-size record at offset 0.
+
+```
+DbFecHeader := {
+    magic                 : [u8; 8],   // "FSQLDFEC"
+    version               : u32,       // 1
+    page_size             : u32,
+    default_group_size    : u32,       // G (e.g., 64)
+    default_r_repair      : u32,       // R (e.g., 4)
+    header_page_r_repair  : u32,       // special-case repair count for page 1 (e.g., 4)
+    db_gen_digest         : [u8; 16],  // best-effort stale-sidecar guard (see above)
+    checksum              : u64,       // xxh3_64 of all preceding fields
+}
+```
+
+The group lookup function `find_page_group_from_db_fec(pgno)` MUST be computed
+from `DbFecHeader` and MUST NOT depend on page 1 bytes.
+
+**Critical correctness hazard (mutable pages; normative):**
+
+Erasure repair symbols for a group are a function of **all** source pages in the
+group. Therefore, changing *any* source page in a group invalidates the group's
+repair symbols.
+
+This creates a dependency-update problem in Compatibility mode because the
+SQLite `.db` file is **mutable** (pages are overwritten during checkpointing).
+If `.db-fec` were updated by concurrent transactions on disjoint pages, it would
+introduce both:
+- catastrophic write amplification (read/encode/write the whole group per page),
+  and/or
+- race conditions (multiple writers updating the same group's repair symbols).
+
+**V1 design rule (required):** In Compatibility mode, `.db-fec` is maintained
+ONLY by the **checkpoint subsystem** (single logical writer), never by
+transaction writers. Writers append to `.wal`; checkpoint copies pages into
+`.db` and is the only component allowed to mutate `.db` and `.db-fec`.
+
+**Repair writeback discipline (required):** Even though repair may be triggered
+by a read path, the act of writing repaired bytes back to `foo.db` MUST be
+performed by the checkpoint subsystem under the same mutual exclusion used for
+checkpoint writes. This prevents `.db` mutation from occurring concurrently
+with checkpointing and avoids introducing a second `.db` writer.
+
+**WAL truncation safety rule (required):**
+
+`.db-fec` exists to protect pages whose newest committed version is no longer
+present in the WAL after a checkpoint. Therefore:
+
+- For `RESTART` / `TRUNCATE` checkpoints (those that discard WAL history),
+  the checkpointer MUST NOT discard/truncate/restart the WAL unless it has first
+  updated and `fsync`'d `.db-fec` repair symbols for every page group that
+  contains at least one page whose newest committed version would otherwise be
+  lost from the WAL.
+- If `.db-fec` update is disabled (PRAGMA) or fails, the checkpointer MUST
+  degrade the checkpoint to a mode that does **not** discard WAL history (e.g.
+  `FULL`) until `.db-fec` catch-up succeeds, OR refuse the requested checkpoint
+  mode with a clear error.
+
+This ordering prevents the "stale parity" failure mode where `.db` is updated
+but `.db-fec` is not, and later a bitrot event causes the system to "repair" a
+page to an older logical state.
+
+**Independent validation (required):**
+
+As with `.wal-fec` (§3.4.1), `.db-fec` MUST store independent per-source hashes
+for the page bytes it protects so that:
+- surviving source pages can be validated before being fed into a decoder, and
+- recovered pages can be validated against an expected digest.
+
+**Source-of-truth precedence (Compatibility mode; normative):**
+
+If corruption is detected for a page `P`, the engine MUST prefer repairing from
+the newest committed source:
+
+1. **WAL first:** If `P` has a committed frame in the WAL that is visible at the
+   current snapshot (WAL index lookup), repair that frame via `.wal-fec`
+   (§3.4.1) if needed and treat the WAL result as authoritative.
+2. **DB second:** Only if no suitable committed WAL frame exists for `P` (i.e.,
+   the `.db` image is the newest committed version) MAY the engine attempt
+   `.db-fec` repair as specified below.
+
+This rule prevents a "successful repair" from returning an older page image
+when a newer committed version exists in WAL state.
+
 **Read Path with On-the-Fly Repair**
 
 The read path is modified to detect and repair corrupted pages transparently:
+
+**`verify_page_integrity` (normative behavior):**
+- If page encryption is enabled (§15), integrity is verified via the page AEAD
+  tag (Poly1305) with required AAD (swap resistance).
+- Else if `PRAGMA page_checksum = ON` (§7.4), integrity is verified via the
+  page's reserved-space XXH3-128 checksum.
+- Else, Compatibility mode MAY only detect corruption via structural checks
+  (B-tree invariants) or explicit `PRAGMA integrity_check`. In this case,
+  on-the-fly repair triggers are best-effort because "bitflips that preserve
+  structure" may not be detected.
 
 ```
 read_page_with_repair(pgno: PageNumber) -> Result<PageData>:
     // Step 1: Read the page directly (fast path, no overhead)
     page = read_raw_page(pgno)
-    checksum = compute_xxhash3(page)
 
-    if checksum == stored_checksum(pgno):
+    if verify_page_integrity(pgno, page):
         return Ok(page)    // Page is intact, zero overhead
 
     // Step 2: Page is corrupted. Attempt on-the-fly repair.
     // The group lookup uses `.db-fec` geometry and MUST NOT depend on page 1.
     group = find_page_group_from_db_fec(pgno)
+    meta = read_db_fec_group_meta(group)
 
     // Read all pages in the group + repair symbols
     available_symbols = []
@@ -2092,32 +2188,93 @@ read_page_with_repair(pgno: PageNumber) -> Result<PageData>:
         if pg == pgno:
             continue    // Skip the corrupted page
         page_data = read_raw_page(pg)
-        if verify_checksum(pg, page_data):
+        // Validate sources independently of page-embedded checksums (like WAL-FEC).
+        // This also detects stale `.db-fec` metadata for the group.
+        if xxh3_128(page_data) == meta.source_page_xxh3_128[pg - group.start]:
             available_symbols.append((pg - group.start, page_data))    // ISI = offset within group
 
     // Read repair symbols for this group
     for r in 0..group.repair:
         repair_data = read_repair_symbol_from_db_fec(group, r)
-        if verify_checksum_repair(group, r, repair_data):
-            available_symbols.append((group.size + r, repair_data))    // ISI = G + r
+        if verify_symbol_record_envelope(repair_data):
+            available_symbols.append((group.size + r, repair_data.symbol_data))    // ISI = K + r
 
     if available_symbols.len() >= group.size:
         // Enough symbols to decode
-        decoder = RaptorQDecoder::new(group.size, page_size)
+        decoder = RaptorQDecoder::new(meta.oti)
         for (isi, data) in available_symbols:
             decoder.add_symbol(isi, data)
         recovered = decoder.decode()?
         // Extract the corrupted page from recovered data
         repaired_page = recovered[pgno - group.start]
 
+        // Validate recovered bytes against the expected digest for this group snapshot.
+        // If this fails, treat as unrecoverable rather than "repairing" to the wrong bytes.
+        if xxh3_128(repaired_page) != meta.source_page_xxh3_128[pgno - group.start]:
+            return Err(SQLITE_CORRUPT)
+
         // Write back the repaired page (self-healing) using the normal durability path.
-        write_raw_page(pgno, repaired_page)
-        update_checksum(pgno, compute_xxhash3(repaired_page))
+        // Note: Do NOT "update checksums to match the recovered bytes". The recovered page
+        // already includes the correct reserved-space checksum/tag bytes for this snapshot.
+        enqueue_checkpoint_repair_writeback(pgno, repaired_page)
 
         return Ok(repaired_page)
     else:
         return Err(SQLITE_CORRUPT)    // Unrecoverable: too many corrupted pages in group
 ```
+
+**`foo.db-fec` group metadata (required):**
+
+Each group is represented by:
+
+1. A `DbFecGroupMeta` record describing the group and carrying independent
+   per-source validation digests, followed by
+2. `R` repair `SymbolRecord`s (Section 3.5.2) for ESIs `K..K+R-1`.
+
+This mirrors the `.wal-fec` structure (§3.4.1) but with sources taken from the
+`.db` file instead of `.wal` frames.
+
+```
+DbFecGroupMeta := {
+    magic          : [u8; 8],    // "FSQLDGRP"
+    version        : u32,        // 1
+    page_size      : u32,
+    start_pgno     : u32,
+    group_size     : u32,        // K (source pages)
+    r_repair       : u32,        // R
+    oti            : OTI,        // decoding params (symbol size, block partitioning)
+
+    // Independent per-source validation (required for safe repair):
+    // xxh3_128 of each source page's on-disk bytes for this group snapshot.
+    // ISI i corresponds to page number (start_pgno + i).
+    source_page_xxh3_128: Vec<[u8; 16]>,  // length = K
+
+    // Bind to the target database generation (best-effort; see above hazard notes).
+    // This is NOT used as a security mechanism; it is a stale-sidecar guard.
+    db_gen_digest  : [u8; 16],   // Trunc128(BLAKE3("fsqlite:compat:dbgen:v1" || ...))
+    checksum       : u64,        // xxh3_64 of all preceding fields
+}
+```
+
+**DbFecGroupMeta invariants (normative):**
+- `source_page_xxh3_128.len() == group_size`
+- `page_size` MUST match the associated `.db`'s page size.
+- Readers MUST ignore any `DbFecGroupMeta` whose `db_gen_digest` does not match
+  the current `DbFecHeader.db_gen_digest` (stale/foreign sidecar guard).
+
+**Write path / checkpoint integration (normative):**
+
+- `.db-fec` generation MUST NOT occur in the transaction commit critical path.
+- When checkpointing pages from WAL into `.db`, the checkpointer MUST ensure
+  `.db-fec` is updated for the affected page groups before it performs any WAL
+  operation that would discard the newest committed version of those pages
+  (`RESTART` / `TRUNCATE`), per the WAL truncation safety rule above.
+- The checkpointer MAY compute group repair symbols by:
+  - full recomputation: read the K source pages for the group and re-encode, or
+  - incremental update: apply deltas to existing repair symbols using the
+    code's linearity (advanced; optional).
+  In either case, the resulting `DbFecGroupMeta` + repair symbols MUST match
+  the exact `.db` bytes that are durable after the checkpoint.
 
 **Interaction with B-tree Page Types**
 
@@ -15252,13 +15409,23 @@ the row-store B-tree:
 
 ### 21.9 Erasure-Coded Page Storage (Implementation Notes)
 
-Section 3.4.6 fully specifies erasure-coded page storage. Implementation notes:
+Section 3.4.6 specifies erasure-coded page storage and the required correctness
+constraints for Compatibility mode mutability. Implementation notes:
 - Modified page allocation: allocate G pages as a group
 - Repair page storage: in the ECS object store (Native mode) or in a
   `foo.db-fec` sidecar file (Compatibility mode)
 - Read path: attempt source page first, fall back to erasure recovery
 - Group size selection: benchmark G=32, G=64, G=128 to find the optimal
   balance of space overhead vs recovery capability per workload
+
+Additional notes:
+- **Checkpoint-only writer:** In Compatibility mode, `.db-fec` is maintained only
+  by checkpoint (never by transaction writers) to avoid group-level write
+  contention and repair-symbol races.
+- **WAL truncation ordering:** `RESTART/TRUNCATE` checkpoints must not discard
+  WAL history unless `.db-fec` has been updated and `fsync`'d for affected page
+  groups (Section 3.4.6). If `.db-fec` is behind, degrade to a non-truncating
+  checkpoint mode.
 
 ### 21.10 Time Travel Queries and Tiered Symbol Storage (Implementation Notes)
 
