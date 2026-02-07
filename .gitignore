@@ -53,3 +53,6 @@ fuzz/artifacts/
 
 # bv (beads viewer) local config and caches
 .bv/
+
+# Spec evolution visualization artifacts (generated)
+visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html

@@ -236,10 +236,10 @@ patterns. The following constraints are non-negotiable for hot-path code:
   SQLite), little-endian for FrankenSQLite-native ECS structures (matching
   x86/ARM native order for zero-cost decode).
 
-- **Cache-line awareness.** The MVCC `PageLockTable` shards (Section 5.8)
-  and hot-plane witness index buckets (Section 5.6.4.5) MUST be padded to
-  64-byte cache-line boundaries to prevent false sharing between concurrent
-  writers.
+- **Cache-line awareness.** Hot shared-memory coordination structures
+  (`TxnSlot`, §5.6.2; `SharedPageLockTable`, §5.6.3) and hot-plane witness index
+  buckets (§5.6.4.5) MUST be designed to avoid false sharing (cache-line
+  alignment/padding where appropriate).
 
 - **Bounded parallelism.** Any internal parallelism (prefetch tasks, background
   compaction, replication, integrity sweeps, encode/decode helpers) MUST be
@@ -3958,11 +3958,12 @@ struct ActiveTxnInfo {
 }
 
 fn observe_lock_exclusivity(
-    lock_table: &PageLockTable,
+    lock_table: &InProcessPageLockTable,
     active_transactions: &HashMap<TxnId, ActiveTxnInfo>,
 ) -> bool {
-    // The lock table maps PageNumber -> TxnId.
-    // By construction, HashMap allows only one value per key.
+    // The in-process lock table maps PageNumber -> TxnId.
+    // (For shared-memory `SharedPageLockTable`, the analogous check scans the
+    // fixed-capacity entries array; §5.6.3.)
     // But we additionally verify against the per-transaction lock sets:
     let mut page_holders: HashMap<PageNumber, Vec<TxnId>> = HashMap::new();
     for (txn_id, txn) in active_transactions {
@@ -5386,17 +5387,32 @@ PageVersion := {
 
 ARENA_CHUNK := 4096  -- power-of-two recommended (fast div/mod; cache-friendly)
 
-VersionArena := {
-    chunks    : Vec<Vec<PageVersion>>, -- each chunk reserves ARENA_CHUNK and never grows beyond it
-    free_list : Vec<VersionIdx>,       -- recycled slots from GC
-    high_water: VersionIdx,            -- bump pointer for new allocations
-}
+	VersionArena := {
+	    chunks    : Vec<Vec<PageVersion>>, -- each chunk reserves ARENA_CHUNK and never grows beyond it
+	    free_list : Vec<VersionIdx>,       -- recycled slots from GC
+	    high_water: VersionIdx,            -- bump pointer for new allocations
+	}
 
-PageLockTable := ShardedHashMap<PageNumber, TxnId>  -- exclusive write locks
-    -- Sharded by PageNumber hash into N shards (N = 64 default).
-    -- Each shard is a parking_lot::Mutex<HashMap<PageNumber, TxnId>>.
-    -- Shard count is a power of two for fast modular arithmetic (pgno & (N-1)).
-    --
+	-- MULTI-PROCESS NOTE (normative): `VersionArena` and the in-memory page
+	-- version chains are **per-process caches**. They are not shared across OS
+	-- processes. Cross-process snapshot isolation is preserved because the
+	-- committed page bytes and their publication order are durable:
+	-- - Compatibility mode: WAL frames + WAL index (§11).
+	-- - Native mode: CommitCapsules/CommitProofs + marker stream (§7.11, §3.5.4.1).
+	-- Therefore `resolve(pgno, snapshot)` MUST be able to materialize the newest
+	-- committed version with `commit_seq <= snapshot.high` by consulting the
+	-- durable store, even if the version was created by another process.
+
+	PageLockTable := (SharedPageLockTable in shm; §5.6.3)  -- exclusive page write locks (Concurrent mode)
+	    -- Cross-process correctness requires a shared-memory lock table. The
+	    -- shared-memory `SharedPageLockTable` (§5.6.3) is the single source of
+	    -- truth when more than one process may attach to the same database.
+
+	InProcessPageLockTable := ShardedHashMap<PageNumber, TxnId>  -- exclusive write locks (single-process only)
+	    -- Sharded by PageNumber hash into N shards (N = 64 default).
+	    -- Each shard is a parking_lot::Mutex<HashMap<PageNumber, TxnId>>.
+	    -- Shard count is a power of two for fast modular arithmetic (pgno & (N-1)).
+	    --
     -- CONTENTION MODEL (Alien-Artifact Discipline):
     -- With W concurrent writers and S shards, the probability that at least
     -- two writers contend on the same shard follows the birthday problem:
@@ -5531,11 +5547,14 @@ Formal: forall P : forall T1, T2 :
     => NOT (P in T1.page_locks AND P in T2.page_locks)
 ```
 
-*Enforcement:* `PageLockTable::try_acquire(pgno, txn_id)` performs an atomic
-check-and-set under a mutex. If `pgno` is already mapped to a different
-`txn_id`, the call returns `Err(SQLITE_BUSY)` without modifying the table.
-The lock is only inserted if the page is unlocked or already held by the
-same transaction (idempotent re-acquire).
+*Enforcement:* In Concurrent mode, `SharedPageLockTable::try_acquire(pgno, txn_id)`
+enforces exclusivity using only atomic operations in shared memory (§5.6.3):
+it installs the key (if missing) and CASes `owner_txn` from 0 -> `txn_id`. If
+`owner_txn != 0` and not equal to `txn_id`, it returns `Err(SQLITE_BUSY)`
+immediately (no blocking/spin). In single-process-only builds, an in-process
+sharded mutex+HashMap table (`InProcessPageLockTable`, §5.1) MAY be used as a
+reference implementation, but it MUST NOT be treated as a substitute for the
+shared-memory lock table in multi-process deployments.
 
 *Violation consequence:* Two transactions simultaneously modifying the same page
 would produce two conflicting `PageVersion` entries. The version chain would
@@ -5686,7 +5705,9 @@ visible(V, S) :=
 
 resolve(P, S) :=
     first V in version_chain(P) where visible(V, S)
-    // Falls back to on-disk baseline if no committed version found
+    // If the in-process chain cache is missing/stale, consult the durable store
+    // (WAL/marker stream) and materialize missing versions into VersionArena.
+    // Falls back to on-disk baseline only if no committed version exists <= S.high.
 
 resolve_for_txn(P, T) -> Option<VersionIdx> :=
     // Returns the VersionArena index of the base version for a write.
@@ -5828,35 +5849,54 @@ commit(manager, T) -> Result<()>:
         abort(T)
         return Err(SQLITE_SCHEMA)
 
-    if T.mode == Concurrent:
-        // Step 1: SSI validation (serializable by default).
-        // Witness-plane candidate discovery + refinement + pivot abort rule lives in §5.7.
-        // This procedure emits `DependencyEdge` / `AbortWitness` / `CommitProof` artifacts in Native mode.
-        ssi_validate_and_publish(T)?  // returns Err(SQLITE_BUSY_SNAPSHOT) if pivot
+    if T.mode == Serialized:
+        // Serialized mode does not rebase/merge. Any FCW conflict is a snapshot
+        // abort (SQLite "reader-turned-writer" semantics).
+        response = write_coordinator.publish(T)
+        match response:
+            Ok(commit_seq) =>
+                T.state = Committed{commit_seq}
+                release_page_locks(T)
+                if T.serialized_write_lock_held:
+                    manager.global_write_mutex.unlock()
+                return Ok(())
 
-    // Merge-Retry Loop (Concurrent mode only):
-    // The Coordinator is the source of truth. If it rejects a Concurrent txn with
-    // Conflict, we MAY retry the merge logic with the authoritative conflict info
-    // it provides.
+            Conflict(_pages, _seq) =>
+                abort(T)
+                return Err(SQLITE_BUSY_SNAPSHOT)
+
+            Aborted(code) =>
+                abort(T)
+                return Err(code)
+
+            IoError(_e) =>
+                abort(T)
+                return Err(SQLITE_IOERR)
+
+    // Concurrent mode
     //
-    // Serialized mode MUST NOT retry: it cannot rebase/merge. A Conflict indicates
-    // a stale-snapshot write (SQLite "reader-turned-writer" semantics) and MUST
-    // abort with SQLITE_BUSY_SNAPSHOT.
+    // Step 1: SSI validation (serializable by default).
+    // Witness-plane candidate discovery + refinement + pivot abort rule lives in §5.7.
+    // This procedure emits `DependencyEdge` / `AbortWitness` / `CommitProof` artifacts in Native mode.
+    ssi_validate_and_publish(T)?  // returns Err(SQLITE_BUSY_SNAPSHOT) if pivot
+
+    // Merge-Retry Loop:
+    // The Coordinator is the source of truth. If it rejects us with Conflict, we
+    // must retry the merge logic with the authoritative conflict info it provides.
     loop:
-        if T.mode == Concurrent:
-            // Step 2: First-committer-wins (FCW) validation + merge policy (§5.10.4).
-            // NOTE: On first pass, this uses local CommitIndex. On retry, it uses
-            // the Conflict info returned by the coordinator.
-            for pgno in T.write_set.keys():
-                if commit_index.latest_commit_seq(pgno) > T.snapshot.high:
-                    // Base drift detected: this would be an abort under strict FCW.
-                    //
-                    // If `PRAGMA fsqlite.write_merge = SAFE`, attempt the strict safety
-                    // ladder in §5.10.4 (deterministic rebase + structured patch merge).
-                    // Raw byte-disjoint XOR merge is forbidden for SQLite structured pages.
-                    if !try_resolve_conflict_via_merge_policy(T, pgno):
-                        abort(T)
-                        return Err(SQLITE_BUSY_SNAPSHOT)  // retryable conflict
+        // Step 2: First-committer-wins (FCW) validation + merge policy (§5.10.4).
+        // NOTE: On first pass, this uses local CommitIndex. On retry, it uses
+        // the Conflict info returned by the coordinator.
+        for pgno in T.write_set.keys():
+            if commit_index.latest_commit_seq(pgno) > T.snapshot.high:
+                // Base drift detected: this would be an abort under strict FCW.
+                //
+                // If `PRAGMA fsqlite.write_merge = SAFE`, attempt the strict safety
+                // ladder in §5.10.4 (deterministic rebase + structured patch merge).
+                // Raw byte-disjoint XOR merge is forbidden for SQLite structured pages.
+                if !try_resolve_conflict_via_merge_policy(T, pgno):
+                    abort(T)
+                    return Err(SQLITE_BUSY_SNAPSHOT)  // retryable conflict
 
         // Step 3: Persist + publish using the selected commit protocol (Section 7).
         // The commit sequencer assigns commit_seq and appends the atomic marker/record.
@@ -5865,18 +5905,11 @@ commit(manager, T) -> Result<()>:
             Ok(commit_seq) =>
                 T.state = Committed{commit_seq}
                 release_page_locks(T)
-                if T.mode == Serialized && T.serialized_write_lock_held:
-                    manager.global_write_mutex.unlock()
                 return Ok(())
 
             Conflict(pages, seq) =>
                 // The coordinator saw a conflict our local index missed (stale cache).
-                //
-                // Concurrent: update local knowledge and retry Step 2 (merge ladder).
-                // Serialized: cannot rebase; treat as a snapshot conflict and abort.
-                if T.mode == Serialized:
-                    abort(T)
-                    return Err(SQLITE_BUSY_SNAPSHOT)
+                // Update local knowledge and RETRY the merge loop.
                 commit_index.update_from_coordinator(pages, seq)
                 continue // Loop back to Step 2 to attempt merge with new info
 
@@ -5884,7 +5917,7 @@ commit(manager, T) -> Result<()>:
                 abort(T)
                 return Err(code)
 
-            IoError(e) =>
+            IoError(_e) =>
                 abort(T)
                 return Err(SQLITE_IOERR)
 ```
@@ -6304,8 +6337,10 @@ operations.
   - **Native mode:** `RootManifest.schema_epoch` (§3.5.5).
   - **Compatibility mode:** the durable schema cookie value (SQLite header field
     at offset 40; §11.1) as resolved at the durable WAL tip (reader algorithm;
-    §11.10). (Schema epoch is a logical monotone; a wrapped or decreasing value
-    indicates corruption or a broken open sequence and MUST fail closed.)
+    §11.10).
+    **Note:** SQLite's schema cookie is a 32-bit counter that increments modulo
+    2^32. Do not assume numeric monotonicity; for merge safety we require only
+    equality (any schema change must produce a different cookie value).
 - On database open (native mode), implementations MUST set `shm.ecs_epoch` from
   `RootManifest.ecs_epoch` so cross-process services share the same epoch-scoped
   remote/key policy configuration (§4.18). Loads/stores MUST use Acquire/Release.
@@ -6342,13 +6377,16 @@ TxnSlot := {
     has_out_rw      : AtomicBool,    -- SSI: has outgoing rw-antidependency
     marked_for_abort: AtomicBool,    -- SSI: eager pivot abort signal (optimization)
     write_set_pages : AtomicU32,     -- count of pages in write set (for GC sizing)
-    claiming_timestamp: AtomicU64,   -- unix timestamp when Phase 1 CAS set TXN_ID_CLAIMING;
-                                   -- used by cleanup to detect stuck CLAIMING slots (§5.6.2).
-                                   -- Written AFTER the successful Phase 1 CAS; zeroed when slot is freed.
-    _padding        : [u8; 48],      -- pad to 128 bytes (two cache lines; prevents false sharing between adjacent slots)
-                                   -- Layout: 80 bytes of fields with repr(C) alignment (2B gap after mode
-                                   -- for witness_epoch align, 1B gap after marked_for_abort for
-                                   -- write_set_pages align) + 48B padding = 128B total.
+    claiming_timestamp: AtomicU64,   -- unix timestamp when `txn_id` entered a sentinel state:
+                                   -- Phase 1 CAS set TXN_ID_CLAIMING, or cleanup CAS set TXN_ID_CLEANING.
+                                   -- Used by cleanup to detect stuck sentinel slots (§5.6.2).
+                                   -- Written AFTER the successful CAS; zeroed when slot is freed.
+	    cleanup_txn_id   : AtomicU64,    -- crash-cleanup: TxnId being cleaned when txn_id==TXN_ID_CLEANING.
+	                                   -- Only meaningful when txn_id==TXN_ID_CLEANING.
+	                                   -- MUST be 0 in all other states; MUST be zeroed when slot is freed.
+	    _padding        : [u8; 40],      -- pad to 128 bytes (two cache lines; prevents false sharing between adjacent slots)
+                                   -- Layout: 88 bytes of fields with repr(C) alignment + 40B padding = 128B total.
+                                   -- Gaps: 2B after mode (witness_epoch align), 1B after marked_for_abort (write_set_pages align).
 }
 ```
 
@@ -6360,7 +6398,7 @@ MUST be rejected (or not compiled), and only Serialized mode is supported.
 
 **Slot lifecycle:**
 1. **Acquire (atomic, TOCTOU-safe):** Process scans TxnSlot array for a slot
-   with `txn_id == 0`. The acquisition is a **two-phase protocol**:
+   with `txn_id == 0`. The acquisition is a **three-phase protocol**:
 
    **Phase 1 (claim):** CAS `txn_id` from 0 to a **sentinel value**
    `TXN_ID_CLAIMING := u64::MAX`. This is an atomic claim that prevents
@@ -6370,7 +6408,9 @@ MUST be rejected (or not compiled), and only Serialized mode is supported.
    **Reserved sentinels (normative):**
    - `TXN_ID_CLAIMING := u64::MAX` means "slot is claimed but not yet published".
    - `TXN_ID_CLEANING := u64::MAX - 1` means "cleanup owns this slot and is
-     resetting fields"; acquisitions MUST treat it as non-free.
+     resetting fields"; acquisitions MUST treat it as non-free. When
+     `txn_id == TXN_ID_CLEANING`, `cleanup_txn_id` records the TxnId being
+     cleaned so crash cleanup is retryable.
    These sentinel values are never valid TxnIds.
 
    **Phase 2 (initialize):** With the slot exclusively claimed (no other
@@ -6386,22 +6426,23 @@ MUST be rejected (or not compiled), and only Serialized mode is supported.
    - set `begin_seq = snap` and `snapshot_high = snap` (from the SAME `snap`),
    - set `mode` (Serialized or Concurrent) for this transaction,
    - clear `commit_seq = 0`, clear SSI flags/counters (`has_in_rw/has_out_rw/marked_for_abort/write_set_pages = 0`),
+   - clear `cleanup_txn_id = 0` (must never leak across slot reuse),
    - set `pid`, `pid_birth`, `lease_expiry`, and `state = Active`.
    If `mode == Concurrent`, set `witness_epoch = HotWitnessIndex.epoch.load(Acquire)` so all
    witness-plane registrations for the transaction are pinned to a single epoch
    generation (prevents reader-induced epoch livelock; §5.6.4.8).
 
-	   **Phase 3 (publish):** Publish the real TxnId with a CAS:
-	   `CAS(txn_id, TXN_ID_CLAIMING -> real_txn_id, AcqRel, Acquire)`.
-	   Only after this CAS succeeds is the slot visible to other processes as a
-	   live transaction.
-	   
-	   **If the CAS fails:** Some other actor (cleanup) reclaimed the slot while
-	   this transaction was stalled in Phase 2. The transaction MUST abort and
-	   restart slot acquisition. A plain store is forbidden here because it can
-	   clobber a reclaimed slot and corrupt cross-process state.
+   **Phase 3 (publish):** Publish the real TxnId with a CAS:
+   `CAS(txn_id, TXN_ID_CLAIMING -> real_txn_id, AcqRel, Acquire)`.
+   Only after this CAS succeeds is the slot visible to other processes as a
+   live transaction.
 
-   **Why sentinel:** Without the two-phase protocol, there is a TOCTOU window
+   **If the CAS fails:** Some other actor (cleanup) reclaimed the slot while
+   this transaction was stalled in Phase 2. The transaction MUST abort and
+   restart slot acquisition. A plain store is forbidden here because it can
+   clobber a reclaimed slot and corrupt cross-process state.
+
+   **Why sentinel:** Without the three-phase protocol, there is a TOCTOU window
    between the CAS(0 → real_txn_id) and the field initialization. During this
    window, cleanup_orphaned_slots() or another reader could observe a slot
    with a valid txn_id but uninitialized begin_seq / pid / lease_expiry,
@@ -6444,6 +6485,7 @@ MUST be rejected (or not compiled), and only Serialized mode is supported.
    MUST clear snapshot/epoch fields so a future claimer cannot transiently expose
    stale values under `TXN_ID_CLAIMING`:
    - `begin_seq = 0`, `snapshot_high = 0`, `witness_epoch = 0`,
+   - `cleanup_txn_id = 0` and `claiming_timestamp = 0`,
    - clear SSI flags/counters (`has_in_rw/has_out_rw/marked_for_abort/write_set_pages = 0`),
    - set `state = Free` and clear/zero other metadata as desired (pid/lease, etc.).
    The `txn_id.store(0, Release)` MUST be the final write that publishes the slot
@@ -6468,9 +6510,15 @@ cleanup_orphaned_slots():
                 slot.claiming_timestamp.CAS(0, now)
                 continue
             if now - slot.claiming_timestamp > CLAIMING_TIMEOUT_SECS:
+                // If the cleaner crashed mid-release, we must not leak locks.
+                // cleanup_txn_id preserves the original TxnId so cleanup is retryable.
+                orphan_txn_id = slot.cleanup_txn_id.load()
+                if orphan_txn_id != 0:
+                    release_page_locks_for(orphan_txn_id)
                 // Best-effort reclaim: clear fields again and free the slot.
                 slot.state = Free
                 slot.mode = Serialized
+                slot.commit_seq = 0
                 slot.begin_seq = 0
                 slot.snapshot_high = 0
                 slot.witness_epoch = 0
@@ -6481,9 +6529,11 @@ cleanup_orphaned_slots():
                 slot.pid = 0
                 slot.pid_birth = 0
                 slot.lease_expiry = 0
+                slot.cleanup_txn_id = 0
                 slot.claiming_timestamp = 0
                 slot.txn_id = 0  // Free the slot (Release ordering, LAST)
             continue
+
         if slot.txn_id == TXN_ID_CLAIMING:
             // Slot is being claimed by another process (Phase 1 of acquire).
             //
@@ -6511,6 +6561,7 @@ cleanup_orphaned_slots():
                     // observe stale begin_seq/witness_epoch under TXN_ID_CLAIMING (§5.6.5, §5.6.4.8).
                     slot.state = Free
                     slot.mode = Serialized
+                    slot.commit_seq = 0
                     slot.begin_seq = 0
                     slot.snapshot_high = 0
                     slot.witness_epoch = 0
@@ -6521,22 +6572,28 @@ cleanup_orphaned_slots():
                     slot.pid = 0
                     slot.pid_birth = 0
                     slot.lease_expiry = 0
+                    slot.cleanup_txn_id = 0
                     slot.claiming_timestamp = 0
                     slot.txn_id = 0  // Free the slot (Release ordering, LAST)
-                continue  // skip the lease/liveness check — fields are stale
-            else:
-                continue  // CLAIMING recently; give the claimer time
+            continue  // skip the lease/liveness check — fields are stale
+
         if slot.txn_id != 0 AND slot.lease_expiry < now:
             // Lease expired -- check whether the owning process still exists.
             // IMPORTANT: PID reuse is real; liveness checks MUST defend against it.
             if !process_alive(slot.pid, slot.pid_birth):
                 // Process crashed. Abort its transaction.
-                // ATOMICITY: CAS txn_id from current value to 0 to prevent
-                // double-cleanup if two processes race. If CAS fails, another
-                // process already cleaned this slot — skip it.
+                //
+                // ATOMICITY: record the old TxnId for retryable cleanup, then
+                // CAS txn_id to TXN_ID_CLEANING so only one cleaner proceeds.
+                // If CAS fails, another process already claimed cleanup — skip it.
                 old_txn_id = slot.txn_id.load()
-                if !slot.txn_id.CAS(old_txn_id, TXN_ID_CLAIMING):
-                    continue  // someone else is cleaning this slot
+                slot.cleanup_txn_id = old_txn_id  // MUST happen before sentinel overwrite (crash-safety)
+                if !slot.txn_id.CAS(old_txn_id, TXN_ID_CLEANING):
+                    // Avoid leaking cleanup_txn_id into a non-cleaning slot.
+                    slot.cleanup_txn_id = 0
+                    continue  // someone else is cleaning this slot (or slot changed)
+                // Seed the timeout clock without overwriting a previously-seeded value.
+                slot.claiming_timestamp.CAS(0, now)
                 release_page_locks_for(old_txn_id)
                 slot.state = Free
                 slot.mode = Serialized
@@ -6548,9 +6605,10 @@ cleanup_orphaned_slots():
                 slot.has_out_rw = false
                 slot.marked_for_abort = false
                 slot.write_set_pages = 0
-                slot.pid = 0             // Zero stale metadata to prevent
-                slot.pid_birth = 0       // future CLAIMING-crash scenarios
-                slot.lease_expiry = 0    // from reading ghost values.
+                slot.pid = 0
+                slot.pid_birth = 0
+                slot.lease_expiry = 0
+                slot.cleanup_txn_id = 0
                 slot.claiming_timestamp = 0
                 slot.txn_id = 0    // Free the slot (Release ordering, LAST)
 ```
@@ -6745,6 +6803,22 @@ is incorrect because it would create entries with no discoverable key.
   lock-free linear-probing table with separate `(page_number, owner_txn)` atomics
   is not safe; rebuild under lock-quiescence is the only supported removal mechanism
   (§5.6.3.1).
+
+**Crash cleanup: release all locks for a TxnId (normative, crash-only):**
+
+When a process crashes, its in-process `Transaction.page_locks` set is gone, but
+the shared-memory lock table still contains `owner_txn = old_txn_id` entries.
+Therefore crash cleanup MUST be able to release locks using only shared state:
+
+```
+release_page_locks_for(txn_id):
+  for entry in entries:
+    entry.owner_txn.CAS(txn_id, 0)  // do not clear page_number (key-stable)
+```
+
+This is `O(capacity)` and is acceptable because it is executed only for:
+- orphaned TxnSlot cleanup (§5.6.2), and
+- rebuild drain assistance (§5.6.3.1).
 
 Because keys persist, the table can saturate in long-running workloads. The
 lease-based rebuild protocol (§5.6.3.1) clears the table at a proven lock-quiescence
@@ -8032,16 +8106,32 @@ entry (§4.16.1) showing:
 
 ### 5.8 Conflict Detection and Resolution Detail
 
-**Page lock table implementation:**
+**Page lock table implementation (normative):**
+
+- **Concurrent mode (cross-process):** `SharedPageLockTable` in
+  `foo.db.fsqlite-shm` (§5.6.3) is the canonical lock table. All page-level
+  writer exclusion MUST be enforced via the shared-memory table, not an
+  in-process HashMap.
+- **Normal commit/abort (fast path):** A transaction SHOULD release page locks
+  by iterating its in-process `page_locks` set (touch only pages it actually
+  locked).
+- **Crash cleanup (slow path):** Orphan cleanup MUST use the shared-memory scan
+  `release_page_locks_for(txn_id)` (§5.6.3) because the crashed process's
+  `page_locks` set is gone.
+
+**Single-process reference implementation (NOT cross-process safe):** The code
+below is a reference implementation suitable only for unit tests and
+single-process simulations. It MUST NOT be used when multiple processes may
+attach to the same database.
 
 ```rust
 const LOCK_TABLE_SHARDS: usize = 64;  // power of two for fast modular arithmetic
 
-pub struct PageLockTable {
+pub struct InProcessPageLockTable {
     shards: [parking_lot::Mutex<HashMap<PageNumber, TxnId>>; LOCK_TABLE_SHARDS],
 }
 
-impl PageLockTable {
+impl InProcessPageLockTable {
     fn shard(&self, pgno: PageNumber) -> &parking_lot::Mutex<HashMap<PageNumber, TxnId>> {
         &self.shards[pgno.get() as usize & (LOCK_TABLE_SHARDS - 1)]
     }
@@ -8094,10 +8184,10 @@ impl PageLockTable {
 }
 ```
 
-Note: `release_all` iterates the per-transaction lock set (typically tens
-of entries), not the entire lock table (which could be thousands of entries
-under high concurrency). This is O(W) where W is the transaction's write
-set size, not O(L) where L is total locked pages.
+Note: `release_all` iterates the per-transaction lock set (typically tens of
+entries), not the entire lock table. This is O(W) where W is the transaction's
+write set size. Crash cleanup cannot rely on this set and MUST use the shared
+table scan (§5.6.3).
 
 **Commit validation algorithm:**
 
@@ -8513,10 +8603,15 @@ IntentFootprint := {
   // re-evaluated during deterministic rebase/merge (e.g., predicate reads, reads
   // from other tables, SELECT-before-UPDATE decisions).
   //
-  // IMPORTANT: Do NOT include uniqueness checks for keys that this op writes
-  // (e.g., INSERT key-existence probes). Those are re-validated against the
-  // rebased base snapshot during replay (§5.10.2) and therefore are not
-  // "blocking reads".
+  // IMPORTANT: Uniqueness/existence probes require nuance.
+  // - For conflict policies that abort/rollback/fail on violation, do NOT record
+  //   the probe as a blocking read: replay re-validates constraints against the
+  //   rebased base snapshot, and any mismatch causes replay failure (abort).
+  // - For conflict policies that may succeed without writing or by rewriting rows
+  //   (`OR IGNORE`, `REPLACE`, UPSERT `DO NOTHING/DO UPDATE`), the probe is a
+  //   branch decision that can affect observable behavior. V1 deterministic rebase
+  //   MUST forbid these unless the chosen branch is encoded in the intent; until
+  //   then, implementations MUST record the probe in `reads` (blocking).
   reads : Vec<SemanticKeyRef>,
 
   // Semantic writes performed by this op (the logical keys it creates/updates/deletes).
@@ -8664,9 +8759,11 @@ distinguishing two categories of reads:
   creates a stale dependency on the snapshot base. If any `IntentOp.footprint.reads`
   is non-empty, rebase MUST NOT proceed (replaying against a different base creates
   a Lost Update / Write Skew).
-  Uniqueness checks for keys the op writes are NOT blocking reads and MUST NOT
-  be recorded in `footprint.reads`; they are re-validated against the rebased
-  base snapshot as part of normal constraint enforcement during replay.
+  Uniqueness/existence probes for keys the op writes are only non-blocking for
+  conflict policies that abort/rollback/fail on violation. For policies that may
+  succeed on violation (`OR IGNORE`, `REPLACE`, UPSERT `DO NOTHING/DO UPDATE`),
+  the probe MUST be recorded as a blocking read (or the op MUST be marked
+  non-rebaseable) unless/until the intent log encodes the chosen branch.
 - **Expression reads:** Column reads embedded in `RebaseExpr` within an
   `UpdateExpression` intent. These are NOT recorded in `footprint.reads` because
   the read is captured in the expression AST itself. During rebase, the expression
@@ -9108,6 +9205,32 @@ pub struct CachedPage {
     pub wal_frame: Option<u32>,   // WAL frame number if from WAL
 }
 
+/// An implementation-specific handle into T1/T2 for O(1) index lookups.
+/// - Exact ARC: typically a NodeIdx in a slab-allocated intrusive list.
+/// - CAR: typically a SlotIdx in the clock buffer.
+pub struct EntryRef {
+    // impl-specific
+}
+
+/// T1/T2 recency structures (policy-visible state).
+///
+/// Required operations (conceptual):
+/// - membership probe by key (via `index`)
+/// - `front()` / `pop_front()` / `push_back()` / `move_to_back()` / `rotate_front_to_back()`
+pub struct RecencyStore<K, V> {
+    // impl-specific
+    _phantom: std::marker::PhantomData<(K, V)>,
+}
+
+/// B1/B2 ghost structures (metadata-only, order-preserving).
+///
+/// Required operations (conceptual):
+/// - `contains(key)` / `remove(key)` / `push_back(key)` / `pop_front()`
+pub struct GhostStore<K> {
+    // impl-specific
+    _phantom: std::marker::PhantomData<K>,
+}
+
 	/// The MVCC-aware ARC cache.
 	///
 	/// IMPLEMENTATION NOTE (Extreme Optimization Discipline):
@@ -9167,15 +9290,13 @@ pub struct CachedPage {
 /// is sequential over a dense array).
 pub struct ArcCache {
     /// T1: pages accessed exactly once recently (recency-favored).
-    /// Physical: CircularClockBuffer<CachedPage> with reference bit.
-    t1: LinkedHashMap<CacheKey, Arc<CachedPage>>,
+    t1: RecencyStore<CacheKey, Arc<CachedPage>>,
     /// T2: pages accessed two or more times recently (frequency-favored).
-    /// Physical: CircularClockBuffer<CachedPage> with reference bit.
-    t2: LinkedHashMap<CacheKey, Arc<CachedPage>>,
+    t2: RecencyStore<CacheKey, Arc<CachedPage>>,
     /// B1: ghost entries evicted from T1 (metadata only, no page data).
-    b1: LinkedHashSet<CacheKey>,
+    b1: GhostStore<CacheKey>,
     /// B2: ghost entries evicted from T2 (metadata only, no page data).
-    b2: LinkedHashSet<CacheKey>,
+    b2: GhostStore<CacheKey>,
     /// Adaptive parameter: target size for T1. Range [0, capacity].
     p: usize,
     /// Maximum number of pages in T1 + T2 combined.
@@ -9184,9 +9305,9 @@ pub struct ArcCache {
     total_bytes: usize,
     /// Maximum bytes allowed (derived from PRAGMA cache_size).
     max_bytes: usize,
-    /// Lookup index: HashMap<CacheKey, SlotIdx> for O(1) cache probes.
-    /// SlotIdx encodes which clock (T1 or T2) and the array index.
-    index: HashMap<CacheKey, SlotIdx>,
+    /// Lookup index: HashMap<CacheKey, EntryRef> for O(1) cache probes.
+    /// EntryRef points into T1/T2 (NodeIdx for exact ARC, SlotIdx for CAR).
+    index: HashMap<CacheKey, EntryRef>,
 }
 ```
 
@@ -10584,8 +10705,10 @@ Modules:
   `capture_snapshot()` logic. Visibility predicate (`commit_seq <= snapshot.high`).
 - `version.rs`: `PageVersion` struct and version chains (arena-backed indices;
   ordered by `commit_seq`).
-- `lock_table.rs`: `PageLockTable` (HashMap<PageNumber, TxnId>). `try_acquire`,
-  `release`, `release_all`.
+- `lock_table.rs`: Page-level writer exclusion:
+  - `InProcessPageLockTable` (sharded HashMap) for single-process/unit tests, and
+  - `ShmPageLockTable` adapter over `SharedPageLockTable` in shared memory (§5.6.3)
+    for multi-process Concurrent mode.
 - `transaction.rs`: `Transaction` struct. Lifecycle: Active -> Committed/Aborted.
   Write set, intent log, witness keys, page locks.
 - `commit.rs`: Commit validation (FCW via `CommitIndex` + merge ladder). Commit
@@ -10937,22 +11060,19 @@ the trait. Test mocks for sealed traits live alongside the trait definition
 /// # Error Handling
 /// All methods return `Result<T, FrankenError>`. I/O errors are wrapped in
 /// `FrankenError::IoError(std::io::Error)`. Permission errors map to
-/// `FrankenError::CantOpen` or `FrankenError::Auth`.
-pub trait Vfs: Send + Sync {
-    /// The file handle type produced by this VFS.
-    type File: VfsFile;
-
-    /// Open a file at the given path with the specified flags.
+	/// `FrankenError::CantOpen` or `FrankenError::Auth`.
+	pub trait Vfs: Send + Sync {
+	    /// Open a file at the given path with the specified flags.
+	    ///
+	    /// `path` is None for temporary files (the VFS chooses a path).
+	    /// Returns the opened file handle and the flags that were actually used
+	    /// (some flags may be modified, e.g., READWRITE downgraded to READONLY).
     ///
-    /// `path` is None for temporary files (the VFS chooses a path).
-    /// Returns the opened file handle and the flags that were actually used
-    /// (some flags may be modified, e.g., READWRITE downgraded to READONLY).
-    ///
-    /// # Errors
-    /// - `FrankenError::CantOpen` if the file cannot be opened.
-    /// - `FrankenError::IoError` for underlying I/O failures.
-    fn open(&self, cx: &Cx, path: Option<&Path>, flags: VfsOpenFlags)
-        -> Result<(Self::File, VfsOpenFlags)>;
+	    /// # Errors
+	    /// - `FrankenError::CantOpen` if the file cannot be opened.
+	    /// - `FrankenError::IoError` for underlying I/O failures.
+	    fn open(&self, cx: &Cx, path: Option<&Path>, flags: VfsOpenFlags)
+	        -> Result<(Box<dyn VfsFile>, VfsOpenFlags)>;
 
     /// Delete a file. If `sync_dir` is true, also sync the directory
     /// containing the file to ensure the deletion is durable.
@@ -13290,7 +13410,10 @@ returns NULL. For blob arguments, operates on bytes; for text, operates
 on characters.
 
 **last_insert_rowid()** -> integer. Returns the rowid of the most recent
-successful INSERT on the same database connection.
+successful INSERT on the same database connection. Inserts performed by trigger
+programs MUST NOT change the value observable after the outer statement
+completes; `last_insert_rowid()` reflects the rowid inserted by the top-level
+INSERT statement (matches C SQLite behavior).
 
 **length(X)** -> integer. For text: number of characters (not bytes). For
 blob: number of bytes. For NULL: NULL. For numbers: length of text
@@ -14534,8 +14657,11 @@ raptorq integration: 2,000, encryption: 2,000).
   `schema_epoch` at BEGIN), visibility predicate (`commit_seq <= snapshot.high`)
 - `crates/fsqlite-mvcc/src/version_chain.rs`: Page version chains, GF(256)
   delta encoding via RaptorQ (Section 3.4.4)
-- `crates/fsqlite-mvcc/src/lock_table.rs`: Sharded PageLockTable (64 shards)
-  with try_acquire (non-blocking) and release_all
+- `crates/fsqlite-mvcc/src/lock_table.rs`: Page-level writer exclusion:
+  - `ShmPageLockTable` adapter over `SharedPageLockTable` in shared memory (§5.6.3)
+    for multi-process Concurrent mode, and
+  - `InProcessPageLockTable` (sharded HashMap, 64 shards) for unit tests and
+    single-process simulations.
 - `crates/fsqlite-mvcc/src/witness_plane.rs`: SSI witness plane integration:
   witness-key registration (`register_read`/`register_write`), shared-memory
   `HotWitnessIndex` updates, cold-plane witness object emission (`ReadWitness`,
