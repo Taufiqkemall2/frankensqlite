@@ -1363,10 +1363,13 @@ ENCODING:
         - Deterministically serialize the changeset (the pages + metadata) into
           a byte stream of length F bytes (`changeset_bytes`).
         - Compute a stable per-changeset identifier:
-          `changeset_object_id = Trunc128(BLAKE3("fsqlite:replication:changeset:v1" || changeset_bytes))`.
-          This ObjectId is carried in every UDP packet so receivers can join mid-stream and
+          `changeset_id = Trunc128(BLAKE3("fsqlite:replication:changeset:v1" || changeset_bytes))`.
+          This ChangesetId is carried in every UDP packet so receivers can join mid-stream and
           so multiple concurrent changesets can be multiplexed without relying on the
           RaptorQ Source Block Number (SBN) as a global partition key.
+          NOTE: `ChangesetId` is a RaptorQ object identifier for this replication stream.
+          It is NOT the ECS `ObjectId` (§3.5.1), which uses a different domain-separated
+          construction for durable objects.
         - Choose a transport symbol size `T_replication` (bytes per encoding
           symbol on the wire). `T_replication` is independent of the SQLite
           page size; it is chosen to respect the transport's constraints (MTU,
@@ -1376,7 +1379,7 @@ ENCODING:
           symbols for the block.
         - **Block-size limit (normative):** If `K_source > 56,403` (RFC 6330 Table 2),
           the sender MUST shard the transfer into multiple independent changeset objects
-          (each with its own `changeset_bytes` and `changeset_object_id`) such that
+          (each with its own `changeset_bytes` and `changeset_id`) such that
           each shard satisfies `K_source <= 56,403`. Multi-block (SBN>0) changesets are
           not used in V1.
         - Compute intermediate symbols (one-time cost: O(F) bytes of work)
@@ -1442,8 +1445,8 @@ by:
 Implementations MUST NOT assume that a single changeset object can represent an
 entire database snapshot. For large transfers (initial snapshot, bulk backfill,
 or very large write sets), replication MUST shard the transfer into **multiple
-independent changeset objects**, each with its own `changeset_object_id` and its
-own RaptorQ symbol stream. This removes any total database size limit from the
+independent changeset objects**, each with its own `changeset_id` and its own
+RaptorQ symbol stream. This removes any total database size limit from the
 protocol: overall capacity is unbounded because the number of changeset objects
 is unbounded.
 
@@ -1453,14 +1456,14 @@ is unbounded.
 Replication Packet (variable size):
     Offset  Size    Field
     ------  ----    -----
-    0       16      Changeset ObjectId (16 bytes)
-                    - `changeset_object_id` computed in ENCODING (above)
+    0       16      ChangesetId (16 bytes)
+                    - `changeset_id` computed in ENCODING (above)
                     - Identifies which changeset this symbol belongs to
                     - Enables multiplexing many concurrent changesets on the same UDP socket
     16      1       Source block number (u8)
                     - Identifies which source block this symbol belongs to
                     - **V1 rule:** MUST be 0. Each changeset object is encoded as a single
-                      RaptorQ source block (sharding across `changeset_object_id`s handles large transfers).
+                      RaptorQ source block (sharding across `changeset_id`s handles large transfers).
                     - Reserved for future multi-block changesets; receivers MAY reject `source_block != 0`.
     17      3       Encoding Symbol ID (u24 big-endian)
                     - The ISI of this symbol
@@ -1502,22 +1505,34 @@ LISTENING:
 COLLECTING:
     Entry: At least one packet received.
     State:
-        - decoders: HashMap<ObjectId, RaptorQDecoder> (one decoder per `changeset_object_id`)
-        - received_counts: HashMap<ObjectId, u32>
+        - decoders: HashMap<ChangesetId, DecoderState> (one decoder per `changeset_id`)
+        - received_counts: HashMap<ChangesetId, u32>   // counts UNIQUE symbols accepted by decoder
+
+        DecoderState := {
+          decoder    : RaptorQDecoder,
+          k_source   : u32,
+          symbol_size: u32,   // T_replication (inferred from packet length)
+        }
     Action (on each packet):
-        - Parse packet header (changeset_object_id, source_block, ISI, K_source)
-        - **V1 rule:** If `source_block != 0`, reject (multi-block changesets are not used in V1; sharding uses multiple `changeset_object_id`s).
-        - Get or create decoder for `changeset_object_id` (created from `K_source` in the first packet)
-        - Add symbol to decoder: decoder.add_symbol(ISI, symbol_data)
-        - Increment `received_counts[changeset_object_id]`
-        - If `received_counts[changeset_object_id] >= K_source`: attempt decode for that changeset
+        - Parse packet header (changeset_id, source_block, ISI, K_source).
+        - Compute `symbol_size = packet_len - 24` (MUST be > 0).
+        - **V1 rule:** If `source_block != 0`, reject (multi-block changesets are not used in V1; sharding uses multiple `changeset_id`s).
+        - Validate: `1 <= K_source <= 56,403` (RFC 6330 Table 2). Reject on violation.
+        - Get or create decoder state for `changeset_id`:
+          - If missing: create `RaptorQDecoder(K_source, symbol_size)` and store `(k_source, symbol_size)`.
+          - If present: reject if `K_source != state.k_source` or `symbol_size != state.symbol_size`.
+        - Add symbol to decoder: `accepted = state.decoder.add_symbol(ISI, symbol_data)` (MUST deduplicate by ISI)
+        - If `accepted`: increment `received_counts[changeset_id]`
+        - If `received_counts[changeset_id] >= K_source`: attempt decode for that changeset
     Transition -> DECODING (when enough symbols collected)
 
 DECODING:
     Entry: >= K_source symbols collected for at least one changeset object.
     Action:
-        - Call decoder.decode(cx) for the ready `changeset_object_id`
-        - If success: recovered K_source source symbols (and thus `changeset_bytes` for that changeset object)
+        - Call `decoder.decode(cx)` for the ready `changeset_id`.
+        - On success: recover `changeset_bytes_padded` of length `K_source * symbol_size`.
+          Parse `ChangesetHeader.total_len` from the decoded bytes and truncate to `total_len`
+          to obtain the true `changeset_bytes` (padding in the final symbol is ignored).
         - If failure (rare, ~1% at exactly K_source): stay in COLLECTING, wait for more
     Transition -> APPLYING (on successful decode)
     Transition -> COLLECTING (on decode failure, need more symbols)
@@ -5707,14 +5722,25 @@ What each transaction sees when reading `P1`:
 BeginKind := {Deferred, Immediate, Exclusive, Concurrent}
 
 begin(manager, begin_kind) -> Transaction:
-    // `TxnId=0` is reserved as a shared-memory sentinel (slot free). `fetch_add`
-    // returns the previous value, so we shift the domain by +1.
-    raw = manager.next_txn_id.fetch_add(1, SeqCst)
-    candidate = raw + 1
-    if candidate == TXN_ID_CLEANING OR candidate == TXN_ID_CLAIMING:
-        // Reserved shared-memory sentinels (§5.6.2). This means the TxnId space is exhausted.
-        abort(FATAL_TXN_ID_OVERFLOW)
-    txn_id = candidate
+    // TxnId allocation MUST never publish reserved sentinel values into shared memory.
+    //
+    // Domain:
+    // - `TxnId=0` is reserved as a shared-memory sentinel (slot free).
+    // - `TXN_ID_CLEANING := u64::MAX - 1` and `TXN_ID_CLAIMING := u64::MAX` are
+    //   reserved by the TxnSlot protocol (§5.6.2).
+    //
+    // IMPORTANT: `fetch_add` is forbidden here. It advances the counter even when
+    // we abort and will eventually wrap, producing `TxnId=0`. Use a CAS loop so
+    // illegal values are never published.
+    loop:
+        raw = manager.next_txn_id.load(Acquire)
+        candidate = raw + 1
+        if candidate == 0 OR candidate == TXN_ID_CLEANING OR candidate == TXN_ID_CLAIMING:
+            // TxnId space exhausted or corrupted. This is fatal: TxnSlots cannot be reused safely.
+            abort(FATAL_TXN_ID_OVERFLOW)
+        if manager.next_txn_id.CAS(raw, candidate, AcqRel, Acquire):
+            txn_id = candidate
+            break
     txn_epoch = 0  // in-process; cross-process uses TxnSlot.epoch (Section 5.6.2)
     snapshot = Snapshot {
         high: manager.commit_seq.load(Acquire),
@@ -6839,9 +6865,11 @@ Instead, the B-tree/VDBE MUST register witnesses at key granularity:
 - **Range scan / predicate read (phantom protection; SERIALIZABLE requirement):**
   For any cursor iteration that can observe a predicate-defined set (e.g. `WHERE k > 10`,
   `BETWEEN`, prefix LIKE on an index, or a full scan), implementations MUST register
-  `WitnessKey::Page(leaf_pgno)` as a read witness for every **leaf** page visited by
-  `OP_Next`/`OP_Prev` (including the first leaf page reached by the initial seek, even
-  if the scan returns zero rows). This witnesses the *gaps* between returned keys:
+  `WitnessKey::Page(leaf_pgno)` as a read witness for every **leaf** page whose cell
+  content area is inspected while positioning the cursor for the range (initial
+  `Seek*`/`MoveTo` step for the scan) and for every leaf page visited by
+  `OP_Next`/`OP_Prev` thereafter (even if the scan returns zero rows). This witnesses
+  the *gaps* between returned keys:
   any insert/delete that would create a phantom must structurally modify some visited
   leaf page and therefore must emit a `Page(leaf_pgno)` write witness, creating an
   rw-antidependency discoverable by the witness plane.
@@ -8981,6 +9009,7 @@ pub struct CachedPage {
     pub data: PageData,
     pub ref_count: AtomicU32,     // pinned by active operations
     pub dirty: AtomicBool,        // modified but not yet flushed to WAL
+    pub flush_inflight: AtomicBool, // true while a flush is in progress; blocks eviction
     pub xxh3: Xxh3Hash,           // integrity hash of data at load time
     pub byte_size: usize,         // actual memory (for variable-size deltas)
     pub wal_frame: Option<u32>,   // WAL frame number if from WAL
@@ -9131,9 +9160,9 @@ Consequently, the REPLACE/REQUEST logic above MUST be implemented with a
 
 1. Select an eviction candidate under the cache mutex.
 2. Drop the mutex.
-3. Attempt to flush (WAL write) outside the mutex using the cancel-safe dirty
-   claim in §6.6 (`dirty: true -> false` via CAS). If flush fails, the page MUST
-   remain dirty and MUST NOT be evicted.
+3. Attempt to flush (WAL write) outside the mutex using the cancel-safe flush
+   claim in §6.6 (`flush_inflight: false -> true` via CAS). If flush fails, the
+   page MUST remain dirty and MUST NOT be evicted.
 4. Re-acquire the mutex and evict only if the page is still present, still
    unpinned (`ref_count == 0`), and now clean.
 
@@ -9247,17 +9276,31 @@ Canonical pattern (conceptual; compatible with asupersync's cancel-safe `watch` 
 ```
 CacheEntry :=
   | Ready(Arc<CachedPage>)
-  | Loading { done: watch::Receiver<Option<Result<(), Error>>> }  // None=pending; Some=complete (waiters re-run REQUEST)
+  | Loading { done: watch::Receiver<LoadStatus> }
 
-REQUEST_ASYNC(cx, cache_mutex, key) -> Result<Arc<CachedPage>>:
+LoadStatus :=
+  | Pending
+  | Ok
+  | Err(Arc<Error>)
+
+REQUEST_ASYNC(cx, cache_mutex, key) -> Result<Arc<CachedPage>, Arc<Error>>:
   loop:
     lock cache_mutex
     match cache.get_entry(key):
       Ready(page) => { arc_promote_and_pin(cache, key, page); unlock; return Ok(page); }
-      Loading(done) => { local = done.clone(); unlock; local.changed(cx).await?; continue; }
+      Loading(done) => {
+        let mut local = done.clone();
+        unlock;
+        local.changed(cx).await?;
+        match local.borrow_and_clone() {
+          Pending => continue,            // spurious wake; still loading
+          Ok => continue,                 // loader finished; re-run REQUEST to observe Ready
+          Err(e) => return Err(e),
+        }
+      }
       Missing => {
         // Install Loading placeholder (this caller becomes the single loader)
-        let (tx, rx) = watch::channel::<Option<Result<(), Error>>>(None);
+        let (tx, rx) = watch::channel::<LoadStatus>(Pending);
         cache.insert_loading(key, rx);
         unlock;
 
@@ -9268,8 +9311,8 @@ REQUEST_ASYNC(cx, cache_mutex, key) -> Result<Arc<CachedPage>>:
         lock cache_mutex
         cache.remove_loading(key);
         match load_res {
-          Ok(page) => { arc_insert_as_miss(cache, key, page); tx.send(Some(Ok(())))?; }
-          Err(e) => { tx.send(Some(Err(e)))?; }
+          Ok(page) => { arc_insert_as_miss(cache, key, page); tx.send(LoadStatus::Ok)?; }
+          Err(e) => { tx.send(LoadStatus::Err(Arc::new(e)))?; }
         }
         unlock;
         continue;
@@ -9277,8 +9320,8 @@ REQUEST_ASYNC(cx, cache_mutex, key) -> Result<Arc<CachedPage>>:
 ```
 
 **Cancellation safety:** If the loader task is cancelled after installing the Loading
-placeholder, it MUST resolve the `done` latch (send an error) and remove the placeholder,
-so waiters do not block forever.
+placeholder, it MUST resolve the `done` latch (send `Err(Cancelled)`) and remove
+the placeholder, so waiters do not block forever.
 
 **Complexity:** Each cache operation is O(1) amortized. Ghost lists consume
 16 bytes per CacheKey (`PageNumber`: 4B + 4B alignment padding + `CommitSeq`:
@@ -9348,20 +9391,42 @@ under 200 even for heavy workloads.
 
 **Dirty page flush protocol:**
 
+**Cancellation safety (normative):** After an evictor successfully claims
+`page.flush_inflight = true`, it MUST run the flush to completion (mask
+cancellation) and MUST clear `flush_inflight` on all paths (success, failure).
+Stranding `flush_inflight=true` is a liveness bug that can permanently prevent
+eviction of the page.
+
 ```rust
 fn flush_dirty_page(page: &CachedPage, wal: &WalWriter) -> Result<()> {
-    // Atomically claim the flush to prevent double-flush from concurrent evictors
-    if page.dirty.compare_exchange(true, false, SeqCst, SeqCst).is_ok() {
-        match wal.write_frame(page.key.pgno, &page.data) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // WAL write failed (e.g., disk full). Restore dirty flag.
-                page.dirty.store(true, SeqCst);
-                Err(e)
-            }
+    if !page.dirty.load(Acquire) {
+        return Ok(());
+    }
+
+    // Atomically claim the flush to prevent double-flush AND to block eviction
+    // while the WAL write is in progress.
+    if page
+        .flush_inflight
+        .compare_exchange(false, true, AcqRel, Acquire)
+        .is_err()
+    {
+        // Another evictor is already flushing this page.
+        return Err(SQLITE_BUSY);
+    }
+
+    // Cancellation must not strand `flush_inflight=true`.
+    let res = wal.write_frame(page.key.pgno, &page.data);
+    match res {
+        Ok(()) => {
+            page.dirty.store(false, Release);
+            page.flush_inflight.store(false, Release);
+            Ok(())
         }
-    } else {
-        Ok(()) // already flushed by another thread
+        Err(e) => {
+            // WAL write failed (e.g., disk full). Keep dirty=true and unblock eviction.
+            page.flush_inflight.store(false, Release);
+            Err(e)
+        }
     }
 }
 ```
