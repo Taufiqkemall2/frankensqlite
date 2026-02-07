@@ -928,6 +928,14 @@ Each writing txn records both:
    - `Delete { table, key }`
    - `Update { table, key, new_record }`
    - index maintenance ops as needed
+
+RowId constraint (critical for merge correctness):
+
+- In `BEGIN CONCURRENT`, any INSERT that uses auto-rowid allocation (`OP_NewRowid`)
+  MUST allocate a snapshot-independent, per-table unique RowId so concurrent
+  writers never "pre-bind" the same `(table, rowid)` key. Commit-time rebase MUST
+  NOT remap rowids (would invalidate `last_insert_rowid()` and RETURNING). See
+  canon §5.10.1.1.
 2. **Materialized page deltas** (for fast intra-txn reads):
    - `FullPageImage`
    - `SparseRangeXor` (byte ranges + XOR payload)
@@ -1244,12 +1252,14 @@ PRAGMA raptorq_repair_symbols = N;      -- set (0 disables)
 Semantics:
 
 - `N = 0`: exact SQLite-style WAL behavior (no FEC sidecar writes)
-- `N = 1`: tolerate 1 torn/corrupt frame per commit group
-- `N = 2`: tolerate 2 torn/corrupt frames per commit group (default)
+- `N = 1`: tolerate 1 missing/corrupt frame per **repairable** commit group
+- `N = 2`: tolerate 2 missing/corrupt frames per **repairable** commit group (default)
 
 Persistence:
 
-- This PRAGMA SHOULD be stored in the SQLite DB header reserved bytes (offset 72–91) so it travels with the database file without breaking compatibility (C SQLite ignores those bytes).
+- Compatibility mode: persist in a `.wal-fec` sidecar header record with checksum
+  (keep SQLite DB header reserved bytes 72-91 as zero for strict format hygiene).
+- Native mode: persist in `RootManifest` metadata.
 
 #### 9.9.2 FEC Object Model (Compat Mode)
 
@@ -1259,6 +1269,13 @@ For each WAL commit group `G` that writes `K` pages:
 - generate `R = PRAGMA raptorq_repair_symbols` **repair symbols**
 - write the `K` source frames to `.wal` normally
 - write only the `R` repair symbols + minimal metadata to `.wal-fec`
+
+Durability vs repairability (match canon §3.4.1):
+
+- A commit is **durable** once the `.wal` frames are written and `fsync`'d (SQLite semantics).
+- A group is **repairable** only once its `.wal-fec` metadata + repair symbols are written and `fsync`'d.
+- Default behavior is pipelined: commit ACK does not wait for `.wal-fec`; repairability may lag.
+- Implementations MAY offer an opt-in synchronous mode that waits for `.wal-fec` `fsync` before ACK.
 
 Metadata we MUST store per group:
 
@@ -1283,6 +1300,9 @@ On open/recovery in compatibility mode:
      - collect repair symbols from `.wal-fec`
      - if `valid_sources + repairs >= K`: decode to reconstruct missing source pages, then apply the reconstructed pages as if they were present in the WAL
      - else: group unrecoverable (equivalent to catastrophic loss)
+
+If the corresponding `.wal-fec` metadata/repairs are missing (group not repairable),
+recovery MUST fall back to SQLite behavior for that group (truncate at first invalid frame).
 
 This gives us “self-healing WAL” behavior without breaking SQLite’s WAL format.
 
