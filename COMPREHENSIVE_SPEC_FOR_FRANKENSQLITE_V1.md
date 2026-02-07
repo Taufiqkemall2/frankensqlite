@@ -6766,19 +6766,13 @@ integrity. This must be implemented exactly for file format compatibility.
 ```rust
 /// Compute SQLite WAL checksum, chaining from (s1_init, s2_init).
 ///
-/// `big_end_cksum` is `(magic & 1) != 0`, passed DIRECTLY from the WAL
-/// header magic value — NOT derived via `(bigEndCksum == SQLITE_BIGENDIAN)`.
+/// `big_end_cksum` is `(magic & 1) != 0` from the WAL header (wal.c): it records
+/// whether the WAL creator machine was big-endian.
 ///
-/// C SQLite's walChecksumBytes(nativeCksum, ...) receives bigEndCksum as
-/// nativeCksum. Despite the misleading C parameter name, the semantics are:
-///   bigEndCksum=1 (magic 0x377F0683) → read u32 in native byte order
-///   bigEndCksum=0 (magic 0x377F0682) → BYTESWAP32 each u32 before accumulating
-///
-/// On little-endian (x86/ARM), the common case is magic 0x377F0682
-/// (bigEndCksum=0), so C ALWAYS byte-swaps. A previous version of this
-/// function used `native_cksum = (bigEndCksum == SQLITE_BIGENDIAN)` which
-/// INVERTED the swap/no-swap decision on LE — producing checksums
-/// incompatible with C SQLite.
+/// SQLite computes `nativeCksum = (bigEndCksum == SQLITE_BIGENDIAN)` and calls:
+/// `walChecksumBytes(nativeCksum, ...)`. When `nativeCksum == 0`, it
+/// BYTESWAP32's each u32 word before accumulating. This is equivalent to:
+/// `native_cksum = (big_end_cksum == cfg!(target_endian = "big"))`.
 pub fn wal_checksum(
     data: &[u8],
     s1_init: u32,
@@ -6788,16 +6782,17 @@ pub fn wal_checksum(
     assert!(data.len() % 8 == 0);
     let mut s1 = s1_init;
     let mut s2 = s2_init;
+    let native_cksum = big_end_cksum == cfg!(target_endian = "big");
 
     for chunk in data.chunks_exact(8) {
-        let (a, b) = if big_end_cksum {
-            // bigEndCksum=1: C reads *aData (native u32, no swap)
+        let (a, b) = if native_cksum {
+            // nativeCksum=1: read u32 words in native byte order (no swap)
             (
                 u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
                 u32::from_ne_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]),
             )
         } else {
-            // bigEndCksum=0: C does BYTESWAP32(*aData)
+            // nativeCksum=0: BYTESWAP32 each u32 before accumulating
             (
                 u32::from_ne_bytes([chunk[3], chunk[2], chunk[1], chunk[0]]),
                 u32::from_ne_bytes([chunk[7], chunk[6], chunk[5], chunk[4]]),
@@ -6811,16 +6806,17 @@ pub fn wal_checksum(
 ```
 
 **Endianness determination from WAL magic:**
-- `0x377f0682` (bit 0 = 0): `bigEndCksum = 0`. Created on a little-endian
-  machine. C SQLite uses the BYTESWAP path (swaps each u32 from LE to BE
-  before accumulating). This is the common case on x86/ARM.
-- `0x377f0683` (bit 0 = 1): `bigEndCksum = 1`. Created on a big-endian
-  machine. C SQLite uses the native path (reads u32 as-is, already BE).
+- `0x377f0682` (bit 0 = 0): `bigEndCksum = 0` (created on a little-endian machine).
+  - On little-endian readers: `nativeCksum = 1` (no swap).
+  - On big-endian readers: `nativeCksum = 0` (BYTESWAP32 each u32).
+- `0x377f0683` (bit 0 = 1): `bigEndCksum = 1` (created on a big-endian machine).
+  - On big-endian readers: `nativeCksum = 1` (no swap).
+  - On little-endian readers: `nativeCksum = 0` (BYTESWAP32 each u32).
 
 The magic is always read via big-endian `u32` decoding (matching SQLite's
-`sqlite3Get4byte`). The caller passes `big_end_cksum = (magic & 1) != 0`
-directly to this function. Do NOT use `(bigEndCksum == SQLITE_BIGENDIAN)` —
-the C code passes `bigEndCksum` verbatim as the `nativeCksum` parameter.
+`sqlite3Get4byte`). The caller passes `big_end_cksum = (magic & 1) != 0` to this
+function; this function derives `native_cksum` exactly as SQLite does:
+`nativeCksum = (bigEndCksum == SQLITE_BIGENDIAN)`.
 
 FrankenSQLite writes WAL files using native byte order for performance.
 
@@ -9056,24 +9052,26 @@ cannot be validated or written.
 /// Compute WAL checksum over `data` using the double-accumulator algorithm.
 /// See §7.1 for the canonical implementation and parameter semantics.
 ///
-/// `big_end_cksum` = `(magic & 1) != 0`. Passed directly from the WAL
-/// header magic value. When true (magic 0x377F0683, created on BE machine),
-/// read u32s in native byte order. When false (magic 0x377F0682, created on
-/// LE machine — the common case on x86/ARM), BYTESWAP each u32.
+/// `big_end_cksum = (magic & 1) != 0` records whether the WAL creator machine
+/// was big-endian. Compute:
+/// `native_cksum = (big_end_cksum == cfg!(target_endian = "big"))`.
+/// When `native_cksum == 0`, BYTESWAP32 each u32 before accumulating (SQLite
+/// `walChecksumBytes(nativeCksum, ...)`).
 ///
 /// The data MUST be padded to a multiple of 8 bytes (zero-padded if
 /// necessary). This function processes the data in 8-byte chunks,
 /// treating each chunk as two 32-bit unsigned integers.
 fn wal_checksum(data: &[u8], mut s0: u32, mut s1: u32, big_end_cksum: bool) -> (u32, u32) {
     assert!(data.len() % 8 == 0, "WAL checksum data must be 8-byte aligned");
+    let native_cksum = big_end_cksum == cfg!(target_endian = "big");
     for chunk in data.chunks_exact(8) {
-        let (d0, d1) = if big_end_cksum {
-            // bigEndCksum=1: C reads *aData (native u32, no swap)
+        let (d0, d1) = if native_cksum {
+            // nativeCksum=1: read u32 words in native byte order (no swap)
             let d0 = u32::from_ne_bytes(chunk[0..4].try_into().unwrap());
             let d1 = u32::from_ne_bytes(chunk[4..8].try_into().unwrap());
             (d0, d1)
         } else {
-            // bigEndCksum=0: C does BYTESWAP32(*aData)
+            // nativeCksum=0: BYTESWAP32 each u32 before accumulating
             let d0 = u32::from_ne_bytes(chunk[0..4].try_into().unwrap()).swap_bytes();
             let d1 = u32::from_ne_bytes(chunk[4..8].try_into().unwrap()).swap_bytes();
             (d0, d1)
@@ -10649,11 +10647,12 @@ supersedes shared-cache entirely: multiple connections within a process
 share the MVCC version chains and benefit from page-level concurrency, which
 is strictly superior.
 
-**Windows VFS.** Windows file locking uses `LockFileEx`/`UnlockFileEx`
-instead of `fcntl`, and the shared memory coordination uses
-`CreateFileMapping` instead of `mmap`. `WindowsVfs` is in-scope and
-implements the same `Vfs` trait as `UnixVfs`. Platform-specific code is
-isolated behind `#[cfg(target_os)]` gates.
+**NOTE:** `WindowsVfs` is NOT an exclusion -- it is in-scope (listed under
+§15 for completeness of the VFS discussion). Windows file locking uses
+`LockFileEx`/`UnlockFileEx` instead of `fcntl`, and shared memory uses
+`CreateFileMapping` instead of `mmap`. `WindowsVfs` implements the same
+`Vfs` trait as `UnixVfs`. Platform-specific code is isolated behind
+`#[cfg(target_os)]` gates.
 
 **Multiplexor VFS.** C SQLite's multiplexor shards large databases across
 multiple files to work around filesystem limitations (e.g., FAT32 4GB limit).
@@ -10779,8 +10778,9 @@ with a global lock table (`unixInodeInfo`). We need an equivalent.
 
 **Deliverables:**
 - `crates/fsqlite-btree/src/cursor.rs`: `BtCursor` with page-stack
-  traversal (max depth 20 for 4KB pages, 2^20 * ~100 entries/page = 100
-  billion rows capacity)
+  traversal (max depth 20 for 4KB pages; with interior page fanout
+  ~300-400 for table B-trees, capacity vastly exceeds any practical
+  database size even at depth 5-6)
 - `crates/fsqlite-btree/src/cell.rs`: Cell parsing for all 4 page types
   (INTKEY table leaf/interior, BLOBKEY index leaf/interior), overflow
   detection, local payload calculation
@@ -10964,10 +10964,12 @@ raptorq integration: 2,000).
   bucket epoch advance (§5.6.4.8), memory bound enforcement
 - `crates/fsqlite-mvcc/src/coordinator.rs`: Write coordinator using
   asupersync two-phase MPSC channel, commit serialization for WAL append
-- `crates/fsqlite-mvcc/src/arc_cache.rs`: ARC cache with (PageNumber, CommitSeq)
-  keys, eviction constraints (pinned, dirty, superseded)
-- `crates/fsqlite-pager/src/mvcc_pager.rs`: MvccPager trait implementation
-  bridging B-tree layer to MVCC layer, Cx threading
+- `crates/fsqlite-pager/src/cache.rs`: ARC cache with (PageNumber, CommitSeq)
+  keys, MVCC-aware eviction constraints (pinned, dirty, superseded). Lives in
+  fsqlite-pager (L2) because the MvccPager trait is defined there; CommitSeq
+  is imported from fsqlite-types.
+- `crates/fsqlite-pager/src/mvcc_pager.rs`: MvccPager trait definition;
+  implementation in fsqlite-mvcc (L3) bridges B-tree layer to MVCC, Cx threading
 
 **Acceptance criteria:**
 - Serialized mode: Exact C SQLite behavior -- single writer, SERIALIZABLE
