@@ -18,6 +18,8 @@ If any other project docs disagree with this file, treat this file as authoritat
 1. Non-Negotiables (Hard Constraints)
 2. Success Definition (What “Parity” Means)
 3. The Big Idea: “Erasure-Coded Streams” Everywhere
+3.1 RaptorQ Primer (RFC 6330 Terms We Use)
+3.2 RaptorQ Permeation Map (Every Pore, Every Layer)
 4. Operating Modes (Compatibility vs Native)
 5. Core Data Model (Formal-ish, Testable)
 6. ECS Storage Substrate (Objects, Symbols, Physical Layout)
@@ -90,7 +92,7 @@ These are hard project constraints for all work:
 - **User is in charge.** If the user overrides anything, follow the user.
 - **No file deletion** without explicit written permission.
 - **No destructive commands** unless the user explicitly provides the exact command and confirms they want the irreversible consequences. This includes but is not limited to `git reset --hard`, `git clean -fd`, and `rm -rf`.
-- **Branch:** `main` only (never reference `master` in docs or code).
+- **Branch:** `main` only (the legacy default-branch name must not appear in docs or code).
 - **Rust toolchain:** nightly, edition 2024.
 - **No `unsafe`** anywhere: workspace lints forbid unsafe code.
 - **Clippy:** `pedantic` + `nursery` denied at workspace level; warnings are treated as errors.
@@ -217,7 +219,65 @@ Implementation note (practical API surface we will bind to):
 - `asupersync::config::RaptorQConfig` for validated parameterization
 - `asupersync::raptorq::RaptorQSenderBuilder` / `RaptorQReceiverBuilder` for pipeline construction
 
+### 3.1.1 Overhead, Failure Probability, and Defaults (Operational Guidance)
+
+RaptorQ is “any K symbols suffice” in the *engineering* sense, but the decode success probability at exactly `K` is not literally 1. The whole point of repair symbols is to drive decode failure probability into the floor.
+
+Rules of thumb (backed by RFC 6330 guidance and typical RaptorQ behavior):
+
+- decoding with **exactly K** received symbols can very rarely fail (still extremely good compared to older fountain codes)
+- decoding with **K+1** or **K+2** received symbols makes failure probability effectively negligible for our purposes
+
+Therefore, we define a default redundancy policy:
+
+- **V1 default:** aim to persist/replicate enough symbols that a decoder can almost always collect **K+2** symbols for each source block without coordination.
+- expose knobs via PRAGMAs (see §9.3, §9.9, §12.6):
+  - `PRAGMA raptorq_overhead_percent = ...`
+  - `PRAGMA raptorq_repair_symbols = ...` (compatibility view policy)
+
+We also respect RFC 6330 source-block limits by chunking large objects into multiple source blocks via `ObjectParams`.
+
 **Why a primer belongs here:** Every agent implementing any durable or replicated path must understand the meaning of `K`, symbol sizing, overhead, and OTI. RaptorQ is not “a compression trick”; it is the algebra of our durability and replication contracts.
+
+---
+
+## 3.2 RaptorQ Permeation Map (Every Pore, Every Layer)
+
+This is the “no excuses” mapping from subsystem → ECS/RaptorQ role.
+
+**Durability plane (disk):**
+
+- commits: `CommitCapsule` + `CommitMarker` objects (always ECS)
+- checkpoints: chunked snapshots as ECS objects (always ECS)
+- indices: IndexSegments as ECS objects (always ECS)
+- repair: decode from surviving symbols; produce `DecodeProof` in lab/debug builds
+
+**Concurrency plane (memory):**
+
+- MVCC history: PageHistory objects (patch chains encoded as ECS objects)
+- conflict reduction: intent logs are small ECS objects, replayed deterministically for rebase merge
+- explainability: abort witnesses are attachable artifacts (lab builds)
+
+**Replication plane (network):**
+
+- transport primitives are symbol-native (`SymbolSink`/`SymbolStream`)
+- anti-entropy is “which object ids do you have?” + “send any symbols”
+- bootstrap is “stream checkpoint chunks until decode”
+
+**Observability plane (alien-artifact explainability):**
+
+- decode proofs when repair happens
+- deterministic trace capture + replay under `LabRuntime`
+- e-process monitors for invariants (anytime-valid alarms)
+- TLA+ export of traces for bounded model checking of commit/replication/recovery
+
+**Wild but aligned experiments (encouraged, feature-gated):**
+
+- **Inter-object coding for replication:** treat a batch of objects as a “super-object” so a sender can transmit mixed symbols that maximize throughput over lossy links.
+- **Symbol-level RAID on a single machine:** distribute symbols across multiple local devices/paths; any `K` reconstructs (RAID-like redundancy without strict striping).
+- **Integrity sweeps as information theory:** periodically sample symbols and attempt partial decodes; use e-process monitors to detect elevated corruption rates early.
+
+If a new feature persists bytes or ships bytes, it MUST declare its ECS object type, symbol policy (K/R), and repair story.
 
 ---
 
@@ -251,10 +311,13 @@ We keep this section intentionally executable: every predicate here must map to 
 ### 5.1 Identifiers and Types
 
 - `TxnId`: monotone increasing transaction id.
+- `CommitSeq`: monotone increasing commit sequence number (the durable “commit clock”).
+- `SnapshotId`: opaque identifier for a captured snapshot basis (can be derived from `CommitSeq` + in-flight set digest).
 - `Pgno`: page number (1-based).
 - `PageSize`: configured page size.
 - `ObjectId`: content-addressed id of an ECS object (e.g., hash of canonical object header + source bytes).
 - `SymbolId`: (object id, encoding symbol id) per RFC 6330.
+- `Digest`: integrity hash (algorithm is versioned in object headers).
 
 ### 5.2 The ECS Object
 
@@ -274,7 +337,7 @@ Each object has:
   - `object_len`
   - `encoding_params` (symbol size, K, etc; RFC 6330 derived)
   - `integrity` (hash / checksum and algorithm id)
-  - `links` (parents / dependencies; see §8)
+  - `links` (parents / dependencies; see §9.4)
 - `source_bytes`: the payload to be encoded
 
 RaptorQ encoding produces:
@@ -282,18 +345,40 @@ RaptorQ encoding produces:
 - `K` **source symbols** (systematic)
 - optionally `R` **repair symbols** (overhead), such that receiving any `K` symbols from the union suffices (with high probability, but we treat RFC 6330 compliance as the operational contract)
 
+#### 5.2.1 Canonical Encoding (Deterministic Bytes, Not “Serde Vibes”)
+
+If `ObjectId` is content-derived, then object headers MUST be canonically encoded:
+
+- explicit versioned wire format
+- explicit endianness (little-endian for fixed-width ints)
+- explicit map ordering (sorted keys)
+- no floating-point in canonical headers
+
+We do not use JSON for canonical bytes. JSON is for fixtures and human interchange, not identity.
+
 ### 5.3 Commit Capsule (The Heartbeat)
 
 We define a commit capsule object type:
 
 ```
 CommitCapsule {
-  commit_id: TxnId,
+  commit_seq: u64,
   snapshot_basis: SnapshotId,
-  writes: Vec<PageDelta>,
-  read_conflicts: Vec<ConflictEvidence>,   // for SSI validation
-  schema_delta: Option<SchemaDelta>,       // when DDL involved
-  checks: CommitChecks,                   // invariants / quick checks
+
+  // Preferred: semantic intent log (merge/rebase friendly)
+  intent_log: Vec<IntentOp>,
+
+  // Optional: materialized patches for fast reads / recovery acceleration
+  page_deltas: Vec<PageDelta>,
+
+  // Explainability / conformance witnesses (feature-gated in release)
+  read_set_digest: Digest,
+  write_set_digest: Digest,
+  ssi_witnesses: Vec<SsiWitness>,
+
+  // DDL and other metadata
+  schema_delta: Option<SchemaDelta>,
+  checks: CommitChecks,
 }
 ```
 
@@ -304,6 +389,21 @@ Where `PageDelta` is not necessarily “a full page image”. It can be:
 - algebraic delta (GF(256) vector / XOR patch), enabling merge (see §8)
 
 The capsule is encoded into RaptorQ symbols and persisted/distributed via ECS.
+
+### 5.4 Commit Marker (The Commit Clock)
+
+A commit marker is the atomic publish record:
+
+```
+CommitMarker {
+  commit_seq: u64,
+  capsule_object_id: ObjectId,
+  prev_marker: Option<ObjectId>,
+  integrity: Digest,
+}
+```
+
+If the marker is committed, the commit is committed. Recovery replays markers in order and ignores unmarked capsules.
 
 ---
 
@@ -458,6 +558,26 @@ Practical rule:
 
 This makes “the object” a platonic mathematical entity: any replica can regenerate missing repair symbols (within policy) without coordination.
 
+### 6.10 Symbol Size Policy (Object-Type-Aware, Measured)
+
+Symbol size is a major performance lever:
+
+- too small: too many symbols, higher metadata overhead, more routing work
+- too large: worse cache behavior, higher per-symbol loss impact, more wasted decode work
+
+We therefore choose symbol size per object type, with sane defaults and benchmark-driven tuning:
+
+- `CommitCapsule` (page deltas / intent chunks):
+  - default `symbol_size = page_size` (e.g., 4096)
+  - rationale: aligns encoding units with page images and patch application boundaries
+- `IndexSegment`:
+  - default `symbol_size` in the 1–4 KiB range (often 1280 or 4096 depending on size)
+  - rationale: segment payloads are metadata-heavy; smaller symbols can reduce tail loss impact
+- `CheckpointChunk`:
+  - default larger `symbol_size` (e.g., 16–64 KiB) when shipping over reliable local disk, but MAY fall back to page-sized for compatibility export
+
+All of this is versioned in `RootManifest` so replicas decode correctly.
+
 ---
 
 ## 7. Concurrency: MVCC + SSI (Serializable by Default)
@@ -567,6 +687,15 @@ Rationale:
 - Under SI + first-committer-wins, anomalies require rw edges; preventing “rw pivots” prevents dangerous structures and therefore prevents cycles.
 - This is conservative (more aborts than necessary) but serializable.
 
+Proof sketch (why this implies serializable behavior):
+
+- Consider the serialization graph whose edges are the rw-antidependencies we track at our chosen granularity.
+- Any directed cycle would require every transaction on the cycle to have at least one incoming and at least one outgoing edge.
+- Therefore, if we prevent any committed transaction from having both `has_in_rw && has_out_rw`, the committed graph cannot contain a directed cycle.
+- Acyclic serialization graph ⇒ a valid topological order exists ⇒ the execution is equivalent to some serial schedule.
+
+This is the “alien artifact” stance: we start with a simple rule with a clear correctness argument, then we refine to reduce aborts once conformance is stable.
+
 This is the “go for broke” choice: correctness first, then reduce aborts with refinements once conformance is stable.
 
 ### 7.5 Concrete SSI State (Low-Overhead, Deterministic)
@@ -655,6 +784,103 @@ For concurrency correctness, we require:
   - construct known write-skew patterns and ensure at least one txn aborts under default serializable mode.
 - **Oracle parity**:
   - for all sequential workloads (the vast majority of conformance), results match C SQLite.
+
+### 7.11 Conflict Probability Model (So We Know What To Optimize)
+
+We explicitly model expected conflict rates so we can tell if improvements are real.
+
+Uniform write model (rough, but useful):
+
+- Table has `P` pages.
+- Each txn writes `W` (distinct) pages, uniformly at random.
+
+Probability that two txns conflict on at least one page:
+
+```
+Pr[conflict] = 1 - (1 - W/P)^W  ≈  W^2 / P   (when W << P)
+```
+
+Reality model:
+
+- B-tree workloads are not uniform; they are hot-page heavy (root/internal pages) and often Zipf-like.
+- This is exactly why §8 exists: deterministic rebase and mergeable intents reduce conflicts on hot pages.
+
+We will validate the model with benchmarks that control:
+
+- `P` (table size)
+- `W` (writes/txn)
+- hot-page skew (Zipf parameter)
+
+### 7.12 Mechanical Sympathy: Data Structures That Make This Fast
+
+This is where Gemini’s feedback is correct: the math is only valuable if it is embodied in the right low-level structures.
+
+#### 7.12.1 Active Transaction Set Representation (Adaptive)
+
+We need fast membership tests for:
+
+- snapshot visibility (`created_by ∈ in_flight?`)
+- SSI overlap checks / state pruning
+
+We therefore define `ActiveTxnSet` as an adaptive structure:
+
+- small case (common): `SmallVec<TxnId>` sorted
+- large case: `roaring::RoaringTreemap` (u64) for fast set operations
+- optional accelerator: Bloom filter for fast negative checks, with exact verification on “might contain”
+
+Correctness rule:
+
+- Bloom filters MAY be used only as a fast negative; positives MUST be verified against an exact set, or else we risk hiding visible commits (incorrect).
+
+#### 7.12.2 Sharded Tables (No Global Contention)
+
+Global maps on hot paths must be sharded:
+
+- page write lock table
+- SIREAD table (page → readers)
+- per-page version presence filter metadata
+
+Implementation strategy:
+
+- `N` shards (power of two, e.g., 64 or 256)
+- shard chosen by `pgno.hash() & (N-1)`
+- each shard guarded by `parking_lot` lock
+
+This preserves our “no waiting while holding locks” rule: the only blocking is narrow (a shard mutex), and we never hold multiple shard locks at once.
+
+#### 7.12.3 Epoch-Based Reclamation (Safe, No Unsafe)
+
+We want the *effect* of EBR (quick reclamation without global pauses) without unsafe pointer tricks.
+
+We therefore define reclamation epochs in terms of the commit clock:
+
+- `CommitSeq` acts as the global epoch.
+- `min_active_begin_seq` (or `min_snapshot_high`) defines the GC horizon.
+- any page history version whose `created_by_commit_seq < horizon` is reclaimable.
+
+Implementation:
+
+- store versions as `Arc`-owned objects
+- remove reclaimable versions from maps/lists when horizon advances
+- memory is freed by `Arc` drops (safe Rust)
+
+This gives us “epoch reclamation semantics” while preserving `#[forbid(unsafe_code)]`.
+
+### 7.13 Upgrade Path: Full SSI (Cahill/Fekete) To Reduce Abort Rate
+
+The conservative “no committed pivot” rule (§7.4) is intentionally simple and correct, but it may abort more than necessary.
+
+Once conformance is stable, we can upgrade to a closer-to-classic SSI implementation:
+
+- Track rw-antidependencies with enough metadata to apply the classic commit-order condition (the “T3 commits before T1” aspect).
+- Persist SIREAD state beyond txn commit when required (a committed txn’s SIREAD locks may still participate in a dangerous structure until all overlapping txns resolve).
+- Abort policy becomes more selective (abort only when a genuine dangerous structure is formed).
+
+This upgrade is driven by data:
+
+- collect abort witnesses (which pages/tags, which txns) in lab builds
+- quantify false-positive aborts vs throughput
+- refine granularity (page → range/cell tags) only where needed
 
 ---
 
@@ -910,6 +1136,12 @@ Protocol for txn `T`:
 
 **Critical ordering:** marker publication MUST happen after capsule durability is satisfied. If marker is durable but capsule is not decodable, we violated our core contract.
 
+Proof sketch (marker ⇒ decodable capsule under budget):
+
+- The commit path does not publish a marker until the durability policy reports enough persisted symbols for the capsule.
+- Decoding requires ≥K symbols (ObjectParams).
+- Therefore, under the assumed loss/corruption budget, recovery can collect ≥K valid symbols and decode the capsule.
+
 ### 9.6 Recovery Algorithm (Native Mode)
 
 Startup:
@@ -965,43 +1197,183 @@ Two mapping strategies:
 
 In both cases, ECS remains the source-of-truth in native mode; compatibility artifacts are derived views.
 
+### 9.9 WAL-FEC Sidecar (Corrected, SQLite-Compatible, Still RaptorQ)
+
+Opus had a powerful idea: treat each WAL commit group as `K` source symbols (page images) plus `R` repair symbols. That idea is correct.
+
+The *frame-header embedding* idea, however, must be corrected:
+
+- SQLite WAL frame headers do **not** have spare padding bytes; the 24-byte header contains page number, dbsize-for-commit, salts, and checksums (see `legacy_sqlite_code/sqlite/src/wal.c`).
+- Therefore, we MUST NOT repurpose header bytes for RaptorQ metadata in a way that would break salt/checksum validation or cause C SQLite to truncate the WAL at the first “weird” frame.
+
+So the compatibility design is:
+
+> Keep `.wal` strictly SQLite-correct. Put all redundancy in `.wal-fec` (sidecar).
+
+#### 9.9.1 PRAGMA: `raptorq_repair_symbols`
+
+We expose:
+
+```sql
+PRAGMA raptorq_repair_symbols;          -- query (default: 2)
+PRAGMA raptorq_repair_symbols = N;      -- set (0 disables)
+```
+
+Semantics:
+
+- `N = 0`: exact SQLite-style WAL behavior (no FEC sidecar writes)
+- `N = 1`: tolerate 1 torn/corrupt frame per commit group
+- `N = 2`: tolerate 2 torn/corrupt frames per commit group (default)
+
+Persistence:
+
+- This PRAGMA SHOULD be stored in the SQLite DB header reserved bytes (offset 72–91) so it travels with the database file without breaking compatibility (C SQLite ignores those bytes).
+
+#### 9.9.2 FEC Object Model (Compat Mode)
+
+For each WAL commit group `G` that writes `K` pages:
+
+- define a compat ECS object `CompatWalCommitGroup` whose **source symbols** are the `K` page images (symbol size = `page_size`)
+- generate `R = PRAGMA raptorq_repair_symbols` **repair symbols**
+- write the `K` source frames to `.wal` normally
+- write only the `R` repair symbols + minimal metadata to `.wal-fec`
+
+Metadata we MUST store per group:
+
+- a stable `group_id` (e.g., `(wal_salt1, wal_salt2, end_frame_no)` or a content-derived id)
+- `ObjectParams` (object id, object_size, symbol_size, source_blocks, K)
+- the ordered list of `Pgno`s corresponding to source symbol indices `0..K-1`
+- the WAL frame range `(start_frame, end_frame)` so recovery can partition without relying on possibly-corrupted commit headers
+
+`wal-fec` record format can reuse our ECS symbol record envelope (§6.4), with one additional “group metadata” record that carries the `Pgno` list.
+
+#### 9.9.3 Recovery With WAL-FEC (Compat Mode)
+
+On open/recovery in compatibility mode:
+
+1. Scan `.wal` frames in fixed increments (frame size is known from page size).
+2. Partition frames into commit groups using WAL frame range hints from `.wal-fec` when present.
+3. For each group:
+   - validate each source frame’s salt+checksum (SQLite rules)
+   - if all valid: apply normally
+   - if some invalid:
+     - collect valid source page images
+     - collect repair symbols from `.wal-fec`
+     - if `valid_sources + repairs >= K`: decode to reconstruct missing source pages, then apply the reconstructed pages as if they were present in the WAL
+     - else: group unrecoverable (equivalent to catastrophic loss)
+
+This gives us “self-healing WAL” behavior without breaking SQLite’s WAL format.
+
 ---
 
 ## 10. The Radical Index: RaptorQ-Coded Index Segments
 
-SQLite maintains a WAL index so readers can locate the latest frame for a page without scanning the whole WAL.
+Classic SQLite uses a separate WAL-index structure to avoid scanning the WAL.
 
-We go harder:
+FrankenSQLite’s premise is stronger:
 
-### 10.1 Index As A Stream Of Objects
+- our durability is object-based (capsules, markers, page patches)
+- our transport/storage is symbol-based (ECS)
+- therefore our index MUST also be object-based and self-healing
 
-We define an **IndexSegment** object:
+This section specifies an **index stack** that lives inside ECS and can be repaired/rebuilt.
+
+### 10.1 What The Index Must Answer (Minimum Query API)
+
+Given `(pgno, snapshot)` we need:
+
+1. The newest committed version ≤ snapshot.
+2. A pointer to the bytes (or the intent replay recipe) to materialize that page.
+
+Given `object_id` we need:
+
+- where to find symbols quickly (optional accelerator; not correctness-critical).
+
+### 10.2 VersionPointer (The Atom of Lookup)
+
+We define:
 
 ```
-IndexSegment {
-  segment_id,
-  covers_commits: [TxnIdStart, TxnIdEnd],
-  page_to_latest: Map<Pgno, VersionPointer>,
-  bloom/quotient filters: optional accelerators,
-  integrity + links
+VersionPointer {
+  commit_seq: u64,
+  patch_object: ObjectId,     // ECS object containing the patch (or intent chunk)
+  patch_kind: PatchKind,      // intent vs physical, etc.
+  base_hint: Option<ObjectId> // optional “base image” hint for faster materialization
 }
 ```
 
-This segment is itself encoded via RaptorQ and persisted via ECS. Therefore:
+The pointer is stable and replicable:
 
-- the index is self-healing (lose part of it, decode from remaining symbols)
-- replication is natural (symbols distributed like any other object)
-- late-join replicas can reconstruct index incrementally without perfect logs
+- it references only object ids
+- it does not embed physical offsets
 
-### 10.2 Why This Is Not “Too Much”
+### 10.3 IndexSegment Types (Yes, Multiple)
 
-Because:
+We use multiple segment kinds, all ECS objects:
 
-- The conformance harness is our judge.
-- The lab runtime is our debugger for concurrency.
-- If it fails, we can retreat to a conventional index implementation while keeping the ECS interface.
+1. **PageVersionIndexSegment**
+   - maps `Pgno -> VersionPointer` for a commit range
+   - includes filters for “segment contains pgno”
+2. **ObjectLocatorSegment** (accelerator only)
+   - maps `ObjectId -> Vec<SymbolLogOffset>` (or “segment id + offset”)
+   - rebuildable by scanning symbol logs
+3. **ManifestSegment**
+   - maps `commit_seq ranges -> index segment tips`
+   - speeds bootstrapping so we don’t need to scan everything
 
-But the V1 spec assumes we **attempt** the coded index because it aligns with the core thesis: *everything durable is an erasure-coded object stream*.
+All segments are RaptorQ-encoded objects and therefore self-healing.
+
+### 10.4 Lookup Algorithm (Read Path)
+
+To read page `P` under snapshot `S`:
+
+1. Check pager cache (ARC) for a visible committed version.
+2. If cache miss:
+   - consult Version Presence Filter (§11.2). If “no versions” → read base page view.
+3. Else:
+   - find candidate `VersionPointer`s by scanning newest index segments backward until we find `commit_seq <= S.high` and visibility holds
+   - fetch/decode referenced patch objects (repairing if needed)
+   - materialize page by:
+     - applying physical patch to base, or
+     - replaying intent log chunk deterministically
+
+This algorithm is designed to degrade gracefully:
+
+- if index segments are missing/corrupt, we can fall back to scanning marker stream and rebuilding segments.
+
+### 10.5 Segment Construction (Background, Deterministic)
+
+Segment builder:
+
+- consumes the commit marker stream in order
+- for each committed capsule:
+  - extracts page patch object references
+  - updates a builder map `Pgno -> VersionPointer`
+- periodically flushes a new segment object covering `[start_commit, end_commit]`
+
+We MUST make construction deterministic:
+
+- stable ordering of map iteration
+- stable encoding of segments
+- stable object id derivation
+
+### 10.6 Repair and Rebuild
+
+IndexSegments are self-healing:
+
+- if some symbols are missing/corrupt, decode from remaining symbols
+- if decode impossible (beyond budget), rebuild by re-consuming marker stream + capsules
+
+We treat “index unrebuildable but commit markers exist” as a serious integrity failure; lab tests should force this case to ensure diagnostics are good.
+
+### 10.7 Boldness Constraint
+
+We do this in V1:
+
+- coded index segments are not a “Phase 9 nice-to-have”
+- the index is part of the fundamental ECS thesis
+
+Fallbacks exist only as emergency escape hatches after conformance/perf data proves a need.
 
 ---
 
@@ -1093,102 +1465,305 @@ We do not accept unbounded growth of:
 - symbol caches
 - index segment caches
 
+### 11.6 ARC Mechanics (Enough Detail To Implement Correctly)
+
+ARC maintains four LRU lists:
+
+- `T1`: recent pages in cache (recency)
+- `T2`: frequent pages in cache (frequency)
+- `B1`: “ghost” entries recently evicted from `T1`
+- `B2`: “ghost” entries recently evicted from `T2`
+
+The key control variable is `p` (target size of `T1`). ARC adapts `p` based on whether misses hit `B1` or `B2`:
+
+- miss hits `B1` ⇒ increase `p` (more recency)
+- miss hits `B2` ⇒ decrease `p` (more frequency)
+
+Implementation requirements:
+
+- O(1) amortized per request
+- ghost lists store keys only (no page data)
+- eviction never evicts pinned pages (or else cursors/txns break)
+
+This is enough structure to avoid the common “LRU scan death spiral”.
+
+### 11.7 MVCC-Aware ARC Keys (Versions Are Not Free)
+
+Standard ARC keys on `Pgno`. MVCC complicates this because there may be multiple versions of a page visible to different snapshots.
+
+We therefore define an ARC key:
+
+```
+CacheKey = (pgno, version_tag)
+```
+
+Where `version_tag` is:
+
+- `CommittedTip` for the newest committed version
+- or a `CommitSeq`/`TxnId`-derived tag for a historical version needed by an active snapshot
+
+Policy:
+
+- the cache MUST prefer keeping the newest committed version of hot pages
+- historical versions are kept only while required by active snapshots; once the GC horizon advances (§7.12.3), they become eligible for eviction/reclamation
+- version presence filter (§11.2) keeps the common case fast: most pages never take the “multi-version” path
+
+### 11.8 Optional: Cache Integrity Verification (Debuggable Corruption)
+
+We MAY support a debug/diagnostic mode:
+
+- store `xxh3_128(page_bytes)` alongside cached pages
+- on cache read, optionally re-hash and compare
+
+If mismatch:
+
+- evict the page from cache
+- surface a diagnostic (and in lab builds, attach evidence to the trace)
+
+This is useful for catching “impossible” corruption early during development and stress testing, without making it a mandatory hot-path tax.
+
 ---
 
 ## 12. Replication: Fountain-Coded, Loss-Tolerant, Late-Join Friendly
 
-We treat replication as distributing ECS symbols:
+Replication is not “ship WAL frames over TCP”. Replication is:
 
-- Writers create commit capsules and markers.
-- Capsules are encoded into symbols.
-- Symbols are shipped over lossy transports (e.g., UDP) using asupersync networking.
+> Make ECS symbols flow through the network so that every replica can decode the same objects, without requiring reliable ordered delivery.
 
-Properties:
+We explicitly embrace:
 
-- **Late join:** replica can start receiving symbols mid-stream; any `K` symbols suffice.
-- **No fragile ack protocol:** the receiver doesn’t need “symbol #17”; it needs *any set*.
-- **Bandwidth optimal:** near-minimal retransmission overhead.
+- loss
+- reordering
+- duplication
+- multipath delivery
 
-### 12.1 Quorum Durability / Quorum Replication (Optional Mode)
+because fountain codes make that cheap.
 
-We can define a commit as “durable” only after:
+### 12.1 Replication Roles and Modes
 
-- local persistence of a threshold of symbols, and/or
-- acknowledgement (by symbol receipts) from a quorum of replicas
+We define two modes:
 
-This becomes a tunable policy:
+1. **Leader commit clock (V1 default):**
+   - one node publishes the authoritative marker stream
+   - other nodes replicate objects + markers and serve reads
+   - writers can still be concurrent within the leader (MVCC)
+2. **Multi-writer (experimental):**
+   - multiple nodes publish capsules
+   - marker stream ordering becomes a distributed problem (not V1 default)
 
-- `PRAGMA durability = local`
-- `PRAGMA durability = quorum(M)`
+V1 focuses on (1) to keep semantics sharp and testable while still delivering the core “cure concurrent writers” win.
 
-### 12.2 Distributed Consistency (Asupersync Sheaf Lens)
+### 12.2 What We Replicate (Object Classes)
 
-When multiple nodes produce commit streams, inconsistencies can arise that are not visible pairwise. Asupersync includes a sheaf-style obstruction detector for “no global assignment explains local observations”.
+We replicate ECS objects, not files:
 
-We use that to detect replication anomalies early:
+- commit capsules (and patch objects they reference)
+- commit markers (the commit clock)
+- index segments
+- checkpoints and snapshot manifests
+- (optionally) decode proofs / audit traces for debugging
 
-- phantom commits
-- diverging manifests
-- inconsistent merge histories
+### 12.3 Transport Substrate (asupersync)
 
-This is “alien artifact” correctness: not just “it probably works”, but “we have invariants and detectors with formal grounding”.
+We build replication on:
 
-### 12.3 Symbol Assignment (Consistent Hashing + Quorums)
+- `asupersync::transport::{SymbolSink, SymbolStream, SymbolRouter, MultipathAggregator, SymbolDeduplicator, SymbolReorderer}`
+- simulated networks for tests: `asupersync::transport::mock::SimNetwork`
 
-We do not replicate “files”. We replicate **symbols**.
+The transport layer deals in `AuthenticatedSymbol` so we can turn security on without redesigning the pipeline.
 
-Default distribution model (native mode):
+### 12.4 Symbol Routing: Consistent Hashing + Policies
 
-- Each object is encoded into `K + R` symbols.
-- Each symbol is assigned to one or more replicas via **consistent hashing** (asupersync distributed module).
-- Durability/availability policy is expressed as “how many distinct replica symbol-stores must hold symbols so that any reader can collect at least `K` symbols”.
+We do not assign “objects to nodes”. We assign **symbols** to nodes.
 
-This is the key operational lever:
+Default:
 
-- Increase `R` (repair overhead) to tolerate loss without coordination.
-- Increase replication factor (symbols stored on more replicas) to tolerate node failures.
-- Tune quorum rules (commit ack) to trade latency for stronger guarantees.
+- encode object into `K` source symbols + `R` repair symbols
+- assign each symbol to one or more nodes via `asupersync::distributed::consistent_hash`
+- replication factor and `R` determine:
+  - node-loss tolerance
+  - loss tolerance
+  - catch-up rate
+
+### 12.5 Anti-Entropy (Late Join Is Just Another Case)
+
+Replication must converge even if nodes are offline.
+
+Anti-entropy loop:
+
+1. Exchange tips:
+   - latest `RootManifest` object id
+   - latest marker stream position / marker id
+   - optional index segment tips
+2. Compute missing object ids (set difference via manifests/index summaries).
+3. Request symbols for missing objects.
+4. Stream symbols until decode succeeds; stop early once K symbols gathered.
+5. Persist decoded objects locally; update caches.
+
+Because objects are fountain-coded:
+
+- a requester can ask for “any symbols for object X” without tracking which ESIs it already has
+- the responder can send whatever is convenient (source first, then repairs)
+
+### 12.6 Quorum Durability (Commit-Time Policy)
+
+Commit can be declared durable only after a quorum of symbol stores have accepted enough symbols.
+
+We reuse asupersync quorum semantics (`asupersync::combinator::quorum`):
+
+- local-only: `quorum(1, [local_store])`
+- 2-of-3: `quorum(2, [storeA, storeB, storeC])`
+
+This is integrated into §9.5 step (3).
+
+### 12.7 Snapshot Shipping (Bootstrap by Fountain Code)
+
+To bring up a new replica:
+
+1. Send the latest checkpoint manifest id.
+2. Stream checkpoint chunks as symbols until the replica decodes the checkpoint.
+3. Stream marker stream deltas since the checkpoint.
+4. Replica is now caught up.
+
+Because chunks are fountain-coded:
+
+- loss does not require retransmission bookkeeping
+- multiple existing replicas can multicast symbols; the joiner just needs any K
+
+### 12.8 Consistency Checking (Sheaf + TLA+ Export)
+
+We treat distributed correctness as first-class:
+
+- **Sheaf check:** use `asupersync::trace::distributed::sheaf` to detect anomalies that pairwise comparisons miss (phantom “global” commits that no single node witnessed end-to-end).
+- **TLA+ export:** use `asupersync::trace::tla_export` to export traces into TLA+ behaviors for model checking of bounded scenarios (commit, replication, recovery).
+
+This is how “alien artifact” systems stay explainable under distributed complexity.
+
+### 12.9 Security (Authenticated Symbols)
+
+Replication MAY be secured by enabling an `asupersync::security::SecurityContext`:
+
+- symbols become `AuthenticatedSymbol`
+- receivers verify tags before accepting symbols
+- unauthenticated/corrupted symbols are ignored (repair handles loss)
+
+Security is an orthogonal dimension; it does not change ECS semantics.
 
 ---
 
 ## 13. The Asupersync Integration Contract (Cx Everywhere)
 
-### 13.1 Cx Capability Context
+Asupersync is not “a convenience dependency”. It is the runtime semantics of the project:
 
-All non-trivial operations must take a `&Cx` (capability context):
+- no Tokio
+- no ad-hoc async
+- deterministic concurrency testing as a first-class capability
+
+### 13.1 `Cx` Capability Context (Ambient Semantics, Explicitly Passed)
+
+All non-trivial operations MUST take a `&asupersync::Cx`:
 
 - VFS I/O
-- networking
-- timeouts
+- ECS symbol persistence
+- replication networking
+- timeouts / deadlines
 - cancellation
-- deterministic test runtime hooks
+- determinism hooks (lab runtime)
+- observability / tracing attachments
 
-We treat `Cx` as the ambient “operating semantics”. In production, it maps to real I/O and clocks. In tests, it maps to lab runtime (virtual time + deterministic scheduling).
+`Cx` is cheaply cloneable and carries structured observability + drivers (I/O, timers, entropy, logical clock).
 
-### 13.2 Deterministic Concurrency Testing
+Design rule:
 
-All concurrency-critical components (MVCC/SSI, commit pipeline, replication, recovery) must be tested under:
+- Core engine APIs SHOULD accept `&Cx` even if they are synchronous today. This keeps the architecture honest and prevents “oops we need async later” rewrites.
 
-- **Lab runtime** (virtual time, deterministic scheduling)
-- **DPOR schedule exploration** (Mazurkiewicz trace equivalence classes)
+### 13.2 RaptorQ Pipelines (The Only RaptorQ We Use)
+
+We use asupersync’s RaptorQ integration:
+
+- `asupersync::raptorq::{RaptorQSenderBuilder, RaptorQReceiverBuilder, RaptorQSender, RaptorQReceiver}`
+- `asupersync::transport::{SymbolSink, SymbolStream}`
+- `asupersync::security::{SecurityContext, AuthenticatedSymbol}` (optional)
+- `asupersync::raptorq::proof::{DecodeProof, DecodeProofBuilder}` (audit)
+
+Canonical encode path (conceptual):
+
+```rust
+use asupersync::{Cx, config::RaptorQConfig, raptorq::RaptorQSenderBuilder};
+
+fn encode_object(cx: &Cx, object_id: asupersync::types::symbol::ObjectId, bytes: &[u8]) {
+    let mut sender = RaptorQSenderBuilder::new()
+        .config(RaptorQConfig::default())
+        .transport(/* SymbolSink */)
+        .build()
+        .unwrap();
+    let _outcome = sender.send_object(cx, object_id, bytes).unwrap();
+}
+```
+
+### 13.3 Transport & Network Simulation (Testing Is The Spec)
+
+Replication and ECS symbol plumbing MUST be testable without the real network:
+
+- `asupersync::transport::mock::SimNetwork` for loss/reorder/duplication
+- routers/dispatchers for symbol routing
+- multipath aggregator for combining symbol streams
+
+We want to be able to write tests like:
+
+- “drop 30% of symbols, reorder arbitrarily, still decode”
+- “corrupt every 1000th symbol, decode proof shows repair”
+
+### 13.4 LabRuntime: Deterministic Scheduling + Virtual Time + Chaos
+
+All concurrency-critical tests MUST run under `asupersync::LabRuntime`:
+
+- deterministic scheduling by seed
+- virtual time for timeouts and timers
+- chaos injection (deterministic) to stress I/O ordering
+- trace capture and replay for debugging
+
+We consider it a bug if we cannot reproduce a concurrency failure with a single seed.
+
+### 13.5 DPOR Exploration (Mazurkiewicz Trace Semantics)
 
 We do not accept “run it 10,000 times and hope”.
 
-### 13.3 Anytime-Valid Invariant Monitoring (e-processes)
+For MVCC/commit/replication protocols:
 
-We instrument invariants as e-processes (Ville’s inequality) to allow “peeking” without invalidating guarantees:
+- use DPOR-style schedule exploration (`asupersync::lab::explorer`)
+- track coverage by Mazurkiewicz trace equivalence (trace monoid fingerprints)
 
-- MVCC invariant monitors
-- replication divergence monitors
-- memory growth monitors (version chains / symbol cache)
+This makes concurrency bugs discoverable early, not after production incidents.
 
-This is a core part of “operational excellence”: the system watches itself.
+### 13.6 Oracles: Anytime-Valid Monitoring (e-processes) + Conformal Budgets
 
-### 13.4 `Cx` In Every Trait (No Ambient Authority)
+We use:
+
+- `asupersync::lab::oracle::eprocess` for anytime-valid invariant monitoring:
+  - MVCC invariants
+  - memory growth bounds
+  - replication divergence signals
+- `asupersync::lab::conformal` for distribution-free calibration of performance thresholds in lab harnesses (avoid “benchmark noise” excuses).
+
+### 13.7 Formalization Hooks: TLA+ Export + Distributed Sheaf Checks
+
+Asupersync includes:
+
+- `asupersync::trace::tla_export` for exporting traces into TLA+ behaviors/spec skeletons
+- `asupersync::trace::distributed::sheaf` for higher-order consistency detection
+
+We will use these specifically for:
+
+- commit marker publish protocol
+- recovery replay
+- replication anti-entropy
+
+### 13.8 `Cx` In Every Trait (No Ambient Authority)
 
 Concrete rule:
 
-- Any trait method that can touch time, I/O, networking, cancellation, concurrency, or randomness must accept a `&asupersync::Cx` (usually as the first parameter after `&self`).
+- Any trait method that can touch time, I/O, networking, cancellation, concurrency, or randomness MUST accept `&Cx` (typically immediately after `&self`).
 
 Examples (conceptual signatures):
 
@@ -1206,57 +1781,97 @@ pub trait VfsFile {
 }
 
 pub trait Ecs {
-    fn put_symbols(&self, cx: &Cx, obj: ObjectId, symbols: &[Symbol]) -> Result<()>;
-    fn get_any_k_symbols(&self, cx: &Cx, obj: ObjectId, k: usize) -> Result<Vec<Symbol>>;
+    fn put_symbol_records(&self, cx: &Cx, records: &[EcsSymbolRecordV1]) -> Result<()>;
+    fn get_any_k(&self, cx: &Cx, params: ObjectParams, k: usize) -> Result<Vec<AuthenticatedSymbol>>;
 }
 ```
-
-Why this matters:
-
-- In production, `Cx` is how we get cancellation, deadlines, and observability for free.
-- In tests, `Cx` is what binds us to **LabRuntime** (virtual time + deterministic scheduling), making concurrency bugs reproducible.
-- In distributed mode, `Cx` is where security context and symbol authentication live.
-
-### 13.5 Lab Runtime Is Mandatory For Concurrency-Critical Tests
-
-Asupersync provides:
-
-- `asupersync::LabRuntime`: deterministic scheduler + virtual time
-- DPOR-style schedule exploration (Mazurkiewicz trace quotient)
-- trace capture/replay
-
-Policy:
-
-- MVCC/SSI tests must run under `LabRuntime`.
-- Commit pipeline + replication must have at least one test that explores schedules (not just fixed interleavings).
 
 ---
 
 ## 14. Conformance Harness (The Oracle Is The Judge)
 
-Conformance is not Phase 9. It starts immediately.
+Conformance is not Phase 9. It starts immediately, and it is how we keep the project honest while being radically innovative internally.
 
-### 14.1 Oracle
+Principle:
 
-- Build and run C SQLite 3.52.0 from `legacy_sqlite_code/`.
-- Run identical test inputs against:
-  - C SQLite (oracle)
-  - FrankenSQLite
-- Compare structured outputs:
-  - rows
-  - types (where observable)
-  - error codes and normalized messages
+> We are allowed to change *how* it works. We are not allowed to change *what it does* (unless explicitly approved).
 
-### 14.2 Test Corpora
+### 14.1 The Oracle
+
+Oracle = C SQLite 3.52.0 built from `legacy_sqlite_code/`.
+
+The harness MUST be able to:
+
+- run the Oracle in-process or via a small runner binary
+- execute SQL statements and prepared statements
+- capture results and error codes deterministically
+
+### 14.2 What We Compare (Not Just Rows)
+
+For each test case, we compare:
+
+- result rows (including NULL behavior)
+- type affinity where observable
+- error code + extended error code (normalized)
+- affected-row counts (`changes()`, `total_changes()`)
+- `last_insert_rowid()` where relevant
+- transaction boundary effects (commit/rollback, savepoints)
+
+### 14.3 Fixture Format (Self-Describing)
+
+We standardize on a JSON fixture format so it can be generated by the Oracle runner and consumed by Rust tests:
+
+```json
+{
+  "name": "insert-and-select",
+  "steps": [
+    { "op": "open", "flags": "readwrite_create", "pragmas": ["journal_mode=WAL"] },
+    { "op": "exec", "sql": "CREATE TABLE t(x INTEGER);" },
+    { "op": "exec", "sql": "INSERT INTO t VALUES (1),(2),(3);" },
+    { "op": "query", "sql": "SELECT x FROM t ORDER BY x;", "expect": { "rows": [["1"],["2"],["3"]] } }
+  ]
+}
+```
+
+Notes:
+
+- Harness MUST support multi-step cases (transactions, temp objects, pragmas).
+- Results are string-normalized by default; type-aware comparison is opt-in per case when needed.
+
+### 14.4 Corpora (Breadth + Depth)
+
+We run:
 
 - SQLLogicTest (SLT) ingestion (broad SQL coverage).
-- Targeted SQLite tests for tricky semantics (transactions, triggers, etc.).
-- Crash/recovery tests (fault injection).
-- Replication tests (lossy network simulation).
+- targeted micro-suites for tricky semantics:
+  - floating-point corner cases
+  - collations
+  - NULL and type affinity oddities
+  - triggers/CTEs/window functions
+- regression tests for concurrency anomalies:
+  - write skew patterns (must abort under default serializable mode)
 
-### 14.3 “Golden Output” Discipline
+And also non-oracle suites:
 
-Every optimization or behavioral change must preserve golden outputs unless an intentional divergence is explicitly approved and documented.
+- crash/recovery fault-injection tests (native mode durability contract)
+- replication convergence tests (SimNetwork, loss/reorder/dup)
+
+### 14.5 Normalization Rules (Avoid False Failures)
+
+The harness MUST encode the Oracle’s semantics faithfully while avoiding meaningless diffs:
+
+- unordered SELECT results: compare as multisets only when SQL has no ORDER BY and Oracle makes no ordering guarantee (SLT already encodes sorting rules; we follow that).
+- floating-point: compare either exact strings (default) or tolerance mode where explicitly requested.
+- error messages: compare error codes; messages can be normalized (Oracle’s exact phrasing is not always stable).
+
+### 14.6 Golden Output Discipline (Behavior Isomorphism)
+
+Every optimization or refactor must preserve golden outputs unless:
+
+- we explicitly document an intentional divergence, and
+- add a harness annotation explaining why it is acceptable.
+
+This is the “extreme optimization” guardrail: change one lever, prove behavior unchanged.
 
 ---
 
@@ -1269,6 +1884,20 @@ We operate under the strict loop:
 3. Prove behavior unchanged (oracle)
 4. Implement one lever
 5. Re-measure
+
+Non-negotiable rule:
+
+- We do not optimize “from vibes”. We optimize from profiles and budgets.
+
+Practical commands (examples):
+
+```bash
+# Micro baseline (example)
+hyperfine --warmup 3 --runs 10 'cargo run -p fsqlite-harness -- bench-case page_read_hot'
+
+# CPU profile (example)
+cargo flamegraph -p fsqlite-core -- benchmark_name
+```
 
 ### 15.1 Benchmarks We Must Have Early
 
@@ -1288,10 +1917,61 @@ Macro:
 
 ### 15.2 Checksums / Hashes (Performance Reality)
 
-- Use fast non-crypto hashes (e.g., xxhash3) for hot-path integrity where attacker resistance is not required.
-- Reserve SHA-256 for security-critical contexts (authenticity, content addressing if desired).
+We separate three concerns:
 
-### 15.3 Build Profiles (Perf First, Size As A Separate Track)
+1. **Hot-path corruption detection** (fast, non-crypto).
+2. **Content identity** (stable, collision-resistant enough for addressing).
+3. **Authenticity / security boundaries** (cryptographic, keyed where needed).
+
+Policy:
+
+- Hot-path page/symbol integrity: **XXH3-128** (via `xxhash-rust`) is the default.
+  - Rationale: extremely high throughput; excellent for detecting torn writes/bitrot quickly.
+  - Note: the crate may use unsafe internally for SIMD; our workspace code remains `#[forbid(unsafe_code)]`.
+- Content addressing (`ObjectId` derivation): **BLAKE3** truncated to 128 bits (stable, fast, strong).
+- Auth boundaries (optional): use `asupersync::security::SecurityContext` and authenticated symbols (don’t reinvent crypto).
+
+We do NOT use SHA-256 on hot paths unless we have a specific security requirement; it is too slow for page-per-access integrity.
+
+### 15.3 Mechanical Sympathy (Speed Without Cheating)
+
+Gemini’s point is correct: “math is instructions.” The project should feel like it was built by someone who can see the CPU.
+
+Non-negotiables:
+
+- **Avoid allocation in the read path**: cache lookups, version checks, and index resolution must be allocation-free in the common case.
+- **Keep working sets in L1/L2**: small, contiguous structures for hot metadata (active txn sets, per-page flags, shard locks).
+- **Exploit auto-vectorization**: GF(256) symbol ops and XOR patches should operate on `u64`/`u128` chunks where possible (safe Rust), letting LLVM vectorize.
+- **Use optimized deps instead of writing unsafe**: SIMD happens inside vetted crates (xxhash/blake3/asupersync), not in our code.
+
+### 15.4 Zero-Copy (Where It Helps, Without Breaking Canonical Bytes)
+
+We distinguish:
+
+- **Canonical bytes** (affecting `ObjectId`): MUST be explicit, stable, versioned, and not dependent on compiler/layout. We keep manual encoding here (§5.2.1).
+- **Rebuildable caches** (accelerators): MAY use zero-copy formats for speed.
+
+V1 stance:
+
+- Use explicit byte layouts for ECS symbol records and log segments.
+- Consider `rkyv`/zero-copy for caches only (object locator cache, index cache), because caches can be blown away and rebuilt without affecting correctness.
+
+### 15.5 Isomorphism Proof Template (Required For Optimizations)
+
+For every performance change:
+
+```
+Change: <description>
+- Ordering preserved:     yes/no (+why)
+- Tie-breaking unchanged: yes/no (+why)
+- Float behavior:         identical / N/A
+- RNG seeds:              unchanged / N/A
+- Oracle fixtures:        PASS (reference case ids)
+```
+
+This is how we stay fast without drifting from parity.
+
+### 15.6 Build Profiles (Perf First, Size As A Separate Track)
 
 This is a database engine, not a demo binary. We want **opt-level 3** for performance-critical builds.
 
@@ -1309,68 +1989,197 @@ Rationale:
 
 ## 16. Implementation Plan (V1 Phases)
 
-This plan is ordered to prevent the “build then refactor” trap.
+This plan is ordered to prevent the “build then refactor” trap, and each phase has an explicit exit criterion.
 
-### Phase 0: Oracle + Harness + Baselines (Days 1+)
+Guiding rule (porting-to-rust):
 
-- Build C SQLite oracle runner.
-- Establish golden output format.
-- Ingest SLT smoke subset.
-- Stand up criterion benches for the earliest hot loops.
+- We implement from *spec and oracle behavior*, not by translating C function-by-function.
 
-### Phase 1: ECS Skeleton + RaptorQ Plumbing + Cx Plumbing
+### Phase 0 Gate: Oracle Harness Is Alive
 
-- Define ECS object headers, ids, symbol store abstraction.
-- Integrate asupersync RaptorQ pipeline builders.
-- Thread `&Cx` through the engine’s core traits.
+Deliverables:
 
-### Phase 2: MVCC + SSI Core (Serializable Concurrent Writers)
+- Oracle runner builds C SQLite 3.52.0 from `legacy_sqlite_code/`.
+- A JSON fixture format exists (§14.3).
+- At least one smoke suite runs Oracle vs Rust and produces a clear diff on failure.
 
-- Implement MVCC types and visibility.
-- Implement SSI tracking at page granularity.
-- Implement commit capsules (deltas) and commit marker semantics.
-- Lab runtime schedule exploration for invariants.
+Exit criteria:
 
-### Phase 3: Coded Index Segments
+- `cargo test -p fsqlite-harness` passes locally.
 
-- Implement index segment objects and lookups.
-- Encode/store as ECS objects (self-healing indices).
+### Phase 1 Gate: ECS Skeleton + `Cx` Plumbing
 
-### Phase 4: B-Tree + VDBE + Full SQL Surface (Driven By Oracle)
+Deliverables:
 
-- Implement B-tree from spec + proptest.
-- Implement VDBE mem/register + opcodes.
-- Expand conformance to chase failures to zero.
+- ECS symbol record format (§6.4) implemented in `crates/fsqlite-wal` initially (we can split into a dedicated ECS crate later only if layering pain is proven).
+- Local symbol log append + scan works.
+- `RootManifest` exists; `ecs/root` bootstraps.
+- Core traits accept `&Cx` (VFS, pager, ECS).
 
-### Phase 5: Replication + Snapshot Shipping
+Exit criteria:
 
-- Fountain-coded commit shipping over lossy transport.
-- Late join replica bootstrap via snapshot symbols.
-- Distributed consistency checks + invariant monitors.
+- A “toy commit” object can be encoded, persisted, decoded, and verified end-to-end.
 
-### Phase 6: Algebraic Write Merging (Conflict Reduction)
+### Phase 2 Gate: Serializable MVCC Core
 
-- Introduce structured page patch format.
-- Merge disjoint cell-range deltas.
-- Prove correctness by invariants + oracle behavior on concurrency tests.
+Deliverables:
+
+- MVCC snapshot capture + visibility rules (§7.2).
+- Page-SSI conservative rule implemented (§7.4–§7.7).
+- Commit capsule + marker protocol implemented (§9.4–§9.5).
+- Deterministic schedule tests under `LabRuntime` for:
+  - no deadlocks
+  - deterministic abort decisions
+
+Exit criteria:
+
+- Concurrency regression suite catches write skew (at least one txn aborts).
+- Sequential conformance smoke cases still match Oracle.
+
+### Phase 3 Gate: Coded Index Segments
+
+Deliverables:
+
+- `PageVersionIndexSegment` object type implemented (§10.3).
+- Lookup path can resolve `(pgno, snapshot)` using segments.
+- Rebuild-from-marker-stream works (delete caches, still boot).
+
+Exit criteria:
+
+- A benchmark demonstrates “no index scan” page lookup is fast enough for p95 goals.
+
+### Phase 4 Gate: SQL Surface Marches Toward Parity (Driven by Oracle)
+
+Deliverables:
+
+- Parser/AST/planner/VDBE coverage expands guided by failing Oracle fixtures.
+- B-tree correctness enforced by proptest invariants.
+- Continuous fuzzing against the oracle harness:
+  - fuzz SQL text → execute Oracle vs Rust → compare outputs
+  - fuzz VDBE opcode sequences in isolation where possible (crash = failure, divergence = failure)
+- Extensions are feature-gated but spec’d for parity targets.
+
+Exit criteria:
+
+- SLT subset passes (increasing over time).
+- No “known failing” bucket unless explicitly documented.
+
+### Phase 5 Gate: Replication + Snapshot Shipping
+
+Deliverables:
+
+- Symbol streaming over asupersync transport (SimNetwork tests).
+- Anti-entropy loop converges under loss/reorder/dup.
+- Snapshot bootstrap works from checkpoint chunks.
+
+Exit criteria:
+
+- Deterministic replication tests under LabRuntime show convergence.
+
+### Phase 6 Gate: Mergeable Writes (Conflict Rate Collapse)
+
+Deliverables:
+
+- Deterministic rebase replay engine (§8.2) for a meaningful subset of ops.
+- Physical patch merge ladder (§8.5) for safe cases.
+
+Exit criteria:
+
+- Multi-writer benchmark shows reduced abort rate on hot workloads compared to “abort on any same-page write”.
 
 ---
 
 ## 17. Risk Register + Open Questions
 
-These are the “hard edges” we expect to resolve with experiments + conformance + profiling:
+This section is explicit so future us doesn’t rediscover the same cliffs.
 
-- Multi-process writers: do we support true multi-process concurrency in V1, or do we scope V1 to in-process and use replication for multi-node?
-- SSI false positives at page granularity: how to refine with range-based SIREAD locks without blowing overhead?
-- Optimal symbol sizing and overhead (object sizes vary widely).
-- Where to checkpoint to canonical `.db` for compatibility without becoming a bottleneck.
-- Which operations are safely algebraically mergeable on B-tree pages (requires deep invariants).
+### 17.1 Risks (With Mitigations)
+
+R1. **Serializable abort rate too high (Page-SSI is conservative).**  
+Mitigations:
+
+- refine SIREAD keys from page → (page, range/cell tag)
+- add safe snapshot optimizations for read-only txns
+- add intent-level rebase (§8.2) to turn conflicts into merges
+
+R2. **RaptorQ overhead dominates CPU.**  
+Mitigations:
+
+- choose symbol sizing policy based on object type (capsules vs checkpoints)
+- cache decoded objects aggressively
+- profile and tune encoder/decoder hot paths (one lever per change)
+
+R3. **Append-only storage grows without bound.**  
+Mitigations:
+
+- checkpoint and compaction are first-class (§9.7)
+- enforce budgets for history, SIREAD, symbol caches (§11.5)
+
+R4. **Bootstrapping chicken-and-egg (need index to find symbols, need symbols to decode index).**  
+Mitigations:
+
+- symbol records are self-describing (§6.4)
+- one tiny mutable `ecs/root` pointer (§6.5–§6.6)
+- rebuild-from-scan is always possible
+
+R5. **Multi-process concurrency semantics unclear.**  
+Mitigations:
+
+- V1 focuses on in-process correctness + leader replication mode
+- design APIs so shared-memory/lock-table evolution is possible
+- add explicit tests for multi-process behaviors before promising support
+
+R6. **File format compatibility vs “do it right”.**  
+Mitigations:
+
+- treat SQLite `.db/.wal` as compatibility views (§9.8)
+- conformance harness validates observable behavior, not byte-identical layout
+
+R7. **Mergeable writes become a correctness minefield.**  
+Mitigations:
+
+- strict merge ladder (§8.5)
+- proptest invariants + DPOR tests (§8.6)
+- start with deterministic rebase replay for a small op subset
+
+R8. **Distributed mode correctness is hard.**  
+Mitigations:
+
+- keep V1 replication “leader commit clock” default (§12.1)
+- use sheaf checks + TLA+ export for bounded model checking (§12.8, §13.7)
+
+### 17.2 Open Questions (Tracked, With How We Answer Them)
+
+Q1. Multi-process writers: do we support true multi-process concurrent writes in V1?  
+Answer plan: prototype file-lock + marker-stream publish across processes; measure contention; decide based on benchmarks.
+
+Q2. How far do we go with range/cell refinement for SIREAD?  
+Answer plan: start page-only; collect abort witnesses; refine only when abort rate is proven unacceptable.
+
+Q3. Symbol sizing policy per object type (capsule vs checkpoint vs index).  
+Answer plan: benchmark encode/decode throughput vs object sizes; pick defaults; expose PRAGMA overrides for experiments.
+
+Q4. Where to checkpoint for compatibility `.db` without bottlenecking writes?  
+Answer plan: background checkpoint with ECS chunks; measure; keep export optional.
+
+Q5. Which B-tree operations can be replayed deterministically for rebase merge?  
+Answer plan: implement inserts/updates on leaf pages first; grow coverage guided by conflict benchmarks.
+
+Q6. Do we need B-link style concurrency techniques for hot-page split/merge contention?  
+Answer plan: benchmark workloads that hammer the same index/table; if internal-page conflicts dominate, add an internal “structure modification” protocol (ephemeral metadata, not file format changes) inspired by B-link trees: optimistic descent + right-sibling guidance + deterministic retry.
 
 ---
 
 ## 18. Local References (In This Repo)
 
-- RFC 6330: `docs/rfc6330.txt`
-- Legacy C oracle source: `legacy_sqlite_code/`
-- Existing MVCC draft (superseded by this doc): `MVCC_SPECIFICATION.md`
-- Beads workspace: `.beads/`
+- **RaptorQ canon:** `docs/rfc6330.txt`
+- **Legacy oracle (C SQLite 3.52.0):** `legacy_sqlite_code/`
+- Existing extracted structure notes (useful, but this doc is authoritative):
+  - `EXISTING_SQLITE_STRUCTURE.md`
+  - `PLAN_TO_PORT_SQLITE_TO_RUST.md`
+  - `PROPOSED_ARCHITECTURE.md`
+- Previous drafts (superseded by this doc):
+  - `MVCC_SPECIFICATION.md`
+  - `COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md`
+- Issue tracker state:
+  - `.beads/`
