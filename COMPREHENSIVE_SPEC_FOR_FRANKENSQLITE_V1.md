@@ -7315,15 +7315,30 @@ frankensqlite/
 Layer 0 (leaves):     fsqlite-types    fsqlite-error
 Layer 1 (storage):    fsqlite-vfs      fsqlite-ast
 Layer 2 (cache):      fsqlite-pager    fsqlite-parser     fsqlite-func
-Layer 3 (log):        fsqlite-wal      fsqlite-planner
+Layer 3 (log+mvcc):   fsqlite-wal      fsqlite-mvcc       fsqlite-planner
 Layer 4 (btree):      fsqlite-btree
 Layer 5 (vm):         fsqlite-vdbe
-Layer 6 (mvcc):       fsqlite-mvcc
-Layer 7 (ext):        fsqlite-ext-{fts3,fts5,rtree,json,session,icu,misc}
-Layer 8 (core):       fsqlite-core
-Layer 9 (api):        fsqlite
-Layer 10 (apps):      fsqlite-cli      fsqlite-harness
+Layer 6 (ext):        fsqlite-ext-{fts3,fts5,rtree,json,session,icu,misc}
+Layer 7 (core):       fsqlite-core
+Layer 8 (api):        fsqlite
+Layer 9 (apps):       fsqlite-cli      fsqlite-harness
 ```
+
+**Layering rationale (V1.7 errata):**
+
+- **fsqlite-mvcc moved from Layer 6 to Layer 3.** The B-tree layer (L4) needs
+  the `MvccPager` trait for page access. If MVCC stayed at L6, this would be
+  a layer inversion (L4 depending on L6). The `MvccPager` *trait definition*
+  lives in `fsqlite-pager` (L2); `fsqlite-mvcc` (L3) *implements* it. This
+  way `fsqlite-btree` (L4) depends only on `fsqlite-pager` (L2) for the
+  trait, and `fsqlite-core` (L7) wires the concrete implementation.
+
+- **fsqlite-wal does NOT depend on fsqlite-pager** (breaking the cycle).
+  Instead, `fsqlite-pager` defines a `CheckpointPageWriter` trait. During
+  checkpoint, `fsqlite-wal` receives a `&dyn CheckpointPageWriter` callback
+  from `fsqlite-core`, which provides page cache access without creating a
+  compile-time crate dependency from wal -> pager. Both crates depend on
+  `fsqlite-vfs` and `fsqlite-types` (L0-L1) without cycles.
 
 ### 8.3 Per-Crate Detailed Descriptions
 
@@ -7629,14 +7644,14 @@ Compares output row-by-row. Error code matching. Golden file management.
 | fsqlite-pager | fsqlite-vfs | File I/O |
 | fsqlite-pager | fsqlite-types | PageNumber, PageData |
 | fsqlite-wal | fsqlite-vfs | WAL file + SHM file access |
-| fsqlite-wal | fsqlite-pager | Page cache during checkpoint |
 | fsqlite-wal | fsqlite-types | PageNumber, frame types |
+| ~~fsqlite-wal~~ | ~~fsqlite-pager~~ | ~~REMOVED (V1.7): was "page cache during checkpoint" -- created a compile-time cycle. Checkpoint now receives `&dyn CheckpointPageWriter` at runtime from fsqlite-core.~~ |
 | fsqlite-mvcc | fsqlite-wal | WAL append during commit |
-| fsqlite-mvcc | fsqlite-pager | Page cache for version base data |
-| fsqlite-mvcc | fsqlite-types | TxnId, PageNumber, Snapshot |
+| fsqlite-mvcc | fsqlite-pager | Page cache (via MvccPager trait impl), CheckpointPageWriter impl |
+| fsqlite-mvcc | fsqlite-types | TxnId, PageNumber, CommitSeq, Snapshot |
 | fsqlite-mvcc | parking_lot | Fast Mutex for lock table (hot path) |
 | fsqlite-mvcc | asupersync | Two-phase MPSC channel, RaptorQ codec |
-| fsqlite-btree | fsqlite-pager | Page access (via MvccPager trait) |
+| fsqlite-btree | fsqlite-pager | Page access (via MvccPager trait defined in fsqlite-pager) |
 | fsqlite-btree | fsqlite-types | Cell formats, SerialType |
 | fsqlite-ast | fsqlite-types | SqliteValue (for AST literals) |
 | fsqlite-parser | fsqlite-ast | Produces AST nodes |
@@ -8623,7 +8638,11 @@ pub struct VdbeOp {
     pub p2: i32,           // second operand (jump target, register, etc.)
     pub p3: i32,           // third operand
     pub p4: P4,            // extended operand
-    pub p5: u16,           // flags
+    pub p5: u16,           // flags (only low 8 bits are semantically used;
+                           // upper 8 bits MUST be zero. The C SQLite struct
+                           // declares this as u16 for alignment, but all
+                           // opcode flag masks fit in u8. Do NOT store data
+                           // in the upper byte.)
 }
 
 pub enum P4 {
@@ -9449,15 +9468,22 @@ Full expression grammar including all operators by precedence (highest first):
 
 | Precedence | Operators |
 |-----------|-----------|
-| 1 (highest) | `~` (bitwise NOT), unary `+`, unary `-`, `NOT` |
-| 2 | `||` (string concat) |
-| 3 | `*`, `/`, `%` |
-| 4 | `+`, `-` |
-| 5 | `<<`, `>>`, `&`, `|` |
-| 6 | `<`, `<=`, `>`, `>=` |
-| 7 | `=`, `==`, `!=`, `<>`, `IS`, `IS NOT`, `IS DISTINCT FROM`, `IS NOT DISTINCT FROM`, `IN`, `LIKE`, `GLOB`, `MATCH`, `REGEXP`, `BETWEEN` |
-| 8 | `AND` |
-| 9 (lowest) | `OR` |
+| 1 (highest) | `COLLATE` (postfix collation override) |
+| 2 | `~` (bitwise NOT), unary `+`, unary `-` |
+| 3 | `||` (string concat) |
+| 4 | `*`, `/`, `%` |
+| 5 | `+`, `-` |
+| 6 | `<<`, `>>`, `&`, `\|` |
+| 7 | `<`, `<=`, `>`, `>=` |
+| 8 | `=`, `==`, `!=`, `<>`, `IS`, `IS NOT`, `IS DISTINCT FROM`, `IS NOT DISTINCT FROM`, `IN`, `LIKE`, `GLOB`, `MATCH`, `REGEXP`, `BETWEEN` |
+| 9 | `NOT` (prefix logical negation -- lower than comparisons: `NOT x = y` parses as `NOT (x = y)`) |
+| 10 | `AND` |
+| 11 (lowest) | `OR` |
+
+**IMPORTANT:** `NOT` is NOT at the same precedence as unary `~`/`+`/`-`.
+In SQLite, `NOT x = y` means `NOT (x = y)`, not `(NOT x) = y`. This
+matches the SQLite source grammar (parse.y) and documentation. `COLLATE`
+binds tighter than everything: `-x COLLATE NOCASE` is `-(x COLLATE NOCASE)`.
 
 **Special expression forms:**
 - `CAST(expr AS type-name)` -- explicit type conversion
@@ -11310,7 +11336,7 @@ We operate under a strict loop: Baseline -> Profile -> Prove behavior unchanged 
 - **Scan vs Random:** Cache policy sensitivity (ARC vs LRU).
 - **Replication:** Convergence time under 5%, 10%, 25% packet loss.
 
-**Statistical methodology using asupersync's conformal calibration:**
+**Statistical methodology (split conformal + e-process; distribution-free):**
 
 We do not assume normality. We treat performance as heavy-tailed and
 schedule-sensitive, and we use distribution-free calibration and anytime-valid
