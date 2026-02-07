@@ -223,6 +223,10 @@ patterns. The following constraints are non-negotiable for hot-path code:
 - **Zero-copy I/O.** The VFS read/write paths MUST NOT allocate intermediate
   buffers. `read_exact_at` / `write_all_at` operate directly on page-aligned
   buffers. The pager hands out `&[u8]` references to cached pages, not copies.
+  **Clarification:** "Zero-copy" here means *no additional heap allocations or
+  userspace staging copies* in the hot path. It does **not** imply kernel-bypass
+  I/O. Buffered I/O is still used where required (e.g., SQLite `.wal`), and
+  small stack buffers for fixed-size headers are permitted.
 
 - **SIMD-friendly layouts.** Hot comparison paths (B-tree key comparison,
   checksum computation, RaptorQ GF(256) arithmetic) SHOULD use types whose
