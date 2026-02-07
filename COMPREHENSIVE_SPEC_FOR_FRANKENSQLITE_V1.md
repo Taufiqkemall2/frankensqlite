@@ -6689,6 +6689,10 @@ artifacts; if shared memory is corrupted, we rebuild from symbol logs.
    SSI validation of either party we MUST be able to discover `R` as a
    candidate for `K` at *some configured hierarchy level* (refinement may be
    required to confirm intersection).
+   This includes **predicate reads** (phantom protection): if a transaction reads
+   a predicate-defined set (range scan), it MUST register witness keys whose
+   intersection with any write that would change that predicate's result is
+   non-empty (e.g., leaf-page `Page(leaf_pgno)` witnessing; §5.6.4.3).
 2. **Cross-process:** Works when multiple OS processes attach to the same DB
    file and share only the shared-memory region + ECS logs.
 3. **Distributed-ready:** Evidence is ECS objects, so symbol-native replication
@@ -9444,6 +9448,12 @@ pub fn wal_checksum(
     (s1, s2)
 }
 ```
+
+**Clarification (avoid common mis-transcriptions):** SQLite's `walChecksumBytes`
+updates `s1` with the first u32 word and `s2` with the second u32 word of each
+8-byte chunk (`s1 += a + s2; s2 += b + s1`). Some incorrect transcriptions
+"avalanche" by adding each word into both accumulators sequentially; that does
+not match `wal.c` and will break binary interoperability.
 
 **Endianness determination from WAL magic:**
 - `0x377f0682` (bit 0 = 0): `bigEndCksum = 0` (created on a little-endian machine).
