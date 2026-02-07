@@ -6806,7 +6806,7 @@ ssi_validate_and_publish(T):
   T.has_in_rw  = (in_edges not empty)
   T.has_out_rw = (out_edges not empty)
 
-  // 3) Refinement and merge escape hatch (optional but canonical).
+  // 4) Refinement and merge escape hatch (optional but canonical).
   // - Refinement confirms true intersection at finer WitnessKey granularity.
   // - Merge (§5.10) can transform "same page" conflicts into commuting merges,
   //   tightening witness precision and dropping spurious edges.
@@ -6815,13 +6815,13 @@ ssi_validate_and_publish(T):
   T.has_in_rw  = (in_edges not empty)
   T.has_out_rw = (out_edges not empty)
 
-  // 4) Pivot rule (conservative, sound default):
+  // 5) Pivot rule (conservative, sound default):
   //    T is the pivot (T2 in T1->T2->T3): abort T.
   if T.has_in_rw && T.has_out_rw:
      publish AbortWitness(T, edges = in_edges ∪ out_edges)
      abort T with SQLITE_BUSY_SNAPSHOT
 
-  // 5) T3 rule (Cahill/Ports §3.2, "near-miss" check):
+  // 6) T3 rule (Cahill/Ports §3.2, "near-miss" check):
   //    When T commits, it may complete a dangerous structure where some
   //    other active transaction T_other is the pivot. Specifically, if T
   //    wrote a page that T_other read (creating an rw edge T_other->T,
@@ -6839,7 +6839,7 @@ ssi_validate_and_publish(T):
           // T_other is now a pivot: T_x -> T_other -> T (and T is committing)
           T_other.marked_for_abort = true     // eager abort optimization
 
-  // 6) Publish edges + return evidence references for CommitProof.
+  // 7) Publish edges + return evidence references for CommitProof.
   edge_ids = publish DependencyEdge objects for (in_edges ∪ out_edges)
   return (read_wits, write_wits, edge_ids, merge_witnesses)
 ```
