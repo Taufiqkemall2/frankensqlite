@@ -11,8 +11,8 @@
 use std::collections::HashMap;
 
 use fsqlite_types::{
-    CommitSeq, PageData, PageNumber, PageSize, PageVersion, SchemaEpoch, Snapshot, TxnEpoch,
-    TxnToken,
+    BTreePageType, CommitSeq, PageData, PageNumber, PageSize, PageVersion, SchemaEpoch, Snapshot,
+    TxnEpoch, TxnToken,
 };
 
 use crate::core_types::{
@@ -36,6 +36,148 @@ pub enum BeginKind {
     Exclusive,
     /// Concurrent: MVCC page-level locking (no global mutex).
     Concurrent,
+}
+
+/// Merge policy controlled by `PRAGMA fsqlite.write_merge`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WriteMergePolicy {
+    /// Conflicts always abort/retry.
+    Off,
+    /// Semantic merge ladder only (intent replay + structured patches).
+    #[default]
+    Safe,
+    /// Debug-only unsafe experiments on explicitly opaque pages.
+    LabUnsafe,
+}
+
+/// Page class used for merge-safety decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MergePageKind {
+    BtreeInterior,
+    BtreeLeaf,
+    Overflow,
+    Freelist,
+    PointerMap,
+    OpaqueLab,
+}
+
+impl MergePageKind {
+    /// Whether this page has SQLite-internal pointer semantics.
+    #[must_use]
+    pub const fn is_sqlite_structured(self) -> bool {
+        !matches!(self, Self::OpaqueLab)
+    }
+}
+
+/// Chosen conflict response under the active merge policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MergeDecision {
+    AbortRetry,
+    IntentReplay,
+    StructuredPatch,
+    RawXorLab,
+}
+
+/// Classify a raw page image for merge-safety policy checks.
+#[must_use]
+pub fn classify_page_for_merge(page: &[u8]) -> MergePageKind {
+    let Some(first_byte) = page.first().copied() else {
+        return MergePageKind::OpaqueLab;
+    };
+    match BTreePageType::from_byte(first_byte) {
+        Some(kind) if kind.is_leaf() => MergePageKind::BtreeLeaf,
+        Some(_) => MergePageKind::BtreeInterior,
+        None => MergePageKind::OpaqueLab,
+    }
+}
+
+/// Whether raw XOR merge is allowed for this policy/page-kind pair.
+#[must_use]
+pub const fn raw_xor_merge_allowed(
+    policy: WriteMergePolicy,
+    page_kind: MergePageKind,
+    debug_build: bool,
+) -> bool {
+    if page_kind.is_sqlite_structured() {
+        return false;
+    }
+    matches!(policy, WriteMergePolicy::LabUnsafe) && debug_build
+}
+
+/// Resolve the policy-directed merge decision for a conflict.
+#[must_use]
+pub const fn merge_decision(
+    policy: WriteMergePolicy,
+    page_kind: MergePageKind,
+    debug_build: bool,
+) -> MergeDecision {
+    match policy {
+        WriteMergePolicy::Off => MergeDecision::AbortRetry,
+        WriteMergePolicy::Safe => {
+            if page_kind.is_sqlite_structured() {
+                MergeDecision::IntentReplay
+            } else {
+                MergeDecision::StructuredPatch
+            }
+        }
+        WriteMergePolicy::LabUnsafe => {
+            if raw_xor_merge_allowed(policy, page_kind, debug_build) {
+                MergeDecision::RawXorLab
+            } else if page_kind.is_sqlite_structured() {
+                MergeDecision::IntentReplay
+            } else {
+                MergeDecision::StructuredPatch
+            }
+        }
+    }
+}
+
+/// Compute a GF(256) (XOR) patch delta between two equal-length pages.
+#[must_use]
+pub fn gf256_patch_delta(base: &[u8], target: &[u8]) -> Option<Vec<u8>> {
+    if base.len() != target.len() {
+        return None;
+    }
+    Some(
+        base.iter()
+            .zip(target)
+            .map(|(lhs, rhs)| lhs ^ rhs)
+            .collect(),
+    )
+}
+
+/// Check whether two patch deltas have disjoint support.
+#[must_use]
+pub fn gf256_patches_disjoint(delta_a: &[u8], delta_b: &[u8]) -> bool {
+    delta_a.len() == delta_b.len()
+        && delta_a
+            .iter()
+            .zip(delta_b)
+            .all(|(lhs, rhs)| (*lhs == 0) || (*rhs == 0))
+}
+
+/// Compose two disjoint patch deltas onto a base page.
+#[must_use]
+pub fn compose_disjoint_gf256_patches(
+    base: &[u8],
+    delta_a: &[u8],
+    delta_b: &[u8],
+) -> Option<Vec<u8>> {
+    if base.len() != delta_a.len() || base.len() != delta_b.len() {
+        return None;
+    }
+    if !gf256_patches_disjoint(delta_a, delta_b) {
+        return None;
+    }
+    Some(
+        base.iter()
+            .zip(delta_a)
+            .zip(delta_b)
+            .map(|((base_byte, delta_a_byte), delta_b_byte)| {
+                base_byte ^ delta_a_byte ^ delta_b_byte
+            })
+            .collect(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -85,6 +227,8 @@ pub enum MvccError {
     ShmInvalidPageSize,
     /// SHM header checksum does not match recomputed value.
     ShmChecksumMismatch,
+    /// Invalid write-merge policy for current build mode.
+    InvalidWriteMergePolicy,
 }
 
 impl std::fmt::Display for MvccError {
@@ -101,6 +245,7 @@ impl std::fmt::Display for MvccError {
             Self::ShmVersionMismatch => write!(f, "SHM version mismatch"),
             Self::ShmInvalidPageSize => write!(f, "SHM invalid page size"),
             Self::ShmChecksumMismatch => write!(f, "SHM checksum mismatch"),
+            Self::InvalidWriteMergePolicy => write!(f, "invalid write-merge policy"),
         }
     }
 }
@@ -144,6 +289,7 @@ pub struct TransactionManager {
     commit_index: CommitIndex,
     /// Current schema epoch (simplified; in full impl this lives in SHM).
     schema_epoch: SchemaEpoch,
+    write_merge_policy: WriteMergePolicy,
 }
 
 impl TransactionManager {
@@ -157,7 +303,28 @@ impl TransactionManager {
             write_mutex: SerializedWriteMutex::new(),
             commit_index: CommitIndex::new(),
             schema_epoch: SchemaEpoch::ZERO,
+            write_merge_policy: WriteMergePolicy::default(),
         }
+    }
+
+    /// Current write-merge policy.
+    #[must_use]
+    pub const fn write_merge_policy(&self) -> WriteMergePolicy {
+        self.write_merge_policy
+    }
+
+    /// Set write-merge policy (`PRAGMA fsqlite.write_merge`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MvccError::InvalidWriteMergePolicy`] when requesting
+    /// `LAB_UNSAFE` in release builds.
+    pub fn set_write_merge_policy(&mut self, policy: WriteMergePolicy) -> Result<(), MvccError> {
+        if matches!(policy, WriteMergePolicy::LabUnsafe) && !cfg!(debug_assertions) {
+            return Err(MvccError::InvalidWriteMergePolicy);
+        }
+        self.write_merge_policy = policy;
+        Ok(())
     }
 
     /// Begin a new transaction.
@@ -549,11 +716,22 @@ impl TransactionManager {
         for &pgno in &txn.write_set {
             if let Some(latest) = self.commit_index.latest(pgno) {
                 if latest > txn.snapshot.high {
+                    let page_kind = txn
+                        .write_set_data
+                        .get(&pgno)
+                        .map_or(MergePageKind::OpaqueLab, |page| {
+                            classify_page_for_merge(page.as_bytes())
+                        });
+                    let decision =
+                        merge_decision(self.write_merge_policy, page_kind, cfg!(debug_assertions));
                     tracing::warn!(
                         txn_id = %txn.txn_id,
                         pgno = pgno.get(),
                         latest_seq = latest.get(),
                         snapshot_high = txn.snapshot.high.get(),
+                        ?page_kind,
+                        ?decision,
+                        ?self.write_merge_policy,
                         "FCW conflict detected in concurrent commit"
                     );
                     self.abort(txn);
@@ -622,6 +800,7 @@ impl std::fmt::Debug for TransactionManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TransactionManager")
             .field("schema_epoch", &self.schema_epoch)
+            .field("write_merge_policy", &self.write_merge_policy)
             .field(
                 "current_commit_counter",
                 &self.txn_manager.current_commit_counter(),
@@ -638,6 +817,7 @@ impl std::fmt::Debug for TransactionManager {
 mod tests {
     use super::*;
     use fsqlite_types::TxnId;
+    use proptest::prelude::*;
 
     fn mgr() -> TransactionManager {
         TransactionManager::new(PageSize::DEFAULT)
@@ -1451,5 +1631,333 @@ mod tests {
         // txn1 commits successfully.
         let seq = m.commit(&mut txn1).unwrap();
         assert!(seq.get() > 0);
+    }
+
+    #[test]
+    fn test_xor_merge_forbidden_btree_interior() {
+        assert!(!raw_xor_merge_allowed(
+            WriteMergePolicy::Safe,
+            MergePageKind::BtreeInterior,
+            true,
+        ));
+        assert_eq!(
+            merge_decision(WriteMergePolicy::Safe, MergePageKind::BtreeInterior, true),
+            MergeDecision::IntentReplay
+        );
+    }
+
+    #[test]
+    fn test_xor_merge_forbidden_btree_leaf() {
+        assert!(!raw_xor_merge_allowed(
+            WriteMergePolicy::Safe,
+            MergePageKind::BtreeLeaf,
+            true,
+        ));
+        assert_eq!(
+            merge_decision(WriteMergePolicy::Safe, MergePageKind::BtreeLeaf, true),
+            MergeDecision::IntentReplay
+        );
+    }
+
+    #[test]
+    fn test_xor_merge_forbidden_overflow() {
+        assert!(!raw_xor_merge_allowed(
+            WriteMergePolicy::Safe,
+            MergePageKind::Overflow,
+            true,
+        ));
+        assert_eq!(
+            merge_decision(WriteMergePolicy::Safe, MergePageKind::Overflow, true),
+            MergeDecision::IntentReplay
+        );
+    }
+
+    #[test]
+    fn test_xor_merge_forbidden_freelist() {
+        assert!(!raw_xor_merge_allowed(
+            WriteMergePolicy::Safe,
+            MergePageKind::Freelist,
+            true,
+        ));
+        assert_eq!(
+            merge_decision(WriteMergePolicy::Safe, MergePageKind::Freelist, true),
+            MergeDecision::IntentReplay
+        );
+    }
+
+    #[test]
+    fn test_xor_merge_forbidden_pointer_map() {
+        assert!(!raw_xor_merge_allowed(
+            WriteMergePolicy::Safe,
+            MergePageKind::PointerMap,
+            true,
+        ));
+        assert_eq!(
+            merge_decision(WriteMergePolicy::Safe, MergePageKind::PointerMap, true),
+            MergeDecision::IntentReplay
+        );
+    }
+
+    #[test]
+    fn test_disjoint_delta_lemma_correct() {
+        let base = vec![0_u8; 8];
+        let mut page_1 = base.clone();
+        page_1[1] = 0xA1;
+        page_1[5] = 0xB2;
+
+        let mut page_2 = base.clone();
+        page_2[2] = 0x0C;
+        page_2[7] = 0x7D;
+
+        let delta_1 = gf256_patch_delta(&base, &page_1).expect("equal lengths");
+        let delta_2 = gf256_patch_delta(&base, &page_2).expect("equal lengths");
+        assert!(gf256_patches_disjoint(&delta_1, &delta_2));
+
+        let merged =
+            compose_disjoint_gf256_patches(&base, &delta_1, &delta_2).expect("disjoint deltas");
+        assert_eq!(merged, vec![0_u8, 0xA1, 0x0C, 0, 0, 0xB2, 0, 0x7D]);
+    }
+
+    #[test]
+    fn test_counterexample_lost_update() {
+        let pointer_slot = 0_usize;
+        let old_offset = 10_usize;
+        let new_offset = 20_usize;
+
+        let mut page_0 = vec![0_u8; 64];
+        page_0[pointer_slot] = u8::try_from(old_offset).expect("small offset");
+        page_0[old_offset] = b'A';
+
+        let mut page_t1 = page_0.clone();
+        page_t1[pointer_slot] = u8::try_from(new_offset).expect("small offset");
+        page_t1[new_offset] = page_0[old_offset];
+
+        let mut page_t2 = page_0.clone();
+        page_t2[old_offset] = b'B';
+
+        let delta_t1 = gf256_patch_delta(&page_0, &page_t1).expect("equal lengths");
+        let delta_t2 = gf256_patch_delta(&page_0, &page_t2).expect("equal lengths");
+        assert!(gf256_patches_disjoint(&delta_t1, &delta_t2));
+
+        let merged =
+            compose_disjoint_gf256_patches(&page_0, &delta_t1, &delta_t2).expect("disjoint deltas");
+
+        let logical_offset = usize::from(merged[pointer_slot]);
+        let logical_payload = merged[logical_offset];
+        assert_eq!(
+            logical_offset, new_offset,
+            "pointer moved to new location by T1"
+        );
+        assert_eq!(logical_payload, b'A', "stale payload is still reachable");
+        assert_eq!(
+            merged[old_offset], b'B',
+            "T2 update exists at old location but became unreachable"
+        );
+        assert_ne!(
+            logical_payload, b'B',
+            "lost update reproduced despite disjoint byte deltas"
+        );
+    }
+
+    #[test]
+    fn test_pragma_write_merge_off() {
+        let mut m = mgr();
+        m.set_write_merge_policy(WriteMergePolicy::Off)
+            .expect("OFF must be accepted");
+
+        let pgno = PageNumber::new(1).unwrap();
+        let mut txn1 = m.begin(BeginKind::Concurrent).unwrap();
+        let mut txn2 = m.begin(BeginKind::Concurrent).unwrap();
+
+        m.write_page(&mut txn1, pgno, test_data(0x0D)).unwrap();
+        m.commit(&mut txn1).unwrap();
+        m.write_page(&mut txn2, pgno, test_data(0x0D)).unwrap();
+
+        let result = m.commit(&mut txn2);
+        assert_eq!(result.unwrap_err(), MvccError::BusySnapshot);
+    }
+
+    #[test]
+    fn test_pragma_write_merge_safe() {
+        let mut m = mgr();
+        m.set_write_merge_policy(WriteMergePolicy::Safe)
+            .expect("SAFE must be accepted");
+
+        let pgno = PageNumber::new(1).unwrap();
+        let mut txn1 = m.begin(BeginKind::Concurrent).unwrap();
+        let mut txn2 = m.begin(BeginKind::Concurrent).unwrap();
+
+        m.write_page(&mut txn1, pgno, test_data(0x0D)).unwrap();
+        m.commit(&mut txn1).unwrap();
+        m.write_page(&mut txn2, pgno, test_data(0x0D)).unwrap();
+
+        let result = m.commit(&mut txn2);
+        assert_eq!(result.unwrap_err(), MvccError::BusySnapshot);
+        assert_eq!(
+            merge_decision(
+                WriteMergePolicy::Safe,
+                classify_page_for_merge(test_data(0x0D).as_bytes()),
+                cfg!(debug_assertions),
+            ),
+            MergeDecision::IntentReplay
+        );
+    }
+
+    #[test]
+    fn test_pragma_write_merge_lab_unsafe_rejected_in_release() {
+        let mut m = mgr();
+        let result = m.set_write_merge_policy(WriteMergePolicy::LabUnsafe);
+        if cfg!(debug_assertions) {
+            assert!(result.is_ok(), "LAB_UNSAFE is debug-only");
+        } else {
+            assert_eq!(
+                result.unwrap_err(),
+                MvccError::InvalidWriteMergePolicy,
+                "release builds must reject LAB_UNSAFE"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lab_unsafe_still_forbids_btree_xor() {
+        assert!(!raw_xor_merge_allowed(
+            WriteMergePolicy::LabUnsafe,
+            MergePageKind::BtreeLeaf,
+            true,
+        ));
+        assert_eq!(
+            merge_decision(WriteMergePolicy::LabUnsafe, MergePageKind::BtreeLeaf, true),
+            MergeDecision::IntentReplay
+        );
+    }
+
+    #[test]
+    fn test_gf256_delta_as_encoding_not_correctness() {
+        let base = vec![0x0D, 0x10, 0x20, 0x30, 0x40];
+        let target = vec![0x0D, 0x11, 0x20, 0x33, 0x40];
+        let delta = gf256_patch_delta(&base, &target).expect("equal lengths");
+        assert!(
+            delta.iter().any(|byte| *byte != 0),
+            "delta encodes byte differences"
+        );
+
+        let page_kind = classify_page_for_merge(&target);
+        assert_eq!(page_kind, MergePageKind::BtreeLeaf);
+        assert!(
+            !raw_xor_merge_allowed(WriteMergePolicy::Safe, page_kind, true),
+            "delta encoding does not imply merge correctness permission"
+        );
+    }
+
+    #[test]
+    fn prop_merge_safety_compile_time() {
+        let structured = [
+            MergePageKind::BtreeInterior,
+            MergePageKind::BtreeLeaf,
+            MergePageKind::Overflow,
+            MergePageKind::Freelist,
+            MergePageKind::PointerMap,
+        ];
+        for page_kind in structured {
+            assert!(page_kind.is_sqlite_structured());
+            assert!(!raw_xor_merge_allowed(
+                WriteMergePolicy::Safe,
+                page_kind,
+                true,
+            ));
+            assert!(!raw_xor_merge_allowed(
+                WriteMergePolicy::LabUnsafe,
+                page_kind,
+                true,
+            ));
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn prop_disjoint_delta_composition(
+            base in prop::collection::vec(any::<u8>(), 1..256),
+            even_noise in prop::collection::vec(any::<u8>(), 1..64),
+            odd_noise in prop::collection::vec(any::<u8>(), 1..64),
+        ) {
+            let len = base.len();
+            let mut delta_even = vec![0_u8; len];
+            let mut delta_odd = vec![0_u8; len];
+
+            for (idx, byte) in delta_even.iter_mut().enumerate() {
+                if idx % 2 == 0 {
+                    *byte = even_noise[idx % even_noise.len()];
+                }
+            }
+            for (idx, byte) in delta_odd.iter_mut().enumerate() {
+                if idx % 2 == 1 {
+                    *byte = odd_noise[idx % odd_noise.len()];
+                }
+            }
+
+            prop_assert!(gf256_patches_disjoint(&delta_even, &delta_odd));
+            let merged = compose_disjoint_gf256_patches(&base, &delta_even, &delta_odd)
+                .expect("disjoint deltas should compose");
+
+            for idx in 0..len {
+                prop_assert_eq!(merged[idx], base[idx] ^ delta_even[idx] ^ delta_odd[idx]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_e2e_concurrent_insert_different_pages() {
+        let m = mgr();
+        let mut txn1 = m.begin(BeginKind::Concurrent).unwrap();
+        let mut txn2 = m.begin(BeginKind::Concurrent).unwrap();
+
+        m.write_page(&mut txn1, PageNumber::new(3).unwrap(), test_data(0x01))
+            .unwrap();
+        m.write_page(&mut txn2, PageNumber::new(4).unwrap(), test_data(0x02))
+            .unwrap();
+
+        assert!(m.commit(&mut txn1).is_ok());
+        assert!(m.commit(&mut txn2).is_ok());
+    }
+
+    #[test]
+    fn test_e2e_concurrent_insert_same_page_conflict() {
+        let m = mgr();
+        let pgno = PageNumber::new(5).unwrap();
+        let mut txn1 = m.begin(BeginKind::Concurrent).unwrap();
+        let mut txn2 = m.begin(BeginKind::Concurrent).unwrap();
+
+        m.write_page(&mut txn1, pgno, test_data(0x0D)).unwrap();
+        m.commit(&mut txn1).unwrap();
+        m.write_page(&mut txn2, pgno, test_data(0x0D)).unwrap();
+
+        assert_eq!(m.commit(&mut txn2).unwrap_err(), MvccError::BusySnapshot);
+    }
+
+    #[test]
+    fn test_e2e_concurrent_insert_same_page_intent_replay() {
+        let mut m = mgr();
+        m.set_write_merge_policy(WriteMergePolicy::Safe)
+            .expect("SAFE must be accepted");
+
+        let pgno = PageNumber::new(6).unwrap();
+        let mut txn1 = m.begin(BeginKind::Concurrent).unwrap();
+        let mut txn2 = m.begin(BeginKind::Concurrent).unwrap();
+
+        m.write_page(&mut txn1, pgno, test_data(0x0D)).unwrap();
+        m.commit(&mut txn1).unwrap();
+        m.write_page(&mut txn2, pgno, test_data(0x0D)).unwrap();
+
+        let result = m.commit(&mut txn2);
+        assert_eq!(result.unwrap_err(), MvccError::BusySnapshot);
+        assert_eq!(
+            merge_decision(
+                WriteMergePolicy::Safe,
+                classify_page_for_merge(test_data(0x0D).as_bytes()),
+                cfg!(debug_assertions),
+            ),
+            MergeDecision::IntentReplay,
+            "SAFE mode should select semantic merge ladder for structured pages"
+        );
     }
 }

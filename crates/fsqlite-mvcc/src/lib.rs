@@ -9,6 +9,7 @@ pub mod invariants;
 pub mod lifecycle;
 pub mod shm;
 pub mod witness_hierarchy;
+pub mod xor_delta;
 
 pub use cache_aligned::{
     CACHE_LINE_BYTES, CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS, CacheAligned,
@@ -29,4 +30,11 @@ pub use shm::{SharedMemoryLayout, ShmSnapshot};
 pub use witness_hierarchy::{
     HotWitnessIndexDerivationV1, HotWitnessIndexSizingV1, WitnessHierarchyConfigV1,
     WitnessHotIndexManifestV1, WitnessSizingError,
+};
+pub use xor_delta::{
+    DEFAULT_DELTA_THRESHOLD_PCT, DELTA_FIXED_OVERHEAD_BYTES, DELTA_HEADER_BYTES, DELTA_MAGIC,
+    DELTA_RUN_HEADER_BYTES, DELTA_SPARSE_OVERHEAD_PCT, DELTA_VERSION, DeltaEncoding, DeltaError,
+    DeltaThresholdConfig, SparseXorDeltaObject, count_nonzero_xor, decode_sparse_xor_delta,
+    encode_page_delta, encode_sparse_xor_delta, estimate_sparse_delta_size, max_delta_bytes,
+    reconstruct_chain_from_newest, use_delta,
 };

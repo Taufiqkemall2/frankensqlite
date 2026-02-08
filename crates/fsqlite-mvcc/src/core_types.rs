@@ -2359,7 +2359,7 @@ mod tests {
     #[test]
     fn test_lock_table_rebuild_drains_to_zero_holders() {
         // bd-22n.12: begin_rebuild rotates active → draining, new acquisitions
-        // go to fresh active table. After releasing all draining locks, the
+        // go to the fresh active table. After releasing all draining locks, the
         // draining table reaches quiescence and finalize succeeds.
         let mut table = InProcessPageLockTable::new();
         let txn1 = TxnId::new(1).unwrap();
@@ -2414,7 +2414,7 @@ mod tests {
     #[test]
     fn test_read_only_txns_dont_block_rebuild() {
         // bd-22n.12 §5.6.3.1: read-only transactions MUST NOT block rebuild.
-        // Read-only txns don't acquire page locks, so the draining table
+        // Read-only transactions don't acquire page locks, so the draining table
         // reaches quiescence without waiting for them.
         let mut table = InProcessPageLockTable::new();
         let writer = TxnId::new(1).unwrap();
@@ -3045,11 +3045,9 @@ mod tests {
         // Far past any timeout, but process is alive.
         let very_late = claim_time + 10_000;
         let result = try_cleanup_sentinel_slot(&slot, very_late, |_, _| true);
-        assert_eq!(
-            result,
-            SlotCleanupResult::ProcessAlive,
-            "bead_id={BEAD_22N13} case=alive_process_never_reclaimed \
-             CLAIMING slot with alive process must not be reclaimed"
+        assert!(
+            matches!(result, SlotCleanupResult::ProcessAlive),
+            "bead_id={BEAD_22N13} case=alive_process_never_reclaimed"
         );
     }
 
