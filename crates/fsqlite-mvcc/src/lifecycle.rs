@@ -75,6 +75,16 @@ pub enum MvccError {
     InvalidState,
     /// TxnId space exhausted.
     TxnIdExhausted,
+    /// SHM buffer too small (< HEADER_SIZE bytes).
+    ShmTooSmall,
+    /// SHM magic bytes do not match `FSQLSHM\0`.
+    ShmBadMagic,
+    /// SHM version field does not match the expected version.
+    ShmVersionMismatch,
+    /// SHM page_size is not a valid power-of-two in \[512, 65536\].
+    ShmInvalidPageSize,
+    /// SHM header checksum does not match recomputed value.
+    ShmChecksumMismatch,
 }
 
 impl std::fmt::Display for MvccError {
@@ -86,6 +96,11 @@ impl std::fmt::Display for MvccError {
             Self::IoErr => write!(f, "SQLITE_IOERR"),
             Self::InvalidState => write!(f, "invalid transaction state"),
             Self::TxnIdExhausted => write!(f, "TxnId space exhausted"),
+            Self::ShmTooSmall => write!(f, "SHM buffer too small"),
+            Self::ShmBadMagic => write!(f, "SHM bad magic"),
+            Self::ShmVersionMismatch => write!(f, "SHM version mismatch"),
+            Self::ShmInvalidPageSize => write!(f, "SHM invalid page size"),
+            Self::ShmChecksumMismatch => write!(f, "SHM checksum mismatch"),
         }
     }
 }
