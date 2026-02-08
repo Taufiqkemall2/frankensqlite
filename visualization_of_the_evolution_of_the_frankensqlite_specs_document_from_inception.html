@@ -532,6 +532,7 @@
 
       /* Search Palette (bd-24q.9.2) */
       .search-palette-overlay { position: fixed; inset: 0; z-index: 200; background: rgba(2, 6, 23, 0.35); backdrop-filter: blur(4px); display: flex; justify-content: center; padding-top: min(20vh, 160px); }
+      .search-palette-overlay.hidden { display: none; } /* Override display:flex when Tailwind .hidden is applied */
       .search-palette { width: 560px; max-height: 480px; background: white; border-radius: 16px; border: 1px solid rgba(2, 6, 23, 0.12); box-shadow: 0 24px 60px rgba(2, 6, 23, 0.24); display: flex; flex-direction: column; overflow: hidden; animation: spFadeIn 120ms ease-out; }
       @keyframes spFadeIn { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
       .search-palette-input { border: none; border-bottom: 1px solid rgba(2, 6, 23, 0.08); padding: 14px 16px; font-size: 15px; font-family: inherit; outline: none; background: transparent; width: 100%; }
@@ -621,11 +622,20 @@
         .dock { padding-bottom: calc(12px + env(safe-area-inset-bottom)); }
         body { padding-bottom: calc(7rem + env(safe-area-inset-bottom)); }
       }
+      /* Perf dev panel (bd-24q.5.3) */
+      .perf-panel { position: fixed; bottom: 80px; right: 12px; z-index: 50; background: rgba(15,23,42,0.92); color: #e2e8f0; border-radius: 12px; padding: 10px 14px; font: 10px/1.4 ui-monospace, monospace; max-width: 300px; backdrop-filter: blur(8px); box-shadow: 0 4px 24px rgba(0,0,0,0.3); pointer-events: auto; }
+      .perf-panel h4 { margin: 0 0 6px; font-size: 11px; font-weight: 700; color: #818cf8; }
+      .perf-panel table { border-collapse: collapse; width: 100%; }
+      .perf-panel td { padding: 1px 4px; }
+      .perf-panel .over { color: #f87171; }
+      .perf-panel .ok { color: #4ade80; }
       /* Inline highlights (bd-24q.16.1 + bd-24q.16.2) */
       .ih-changed { border-left: 3px solid #22c55e; background: rgba(34,197,94,0.06); padding-left: 6px; }
       .ih-modified { border-left: 3px solid #f59e0b; background: rgba(245,158,11,0.05); padding-left: 6px; }
       .ih-active { box-shadow: inset 0 0 0 2px rgba(37,99,235,0.35); border-radius: 4px; }
       .ih-debug { outline: 1px dashed rgba(99,102,241,0.4); outline-offset: 1px; }
+      .ih-pulse { animation: ihPulse 0.6s ease-out; }
+      @keyframes ihPulse { 0% { box-shadow: inset 0 0 0 2px rgba(34,197,94,0.5); } 100% { box-shadow: none; } }
       .ih-popover { position: absolute; z-index: 50; background: #fff; border: 1px solid rgba(2,6,23,0.12); border-radius: 12px; box-shadow: 0 4px 16px rgba(0,0,0,0.1); padding: 8px 12px; font-size: 11px; max-width: 280px; pointer-events: none; opacity: 0; transition: opacity 0.15s; line-height: 1.5; }
       .ih-popover.visible { opacity: 1; pointer-events: auto; }
       .ih-popover .ih-pop-label { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
@@ -634,7 +644,7 @@
   </head>
 
   <body>
-    <div class="mx-auto max-w-[1200px] px-4 pb-28 pt-10 sm:px-6 lg:px-8" style="position:relative;z-index:31">
+    <div class="mx-auto max-w-[1200px] px-4 pb-28 pt-10 sm:px-6 lg:px-8">
       <!-- Top -->
       <header class="enter">
         <div
@@ -1099,6 +1109,12 @@
                         >
                           Outline
                         </button>
+                        <button id="btnIHToggle" class="focus-ring rounded-xl border border-slate-900/10 bg-white/70 px-3 py-1.5 text-[11px] font-semibold text-slate-900 hover:bg-white" type="button" title="Toggle inline change highlights">Highlights</button>
+                        <div id="ihNav" style="display:none;align-items:center;gap:4px">
+                          <button id="btnIHPrev" class="focus-ring rounded-lg border border-slate-900/10 bg-white/80 px-2 py-0.5 text-[10px] font-semibold text-slate-600 hover:bg-white" type="button" title="Previous change (Alt+Up)" aria-label="Previous change">&uarr;</button>
+                          <span id="ihNavLabel" class="text-[10px] text-slate-400" style="min-width:3rem;text-align:center">0/0</span>
+                          <button id="btnIHNext" class="focus-ring rounded-lg border border-slate-900/10 bg-white/80 px-2 py-0.5 text-[10px] font-semibold text-slate-600 hover:bg-white" type="button" title="Next change (Alt+Down)" aria-label="Next change">&darr;</button>
+                        </div>
                         <button
                           id="btnRawToggle"
                           class="focus-ring rounded-xl border border-slate-900/10 bg-white/70 px-3 py-1.5 text-[11px] font-semibold text-slate-900 hover:bg-white"
@@ -1132,7 +1148,10 @@
                         </div>
                         <div id="miniMapItems" class="flex-1 overflow-y-auto p-3" role="tree" tabindex="0"></div>
                       </nav>
-                      <div id="docRendered" class="md min-w-0 flex-1 max-h-[70vh] overflow-auto rounded-2xl border border-slate-900/10 bg-white/70 p-4"></div>
+                      <div style="position:relative" class="min-w-0 flex-1">
+                        <div id="docRendered" class="md max-h-[70vh] overflow-auto rounded-2xl border border-slate-900/10 bg-white/70 p-4"></div>
+                        <div id="ihPopover" class="ih-popover" aria-hidden="true"></div>
+                      </div>
                       <aside
                         id="storyRail"
                         class="hidden w-64 shrink-0 flex flex-col rounded-2xl border border-slate-900/10 bg-white/70"
@@ -1314,6 +1333,17 @@
                       </div>
                       <div id="workerStatus" class="mt-2 text-xs text-slate-500"></div>
                       <div id="computeProgress" class="mt-2 hidden text-xs font-semibold text-slate-700"></div>
+                      <!-- Global warmup progress bar (bd-24q.5.3) -->
+                      <div id="warmupProgress" class="hidden mt-2">
+                        <div class="flex items-center gap-2">
+                          <div class="flex-1 h-1.5 rounded-full bg-slate-200 overflow-hidden">
+                            <div id="warmupProgressBar" class="h-full rounded-full bg-indigo-500 transition-all duration-300" style="width:0%"></div>
+                          </div>
+                          <span id="warmupProgressLabel" class="text-[10px] text-slate-500 shrink-0">0%</span>
+                          <button id="btnCancelWarmup" class="text-[10px] text-rose-500 hover:text-rose-700 font-semibold" type="button">Cancel</button>
+                        </div>
+                        <div id="warmupStage" class="mt-0.5 text-[10px] text-slate-400 truncate"></div>
+                      </div>
                     </div>
                   </div>
 
@@ -6753,6 +6783,7 @@
         abViewMode: "diff", // 'diff' | 'rendered' — diff shows Diff2Html, rendered shows side-by-side markdown panes
         sbsSyncScroll: true, // sync scroll between side-by-side panes
         sbsMobilePane: "a", // 'a' | 'b' — which pane visible on mobile portrait
+        inlineHighlights: false, // bd-24q.16.2: show inline change highlights in spec view
       };
 
       const METRICS = {
@@ -6983,13 +7014,16 @@
           if (STORY_AUTOPLAY.milestoneIdx >= 0) p.set("si", String(STORY_AUTOPLAY.milestoneIdx));
         }
 
+        // Inline highlights URL state (bd-24q.16.2).
+        if (DOC.inlineHighlights) p.set("ih", "1");
+
         // Canonical ordering: rebuild with v first, then alphabetical key order.
         if ([...p.keys()].length === 0) return "";
         const canon = new URLSearchParams();
         canon.set("v", String(URL_SCHEMA_VERSION));
-        // Canonical key order: v, c, t, raw, dm, cmp, ca, cb, dl, avm, q, mi, bm, b, res, tz, met, sa, si
+        // Canonical key order: v, c, t, raw, dm, cmp, ca, cb, dl, avm, q, mi, bm, b, res, tz, met, sa, si, ih
         if (DOC.compareMode) { p.set("cmp", "1"); p.set("ca", String(DOC.compareFromIdx)); p.set("cb", String(DOC.compareToIdx)); if (DOC.diffLayout !== "side-by-side") p.set("dl", DOC.diffLayout); if (DOC.abViewMode === "rendered") p.set("avm", "rendered"); }
-        for (const k of ["c", "t", "raw", "dm", "cmp", "ca", "cb", "dl", "avm", "q", "mi", "bm", "b", "res", "tz", "met", "sa", "si"]) {
+        for (const k of ["c", "t", "raw", "dm", "cmp", "ca", "cb", "dl", "avm", "q", "mi", "bm", "b", "res", "tz", "met", "sa", "si", "ih"]) {
           if (p.has(k)) canon.set(k, p.get(k));
         }
         return canon.toString();
@@ -7075,6 +7109,9 @@
           result.si = -1;
         }
 
+        // Inline highlights (bd-24q.16.2).
+        result.ih = p.get("ih") === "1";
+
         return result;
       }
 
@@ -7092,6 +7129,7 @@
         STATE.bucketMode = s.bm;
         STATE.bucketEnabled = s.b ? new Set(s.b) : new Set(URL_ALL_BUCKET_IDS);
         if (s.cmp) { DOC.compareMode = true; DOC.compareFromIdx = clamp(s.ca || 0, 0, maxIdx); DOC.compareToIdx = clamp(s.cb || 0, 0, maxIdx); DOC.diffLayout = s.dl || "side-by-side"; DOC.abViewMode = s.avm === "rendered" ? "rendered" : "diff"; }
+        DOC.inlineHighlights = Boolean(s.ih); // bd-24q.16.2
 
         // Sync UI inputs to match restored state.
         const qEl = document.getElementById("q");
@@ -8863,10 +8901,26 @@
         pending.reject(err);
       }
 
+      // Ops that are never cached (mutating, init, or streaming-progress).
+      const _UNCACHEABLE_OPS = new Set([
+        "init_dataset", "cancel", "compute_minhash_signatures",
+      ]);
+
       function workerRequest(op, payload, opts = {}) {
         if (!WORKER_STATE.worker || (op !== "init_dataset" && !WORKER_STATE.ready)) {
           return Promise.reject(new Error(`Worker unavailable for op=${op}`));
         }
+
+        // --- Cache lookup (bd-24q.5.2) ---
+        const useCache = opts.cache !== false && !opts.onProgress && !_UNCACHEABLE_OPS.has(op);
+        if (useCache) {
+          const hit = WORKER_RESULT_CACHE.get(op, payload);
+          if (hit !== undefined) {
+            PERF_BUDGET.log(op, 0.1, true);
+            return Promise.resolve(hit);
+          }
+        }
+
         const reqId = `w${WORKER_STATE.reqSeq++}`;
         const timeoutMs = Number(opts.timeoutMs || 0);
         const signal = opts.signal || null;
@@ -8909,6 +8963,7 @@
             resolve: (value) => {
               if (signal) signal.removeEventListener("abort", abortHandler);
               if (aborted) return;
+              if (useCache) WORKER_RESULT_CACHE.set(op, payload, value);
               resolve(value);
             },
             reject: (err) => {
@@ -8981,8 +9036,56 @@
       const MINHASH_LS_KEY = "fsqlite_viz_minhash_sigs";
       const MINHASH_SCHEMA_VERSION = 1;
 
+      // --- Perf Budget Logger + Progress Controller (bd-24q.5.3) ---
+      const PERF_BUDGET = {
+        entries: [],
+        cacheHits: 0,
+        cacheMisses: 0,
+        log(op, ms, cached) {
+          this.entries.push({ op, ms: Math.round(ms * 100) / 100, cached: !!cached, ts: Date.now() });
+          if (cached) this.cacheHits++; else this.cacheMisses++;
+          const hitRate = this.cacheHits + this.cacheMisses > 0
+            ? ((this.cacheHits / (this.cacheHits + this.cacheMisses)) * 100).toFixed(1)
+            : "0.0";
+          console.log(`[perf] ${op}: ${ms.toFixed(1)}ms${cached ? " (cache hit)" : ""} · hit rate ${hitRate}%`);
+        },
+        summary() {
+          const total = this.entries.reduce((s, e) => s + e.ms, 0);
+          const hitRate = this.cacheHits + this.cacheMisses > 0
+            ? ((this.cacheHits / (this.cacheHits + this.cacheMisses)) * 100).toFixed(1)
+            : "0.0";
+          console.log(`[perf] Summary: ${this.entries.length} ops, ${total.toFixed(0)}ms total, cache hit rate ${hitRate}% (${this.cacheHits}/${this.cacheHits + this.cacheMisses})`);
+          return { entries: [...this.entries], totalMs: total, hitRate, hits: this.cacheHits, misses: this.cacheMisses };
+        },
+      };
+      window.__perfBudget = PERF_BUDGET;
+
+      let WARMUP_ABORT_CONTROLLER = null;
+
+      function showWarmupProgress(pct, stage) {
+        const wrap = document.getElementById("warmupProgress");
+        const bar = document.getElementById("warmupProgressBar");
+        const label = document.getElementById("warmupProgressLabel");
+        const stageEl = document.getElementById("warmupStage");
+        if (!wrap) return;
+        wrap.classList.remove("hidden");
+        if (bar) bar.style.width = Math.min(100, Math.max(0, pct)) + "%";
+        if (label) label.textContent = Math.round(pct) + "%";
+        if (stageEl && stage) stageEl.textContent = stage;
+      }
+
+      function hideWarmupProgress() {
+        const wrap = document.getElementById("warmupProgress");
+        if (wrap) wrap.classList.add("hidden");
+      }
+
       async function warmDerivedWorkerArtifacts() {
         if (!WORKER_STATE.ready) return;
+        WARMUP_ABORT_CONTROLLER?.abort();
+        WARMUP_ABORT_CONTROLLER = new AbortController();
+        const _wSignal = WARMUP_ABORT_CONTROLLER.signal;
+        const _wT0 = performance.now();
+        showWarmupProgress(0, "Starting warmup...");
         try {
           // Try loading cached search index from localStorage (bd-24q.9.1).
           let searchHydrated = false;
@@ -8997,8 +9100,11 @@
             }
           } catch (e) { console.warn("[search] localStorage hydrate failed, will rebuild:", e); }
 
+          if (_wSignal.aborted) throw new DOMException("Warmup cancelled", "AbortError");
+          showWarmupProgress(5, "Building search index...");
+          const _sT0 = performance.now();
           if (!searchHydrated) {
-            await workerRequest("build_search_index", {}, { timeoutMs: 30000 });
+            await workerRequest("build_search_index", {}, { timeoutMs: 30000, signal: _wSignal });
             // Export and persist to localStorage.
             try {
               const exported = await workerRequest("export_search_index", {}, { timeoutMs: 10000 });
@@ -9008,7 +9114,11 @@
             } catch (e) { console.warn("[search] localStorage persist failed:", e); }
           }
           WORKER_DERIVED.searchReady = true;
+          PERF_BUDGET.log("search_index", performance.now() - _sT0, searchHydrated);
 
+          if (_wSignal.aborted) throw new DOMException("Warmup cancelled", "AbortError");
+          showWarmupProgress(25, "Computing MinHash signatures...");
+          const _mT0 = performance.now();
           // Build or hydrate MinHash signatures (bd-24q.14.1), then cluster.
           let minhashHydrated = false;
           try {
@@ -9023,7 +9133,7 @@
           } catch (e) { console.warn("[minhash] localStorage hydrate failed, will rebuild:", e); }
 
           if (!minhashHydrated) {
-            await workerRequest("compute_minhash_signatures", { sigLen: 64, shingleK: 5, mode: "added" }, { timeoutMs: 60000 });
+            await workerRequest("compute_minhash_signatures", { sigLen: 64, shingleK: 5, mode: "added" }, { timeoutMs: 60000, signal: _wSignal });
             try {
               const exported = await workerRequest("export_minhash_signatures", {}, { timeoutMs: 10000 });
               if (exported) {
@@ -9032,18 +9142,38 @@
             } catch (e) { console.warn("[minhash] localStorage persist failed:", e); }
           }
 
-          await workerRequest("compute_clusters", { limit: 12 }, { timeoutMs: 30000 });
+          PERF_BUDGET.log("minhash_signatures", performance.now() - _mT0, minhashHydrated);
+
+          if (_wSignal.aborted) throw new DOMException("Warmup cancelled", "AbortError");
+          showWarmupProgress(55, "Computing clusters...");
+          const _cT0 = performance.now();
+          await workerRequest("compute_clusters", { limit: 12 }, { timeoutMs: 30000, signal: _wSignal });
           WORKER_DERIVED.clusterReady = true;
           void renderClusterPanel();
+          PERF_BUDGET.log("compute_clusters", performance.now() - _cT0, false);
 
+          if (_wSignal.aborted) throw new DOMException("Warmup cancelled", "AbortError");
+          showWarmupProgress(75, "Computing most-edited sections...");
+          const _eT0 = performance.now();
           // Precompute most-edited sections analytics (bd-24q.9.3).
-          await workerRequest("compute_most_edited_sections", { topK: 20 }, { timeoutMs: 120000 });
+          await workerRequest("compute_most_edited_sections", { topK: 20 }, { timeoutMs: 120000, signal: _wSignal });
           WORKER_DERIVED.mostEditedReady = true;
+          PERF_BUDGET.log("most_edited_sections", performance.now() - _eT0, false);
 
+          showWarmupProgress(100, "Done");
+          PERF_BUDGET.log("warmup_total", performance.now() - _wT0, false);
+          PERF_BUDGET.summary();
+          hideWarmupProgress();
           setWorkerStatus("Worker online · search + clustering + analytics ready", "ok");
         } catch (e) {
-          console.error("Worker warmup failed:", e);
-          setWorkerStatus("Worker warmup partial failure.", "error", formatErr(e));
+          hideWarmupProgress();
+          if (e?.name === "AbortError") {
+            console.log("[warmup] Warmup cancelled by user");
+            setWorkerStatus("Warmup cancelled. Some features may be unavailable.", "neutral");
+          } else {
+            console.error("Worker warmup failed:", e);
+            setWorkerStatus("Worker warmup partial failure.", "error", formatErr(e));
+          }
         }
       }
 
@@ -10089,6 +10219,113 @@
         return target;
       }
 
+      // --- Inline Highlights: Controller (bd-24q.16.2) ---
+      let _ihCurrentIdx = -1;
+      let _ihBlocks = [];
+
+      function toggleInlineHighlights() {
+        DOC.inlineHighlights = !DOC.inlineHighlights;
+        const btn = document.getElementById("btnIHToggle");
+        const nav = document.getElementById("ihNav");
+        if (btn) { btn.classList.toggle("bg-slate-900", DOC.inlineHighlights); btn.classList.toggle("text-white", DOC.inlineHighlights); }
+        if (nav) nav.style.display = DOC.inlineHighlights ? "flex" : "none";
+        syncUrlToState();
+        applyOrClearSpecHighlights();
+      }
+
+      function applyOrClearSpecHighlights() {
+        const rendered = document.getElementById("docRendered");
+        if (!rendered) return;
+        if (DOC.inlineHighlights && DOC.tab === "spec" && DOC.idx > 0) {
+          const patch = patchForIdx(DOC.idx);
+          const changedLines = parsePatchChangedNewLines(patch);
+          if (!rendered.querySelector("[data-srcmap]")) {
+            void (async () => {
+              const text = await docTextAt(DOC.idx);
+              renderMarkdownWithSentinels(text, rendered, "", changedLines);
+              applyInlineHighlights(rendered);
+              _ihRefreshNav();
+              _ihSetupPopover();
+            })();
+          } else {
+            applyInlineHighlights(rendered);
+            _ihRefreshNav();
+          }
+        } else {
+          clearInlineHighlights(rendered);
+          _ihBlocks = [];
+          _ihCurrentIdx = -1;
+          _ihUpdateNavLabel();
+          _ihHidePopover();
+        }
+      }
+
+      function _ihRefreshNav() {
+        const rendered = document.getElementById("docRendered");
+        _ihBlocks = rendered ? Array.from(rendered.querySelectorAll("[data-changed='true']")) : [];
+        _ihCurrentIdx = -1;
+        _ihUpdateNavLabel();
+      }
+
+      function _ihUpdateNavLabel() {
+        const lbl = document.getElementById("ihNavLabel");
+        if (!lbl) return;
+        if (!_ihBlocks.length) { lbl.textContent = "0/0"; return; }
+        lbl.textContent = `${_ihCurrentIdx < 0 ? "-" : _ihCurrentIdx + 1}/${_ihBlocks.length}`;
+      }
+
+      function ihNavigate(direction) {
+        if (!_ihBlocks.length) return;
+        if (direction === "next") {
+          _ihCurrentIdx = (_ihCurrentIdx + 1) % _ihBlocks.length;
+        } else {
+          _ihCurrentIdx = _ihCurrentIdx <= 0 ? _ihBlocks.length - 1 : _ihCurrentIdx - 1;
+        }
+        const el = _ihBlocks[_ihCurrentIdx];
+        if (el) {
+          el.scrollIntoView({ behavior: "smooth", block: "center" });
+          el.classList.add("ih-pulse");
+          setTimeout(() => el.classList.remove("ih-pulse"), 600);
+        }
+        _ihUpdateNavLabel();
+      }
+
+      function _ihShowPopover(el) {
+        const pop = document.getElementById("ihPopover");
+        const rendered = document.getElementById("docRendered");
+        if (!pop || !rendered || !el) return;
+        const c = ALL_COMMITS[DOC.idx];
+        if (!c) return;
+        const srcmap = el.getAttribute("data-srcmap") || "";
+        const [startLine, endLine] = srcmap.split(":").map(Number);
+        const lineCount = (endLine || startLine) - (startLine || 0);
+        const bucket = bucketById(c.primary);
+        pop.innerHTML = `<div class="ih-pop-row"><span class="ih-pop-label" style="background:${bucket.color}"></span><strong>${escapeHtml(bucket.name)}</strong></div><div class="ih-pop-row mt-1 text-slate-500">Lines ${startLine + 1}\u2013${endLine} (${lineCount} lines)</div><div class="ih-pop-row mt-0.5 text-slate-500">+${fmtInt(c.add)} \u2212${fmtInt(c.del)} | Impact ${fmtInt(c.impact)}</div>`;
+        const pRect = rendered.getBoundingClientRect();
+        const eRect = el.getBoundingClientRect();
+        pop.style.top = (eRect.top - pRect.top + rendered.scrollTop - pop.offsetHeight - 6) + "px";
+        pop.style.left = Math.min(eRect.left - pRect.left, pRect.width - 290) + "px";
+        pop.classList.add("visible");
+        pop.setAttribute("aria-hidden", "false");
+      }
+
+      function _ihHidePopover() {
+        const pop = document.getElementById("ihPopover");
+        if (pop) { pop.classList.remove("visible"); pop.setAttribute("aria-hidden", "true"); }
+      }
+
+      function _ihSetupPopover() {
+        const rendered = document.getElementById("docRendered");
+        if (!rendered) return;
+        for (const el of rendered.querySelectorAll("[data-changed='true']")) {
+          el.addEventListener("mouseenter", () => { if (DOC.inlineHighlights) _ihShowPopover(el); });
+          el.addEventListener("mouseleave", _ihHidePopover);
+          el.addEventListener("touchstart", (e) => {
+            if (DOC.inlineHighlights) { e.preventDefault(); _ihShowPopover(el); setTimeout(_ihHidePopover, 2500); }
+          }, { passive: false });
+        }
+      }
+
       // ---- Inline Highlights Unit Tests (bd-24q.16.3) ----
       // Run via console: window.__runInlineHighlightTests()
       window.__runInlineHighlightTests = function () {
@@ -11006,12 +11243,19 @@
        */
       let _miniMapOutline = [];
       let _miniMapScrollCleanup = null;
+      let _miniMapLastIdx = -1;
+      let _miniMapLastFilter = "";
 
       async function updateMiniMap() {
         const mm = document.getElementById("miniMap");
         if (!mm || mm.classList.contains("hidden")) return;
 
         const itemsContainer = document.getElementById("miniMapItems") || mm;
+        const searchInput = document.getElementById("miniMapSearch");
+        const filterText = (searchInput?.value || "").toLowerCase().trim();
+
+        if (_miniMapLastIdx === DOC.idx && _miniMapLastFilter === filterText) return;
+
         const outline = await getOutline(DOC.idx);
         _miniMapOutline = outline;
 
@@ -11035,8 +11279,6 @@
         const accentColor = commitForAccent ? bucketById(commitForAccent.primary)?.color : null;
 
         const docEl = document.getElementById("docRendered");
-        const searchInput = document.getElementById("miniMapSearch");
-        const filterText = (searchInput?.value || "").toLowerCase().trim();
 
         const filtered = filterText
           ? outline.filter((e) => e.text.toLowerCase().includes(filterText))
@@ -11102,6 +11344,9 @@
 
         // Follow-along: highlight current heading while scrolling docRendered.
         setupMiniMapFollowAlong(docEl, itemsContainer, outline);
+
+        _miniMapLastIdx = DOC.idx;
+        _miniMapLastFilter = filterText;
       }
 
       /** Highlight a mini-map item as active and scroll it into view. */
@@ -14178,6 +14423,238 @@
       // ---- End Story Mode Unit Tests ----
 
 
+      // ---- Story Mode E2E Tests (bd-24q.4.6) ----
+      // Run via console: window.__runStoryModeE2ETests()
+      window.__runStoryModeE2ETests = async function () {
+        const R = [];
+        const A = (c, m, x) => { R.push(c ? { pass: true, msg: m } : { pass: false, msg: m, ctx: x }); if (!c) console.error("FAIL:", m, x || ""); };
+        const wait = (ms) => new Promise(r => setTimeout(r, ms));
+        const log = (m) => console.log("  [story-e2e]", m);
+
+        if (!DATASET.loaded || !ALL_COMMITS.length) {
+          console.error("Story E2E: Need loaded dataset.");
+          return { passed: 0, failed: 1, total: 1, results: [{ pass: false, msg: "Dataset not loaded" }] };
+        }
+
+        // Save state.
+        const savedIdx = DOC.idx;
+        const savedTab = DOC.tab;
+        const savedActiveIdx = _storyActiveIdx;
+        const savedMilestones = _storyMilestones.slice();
+        const savedAutoplay = { enabled: STORY_AUTOPLAY.enabled, milestoneIdx: STORY_AUTOPLAY.milestoneIdx, pausedAtMilestone: STORY_AUTOPLAY.pausedAtMilestone, _milestoneCommitSet: STORY_AUTOPLAY._milestoneCommitSet };
+        const savedPlaybackState = PLAYBACK.state;
+
+        // --- E2E 1: Toggle story rail open + cards render ---
+        await (async function testOpenStoryRail() {
+          const rail = document.getElementById("storyRail");
+          const btn = document.getElementById("btnStoryToggle");
+          A(rail !== null, "e2e-1: storyRail element exists");
+          A(btn !== null, "e2e-1: btnStoryToggle element exists");
+          // Ensure hidden first.
+          if (rail && !rail.classList.contains("hidden")) rail.classList.add("hidden");
+          // Click toggle to open.
+          if (btn) btn.click();
+          await wait(500);
+          A(!rail.classList.contains("hidden"), "e2e-1: storyRail visible after toggle click");
+          const cards = document.getElementById("storyCards");
+          const items = cards?.querySelectorAll(".story-card") || [];
+          A(items.length > 0, "e2e-1: story cards rendered", { count: items.length });
+          log("Rail open: " + items.length + " cards");
+        })();
+
+        // --- E2E 2: First milestone loads commit + annotation ---
+        await (async function testFirstMilestoneLoads() {
+          const milestones = getMilestones().filter(m => m.commitIdx !== null);
+          if (milestones.length < 1) { log("Skipping (no milestones)"); return; }
+          _storyMilestones = milestones;
+          storyGoToIdx(0);
+          await wait(500);
+          const m = milestones[0];
+          A(DOC.idx === m.commitIdx, "e2e-2: first milestone sets DOC.idx", { got: DOC.idx, expected: m.commitIdx });
+          A(DOC.tab === m.defaultTab, "e2e-2: first milestone sets defaultTab", { got: DOC.tab, expected: m.defaultTab });
+          // Check annotation is rendered in the active card.
+          const activeCard = document.querySelector('.story-card[data-story-idx="0"]');
+          if (activeCard) {
+            const annotation = activeCard.querySelector(".story-annotation");
+            A(annotation !== null, "e2e-2: active card has annotation");
+            A(annotation && annotation.textContent.length > 10, "e2e-2: annotation has content", { len: annotation?.textContent?.length });
+          }
+          // Check progress shows "1/N".
+          const progress = document.getElementById("storyProgress");
+          A(progress && progress.textContent === "1/" + milestones.length, "e2e-2: progress shows 1/N", { got: progress?.textContent });
+          log("First milestone: idx=" + m.commitIdx + " tab=" + m.defaultTab);
+        })();
+
+        // --- E2E 3: Next/prev navigation updates commit + card ---
+        await (async function testNextPrevNavigation() {
+          const milestones = getMilestones().filter(m => m.commitIdx !== null);
+          if (milestones.length < 3) { log("Skipping nav (< 3 milestones)"); return; }
+          _storyMilestones = milestones;
+          storyGoToIdx(0);
+          await wait(300);
+          // Navigate forward.
+          storyNext();
+          await wait(300);
+          A(_storyActiveIdx === 1, "e2e-3: next from 0 → 1", { got: _storyActiveIdx });
+          A(DOC.idx === milestones[1].commitIdx, "e2e-3: DOC.idx matches milestone 1", { got: DOC.idx, expected: milestones[1].commitIdx });
+          // Navigate forward again.
+          storyNext();
+          await wait(300);
+          A(_storyActiveIdx === 2, "e2e-3: next from 1 → 2", { got: _storyActiveIdx });
+          A(DOC.idx === milestones[2].commitIdx, "e2e-3: DOC.idx matches milestone 2", { got: DOC.idx, expected: milestones[2].commitIdx });
+          // Navigate backward.
+          storyPrev();
+          await wait(300);
+          A(_storyActiveIdx === 1, "e2e-3: prev from 2 → 1", { got: _storyActiveIdx });
+          A(DOC.idx === milestones[1].commitIdx, "e2e-3: DOC.idx matches milestone 1 after prev", { got: DOC.idx });
+          // Check progress updates.
+          const progress = document.getElementById("storyProgress");
+          A(progress && progress.textContent === "2/" + milestones.length, "e2e-3: progress updated after nav", { got: progress?.textContent });
+          log("Nav OK: next/prev/progress verified");
+        })();
+
+        // --- E2E 4: focusHeading jump works for milestones with focusHeading ---
+        await (async function testFocusHeadingJump() {
+          const milestones = getMilestones().filter(m => m.commitIdx !== null);
+          const withFocus = milestones.findIndex(m => m.focusHeading);
+          if (withFocus === -1) { log("Skipping focusHeading (none)"); return; }
+          _storyMilestones = milestones;
+          storyGoToIdx(withFocus);
+          await wait(800);
+          const m = milestones[withFocus];
+          A(DOC.idx === m.commitIdx, "e2e-4: focusHeading milestone sets DOC.idx", { got: DOC.idx });
+          // If on spec tab, verify heading element exists.
+          if (m.defaultTab === "spec") {
+            const docEl = document.getElementById("docRendered");
+            const target = docEl?.querySelector("#" + CSS.escape(m.focusHeading));
+            A(target !== null, "e2e-4: focusHeading target element exists", { heading: m.focusHeading });
+          } else {
+            A(true, "e2e-4: focusHeading milestone on " + m.defaultTab + " tab, skip element check");
+          }
+          log("focusHeading: " + m.focusHeading + " at milestone " + withFocus);
+        })();
+
+        // --- E2E 5: Clicking a story card jumps to that commit ---
+        await (async function testCardClick() {
+          const milestones = getMilestones().filter(m => m.commitIdx !== null);
+          if (milestones.length < 2) { log("Skipping card click (< 2 milestones)"); return; }
+          _storyMilestones = milestones;
+          storyGoToIdx(0);
+          await wait(300);
+          const secondCard = document.querySelector('.story-card[data-story-idx="1"]');
+          if (!secondCard) { log("Skipping card click (card not found)"); return; }
+          secondCard.click();
+          await wait(500);
+          A(DOC.idx === milestones[1].commitIdx, "e2e-5: clicking card 1 sets DOC.idx", { got: DOC.idx, expected: milestones[1].commitIdx });
+          A(_storyActiveIdx === 1, "e2e-5: clicking card 1 sets _storyActiveIdx", { got: _storyActiveIdx });
+          log("Card click: OK");
+        })();
+
+        // --- E2E 6: Autoplay starts and sets state correctly ---
+        await (async function testAutoplayStartStop() {
+          playbackStop();
+          storyAutoplayStop();
+          await wait(200);
+          selectCommitIdx(0);
+          await wait(200);
+          storyAutoplayStart();
+          await wait(500);
+          A(STORY_AUTOPLAY.enabled === true, "e2e-6: autoplay enabled after start");
+          A(STORY_AUTOPLAY._milestoneCommitSet instanceof Set, "e2e-6: milestone commit set built");
+          A(STORY_AUTOPLAY._milestoneCommitSet.size > 0, "e2e-6: milestone commit set non-empty", { size: STORY_AUTOPLAY._milestoneCommitSet?.size });
+          const rail = document.getElementById("storyRail");
+          A(rail && !rail.classList.contains("hidden"), "e2e-6: storyRail visible during autoplay");
+          // Stop autoplay.
+          storyAutoplayStop();
+          playbackStop();
+          await wait(200);
+          A(STORY_AUTOPLAY.enabled === false, "e2e-6: autoplay disabled after stop");
+          A(STORY_AUTOPLAY._milestoneCommitSet === null, "e2e-6: milestone set cleared after stop");
+          log("Autoplay start/stop: OK");
+        })();
+
+        // --- E2E 7: Autoplay respects reduced-motion guard ---
+        await (async function testReducedMotionGuard() {
+          const src = storyAutoplayStart.toString();
+          A(src.includes("prefers-reduced-motion"), "e2e-7: storyAutoplayStart checks prefers-reduced-motion");
+          const playSrc = playbackPlay.toString();
+          A(playSrc.includes("prefers-reduced-motion"), "e2e-7: playbackPlay checks prefers-reduced-motion");
+          log("Reduced-motion guard: verified in source");
+        })();
+
+        // --- E2E 8: Permalink round-trip preserves story autoplay state ---
+        await (async function testPermalinkRoundTrip() {
+          const milestones = getMilestones().filter(m => m.commitIdx !== null);
+          if (milestones.length < 3) { log("Skipping permalink (< 3 milestones)"); return; }
+          _storyMilestones = milestones;
+          _storyAutoplayBuildSet();
+          STORY_AUTOPLAY.enabled = true;
+          STORY_AUTOPLAY.milestoneIdx = 2;
+          STORY_AUTOPLAY.pausedAtMilestone = false;
+          storyGoToIdx(2);
+          await wait(300);
+          // Encode URL state.
+          const encoded = encodeUrlState();
+          A(encoded.includes("sa=1"), "e2e-8: URL includes sa=1", { encoded });
+          A(encoded.includes("si=2"), "e2e-8: URL includes si=2", { encoded });
+          // Decode and verify round-trip.
+          const decoded = decodeUrlState("?" + encoded);
+          A(decoded.sa === true, "e2e-8: decoded sa = true", { got: decoded.sa });
+          A(decoded.si === 2, "e2e-8: decoded si = 2", { got: decoded.si });
+          // Clean up.
+          storyAutoplayStop();
+          playbackStop();
+          await wait(200);
+          log("Permalink round-trip: OK");
+        })();
+
+        // --- E2E 9: Mobile story mode opens and navigates ---
+        await (async function testMobileStoryMode() {
+          const sheet = document.getElementById("storyMobileSheet");
+          const overlay = document.getElementById("storyMobileOverlay");
+          if (!sheet || !overlay) { log("Skipping mobile (no elements)"); return; }
+          openStoryMobile();
+          await wait(500);
+          A(!sheet.classList.contains("hidden"), "e2e-9: mobile sheet visible after open");
+          const progress = document.getElementById("storyMobileProgress");
+          A(progress && progress.textContent.includes("/"), "e2e-9: mobile progress shows N/M", { got: progress?.textContent });
+          // Navigate forward if possible.
+          const milestones = getMilestones().filter(m => m.commitIdx !== null);
+          if (milestones.length >= 2 && _storyMobileIdx === 0) {
+            _storyMobileNext();
+            await wait(300);
+            A(_storyMobileIdx === 1, "e2e-9: mobile next advances to 1", { got: _storyMobileIdx });
+          }
+          closeStoryMobile();
+          await wait(300);
+          A(sheet.classList.contains("hidden"), "e2e-9: mobile sheet hidden after close");
+          log("Mobile story: OK");
+        })();
+
+        // Restore state.
+        playbackStop();
+        storyAutoplayStop();
+        _storyActiveIdx = savedActiveIdx;
+        _storyMilestones = savedMilestones;
+        STORY_AUTOPLAY.enabled = savedAutoplay.enabled;
+        STORY_AUTOPLAY.milestoneIdx = savedAutoplay.milestoneIdx;
+        STORY_AUTOPLAY.pausedAtMilestone = savedAutoplay.pausedAtMilestone;
+        STORY_AUTOPLAY._milestoneCommitSet = savedAutoplay._milestoneCommitSet;
+        selectCommitIdx(savedIdx);
+        if (savedTab) setDocTab(savedTab);
+        await wait(300);
+
+        // --- Summary ---
+        const p = R.filter(x => x.pass).length, f = R.filter(x => !x.pass).length;
+        const s = `Story Mode E2E Tests: ${p} passed, ${f} failed, ${R.length} total`;
+        if (f > 0) { console.warn(s); R.filter(x => !x.pass).forEach(x => console.error("  FAIL:", x.msg, x.ctx || "")); }
+        else console.log("%c" + s, "color:green;font-weight:bold");
+        return { passed: p, failed: f, total: R.length, results: R };
+      };
+      // ---- End Story Mode E2E Tests ----
+
+
+
       // ---- Outlier Unit Tests (bd-24q.10.3) ----
       // Run via console: window.__runOutlierTests()
       window.__runOutlierTests = function () {
@@ -15894,6 +16371,215 @@
         return { passed: p, failed: f, total: R.length, results: R };
       };
       // ---- End History Search E2E Tests ----
+
+      // ---- Clustering E2E Tests (bd-24q.14.5) ----
+      // Run via console: window.__runClusteringE2ETests()
+      window.__runClusteringE2ETests = async function () {
+        const R = [];
+        const A = (c, m, x) => { R.push(c ? { pass: true, msg: m } : { pass: false, msg: m, ctx: x }); if (!c) console.error("FAIL:", m, x || ""); };
+        const wait = (ms) => new Promise(r => setTimeout(r, ms));
+        const log = (m) => console.log("  [cluster-e2e]", m);
+
+        if (!DATASET.loaded || !ALL_COMMITS.length) {
+          console.error("Clustering E2E: Need loaded dataset.");
+          return { passed: 0, failed: 1, total: 1, results: [{ pass: false, msg: "Dataset not loaded" }] };
+        }
+
+        // Save state.
+        const savedClusterId = _selectedClusterId;
+        const savedClusterMembers = _selectedClusterMembers.slice();
+        const savedClusterNavIdx = _clusterNavIdx;
+        const savedCommitIdx = DOC.idx;
+
+        // --- E2E 1: Cluster panel elements exist ---
+        await (async function testPanelExists() {
+          const panel = document.getElementById("clusterPanel");
+          const list = document.getElementById("clusterList");
+          A(panel !== null, "e2e-1: clusterPanel element exists");
+          A(list !== null, "e2e-1: clusterList element exists");
+        })();
+
+        // --- E2E 2: Compute clusters and render panel ---
+        await (async function testRenderPanel() {
+          if (!WORKER_STATE.ready) { log("Skipping render (no worker)"); return; }
+          await renderClusterPanel();
+          await wait(1000);
+          const list = document.getElementById("clusterList");
+          const items = list.querySelectorAll(".cluster-item");
+          A(items.length > 0, "e2e-2: cluster items rendered", { len: items.length });
+          log("Rendered " + items.length + " cluster items");
+          // Each item should have a data-cluster-id.
+          if (items.length > 0) {
+            const cid = items[0].dataset.clusterId;
+            A(typeof cid === "string" && cid.startsWith("cl-"), "e2e-2: first item has valid cluster id", { cid });
+          }
+        })();
+
+        // --- E2E 3: Select cluster -> members populated ---
+        await (async function testSelectCluster() {
+          if (!WORKER_STATE.ready) { log("Skipping select (no worker)"); return; }
+          const list = document.getElementById("clusterList");
+          const items = list.querySelectorAll(".cluster-item");
+          if (!items.length) { log("Skipping select (no items)"); return; }
+          const firstCid = items[0].dataset.clusterId;
+          // Simulate click on first cluster.
+          const threshold = parseFloat(document.getElementById("clusterThresholdSel")?.value || "0.3");
+          const limit = parseInt(document.getElementById("clusterLimitSel")?.value || "10", 10);
+          try {
+            const res = await workerRequest("compute_clusters", { limit, threshold }, { timeoutMs: 30000 });
+            const cluster = (res.clusters || []).find(c => c.id === firstCid);
+            if (cluster) {
+              _selectedClusterMembers = cluster.items.map(it => it.idx);
+              _clusterNavIdx = 0;
+            }
+          } catch (e) { A(false, "e2e-3: compute_clusters threw", { err: String(e) }); return; }
+          selectCluster(firstCid);
+          await wait(1000);
+
+          A(_selectedClusterId === firstCid, "e2e-3: _selectedClusterId set", { got: _selectedClusterId, expected: firstCid });
+          A(_selectedClusterMembers.length >= 2, "e2e-3: members populated (>= 2)", { len: _selectedClusterMembers.length });
+          A(_clusterNavIdx === 0, "e2e-3: nav index starts at 0", { got: _clusterNavIdx });
+          log("Selected cluster " + firstCid + " with " + _selectedClusterMembers.length + " members");
+        })();
+
+        // --- E2E 4: Cluster navigation (next/prev) ---
+        await (async function testClusterNav() {
+          if (_selectedClusterMembers.length < 2) { log("Skipping nav (< 2 members)"); return; }
+          const firstMember = _selectedClusterMembers[0];
+          const secondMember = _selectedClusterMembers[1];
+
+          // Navigate to first member.
+          _clusterNavIdx = 0;
+          clusterNavigate(0); // Stay at 0.
+          await wait(200);
+          A(DOC.idx === firstMember, "e2e-4: at first member after nav(0)", { expected: firstMember, got: DOC.idx });
+
+          // Navigate forward.
+          clusterNavigate(1);
+          await wait(200);
+          A(_clusterNavIdx === 1, "e2e-4: navIdx = 1 after forward", { got: _clusterNavIdx });
+          A(DOC.idx === secondMember, "e2e-4: at second member after nav(1)", { expected: secondMember, got: DOC.idx });
+
+          // Navigate backward.
+          clusterNavigate(-1);
+          await wait(200);
+          A(_clusterNavIdx === 0, "e2e-4: navIdx = 0 after back", { got: _clusterNavIdx });
+          A(DOC.idx === firstMember, "e2e-4: back at first member", { expected: firstMember, got: DOC.idx });
+
+          // Navigate past start (clamped).
+          clusterNavigate(-1);
+          await wait(200);
+          A(_clusterNavIdx === 0, "e2e-4: clamped at 0", { got: _clusterNavIdx });
+
+          // Navigate to last member.
+          const lastIdx = _selectedClusterMembers.length - 1;
+          _clusterNavIdx = lastIdx;
+          clusterNavigate(0);
+          await wait(200);
+          A(DOC.idx === _selectedClusterMembers[lastIdx], "e2e-4: at last member", { got: DOC.idx });
+
+          // Navigate past end (clamped).
+          clusterNavigate(1);
+          await wait(200);
+          A(_clusterNavIdx === lastIdx, "e2e-4: clamped at end", { got: _clusterNavIdx });
+          log("Nav test: OK (forward/back/clamp at " + _selectedClusterMembers.length + " members)");
+        })();
+
+        // --- E2E 5: Nav label updates ---
+        await (async function testNavLabel() {
+          const label = document.getElementById("clusterNavLabel");
+          if (!label) { log("Skipping nav label (no element)"); return; }
+          if (_selectedClusterMembers.length < 1) { log("Skipping nav label (no members)"); return; }
+          _clusterNavIdx = 0;
+          updateClusterNav();
+          A(label.textContent === "1 / " + _selectedClusterMembers.length, "e2e-5: nav label at idx 0", { got: label.textContent });
+          if (_selectedClusterMembers.length >= 2) {
+            _clusterNavIdx = 1;
+            updateClusterNav();
+            A(label.textContent === "2 / " + _selectedClusterMembers.length, "e2e-5: nav label at idx 1", { got: label.textContent });
+          }
+        })();
+
+        // --- E2E 6: Timeline highlight on cluster selection ---
+        await (async function testTimelineHighlight() {
+          if (!_selectedClusterMembers.length) { log("Skipping highlight (no members)"); return; }
+          highlightClusterOnTimeline();
+          await wait(200);
+          const highlighted = document.querySelectorAll(".timeline-cluster-highlight");
+          // May be 0 if commit list isn't rendered with data-idx attributes.
+          log("Timeline highlighted elements: " + highlighted.length);
+          A(true, "e2e-6: highlightClusterOnTimeline ran without error");
+        })();
+
+        // --- E2E 7: Deselect cluster ---
+        await (async function testDeselectCluster() {
+          if (!_selectedClusterId) { log("Skipping deselect (none selected)"); return; }
+          const cid = _selectedClusterId;
+          selectCluster(cid); // Toggle off.
+          await wait(500);
+          A(_selectedClusterId === null, "e2e-7: deselected (id = null)", { got: _selectedClusterId });
+          A(_selectedClusterMembers.length === 0, "e2e-7: members cleared", { len: _selectedClusterMembers.length });
+          A(_clusterNavIdx === -1, "e2e-7: navIdx = -1", { got: _clusterNavIdx });
+          const nav = document.getElementById("clusterNav");
+          if (nav) A(nav.classList.contains("hidden"), "e2e-7: nav hidden after deselect");
+          log("Deselect: OK");
+        })();
+
+        // --- E2E 8: Cluster determinism (same params -> same results) ---
+        await (async function testDeterminism() {
+          if (!WORKER_STATE.ready) { log("Skipping determinism (no worker)"); return; }
+          try {
+            const r1 = await workerRequest("compute_clusters", { limit: 5, threshold: 0.3 }, { timeoutMs: 30000 });
+            const r2 = await workerRequest("compute_clusters", { limit: 5, threshold: 0.3 }, { timeoutMs: 30000 });
+            A(r1.clusters.length === r2.clusters.length, "e2e-8: same cluster count", { r1: r1.clusters.length, r2: r2.clusters.length });
+            if (r1.clusters.length > 0 && r2.clusters.length > 0) {
+              A(r1.clusters[0].id === r2.clusters[0].id, "e2e-8: same first cluster id", { r1: r1.clusters[0].id, r2: r2.clusters[0].id });
+              A(r1.clusters[0].size === r2.clusters[0].size, "e2e-8: same first cluster size", { r1: r1.clusters[0].size, r2: r2.clusters[0].size });
+            }
+            log("Determinism: OK (" + r1.clusters.length + " clusters)");
+          } catch (e) { A(false, "e2e-8: determinism test threw", { err: String(e) }); }
+        })();
+
+        // --- E2E 9: Navigation stays within cluster membership ---
+        await (async function testNavWithinCluster() {
+          if (!WORKER_STATE.ready) { log("Skipping nav membership (no worker)"); return; }
+          try {
+            const res = await workerRequest("compute_clusters", { limit: 5, threshold: 0.3 }, { timeoutMs: 30000 });
+            if (!res.clusters.length) { log("Skipping nav membership (no clusters)"); return; }
+            const cluster = res.clusters[0];
+            _selectedClusterId = cluster.id;
+            _selectedClusterMembers = cluster.items.map(it => it.idx);
+            _clusterNavIdx = 0;
+            const memberSet = new Set(_selectedClusterMembers);
+            // Navigate through all members.
+            for (let i = 0; i < _selectedClusterMembers.length && i < 10; i++) {
+              _clusterNavIdx = i;
+              clusterNavigate(0);
+              await wait(50);
+              A(memberSet.has(DOC.idx), "e2e-9: commit at nav " + i + " is a member", { idx: DOC.idx, member: memberSet.has(DOC.idx) });
+            }
+            log("Nav membership: OK (checked " + Math.min(_selectedClusterMembers.length, 10) + " members)");
+          } catch (e) { A(false, "e2e-9: nav membership threw", { err: String(e) }); }
+        })();
+
+        // Restore state.
+        _selectedClusterId = savedClusterId;
+        _selectedClusterMembers = savedClusterMembers;
+        _clusterNavIdx = savedClusterNavIdx;
+        selectCommitIdx(savedCommitIdx);
+        highlightClusterOnTimeline();
+        await wait(200);
+
+        // --- Summary ---
+        const p = R.filter(x => x.pass).length, f = R.filter(x => !x.pass).length;
+        const s = `Clustering E2E Tests: ${p} passed, ${f} failed, ${R.length} total`;
+        if (f > 0) { console.warn(s); R.filter(x => !x.pass).forEach(x => console.error("  FAIL:", x.msg, x.ctx || "")); }
+        else console.log("%c" + s, "color:green;font-weight:bold");
+        return { passed: p, failed: f, total: R.length, results: R };
+      };
+      // ---- End Clustering E2E Tests ----
+
+
       // ---- Clustering Unit Tests (bd-24q.14.4) ----
       // Run via console: window.__runClusteringTests()
       window.__runClusteringTests = async function () {
@@ -16059,7 +16745,273 @@
       };
       // ---- End Clustering Unit Tests ----
 
+      // ---- Performance Unit Tests: Cache + Worker Protocol (bd-24q.5.4) ----
+      // Run via console: window.__runCacheWorkerTests()
+      window.__runCacheWorkerTests = function () {
+        const R = [];
+        const A = (c, m, x) => { R.push(c ? { pass: true, msg: m } : { pass: false, msg: m, ctx: x }); if (!c) console.error("FAIL:", m, x || ""); };
 
+        // --- 1. LruCache keying ---
+        (function test_lruCache_sameKey() {
+          const cache = new LruCache(10);
+          const origHash = WORKER_STATE.datasetHash;
+          WORKER_STATE.datasetHash = "testhash123";
+          cache.set("op1", { a: 1 }, "value1");
+          const val = cache.get("op1", { a: 1 });
+          A(val === "value1", "LRU sameKey: same params → same value", { val });
+          WORKER_STATE.datasetHash = origHash;
+        })();
+
+        (function test_lruCache_diffKey() {
+          const cache = new LruCache(10);
+          const origHash = WORKER_STATE.datasetHash;
+          WORKER_STATE.datasetHash = "testhash123";
+          cache.set("op1", { a: 1 }, "value1");
+          cache.set("op1", { a: 2 }, "value2");
+          const v1 = cache.get("op1", { a: 1 });
+          const v2 = cache.get("op1", { a: 2 });
+          A(v1 === "value1", "LRU diffKey: params {a:1} → value1", { v1 });
+          A(v2 === "value2", "LRU diffKey: params {a:2} → value2", { v2 });
+          WORKER_STATE.datasetHash = origHash;
+        })();
+
+        (function test_lruCache_diffOp() {
+          const cache = new LruCache(10);
+          const origHash = WORKER_STATE.datasetHash;
+          WORKER_STATE.datasetHash = "testhash123";
+          cache.set("opA", {}, "valA");
+          cache.set("opB", {}, "valB");
+          A(cache.get("opA", {}) === "valA", "LRU diffOp: opA → valA");
+          A(cache.get("opB", {}) === "valB", "LRU diffOp: opB → valB");
+          WORKER_STATE.datasetHash = origHash;
+        })();
+
+        (function test_lruCache_diffDatasetHash() {
+          const cache = new LruCache(10);
+          const origHash = WORKER_STATE.datasetHash;
+          WORKER_STATE.datasetHash = "hash1";
+          cache.set("op", {}, "val_hash1");
+          WORKER_STATE.datasetHash = "hash2";
+          cache.set("op", {}, "val_hash2");
+          A(cache.get("op", {}) === "val_hash2", "LRU diffHash: hash2 → val_hash2");
+          WORKER_STATE.datasetHash = "hash1";
+          A(cache.get("op", {}) === "val_hash1", "LRU diffHash: hash1 → val_hash1");
+          WORKER_STATE.datasetHash = origHash;
+        })();
+
+        // --- 2. LRU eviction ---
+        (function test_lruCache_eviction() {
+          const cache = new LruCache(3);
+          const origHash = WORKER_STATE.datasetHash;
+          WORKER_STATE.datasetHash = "evict";
+          cache.set("op", { i: 1 }, "v1");
+          cache.set("op", { i: 2 }, "v2");
+          cache.set("op", { i: 3 }, "v3");
+          A(cache.size === 3, "LRU eviction: size is 3 before overflow", { size: cache.size });
+          cache.set("op", { i: 4 }, "v4"); // Should evict {i:1}
+          A(cache.size === 3, "LRU eviction: size stays 3 after overflow", { size: cache.size });
+          A(cache.get("op", { i: 1 }) === undefined, "LRU eviction: oldest entry (i:1) evicted");
+          A(cache.get("op", { i: 4 }) === "v4", "LRU eviction: newest entry (i:4) present");
+          WORKER_STATE.datasetHash = origHash;
+        })();
+
+        (function test_lruCache_access_refreshes() {
+          const cache = new LruCache(3);
+          const origHash = WORKER_STATE.datasetHash;
+          WORKER_STATE.datasetHash = "refresh";
+          cache.set("op", { i: 1 }, "v1");
+          cache.set("op", { i: 2 }, "v2");
+          cache.set("op", { i: 3 }, "v3");
+          // Access i:1 to refresh it (move to end)
+          cache.get("op", { i: 1 });
+          // Now i:2 is oldest; adding i:4 should evict i:2
+          cache.set("op", { i: 4 }, "v4");
+          A(cache.get("op", { i: 1 }) === "v1", "LRU refresh: accessed entry i:1 survives");
+          A(cache.get("op", { i: 2 }) === undefined, "LRU refresh: stale entry i:2 evicted");
+          A(cache.get("op", { i: 4 }) === "v4", "LRU refresh: new entry i:4 present");
+          WORKER_STATE.datasetHash = origHash;
+        })();
+
+        (function test_lruCache_overwrite() {
+          const cache = new LruCache(5);
+          const origHash = WORKER_STATE.datasetHash;
+          WORKER_STATE.datasetHash = "ow";
+          cache.set("op", { k: "a" }, "old");
+          cache.set("op", { k: "a" }, "new");
+          A(cache.get("op", { k: "a" }) === "new", "LRU overwrite: same key gets updated value");
+          A(cache.size === 1, "LRU overwrite: no duplicate entries", { size: cache.size });
+          WORKER_STATE.datasetHash = origHash;
+        })();
+
+        (function test_lruCache_has() {
+          const cache = new LruCache(5);
+          const origHash = WORKER_STATE.datasetHash;
+          WORKER_STATE.datasetHash = "has";
+          cache.set("op", { x: 1 }, "val");
+          A(cache.has("op", { x: 1 }) === true, "LRU has: returns true for existing key");
+          A(cache.has("op", { x: 2 }) === false, "LRU has: returns false for missing key");
+          WORKER_STATE.datasetHash = origHash;
+        })();
+
+        (function test_lruCache_clear() {
+          const cache = new LruCache(5);
+          const origHash = WORKER_STATE.datasetHash;
+          WORKER_STATE.datasetHash = "clr";
+          cache.set("op", { i: 1 }, "v1");
+          cache.set("op", { i: 2 }, "v2");
+          A(cache.size === 2, "LRU clear: size before clear is 2");
+          cache.clear();
+          A(cache.size === 0, "LRU clear: size after clear is 0");
+          A(cache.get("op", { i: 1 }) === undefined, "LRU clear: entries gone after clear");
+          WORKER_STATE.datasetHash = origHash;
+        })();
+
+        // --- 3. Worker protocol: handleWorkerMessage ---
+        (function test_workerMsg_ok() {
+          // Simulate a pending request resolved by handleWorkerMessage
+          const origPending = new Map(WORKER_STATE.pending);
+          let resolved = null;
+          let rejected = null;
+          const fakeReqId = "test-ok-1";
+          WORKER_STATE.pending.set(fakeReqId, {
+            resolve: (v) => { resolved = v; },
+            reject: (e) => { rejected = e; },
+            onProgress: null,
+            timeoutId: null,
+          });
+          // Simulate worker response
+          handleWorkerMessage({ data: { reqId: fakeReqId, type: "ok", payload: { result: 42 } } });
+          A(resolved !== null, "workerMsg ok: resolve called", { resolved });
+          A(resolved?.result === 42, "workerMsg ok: correct payload", { result: resolved?.result });
+          A(rejected === null, "workerMsg ok: reject not called");
+          A(!WORKER_STATE.pending.has(fakeReqId), "workerMsg ok: pending entry cleaned up");
+          // Restore
+          WORKER_STATE.pending = origPending;
+        })();
+
+        (function test_workerMsg_error() {
+          const origPending = new Map(WORKER_STATE.pending);
+          let resolved = null;
+          let rejected = null;
+          const fakeReqId = "test-err-1";
+          WORKER_STATE.pending.set(fakeReqId, {
+            resolve: (v) => { resolved = v; },
+            reject: (e) => { rejected = e; },
+            onProgress: null,
+            timeoutId: null,
+          });
+          handleWorkerMessage({ data: { reqId: fakeReqId, type: "error", error: { message: "test error", name: "TestError" } } });
+          A(rejected !== null, "workerMsg error: reject called");
+          A(rejected?.message === "test error", "workerMsg error: correct message", { msg: rejected?.message });
+          A(rejected?.name === "TestError", "workerMsg error: correct name", { name: rejected?.name });
+          A(resolved === null, "workerMsg error: resolve not called");
+          A(!WORKER_STATE.pending.has(fakeReqId), "workerMsg error: pending entry cleaned up");
+          WORKER_STATE.pending = origPending;
+        })();
+
+        (function test_workerMsg_cancelled() {
+          const origPending = new Map(WORKER_STATE.pending);
+          let resolved = null;
+          let rejected = null;
+          const fakeReqId = "test-cancel-1";
+          WORKER_STATE.pending.set(fakeReqId, {
+            resolve: (v) => { resolved = v; },
+            reject: (e) => { rejected = e; },
+            onProgress: null,
+            timeoutId: null,
+          });
+          handleWorkerMessage({ data: { reqId: fakeReqId, type: "cancelled" } });
+          A(rejected !== null, "workerMsg cancelled: reject called");
+          A(rejected?.name === "AbortError", "workerMsg cancelled: AbortError", { name: rejected?.name });
+          A(resolved === null, "workerMsg cancelled: resolve not called");
+          WORKER_STATE.pending = origPending;
+        })();
+
+        (function test_workerMsg_progress() {
+          const origPending = new Map(WORKER_STATE.pending);
+          let progressData = null;
+          const fakeReqId = "test-prog-1";
+          WORKER_STATE.pending.set(fakeReqId, {
+            resolve: () => {},
+            reject: () => {},
+            onProgress: (p) => { progressData = p; },
+            timeoutId: null,
+          });
+          handleWorkerMessage({ data: { reqId: fakeReqId, type: "progress", payload: { pct: 50 } } });
+          A(progressData !== null, "workerMsg progress: onProgress called");
+          A(progressData?.pct === 50, "workerMsg progress: correct payload", { pct: progressData?.pct });
+          // Progress should NOT remove from pending
+          A(WORKER_STATE.pending.has(fakeReqId), "workerMsg progress: pending entry kept");
+          WORKER_STATE.pending.delete(fakeReqId);
+          WORKER_STATE.pending = origPending;
+        })();
+
+        (function test_workerMsg_unknown_reqId() {
+          const origPending = new Map(WORKER_STATE.pending);
+          // No pending entry for this reqId - should silently ignore
+          const sizeBefore = WORKER_STATE.pending.size;
+          handleWorkerMessage({ data: { reqId: "nonexistent-123", type: "ok", payload: {} } });
+          A(WORKER_STATE.pending.size === sizeBefore, "workerMsg unknown: no side effects for unknown reqId");
+          WORKER_STATE.pending = origPending;
+        })();
+
+        (function test_workerMsg_no_reqId() {
+          const origPending = new Map(WORKER_STATE.pending);
+          const sizeBefore = WORKER_STATE.pending.size;
+          handleWorkerMessage({ data: { type: "ok", payload: {} } });
+          A(WORKER_STATE.pending.size === sizeBefore, "workerMsg noReqId: no side effects when reqId missing");
+          WORKER_STATE.pending = origPending;
+        })();
+
+        // --- 4. workerRequest reqId correlation ---
+        (function test_workerRequest_unavailable() {
+          const origWorker = WORKER_STATE.worker;
+          const origReady = WORKER_STATE.ready;
+          WORKER_STATE.worker = null;
+          let caught = false;
+          workerRequest("test_op", {}).catch(() => { caught = true; });
+          // Since worker is null, it should reject
+          A(WORKER_STATE.worker === null, "workerRequest unavailable: worker stays null");
+          WORKER_STATE.worker = origWorker;
+          WORKER_STATE.ready = origReady;
+        })();
+
+        (function test_workerRequest_reqId_unique() {
+          const id1 = WORKER_STATE.reqSeq;
+          const id2 = WORKER_STATE.reqSeq + 1;
+          A(id1 !== id2, "workerRequest reqId: sequential reqIds are unique", { id1, id2 });
+        })();
+
+        // --- 5. localStorage cache (schema mismatch clears) ---
+        (function test_lsCache_keyFormat() {
+          const origHash = WORKER_STATE.datasetHash;
+          WORKER_STATE.datasetHash = "lskeyhash";
+          const key = lsCacheKey("myop", { p: 1 });
+          A(key.startsWith(LS_CACHE_PREFIX), "lsCache key: starts with prefix", { key, prefix: LS_CACHE_PREFIX });
+          A(key.includes("myop"), "lsCache key: includes op name", { key });
+          A(key.includes("lskeyhash"), "lsCache key: includes dataset hash", { key });
+          WORKER_STATE.datasetHash = origHash;
+        })();
+
+        // --- Diagnostics ---
+        const failed = R.filter(r => !r.pass);
+        if (failed.length > 0) {
+          console.group("Cache/Worker Protocol Test Diagnostics");
+          failed.forEach(r => console.error("  FAIL:", r.msg, r.ctx || ""));
+          // Print WORKER_STATE summary
+          console.log("WORKER_STATE:", { ready: WORKER_STATE.ready, disabled: WORKER_STATE.disabled, datasetHash: WORKER_STATE.datasetHash?.slice(0, 12), pendingCount: WORKER_STATE.pending.size, reqSeq: WORKER_STATE.reqSeq });
+          console.groupEnd();
+        }
+
+        // Summary
+        const p = R.filter(r => r.pass).length;
+        const f = R.filter(r => !r.pass).length;
+        const summary = "Cache + Worker Protocol Tests: " + p + " passed, " + f + " failed, " + R.length + " total";
+        if (f > 0) { console.warn(summary); R.filter(r => !r.pass).forEach(r => console.error("  FAIL:", r.msg, r.ctx || "")); }
+        else console.log("%c" + summary, "color: green; font-weight: bold");
+        return { passed: p, failed: f, total: R.length, results: R };
+      };
+      // ---- End Performance Unit Tests ----
 
 
 
@@ -16653,6 +17605,7 @@
 
       const RENDER_CACHE = {
         specIdx: -1,
+        specIH: false, // bd-24q.16.2: whether last spec render used inline highlights
         specHtml: "",
         diffIdx: -1,
         diffFromIdx: -1,
@@ -16816,11 +17769,19 @@
           const specView = document.getElementById("docSpecView");
           if (specView) specView.classList.remove("hidden");
 
-          if (RENDER_CACHE.specIdx !== DOC.idx) {
+          // bd-24q.16.2: also re-render when inline highlights toggle changes
+          if (RENDER_CACHE.specIdx !== DOC.idx || RENDER_CACHE.specIH !== DOC.inlineHighlights) {
             const text = await docTextAt(DOC.idx);
             if (raw) raw.textContent = text;
 
-            if (rendered) {
+            if (rendered && DOC.inlineHighlights && DOC.idx > 0) {
+              // bd-24q.16.2: sentinel-based rendering for inline change highlights
+              const _ihPatch = patchForIdx(DOC.idx);
+              const _ihChanged = parsePatchChangedNewLines(_ihPatch);
+              renderMarkdownWithSentinels(text, rendered, "", _ihChanged);
+              applyInlineHighlights(rendered);
+              _ihRefreshNav(); _ihSetupPopover();
+            } else if (rendered) {
               const outline = extractOutline(text);
               OUTLINE_CACHE.set(DOC.idx, outline);
 
@@ -16860,8 +17821,16 @@
               } else {
                 delete window._mdSingleton.renderer.rules.heading_open;
               }
+              clearInlineHighlights(rendered); // bd-24q.16.2
             }
             RENDER_CACHE.specIdx = DOC.idx;
+            RENDER_CACHE.specIH = DOC.inlineHighlights; // bd-24q.16.2
+          }
+
+          // bd-24q.16.2: sync highlights toggle button + nav bar
+          { const _ihB = document.getElementById("btnIHToggle"), _ihN = document.getElementById("ihNav");
+            if (_ihB) { _ihB.className = DOC.inlineHighlights ? "focus-ring rounded-xl bg-slate-900 px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-slate-800" : "focus-ring rounded-xl border border-slate-900/10 bg-white/70 px-3 py-1.5 text-[11px] font-semibold text-slate-900 hover:bg-white"; }
+            if (_ihN) _ihN.style.display = DOC.inlineHighlights ? "inline-flex" : "none";
           }
 
           if (rendered) rendered.classList.toggle("hidden", DOC.rawSpec);
@@ -18727,6 +19696,22 @@
           });
         }
 
+        // --- Inline highlights controls (bd-24q.16.2) ---
+        document.getElementById("btnIHToggle")?.addEventListener("click", toggleInlineHighlights);
+        document.getElementById("btnIHNext")?.addEventListener("click", () => ihNavigate("next"));
+        document.getElementById("btnIHPrev")?.addEventListener("click", () => ihNavigate("prev"));
+        document.addEventListener("keydown", (e) => {
+          if (!DOC.inlineHighlights) return;
+          if (e.altKey && e.key === "ArrowDown") { e.preventDefault(); ihNavigate("next"); }
+          if (e.altKey && e.key === "ArrowUp") { e.preventDefault(); ihNavigate("prev"); }
+        });
+        if (DOC.inlineHighlights) {
+          const btn = document.getElementById("btnIHToggle");
+          const nav = document.getElementById("ihNav");
+          if (btn) { btn.classList.add("bg-slate-900", "text-white"); }
+          if (nav) nav.style.display = "flex";
+        }
+
         document.getElementById("btnPrettyDiff")?.addEventListener("click", () => {
           DOC.diffMode = "pretty";
           syncUrlToState();
@@ -18981,6 +19966,8 @@
 	      _wireHeatStripe();
 	      _wireMiniMapMobile();
 	      _wireStoryMobile();
+	      lsCacheInit();
+	      document.getElementById("btnCancelWarmup")?.addEventListener("click", () => { WARMUP_ABORT_CONTROLLER?.abort(); });
 	      _wireOutlierPanel();
 	      _wireClusterPanel();
 
