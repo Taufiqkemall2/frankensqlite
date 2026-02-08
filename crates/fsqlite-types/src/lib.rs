@@ -1,10 +1,13 @@
 pub mod cx;
+pub mod ecs;
 pub mod flags;
 pub mod limits;
 pub mod opcode;
 pub mod record;
 pub mod serial_type;
 pub mod value;
+
+pub use ecs::{ObjectId, PayloadHash};
 
 use std::fmt;
 use std::num::NonZeroU32;
