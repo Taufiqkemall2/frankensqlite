@@ -369,6 +369,29 @@
       .dock-slider {
         width: 100%;
       }
+      .dock-heat-stripe {
+        width: 100%;
+        height: 12px;
+        display: block;
+        border-radius: 6px;
+        cursor: pointer;
+      }
+      .dock-heat-tooltip {
+        position: fixed;
+        z-index: 50;
+        pointer-events: none;
+        padding: 6px 10px;
+        border-radius: 10px;
+        background: rgba(255,255,255,0.96);
+        border: 1px solid rgba(2,6,23,0.12);
+        box-shadow: 0 8px 24px rgba(2,6,23,0.14);
+        font-size: 11px;
+        color: #0b1220;
+        line-height: 1.4;
+        max-width: 240px;
+        white-space: nowrap;
+        transition: opacity 0.12s;
+      }
 
       /* A/B Compare Typeahead Pickers (bd-24q.1) */
       .ab-picker {
@@ -829,9 +852,13 @@
                         <tr><td class="py-0.5 font-mono">ca</td><td>Compare "A" commit index</td><td>0</td></tr>
                         <tr><td class="py-0.5 font-mono">cb</td><td>Compare "B" commit index</td><td>0</td></tr>
                         <tr><td class="py-0.5 font-mono">dl</td><td>side-by-side | line-by-line</td><td>side-by-side</td></tr>
+                        <tr><td class="py-0.5 font-mono">avm</td><td>diff | rendered</td><td>diff</td></tr>
+                        <tr><td class="py-0.5 font-mono">res</td><td>commit | day | hour | 15m | 5m</td><td>commit</td></tr>
+                        <tr><td class="py-0.5 font-mono">tz</td><td>local | utc</td><td>local</td></tr>
+                        <tr><td class="py-0.5 font-mono">met</td><td>groups | lines | tokens | lev</td><td>groups</td></tr>
                       </tbody>
                     </table>
-                    <div class="mt-2 text-[10px] text-slate-500">Default values are omitted for minimal URLs. Invalid values are clamped. Canonical key order: v, c, t, raw, dm, cmp, ca, cb, dl, q, mi, bm, b.</div>
+                    <div class="mt-2 text-[10px] text-slate-500">Default values are omitted for minimal URLs. Invalid values are clamped. Canonical key order: v, c, t, raw, dm, cmp, ca, cb, dl, avm, q, mi, bm, b, res, tz, met.</div>
                   </div>
                 </span>
               </div>
@@ -868,6 +895,14 @@
                       <div class="text-xs font-semibold text-slate-600">Rendered Markdown</div>
                       <div class="flex items-center gap-2">
                         <button
+                          id="btnStoryToggle"
+                          class="focus-ring rounded-xl border border-slate-900/10 bg-white/70 px-3 py-1.5 text-[11px] font-semibold text-slate-900 hover:bg-white"
+                          type="button"
+                          title="Toggle story mode milestones"
+                        >
+                          Story
+                        </button>
+                        <button
                           id="btnMiniMapToggle"
                           class="focus-ring rounded-xl border border-slate-900/10 bg-white/70 px-3 py-1.5 text-[11px] font-semibold text-slate-900 hover:bg-white"
                           type="button"
@@ -903,6 +938,22 @@
                         <div id="miniMapItems" class="flex-1 overflow-y-auto p-3" role="tree" tabindex="0"></div>
                       </nav>
                       <div id="docRendered" class="md min-w-0 flex-1 max-h-[70vh] overflow-auto rounded-2xl border border-slate-900/10 bg-white/70 p-4"></div>
+                      <aside
+                        id="storyRail"
+                        class="hidden w-64 shrink-0 flex flex-col rounded-2xl border border-slate-900/10 bg-white/70"
+                        style="max-height: 70vh"
+                        aria-label="Story mode milestones"
+                      >
+                        <div class="shrink-0 border-b border-slate-900/10 px-3 py-2 flex items-center justify-between">
+                          <span class="text-[11px] font-semibold text-slate-600">Milestones</span>
+                          <div class="flex items-center gap-1.5">
+                            <button id="storyPrev" class="focus-ring rounded-lg border border-slate-900/10 bg-white/80 px-2 py-0.5 text-[10px] font-semibold text-slate-600 hover:bg-white" type="button" aria-label="Previous milestone">&larr;</button>
+                            <span id="storyProgress" class="text-[10px] text-slate-400">0/0</span>
+                            <button id="storyNext" class="focus-ring rounded-lg border border-slate-900/10 bg-white/80 px-2 py-0.5 text-[10px] font-semibold text-slate-600 hover:bg-white" type="button" aria-label="Next milestone">&rarr;</button>
+                          </div>
+                        </div>
+                        <div id="storyCards" class="flex-1 overflow-y-auto p-3 space-y-2"></div>
+                      </aside>
                     </div>
                     <pre id="docRaw" class="codebox mono mt-3 hidden max-h-[70vh] overflow-auto rounded-2xl p-4 text-[11px] leading-relaxed text-slate-900"></pre>
                   </div>
@@ -925,6 +976,12 @@
                           type="button"
                           title="Toggle side-by-side / unified layout"
                         >Side-by-Side</button>
+                        <button
+                          id="btnSbsRendered"
+                          class="focus-ring rounded-xl border border-slate-900/10 bg-white/70 px-3 py-1.5 text-[11px] font-semibold text-slate-900 hover:bg-white hidden"
+                          type="button"
+                          title="Show rendered markdown side-by-side (A left, B right)"
+                        >Rendered A|B</button>
                         <button
                           id="btnPrettyDiff"
                           class="focus-ring rounded-xl bg-slate-900 px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-slate-800"
@@ -973,6 +1030,42 @@
                     </div>
                     <div id="diffPretty" class="mt-3 max-h-[70vh] overflow-auto rounded-2xl border border-slate-900/10 bg-white/70 p-2"></div>
                     <pre id="diffRaw" class="codebox mono mt-3 hidden max-h-[70vh] overflow-auto rounded-2xl p-4 text-[11px] leading-relaxed text-slate-900"></pre>
+                    <!-- Side-by-Side Rendered Markdown Panes (bd-24q.15.1) -->
+                    <div id="sbsContainer" class="hidden mt-3 relative flex flex-col rounded-2xl border border-slate-900/10 bg-white/70" style="max-height: 70vh">
+                      <!-- Pane header bar: labels + controls -->
+                      <div class="flex items-center justify-between border-b border-slate-900/10 px-3 py-1.5 shrink-0">
+                        <div class="flex items-center gap-4">
+                          <span id="sbsLabelA" class="text-[11px] font-semibold text-blue-700 truncate max-w-[260px]">A</span>
+                          <span class="text-[10px] text-slate-300">|</span>
+                          <span id="sbsLabelB" class="text-[11px] font-semibold text-emerald-700 truncate max-w-[260px]">B</span>
+                        </div>
+                        <div class="flex items-center gap-1">
+                          <button
+                            id="btnSbsCopyLink"
+                            class="focus-ring rounded-lg border border-slate-900/10 bg-white/90 px-2 py-0.5 text-[10px] font-semibold text-slate-600 hover:bg-white"
+                            type="button"
+                            title="Copy permalink for this side-by-side view"
+                          >Copy Link</button>
+                          <button
+                            id="btnSbsSyncScroll"
+                            class="focus-ring rounded-lg border border-slate-900/10 bg-white/90 px-2 py-0.5 text-[10px] font-semibold text-slate-600 hover:bg-white"
+                            type="button"
+                            title="Toggle synced scrolling between panes"
+                          >Sync &#x2714;</button>
+                        </div>
+                      </div>
+                      <!-- Pane content area -->
+                      <div class="flex flex-1 min-h-0 overflow-hidden">
+                        <div id="sbsPaneA" class="md flex-1 min-w-0 overflow-auto p-4" style="scroll-behavior: auto"></div>
+                        <div
+                          id="sbsDivider"
+                          class="shrink-0 cursor-col-resize bg-slate-200 hover:bg-slate-400 transition-colors"
+                          style="width: 5px"
+                          title="Drag to resize panes"
+                        ></div>
+                        <div id="sbsPaneB" class="md flex-1 min-w-0 overflow-auto p-4" style="scroll-behavior: auto"></div>
+                      </div>
+                    </div>
                   </div>
 
                   <div id="docMetricsView" class="hidden">
@@ -1301,7 +1394,23 @@
             id="dockCanvas"
             class="dock-canvas mt-2 rounded-2xl border border-slate-900/10 bg-white/70"
           ></canvas>
+          <canvas
+            id="heatStripeCanvas"
+            class="mt-1 w-full cursor-pointer rounded-lg"
+            style="height:12px"
+            title="Heat stripe: click to jump to densest commit"
+          ></canvas>
+          <div
+            id="heatStripeTooltip"
+            class="pointer-events-none fixed z-50 hidden max-w-[260px] rounded-xl border border-slate-900/10 bg-white/95 px-3 py-2 text-xs shadow-lg backdrop-blur"
+          ></div>
           <input id="dockSlider" class="dock-slider mt-2" type="range" min="0" max="1" value="0" />
+          <canvas
+            id="dockHeatStripe"
+            class="dock-heat-stripe mt-1"
+            aria-label="Heat stripe showing bucket density over time"
+          ></canvas>
+          <div id="dockHeatTooltip" class="dock-heat-tooltip hidden" aria-hidden="true"></div>
           <div class="mt-1 flex items-center justify-between text-[11px] text-slate-500">
             <div id="dockLeftLabel" class="mono">-</div>
             <div id="dockRightLabel" class="mono">-</div>
@@ -6665,6 +6774,8 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         compareToIdx: 0, // "B" commit index
         diffLayout: "side-by-side", // 'side-by-side' | 'line-by-line'
         diffCollapse: true, // collapse unchanged context in A/B diffs
+        abViewMode: "diff", // 'diff' | 'rendered' — diff shows Diff2Html, rendered shows side-by-side markdown panes
+        sbsSyncScroll: true, // sync scroll between side-by-side panes
       };
 
       const METRICS = {
@@ -6722,11 +6833,17 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         mi: 0,          // minimum impact filter
         bm: "primary",  // bucket mode: primary | multi
         b: null,        // enabled bucket ids; null = all
+        res: "commit",  // stack chart resolution: commit | day | hour | 15m | 5m
+        tz: "local",    // timezone mode: local | utc
+        met: "groups",  // stack chart metric: groups | lines | tokens | lev
       };
 
       const URL_VALID_TABS = new Set(["spec", "diff", "metrics", "sections"]);
       const URL_VALID_DIFF_MODES = new Set(["pretty", "raw"]);
       const URL_VALID_BUCKET_MODES = new Set(["primary", "multi"]);
+      const URL_VALID_RESOLUTIONS = new Set(["commit", "day", "hour", "15m", "5m"]);
+      const URL_VALID_TZ_MODES = new Set(["local", "utc"]);
+      const URL_VALID_METRICS = new Set(["groups", "lines", "tokens", "lev"]);
       const URL_ALL_BUCKET_IDS = new Set(BUCKETS.map((b) => b.id));
 
       function encodeUrlState() {
@@ -6744,6 +6861,17 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         if (STATE.minImpact > 0) p.set("mi", String(STATE.minImpact));
         if (STATE.bucketMode !== URL_DEFAULTS.bm) p.set("bm", STATE.bucketMode);
 
+        // Stack chart resolution, timezone, metric (bd-24q.12.2).
+        const resSel = document.getElementById("stackResolution");
+        const tzSel = document.getElementById("stackTimezone");
+        const metSel = document.getElementById("stackMetric");
+        const curRes = resSel?.value || URL_DEFAULTS.res;
+        const curTz = tzSel?.value || URL_DEFAULTS.tz;
+        const curMet = metSel?.value || URL_DEFAULTS.met;
+        if (curRes !== URL_DEFAULTS.res) p.set("res", curRes);
+        if (curTz !== URL_DEFAULTS.tz) p.set("tz", curTz);
+        if (curMet !== URL_DEFAULTS.met) p.set("met", curMet);
+
         // Encode enabled buckets only if not all are enabled.
         const allEnabled = URL_ALL_BUCKET_IDS.size === STATE.bucketEnabled.size &&
           [...URL_ALL_BUCKET_IDS].every((id) => STATE.bucketEnabled.has(id));
@@ -6756,9 +6884,9 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         if ([...p.keys()].length === 0) return "";
         const canon = new URLSearchParams();
         canon.set("v", String(URL_SCHEMA_VERSION));
-        // Canonical key order: v, c, t, raw, dm, cmp, ca, cb, dl, q, mi, bm, b
-        if (DOC.compareMode) { p.set("cmp", "1"); p.set("ca", String(DOC.compareFromIdx)); p.set("cb", String(DOC.compareToIdx)); if (DOC.diffLayout !== "side-by-side") p.set("dl", DOC.diffLayout); }
-        for (const k of ["c", "t", "raw", "dm", "cmp", "ca", "cb", "dl", "q", "mi", "bm", "b"]) {
+        // Canonical key order: v, c, t, raw, dm, cmp, ca, cb, dl, avm, q, mi, bm, b, res, tz, met
+        if (DOC.compareMode) { p.set("cmp", "1"); p.set("ca", String(DOC.compareFromIdx)); p.set("cb", String(DOC.compareToIdx)); if (DOC.diffLayout !== "side-by-side") p.set("dl", DOC.diffLayout); if (DOC.abViewMode === "rendered") p.set("avm", "rendered"); }
+        for (const k of ["c", "t", "raw", "dm", "cmp", "ca", "cb", "dl", "avm", "q", "mi", "bm", "b", "res", "tz", "met"]) {
           if (p.has(k)) canon.set(k, p.get(k));
         }
         return canon.toString();
@@ -6817,6 +6945,14 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
           result.b = null; // null = all enabled
         }
 
+        // Stack chart resolution, timezone, metric (bd-24q.12.2).
+        const res = p.get("res") || URL_DEFAULTS.res;
+        result.res = URL_VALID_RESOLUTIONS.has(res) ? res : URL_DEFAULTS.res;
+        const tz = p.get("tz") || URL_DEFAULTS.tz;
+        result.tz = URL_VALID_TZ_MODES.has(tz) ? tz : URL_DEFAULTS.tz;
+        const met = p.get("met") || URL_DEFAULTS.met;
+        result.met = URL_VALID_METRICS.has(met) ? met : URL_DEFAULTS.met;
+
         // A/B Compare mode.
         result.cmp = p.get("cmp") === "1";
         if (result.cmp) {
@@ -6824,6 +6960,7 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
           const cb = Number(p.get("cb")); result.cb = Number.isFinite(cb) && cb >= 0 ? Math.floor(cb) : 0;
           const dl = p.get("dl") || "side-by-side";
           result.dl = (dl === "line-by-line") ? "line-by-line" : "side-by-side";
+          result.avm = p.get("avm") || "diff";
         }
 
         return result;
@@ -6842,7 +6979,7 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         STATE.minImpact = s.mi;
         STATE.bucketMode = s.bm;
         STATE.bucketEnabled = s.b ? new Set(s.b) : new Set(URL_ALL_BUCKET_IDS);
-        if (s.cmp) { DOC.compareMode = true; DOC.compareFromIdx = clamp(s.ca || 0, 0, maxIdx); DOC.compareToIdx = clamp(s.cb || 0, 0, maxIdx); DOC.diffLayout = s.dl || "side-by-side"; }
+        if (s.cmp) { DOC.compareMode = true; DOC.compareFromIdx = clamp(s.ca || 0, 0, maxIdx); DOC.compareToIdx = clamp(s.cb || 0, 0, maxIdx); DOC.diffLayout = s.dl || "side-by-side"; DOC.abViewMode = s.avm === "rendered" ? "rendered" : "diff"; }
 
         // Sync UI inputs to match restored state.
         const qEl = document.getElementById("q");
@@ -6854,6 +6991,14 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         const impactMob = document.getElementById("impactMobile");
         if (impactEl) impactEl.value = String(STATE.minImpact);
         if (impactMob) impactMob.value = String(STATE.minImpact);
+
+        // Restore stack chart controls from URL state (bd-24q.12.2).
+        const resSel = document.getElementById("stackResolution");
+        const tzSel = document.getElementById("stackTimezone");
+        const metSel = document.getElementById("stackMetric");
+        if (resSel && s.res) resSel.value = s.res;
+        if (tzSel && s.tz) tzSel.value = s.tz;
+        if (metSel && s.met) metSel.value = s.met;
       }
 
       let _urlSyncScheduled = false;
@@ -7101,7 +7246,7 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
 
           function countRoughTokens(s) {
             let n = 0;
-            const re = /[A-Za-z0-9_]+|[^\\\\s]/g;
+            const re = /[A-Za-z0-9_]+|[^\\s]/g;
             while (re.exec(String(s))) n++;
             return n;
           }
@@ -8192,7 +8337,7 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
       function countRoughTokens(s) {
         // Approximate tokens for visualization: words + punctuation runs.
         let n = 0;
-        const re = /[A-Za-z0-9_]+|[^\\s]/g;
+        const re = /[A-Za-z0-9_]+|[^\s]/g;
         while (re.exec(String(s))) n++;
         return n;
       }
@@ -8720,6 +8865,137 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
           return patch;
         } finally {
           if (loading) loading.classList.add("hidden");
+        }
+      }
+
+      // -----------------------------
+      // Side-by-Side Rendered Markdown (bd-24q.15.1)
+      // -----------------------------
+
+      function renderMarkdownToPane(text, paneEl, idPrefix) {
+        if (!paneEl) return;
+        if (!window._mdSingleton) {
+          window._mdSingleton = markdownit({
+            html: false, linkify: true, typographer: true,
+            highlight: (str, lang) => {
+              try {
+                if (lang && hljs.getLanguage(lang)) return `<pre class="hljs"><code>${hljs.highlight(str, { language: lang }).value}</code></pre>`;
+                return `<pre class="hljs"><code>${hljs.highlightAuto(str).value}</code></pre>`;
+              } catch { return `<pre class="hljs"><code>${escapeHtml(str)}</code></pre>`; }
+            },
+          });
+        }
+        const outline = extractOutline(text);
+        const prefix = idPrefix || "";
+        let oIdx = 0;
+        const orig = window._mdSingleton.renderer.rules.heading_open;
+        window._mdSingleton.renderer.rules.heading_open = (tokens, idx, options, env, self) => {
+          const entry = outline[oIdx++];
+          if (entry) tokens[idx].attrSet("id", prefix + entry.id);
+          return self.renderToken(tokens, idx, options);
+        };
+        const html = window._mdSingleton.render(text || "");
+        paneEl.innerHTML = DOMPurify.sanitize(html, { ADD_ATTR: ["id"] });
+        if (orig) window._mdSingleton.renderer.rules.heading_open = orig;
+        else delete window._mdSingleton.renderer.rules.heading_open;
+      }
+
+      let _sbsRenderedKey = "";
+
+      async function renderSbsPanes() {
+        const key = `${DOC.compareFromIdx}:${DOC.compareToIdx}`;
+        if (_sbsRenderedKey === key) return; // already rendered for these indices
+        const paneA = document.getElementById("sbsPaneA");
+        const paneB = document.getElementById("sbsPaneB");
+        const loading = document.getElementById("abDiffLoading");
+        if (!paneA || !paneB) return;
+        if (loading) loading.classList.remove("hidden");
+        try {
+          const [textA, textB] = await Promise.all([
+            docTextAt(DOC.compareFromIdx),
+            docTextAt(DOC.compareToIdx),
+          ]);
+          renderMarkdownToPane(textA, paneA, "sbs-a-");
+          renderMarkdownToPane(textB, paneB, "sbs-b-");
+          _sbsRenderedKey = key;
+          // Update pane labels with commit info (bd-24q.15.1).
+          const cA = ALL_COMMITS[DOC.compareFromIdx];
+          const cB = ALL_COMMITS[DOC.compareToIdx];
+          const lblA = document.getElementById("sbsLabelA");
+          const lblB = document.getElementById("sbsLabelB");
+          if (lblA) lblA.textContent = `A: #${DOC.compareFromIdx} ${cA?.short || ""} \u2014 ${cA?.subject || ""}`;
+          if (lblB) lblB.textContent = `B: #${DOC.compareToIdx} ${cB?.short || ""} \u2014 ${cB?.subject || ""}`;
+          setupSbsDivider();
+          setupSbsSyncScroll();
+        } finally {
+          if (loading) loading.classList.add("hidden");
+        }
+      }
+
+      function setupSbsDivider() {
+        const divider = document.getElementById("sbsDivider");
+        const container = divider?.parentElement; // inner flex row containing panes + divider
+        const paneA = document.getElementById("sbsPaneA");
+        const paneB = document.getElementById("sbsPaneB");
+        if (!divider || !container || !paneA || !paneB) return;
+        if (divider._sbsSetup) return;
+        divider._sbsSetup = true;
+        let dragging = false;
+        divider.addEventListener("pointerdown", (e) => {
+          e.preventDefault();
+          dragging = true;
+          divider.setPointerCapture(e.pointerId);
+          document.body.style.cursor = "col-resize";
+          document.body.style.userSelect = "none";
+        });
+        document.addEventListener("pointermove", (e) => {
+          if (!dragging) return;
+          const rect = container.getBoundingClientRect();
+          const offset = e.clientX - rect.left;
+          const pct = Math.max(15, Math.min(85, (offset / rect.width) * 100));
+          paneA.style.flex = "none";
+          paneA.style.width = `calc(${pct}% - 2.5px)`;
+          paneB.style.flex = "none";
+          paneB.style.width = `calc(${100 - pct}% - 2.5px)`;
+        });
+        const stopDrag = () => { if (!dragging) return; dragging = false; document.body.style.cursor = ""; document.body.style.userSelect = ""; };
+        document.addEventListener("pointerup", stopDrag);
+        document.addEventListener("pointercancel", stopDrag);
+      }
+
+      let _sbsScrollCleanup = null;
+
+      function setupSbsSyncScroll() {
+        if (_sbsScrollCleanup) { _sbsScrollCleanup(); _sbsScrollCleanup = null; }
+        if (!DOC.sbsSyncScroll) return;
+        const paneA = document.getElementById("sbsPaneA");
+        const paneB = document.getElementById("sbsPaneB");
+        if (!paneA || !paneB) return;
+        let syncing = false;
+        const syncFrom = (source, target) => {
+          if (syncing) return;
+          syncing = true;
+          const maxA = source.scrollHeight - source.clientHeight;
+          const maxB = target.scrollHeight - target.clientHeight;
+          if (maxA > 0 && maxB > 0) target.scrollTop = (source.scrollTop / maxA) * maxB;
+          requestAnimationFrame(() => { syncing = false; });
+        };
+        const onScrollA = () => syncFrom(paneA, paneB);
+        const onScrollB = () => syncFrom(paneB, paneA);
+        paneA.addEventListener("scroll", onScrollA, { passive: true });
+        paneB.addEventListener("scroll", onScrollB, { passive: true });
+        _sbsScrollCleanup = () => { paneA.removeEventListener("scroll", onScrollA); paneB.removeEventListener("scroll", onScrollB); };
+      }
+
+      /** Update button styling to reflect current abViewMode. */
+      function updateSbsButtonStyles() {
+        const sbsBtn = document.getElementById("btnSbsRendered");
+        const active = DOC.abViewMode === "rendered";
+        if (sbsBtn) {
+          sbsBtn.classList.toggle("bg-slate-900", active);
+          sbsBtn.classList.toggle("text-white", active);
+          sbsBtn.classList.toggle("bg-white/70", !active);
+          sbsBtn.classList.toggle("text-slate-900", !active);
         }
       }
 
@@ -9257,12 +9533,12 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
             const hid = tr.dataset.headingId;
             if (!hid) return;
             if (DOC.tab !== "spec") setDocTab("spec");
-            requestAnimationFrame(() => {
+            setTimeout(() => {
               const docEl = document.getElementById("docRendered");
               if (!docEl) return;
               const target = docEl.querySelector(`#${CSS.escape(hid)}`);
               if (target) { target.scrollIntoView({ behavior: "smooth", block: "start" }); target.classList.remove("section-highlight"); void target.offsetWidth; target.classList.add("section-highlight"); }
-            });
+            }, 350);
           });
         });
       }
@@ -9461,7 +9737,7 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         // --- countRoughTokens tests ---
         (function testTokens() {
           assert(countRoughTokens("hello world") === 2, "tokens: 2 words");
-          assert(countRoughTokens("a + b = c") === 6, "tokens: operators count", { got: countRoughTokens("a + b = c") });
+          assert(countRoughTokens("a + b = c") === 5, "tokens: operators count", { got: countRoughTokens("a + b = c") });
           assert(countRoughTokens("") === 0, "tokens: empty string");
           assert(countRoughTokens("single") === 1, "tokens: single word");
         })();
@@ -9732,6 +10008,427 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
       };
       // ---- End A/B Compare Unit Tests ----
 
+      // ---- A/B Compare E2E Tests (bd-24q.1.6) ----
+      // Run via console: window.__runABCompareE2ETests()
+      // Requires dataset to be loaded with at least 3 commits.
+      window.__runABCompareE2ETests = async function () {
+        const results = [];
+        const log = (msg, ctx) => console.log("  [AB-E2E]", msg, ctx || "");
+        const assert = (cond, msg, ctx) => {
+          if (!cond) { results.push({ pass: false, msg, ctx }); console.error("  FAIL:", msg, ctx || ""); }
+          else { results.push({ pass: true, msg }); log("PASS: " + msg); }
+        };
+        const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+        if (!DATASET.loaded || ALL_COMMITS.length < 3) {
+          console.error("AB-E2E: Need loaded dataset with >= 3 commits.");
+          return { passed: 0, failed: 1, total: 1, results: [{ pass: false, msg: "Dataset not loaded or < 3 commits" }] };
+        }
+
+        const origIdx = DOC.idx;
+        const origTab = DOC.tab;
+        const origCompare = DOC.compareMode;
+        const origFromIdx = DOC.compareFromIdx;
+        const origToIdx = DOC.compareToIdx;
+        const origLayout = DOC.diffLayout;
+
+        // --- E2E 1: Enable compare mode via toggle ---
+        await (async function testE2E_enableCompare() {
+          DOC.compareMode = false;
+          setDocTab("diff");
+          await wait(200);
+          const btn = document.getElementById("btnCompareToggle");
+          if (btn) {
+            btn.click();
+            await wait(400);
+            assert(DOC.compareMode === true, "ab-e2e: compare mode enabled after toggle click");
+            const bar = document.getElementById("abCompareBar");
+            assert(bar && !bar.classList.contains("hidden"), "ab-e2e: abCompareBar is visible");
+            log("compareFromIdx=" + DOC.compareFromIdx + " compareToIdx=" + DOC.compareToIdx);
+          } else {
+            assert(false, "ab-e2e: btnCompareToggle not found");
+          }
+        })();
+
+        // --- E2E 2: Pick A and B, verify diff renders ---
+        await (async function testE2E_pickAB() {
+          DOC.compareFromIdx = 0;
+          DOC.compareToIdx = Math.min(2, ALL_COMMITS.length - 1);
+          DOC.compareMode = true;
+          populateCompareSelects();
+          setDocTab("diff");
+          await wait(1500);
+          const diffEl = document.getElementById("diffPretty");
+          const hasContent = diffEl && diffEl.innerHTML.length > 50;
+          assert(hasContent, "ab-e2e: diffPretty has content after picking A=0 B=2", { htmlLen: diffEl?.innerHTML.length });
+          const btnA = document.getElementById("pickerABtn");
+          const btnB = document.getElementById("pickerBBtn");
+          assert(btnA && btnA.textContent.length > 2, "ab-e2e: picker A has label text");
+          assert(btnB && btnB.textContent.length > 2, "ab-e2e: picker B has label text");
+        })();
+
+        // --- E2E 3: Metrics bar appears for different A/B ---
+        await (async function testE2E_metricsBar() {
+          DOC.compareFromIdx = 0;
+          DOC.compareToIdx = 2;
+          DOC.compareMode = true;
+          setDocTab("diff");
+          await wait(2000);
+          const bar = document.getElementById("abMetricsBar");
+          const visible = bar && !bar.classList.contains("hidden");
+          assert(visible, "ab-e2e: abMetricsBar visible for A!=B");
+          if (visible) {
+            const linesChip = document.getElementById("abmLines");
+            const hunksChip = document.getElementById("abmHunks");
+            log("Lines chip: " + (linesChip?.textContent || "(empty)"));
+            log("Hunks chip: " + (hunksChip?.textContent || "(empty)"));
+            assert(linesChip && linesChip.textContent.length > 0 && linesChip.textContent !== "...", "ab-e2e: lines chip populated");
+            assert(hunksChip && hunksChip.textContent.length > 0 && hunksChip.textContent !== "...", "ab-e2e: hunks chip populated");
+          }
+        })();
+
+        // --- E2E 4: Swap A and B, verify indices swap ---
+        await (async function testE2E_swap() {
+          DOC.compareFromIdx = 0;
+          DOC.compareToIdx = 2;
+          DOC.compareMode = true;
+          populateCompareSelects();
+          syncUrlToState();
+          await wait(200);
+          const swapBtn = document.getElementById("btnSwapAB");
+          if (swapBtn) {
+            swapBtn.click();
+            await wait(800);
+            assert(DOC.compareFromIdx === 2, "ab-e2e: after swap, fromIdx=2", { got: DOC.compareFromIdx });
+            assert(DOC.compareToIdx === 0, "ab-e2e: after swap, toIdx=0", { got: DOC.compareToIdx });
+          } else {
+            assert(false, "ab-e2e: btnSwapAB not found");
+          }
+        })();
+
+        // --- E2E 5: Toggle diff layout ---
+        await (async function testE2E_diffLayout() {
+          DOC.compareMode = true;
+          DOC.compareFromIdx = 0;
+          DOC.compareToIdx = 2;
+          DOC.diffLayout = "side-by-side";
+          setDocTab("diff");
+          await wait(800);
+          const layoutBtn = document.getElementById("btnDiffLayout");
+          if (layoutBtn) {
+            const beforeLayout = DOC.diffLayout;
+            layoutBtn.click();
+            await wait(800);
+            assert(DOC.diffLayout !== beforeLayout, "ab-e2e: layout toggled");
+            assert(DOC.diffLayout === "line-by-line", "ab-e2e: layout is now line-by-line");
+            layoutBtn.click();
+            await wait(400);
+            assert(DOC.diffLayout === "side-by-side", "ab-e2e: layout back to side-by-side");
+          } else {
+            assert(false, "ab-e2e: btnDiffLayout not found");
+          }
+        })();
+
+        // --- E2E 6: Switch tabs while in compare mode ---
+        await (async function testE2E_tabSwitch() {
+          DOC.compareMode = true;
+          DOC.compareFromIdx = 0;
+          DOC.compareToIdx = 2;
+          for (const tab of ["spec", "diff", "metrics", "sections", "diff"]) {
+            try {
+              setDocTab(tab);
+              await wait(300);
+              assert(DOC.tab === tab, "ab-e2e: tab switch to " + tab + " ok");
+            } catch (e) {
+              assert(false, "ab-e2e: tab switch to " + tab + " threw", { error: String(e) });
+            }
+          }
+        })();
+
+        // --- E2E 7: Permalink round-trip ---
+        await (async function testE2E_permalink() {
+          DOC.compareMode = true;
+          DOC.compareFromIdx = 1;
+          DOC.compareToIdx = Math.min(3, ALL_COMMITS.length - 1);
+          DOC.diffLayout = "line-by-line";
+          setDocTab("diff");
+          await wait(200);
+          const encoded = encodeUrlState();
+          log("Encoded URL state: " + encoded);
+          assert(encoded.includes("cmp=1"), "ab-e2e: permalink has cmp=1");
+          assert(encoded.includes("ca=1"), "ab-e2e: permalink has ca=1");
+          assert(encoded.includes("cb="), "ab-e2e: permalink has cb=");
+          assert(encoded.includes("dl=line-by-line"), "ab-e2e: permalink has dl=line-by-line");
+          const decoded = decodeUrlState(encoded);
+          assert(decoded !== null, "ab-e2e: decoded is not null");
+          assert(decoded.cmp === true, "ab-e2e: decoded.cmp is true");
+          assert(decoded.ca === 1, "ab-e2e: decoded.ca is 1", { got: decoded?.ca });
+          assert(decoded.cb === DOC.compareToIdx, "ab-e2e: decoded.cb matches", { got: decoded?.cb });
+          assert(decoded.dl === "line-by-line", "ab-e2e: decoded.dl is line-by-line");
+          const savedFrom = DOC.compareFromIdx;
+          const savedTo = DOC.compareToIdx;
+          DOC.compareMode = false; DOC.compareFromIdx = 0; DOC.compareToIdx = 0; DOC.diffLayout = "side-by-side";
+          applyUrlState(decoded);
+          assert(DOC.compareMode === true, "ab-e2e: applyUrlState restored compareMode");
+          assert(DOC.compareFromIdx === savedFrom, "ab-e2e: applyUrlState restored fromIdx");
+          assert(DOC.compareToIdx === savedTo, "ab-e2e: applyUrlState restored toIdx");
+          assert(DOC.diffLayout === "line-by-line", "ab-e2e: applyUrlState restored diffLayout");
+        })();
+
+        // --- E2E 8: Disable compare mode ---
+        await (async function testE2E_disableCompare() {
+          DOC.compareMode = true;
+          setDocTab("diff");
+          await wait(200);
+          const btn = document.getElementById("btnCompareToggle");
+          if (btn) {
+            if (!DOC.compareMode) { btn.click(); await wait(200); }
+            btn.click();
+            await wait(400);
+            assert(DOC.compareMode === false, "ab-e2e: compare mode disabled after toggle");
+            const bar = document.getElementById("abCompareBar");
+            assert(bar && bar.classList.contains("hidden"), "ab-e2e: abCompareBar hidden after disable");
+            const metricsBar = document.getElementById("abMetricsBar");
+            assert(!metricsBar || metricsBar.classList.contains("hidden"), "ab-e2e: abMetricsBar hidden after disable");
+          } else {
+            assert(false, "ab-e2e: btnCompareToggle not found");
+          }
+        })();
+
+        // Restore original state.
+        DOC.compareMode = origCompare;
+        DOC.compareFromIdx = origFromIdx;
+        DOC.compareToIdx = origToIdx;
+        DOC.diffLayout = origLayout;
+        DOC.idx = origIdx;
+        setDocTab(origTab);
+        await wait(300);
+
+        const passed = results.filter((r) => r.pass).length;
+        const failed = results.filter((r) => !r.pass).length;
+        const summary = `A/B Compare E2E Tests: ${passed} passed, ${failed} failed, ${results.length} total`;
+        if (failed > 0) {
+          console.warn(summary);
+          results.filter((r) => !r.pass).forEach((r) => console.error("  FAIL:", r.msg, r.ctx || ""));
+        } else {
+          console.log("%c" + summary, "color: green; font-weight: bold");
+        }
+        return { passed, failed, total: results.length, results };
+      };
+      // ---- End A/B Compare E2E Tests ----
+
+      // ---- Permalink Unit Tests (bd-24q.3.4) ----
+      // Run via console: window.__runPermalinkTests()
+      window.__runPermalinkTests=function(){const R=[];const A=(c,m,x)=>{R.push(c?{pass:true,msg:m}:{pass:false,msg:m,ctx:x});if(!c)console.error("FAIL:",m,x||"")};const oD={idx:DOC.idx,tab:DOC.tab,rawSpec:DOC.rawSpec,diffMode:DOC.diffMode,compareMode:DOC.compareMode,compareFromIdx:DOC.compareFromIdx,compareToIdx:DOC.compareToIdx,diffLayout:DOC.diffLayout};const oS={q:STATE.q,minImpact:STATE.minImpact,bucketMode:STATE.bucketMode,bucketEnabled:new Set(STATE.bucketEnabled)};const mx=Math.max(0,(ALL_COMMITS?.length||1)-1);A(decodeUrlState("")===null,"decode:empty->null");A(decodeUrlState("c=5")===null,"decode:no-v->null");A(decodeUrlState("v=999")===null,"decode:bad-v->null");let d=decodeUrlState("v=1");A(d!==null,"decode:v=1 ok");A(d.c===-1,"decode:c=-1",{got:d?.c});A(d.t==="spec","decode:t=spec");A(d.raw===false,"decode:raw=false");A(d.dm==="pretty","decode:dm=pretty");A(d.q==="","decode:q=empty");A(d.mi===0,"decode:mi=0");A(d.bm==="primary","decode:bm=primary");A(d.b===null,"decode:b=null");A(d.cmp===false,"decode:cmp=false");d=decodeUrlState("v=1&c=5&t=diff&raw=1&dm=raw&q=hello&mi=10&bm=multi&b=1,2,3&cmp=1&ca=2&cb=7&dl=line-by-line");A(d.c===5,"decode:c=5");A(d.t==="diff","decode:t=diff");A(d.raw===true,"decode:raw=1");A(d.dm==="raw","decode:dm=raw");A(d.q==="hello","decode:q=hello");A(d.mi===10,"decode:mi=10");A(d.bm==="multi","decode:bm=multi");A(d.b instanceof Set&&d.b.size===3,"decode:b=3ids");A(d.cmp===true,"decode:cmp=true");A(d.ca===2,"decode:ca=2");A(d.cb===7,"decode:cb=7");A(d.dl==="line-by-line","decode:dl=l-b-l");A(decodeUrlState("v=1&t=bogus").t==="spec","decode:bad-tab->spec");A(decodeUrlState("v=1&dm=bogus").dm==="pretty","decode:bad-dm->pretty");A(decodeUrlState("v=1&c=-5").c===-1,"decode:neg-c->-1");A(decodeUrlState("v=1&c=3.7").c===3,"decode:float-c->3");A(decodeUrlState("v=1&c=abc").c===-1,"decode:nan-c->-1");d=decodeUrlState("v=1&b=abc,def");A(d.b instanceof Set&&d.b.size===URL_ALL_BUCKET_IDS.size,"decode:bad-b->all");d=decodeUrlState("v=1&cmp=1");A(d.cmp===true&&d.ca===0&&d.cb===0,"decode:partial-cmp");A(d.dl==="side-by-side","decode:no-dl->sbs");A(decodeUrlState("v=1&cmp=1&dl=bogus").dl==="side-by-side","decode:bad-dl->sbs");DOC.idx=mx;DOC.tab="spec";DOC.rawSpec=false;DOC.diffMode="pretty";DOC.compareMode=false;STATE.q="";STATE.minImpact=0;STATE.bucketMode="primary";STATE.bucketEnabled=new Set(URL_ALL_BUCKET_IDS);A(encodeUrlState()==="","encode:defaults->empty");DOC.tab="diff";let enc=encodeUrlState();A(enc.includes("v=1"),"encode:has-v");A(enc.includes("t=diff"),"encode:t=diff");A(!enc.includes("c="),"encode:no-c@max");DOC.tab="spec";DOC.idx=3;enc=encodeUrlState();A(enc.includes("c=3"),"encode:c=3");DOC.idx=mx;DOC.tab="diff";DOC.compareMode=true;DOC.compareFromIdx=1;DOC.compareToIdx=5;DOC.diffLayout="line-by-line";enc=encodeUrlState();A(enc.includes("cmp=1"),"encode:cmp");A(enc.includes("ca=1"),"encode:ca");A(enc.includes("cb=5"),"encode:cb");A(enc.includes("dl=line-by-line"),"encode:dl");DOC.diffLayout="side-by-side";DOC.compareFromIdx=0;DOC.compareToIdx=1;enc=encodeUrlState();A(!enc.includes("dl="),"encode:sbs-omit");DOC.compareMode=false;DOC.tab="spec";STATE.q="MVCC";enc=encodeUrlState();A(enc.includes("q=MVCC"),"encode:q");STATE.q="";const ids=[...URL_ALL_BUCKET_IDS];STATE.bucketEnabled=new Set(ids.slice(0,2));enc=encodeUrlState();A(enc.includes("b="),"encode:subset-b");STATE.bucketEnabled=new Set(URL_ALL_BUCKET_IDS);DOC.idx=2;DOC.tab="diff";DOC.rawSpec=true;DOC.diffMode="raw";DOC.compareMode=false;STATE.q="test query";STATE.minImpact=5;STATE.bucketMode="multi";const e1=encodeUrlState();applyUrlState(decodeUrlState(e1));const e2=encodeUrlState();A(e1===e2,"roundtrip:basic",{e1,e2});DOC.idx=0;DOC.tab="diff";DOC.rawSpec=false;DOC.diffMode="pretty";DOC.compareMode=true;DOC.compareFromIdx=1;DOC.compareToIdx=Math.min(4,mx);DOC.diffLayout="line-by-line";STATE.q="";STATE.minImpact=0;STATE.bucketMode="primary";STATE.bucketEnabled=new Set(URL_ALL_BUCKET_IDS);const e3=encodeUrlState();applyUrlState(decodeUrlState(e3));const e4=encodeUrlState();A(e3===e4,"roundtrip:compare",{e3,e4});A(DOC.compareMode===true&&DOC.compareFromIdx===1&&DOC.diffLayout==="line-by-line","roundtrip:cmp-ok");DOC.idx=2;DOC.tab="diff";DOC.rawSpec=true;DOC.diffMode="raw";DOC.compareMode=true;DOC.compareFromIdx=0;DOC.compareToIdx=1;DOC.diffLayout="line-by-line";STATE.q="foo";STATE.minImpact=3;STATE.bucketMode="multi";STATE.bucketEnabled=new Set(URL_ALL_BUCKET_IDS);enc=encodeUrlState();const keys=[...new URLSearchParams(enc).keys()];const ord=["v","c","t","raw","dm","cmp","ca","cb","dl","q","mi","bm"];let pv=-1,ok=true;for(const k of ord){const p=keys.indexOf(k);if(p>=0){if(p<pv){ok=false;break}pv=p}}A(ok,"canonical:order",{keys});A(keys[0]==="v","canonical:v-first");A(decodeUrlState("v=1&mi=0").mi===0,"edge:mi=0");A(decodeUrlState("v=1&mi=-5").mi===0,"edge:neg-mi");A(decodeUrlState("v=1&raw=1").raw===true,"edge:raw=1");A(decodeUrlState("v=1&raw=0").raw===false,"edge:raw=0");A(decodeUrlState("v=1&raw=yes").raw===false,"edge:raw=yes");d=decodeUrlState("v=1&b=");A(d.b instanceof Set&&d.b.size===URL_ALL_BUCKET_IDS.size,"edge:empty-b->all");Object.assign(DOC,oD);Object.assign(STATE,oS);const p=R.filter(x=>x.pass).length,f=R.filter(x=>!x.pass).length;const s=`Permalink Tests: ${p} passed, ${f} failed, ${R.length} total`;if(f>0){console.warn(s);R.filter(x=>!x.pass).forEach(x=>console.error("  FAIL:",x.msg,x.ctx||""))}else console.log("%c"+s,"color:green;font-weight:bold");return{passed:p,failed:f,total:R.length,results:R}};
+      // ---- End Permalink Unit Tests ----
+
+      // ---- Permalink E2E Tests (bd-24q.3.5) ----
+      // Run via console: window.__runPermalinkE2ETests()
+      // Requires dataset to be loaded.
+      window.__runPermalinkE2ETests = async function () {
+        const results = [];
+        const log = (msg, ctx) => console.log("  [PL-E2E]", msg, ctx || "");
+        const assert = (cond, msg, ctx) => {
+          if (!cond) { results.push({ pass: false, msg, ctx }); console.error("  FAIL:", msg, ctx || ""); }
+          else { results.push({ pass: true, msg }); log("PASS: " + msg); }
+        };
+        const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+        if (!DATASET.loaded || ALL_COMMITS.length < 3) {
+          console.error("PL-E2E: Need loaded dataset with >= 3 commits.");
+          return { passed: 0, failed: 1, total: 1, results: [{ pass: false, msg: "Dataset not loaded or < 3 commits" }] };
+        }
+
+        const maxIdx = ALL_COMMITS.length - 1;
+        // Save original state.
+        const origDoc = { idx: DOC.idx, tab: DOC.tab, rawSpec: DOC.rawSpec, diffMode: DOC.diffMode, compareMode: DOC.compareMode, compareFromIdx: DOC.compareFromIdx, compareToIdx: DOC.compareToIdx, diffLayout: DOC.diffLayout, abViewMode: DOC.abViewMode };
+        const origState = { q: STATE.q, minImpact: STATE.minImpact, bucketMode: STATE.bucketMode, bucketEnabled: new Set(STATE.bucketEnabled) };
+
+        // --- E2E 1: Complex state round-trip via encode/decode/apply ---
+        await (async function testE2E_complexRoundTrip() {
+          log("Setting complex state...");
+          DOC.idx = 2; DOC.tab = "diff"; DOC.rawSpec = true; DOC.diffMode = "raw";
+          DOC.compareMode = true; DOC.compareFromIdx = 0; DOC.compareToIdx = Math.min(3, maxIdx);
+          DOC.diffLayout = "line-by-line"; DOC.abViewMode = "rendered";
+          STATE.q = "MVCC concurrency"; STATE.minImpact = 5; STATE.bucketMode = "multi";
+          const ids = [...URL_ALL_BUCKET_IDS];
+          STATE.bucketEnabled = new Set(ids.slice(0, Math.min(3, ids.length)));
+
+          const encoded = encodeUrlState();
+          log("Encoded URL: " + encoded);
+          assert(encoded.length > 20, "pl-e2e: complex state produces non-trivial URL", { len: encoded.length });
+
+          // Summarize state before.
+          const stateBefore = { idx: DOC.idx, tab: DOC.tab, raw: DOC.rawSpec, dm: DOC.diffMode, cmp: DOC.compareMode, ca: DOC.compareFromIdx, cb: DOC.compareToIdx, dl: DOC.diffLayout, avm: DOC.abViewMode, q: STATE.q, mi: STATE.minImpact, bm: STATE.bucketMode, bCount: STATE.bucketEnabled.size };
+          log("State before: " + JSON.stringify(stateBefore));
+
+          // Reset to defaults.
+          DOC.idx = maxIdx; DOC.tab = "spec"; DOC.rawSpec = false; DOC.diffMode = "pretty";
+          DOC.compareMode = false; DOC.compareFromIdx = 0; DOC.compareToIdx = 0;
+          DOC.diffLayout = "side-by-side"; DOC.abViewMode = "diff";
+          STATE.q = ""; STATE.minImpact = 0; STATE.bucketMode = "primary";
+          STATE.bucketEnabled = new Set(URL_ALL_BUCKET_IDS);
+
+          // Decode and apply.
+          const decoded = decodeUrlState(encoded);
+          assert(decoded !== null, "pl-e2e: decoded is not null");
+          applyUrlState(decoded);
+
+          // Summarize state after.
+          const stateAfter = { idx: DOC.idx, tab: DOC.tab, raw: DOC.rawSpec, dm: DOC.diffMode, cmp: DOC.compareMode, ca: DOC.compareFromIdx, cb: DOC.compareToIdx, dl: DOC.diffLayout, q: STATE.q, mi: STATE.minImpact, bm: STATE.bucketMode, bCount: STATE.bucketEnabled.size };
+          log("State after: " + JSON.stringify(stateAfter));
+
+          assert(DOC.idx === 2, "pl-e2e: idx restored to 2", { got: DOC.idx });
+          assert(DOC.tab === "diff", "pl-e2e: tab restored to diff");
+          assert(DOC.rawSpec === true, "pl-e2e: rawSpec restored");
+          assert(DOC.diffMode === "raw", "pl-e2e: diffMode restored");
+          assert(DOC.compareMode === true, "pl-e2e: compareMode restored");
+          assert(DOC.compareFromIdx === 0, "pl-e2e: fromIdx restored");
+          assert(DOC.compareToIdx === Math.min(3, maxIdx), "pl-e2e: toIdx restored");
+          assert(DOC.diffLayout === "line-by-line", "pl-e2e: diffLayout restored");
+          assert(STATE.q === "MVCC concurrency", "pl-e2e: query restored");
+          assert(STATE.minImpact === 5, "pl-e2e: minImpact restored");
+          assert(STATE.bucketMode === "multi", "pl-e2e: bucketMode restored");
+          assert(STATE.bucketEnabled.size <= 3, "pl-e2e: bucket subset restored", { got: STATE.bucketEnabled.size });
+        })();
+
+        // --- E2E 2: URL updates when commit changes via selectCommitIdx ---
+        await (async function testE2E_commitChangeUpdatesUrl() {
+          DOC.compareMode = false;
+          DOC.tab = "spec"; DOC.rawSpec = false; DOC.diffMode = "pretty";
+          STATE.q = ""; STATE.minImpact = 0; STATE.bucketMode = "primary";
+          STATE.bucketEnabled = new Set(URL_ALL_BUCKET_IDS);
+          selectCommitIdx(3);
+          await wait(200); // Wait for rAF debounce in syncUrlToState.
+          const qs = encodeUrlState();
+          log("After selectCommitIdx(3), URL: " + qs);
+          assert(qs.includes("c=3"), "pl-e2e: URL has c=3 after selectCommitIdx(3)", { got: qs });
+
+          selectCommitIdx(maxIdx);
+          await wait(200);
+          const qs2 = encodeUrlState();
+          log("After selectCommitIdx(max), URL: " + qs2);
+          assert(!qs2.includes("c=") || qs2 === "", "pl-e2e: URL omits c at maxIdx", { got: qs2 });
+        })();
+
+        // --- E2E 3: Tab switch persists in URL ---
+        await (async function testE2E_tabPersists() {
+          DOC.compareMode = false;
+          setDocTab("metrics");
+          await wait(200);
+          const qs = encodeUrlState();
+          log("After setDocTab(metrics), URL: " + qs);
+          assert(qs.includes("t=metrics"), "pl-e2e: URL has t=metrics", { got: qs });
+
+          setDocTab("spec");
+          await wait(200);
+          const qs2 = encodeUrlState();
+          assert(!qs2.includes("t=") || qs2 === "", "pl-e2e: URL omits t=spec (default)", { got: qs2 });
+        })();
+
+        // --- E2E 4: Compare mode toggle persists in URL ---
+        await (async function testE2E_comparePersists() {
+          const btn = document.getElementById("btnCompareToggle");
+          if (!btn) { assert(false, "pl-e2e: btnCompareToggle not found"); return; }
+          // Ensure off first.
+          if (DOC.compareMode) { btn.click(); await wait(300); }
+          assert(!DOC.compareMode, "pl-e2e: compare off before test");
+
+          btn.click();
+          await wait(300);
+          const qs = encodeUrlState();
+          log("After compare on, URL: " + qs);
+          assert(qs.includes("cmp=1"), "pl-e2e: URL has cmp=1 after toggle on", { got: qs });
+          assert(qs.includes("ca="), "pl-e2e: URL has ca= after toggle on");
+          assert(qs.includes("cb="), "pl-e2e: URL has cb= after toggle on");
+
+          btn.click();
+          await wait(300);
+          const qs2 = encodeUrlState();
+          assert(!qs2.includes("cmp="), "pl-e2e: URL omits cmp after toggle off", { got: qs2 });
+        })();
+
+        // --- E2E 5: Multiple rapid changes produce stable URL ---
+        await (async function testE2E_rapidChangesStable() {
+          DOC.compareMode = false; DOC.tab = "spec";
+          selectCommitIdx(1);
+          selectCommitIdx(2);
+          selectCommitIdx(5 < maxIdx ? 5 : maxIdx);
+          await wait(300); // Let debounce settle.
+          const qs = encodeUrlState();
+          const decoded = decodeUrlState(qs);
+          if (decoded) {
+            applyUrlState(decoded);
+            const qs2 = encodeUrlState();
+            assert(qs === qs2, "pl-e2e: rapid changes produce stable URL", { qs, qs2 });
+          } else {
+            assert(qs === "", "pl-e2e: rapid changes at default produce empty URL");
+          }
+        })();
+
+        // --- E2E 6: copyPermalink function produces valid URL ---
+        await (async function testE2E_copyPermalink() {
+          if (typeof copyPermalink !== "function") {
+            assert(false, "pl-e2e: copyPermalink function not found");
+            return;
+          }
+          DOC.idx = 2; DOC.tab = "diff"; DOC.compareMode = false;
+          STATE.q = "test"; STATE.minImpact = 0; STATE.bucketMode = "primary";
+          STATE.bucketEnabled = new Set(URL_ALL_BUCKET_IDS);
+          // copyPermalink writes to clipboard; we can't easily read it, but
+          // we can verify encodeUrlState produces the expected result.
+          const qs = encodeUrlState();
+          assert(qs.includes("c=2"), "pl-e2e: permalink would have c=2");
+          assert(qs.includes("t=diff"), "pl-e2e: permalink would have t=diff");
+          assert(qs.includes("q=test"), "pl-e2e: permalink would have q=test");
+          log("Permalink URL would be: ?" + qs);
+        })();
+
+        // --- E2E 7: Console warnings logged for diagnostic ---
+        await (async function testE2E_diagnosticLog() {
+          // Verify we can log state summaries without errors.
+          try {
+            const state = { idx: DOC.idx, tab: DOC.tab, cmp: DOC.compareMode, ca: DOC.compareFromIdx, cb: DOC.compareToIdx, q: STATE.q };
+            const url = encodeUrlState();
+            log("Diagnostic state: " + JSON.stringify(state));
+            log("Diagnostic URL: " + url);
+            assert(true, "pl-e2e: diagnostic logging works");
+          } catch (e) {
+            assert(false, "pl-e2e: diagnostic logging threw", { error: String(e) });
+          }
+        })();
+
+        // --- Restore original state ---
+        DOC.compareMode = origDoc.compareMode;
+        DOC.compareFromIdx = origDoc.compareFromIdx;
+        DOC.compareToIdx = origDoc.compareToIdx;
+        DOC.diffLayout = origDoc.diffLayout;
+        DOC.abViewMode = origDoc.abViewMode;
+        DOC.rawSpec = origDoc.rawSpec;
+        DOC.diffMode = origDoc.diffMode;
+        DOC.idx = origDoc.idx;
+        STATE.q = origState.q;
+        STATE.minImpact = origState.minImpact;
+        STATE.bucketMode = origState.bucketMode;
+        STATE.bucketEnabled = origState.bucketEnabled;
+        setDocTab(origDoc.tab);
+        await wait(300);
+
+        const passed = results.filter((r) => r.pass).length;
+        const failed = results.filter((r) => !r.pass).length;
+        const summary = `Permalink E2E Tests: ${passed} passed, ${failed} failed, ${results.length} total`;
+        if (failed > 0) {
+          console.warn(summary);
+          results.filter((r) => !r.pass).forEach((r) => console.error("  FAIL:", r.msg, r.ctx || ""));
+        } else {
+          console.log("%c" + summary, "color: green; font-weight: bold");
+        }
+        return { passed, failed, total: results.length, results };
+      };
+      // ---- End Permalink E2E Tests ----
+
+
+
 
       async function levenshteinForPatchLocal(patch) {
         const hunks = parseUnifiedHunks(patch);
@@ -9783,6 +10480,8 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
 
         syncDockAndDoc();
         if (!opts._fromPopstate) syncUrlToState();
+        // Update story rail if visible.
+        if (!document.getElementById("storyRail")?.classList.contains("hidden")) renderStoryCards();
 
         if (opts.scrollToCommitList) {
           const c = ALL_COMMITS[next];
@@ -9792,6 +10491,110 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
             el.open = true;
           }
         }
+      }
+
+      // -------------------------------------------------------
+      // Story Mode: Desktop UI (bd-24q.4.2)
+      // -------------------------------------------------------
+      let _storyMilestones = [];
+      let _storyActiveIdx = -1;
+
+      /** Render milestone cards in the story rail. */
+      function renderStoryCards() {
+        const rail = document.getElementById("storyRail");
+        const container = document.getElementById("storyCards");
+        if (!rail || !container || rail.classList.contains("hidden")) return;
+
+        _storyMilestones = getMilestones().filter((m) => m.commitIdx !== null);
+
+        if (!_storyMilestones.length) {
+          container.innerHTML = '<div class="text-[11px] text-slate-400 italic">No milestones available</div>';
+          _updateStoryProgress();
+          return;
+        }
+
+        // Find which milestone is closest to (at or before) current DOC.idx.
+        _storyActiveIdx = -1;
+        for (let i = _storyMilestones.length - 1; i >= 0; i--) {
+          if (_storyMilestones[i].commitIdx <= DOC.idx) { _storyActiveIdx = i; break; }
+        }
+        if (_storyActiveIdx === -1 && _storyMilestones.length) _storyActiveIdx = 0;
+
+        const md = window._mdSingleton || window.markdownit?.();
+        container.innerHTML = _storyMilestones.map((m, i) => {
+          const isActive = i === _storyActiveIdx;
+          const commit = ALL_COMMITS[m.commitIdx];
+          const date = commit?.dateIso ? new Date(commit.dateIso).toLocaleDateString() : "";
+          const annotationHtml = md ? md.render(m.annotationMd || "") : escapeHtml(m.annotationMd || "");
+          const metrics = commit ? `+${fmtInt(commit.add || 0)} -${fmtInt(commit.del || 0)}` : "";
+          return `<div class="story-card rounded-xl border p-3 cursor-pointer transition-all ${isActive ? 'border-blue-400 bg-blue-50/80 shadow-sm' : 'border-slate-900/10 bg-white/60 hover:bg-slate-50'}" data-story-idx="${i}">
+            <div class="flex items-center gap-2">
+              <span class="inline-block w-2 h-2 rounded-full shrink-0 ${isActive ? 'bg-blue-500' : 'bg-slate-300'}"></span>
+              <span class="text-[11px] font-semibold ${isActive ? 'text-blue-900' : 'text-slate-700'} truncate">${escapeHtml(m.title)}</span>
+            </div>
+            <div class="mt-1.5 text-[10px] leading-snug text-slate-600 story-annotation">${annotationHtml}</div>
+            <div class="mt-1.5 flex items-center gap-2 text-[10px] text-slate-400">
+              ${date ? `<span>${escapeHtml(date)}</span>` : ""}
+              ${metrics ? `<span class="mono">${escapeHtml(metrics)}</span>` : ""}
+            </div>
+          </div>`;
+        }).join("");
+
+        // Click handlers.
+        container.querySelectorAll(".story-card").forEach((card) => {
+          card.addEventListener("click", () => {
+            const idx = Number(card.dataset.storyIdx);
+            const m = _storyMilestones[idx];
+            if (!m) return;
+            selectCommitIdx(m.commitIdx);
+            if (m.defaultTab) setDocTab(m.defaultTab);
+            // Focus heading after render settles.
+            if (m.focusHeading) {
+              requestAnimationFrame(() => {
+                const docEl = document.getElementById("docRendered");
+                const target = docEl?.querySelector("#" + CSS.escape(m.focusHeading));
+                if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+              });
+            }
+            _storyActiveIdx = idx;
+            renderStoryCards();
+          });
+        });
+
+        // Scroll active card into view.
+        const activeCard = container.querySelector(`.story-card[data-story-idx="${_storyActiveIdx}"]`);
+        if (activeCard) activeCard.scrollIntoView({ block: "nearest", behavior: "smooth" });
+
+        _updateStoryProgress();
+      }
+
+      function _updateStoryProgress() {
+        const el = document.getElementById("storyProgress");
+        if (el) el.textContent = _storyMilestones.length ? `${_storyActiveIdx + 1}/${_storyMilestones.length}` : "0/0";
+      }
+
+      function storyGoToIdx(storyIdx) {
+        const m = _storyMilestones[storyIdx];
+        if (!m) return;
+        selectCommitIdx(m.commitIdx);
+        if (m.defaultTab) setDocTab(m.defaultTab);
+        if (m.focusHeading) {
+          requestAnimationFrame(() => {
+            const docEl = document.getElementById("docRendered");
+            const target = docEl?.querySelector("#" + CSS.escape(m.focusHeading));
+            if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+          });
+        }
+        _storyActiveIdx = storyIdx;
+        renderStoryCards();
+      }
+
+      function storyPrev() {
+        if (_storyActiveIdx > 0) storyGoToIdx(_storyActiveIdx - 1);
+      }
+
+      function storyNext() {
+        if (_storyActiveIdx < _storyMilestones.length - 1) storyGoToIdx(_storyActiveIdx + 1);
       }
 
       // -------------------------------------------------------
@@ -10142,8 +10945,15 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
             }
           }
 
-          document.getElementById("diffPretty")?.classList.toggle("hidden", DOC.diffMode !== "pretty");
-          document.getElementById("diffRaw")?.classList.toggle("hidden", DOC.diffMode !== "raw");
+          // Side-by-side rendered markdown panes (bd-24q.15.1).
+          const sbsContainer = document.getElementById("sbsContainer");
+          const inRenderedMode = DOC.compareMode && DOC.abViewMode === "rendered";
+          if (sbsContainer) {
+            sbsContainer.classList.toggle("hidden", !inRenderedMode);
+            if (inRenderedMode) void renderSbsPanes();
+          }
+          document.getElementById("diffPretty")?.classList.toggle("hidden", inRenderedMode || DOC.diffMode !== "pretty");
+          document.getElementById("diffRaw")?.classList.toggle("hidden", inRenderedMode || DOC.diffMode !== "raw");
 
           // Update diff label for compare mode.
           const diffLabel = document.getElementById("diffLabel");
@@ -10386,11 +11196,177 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         }
       }
 
+      // -----------------------------------------------------------
+      // Heat Stripe: Dock UI Rendering + Tooltip + Click-to-Jump
+      // (bd-24q.13.2)
+      // -----------------------------------------------------------
+
+      let _heatStripeRafPending = false;
+
+      function renderHeatStripe() {
+        const canvas = document.getElementById("dockHeatStripe");
+        if (!canvas || !ALL_COMMITS.length) return;
+
+        const stripe = computeHeatStripe(ALL_COMMITS, {
+          resolution: "commit",
+          tzMode: "local",
+          metric: "lines",
+          bucketMode: STATE.bucketMode,
+        });
+        if (!stripe || !stripe.bins.length) return;
+
+        const dpr = window.devicePixelRatio || 1;
+        const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+        const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+        if (canvas.width !== w || canvas.height !== h) {
+          canvas.width = w;
+          canvas.height = h;
+        }
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
+        ctx.clearRect(0, 0, w, h);
+
+        const binW = w / stripe.bins.length;
+        const maxM = Math.max(1, stripe.maxMass);
+
+        for (let i = 0; i < stripe.bins.length; i++) {
+          const bin = stripe.bins[i];
+          if (bin.empty) continue;
+          const intensity = Math.sqrt(bin.totalMass / maxM);
+          ctx.globalAlpha = 0.15 + 0.85 * intensity;
+          ctx.fillStyle = bin.dominantColor;
+          ctx.fillRect(i * binW, 0, Math.max(1, binW), h);
+        }
+        ctx.globalAlpha = 1;
+
+        // Draw selected marker
+        if (DOC.idx >= 0 && DOC.idx < stripe.bins.length) {
+          const sx = DOC.idx * binW;
+          ctx.strokeStyle = "rgba(2,6,23,0.7)";
+          ctx.lineWidth = Math.max(1, dpr);
+          ctx.strokeRect(sx + 0.5, 0.5, Math.max(1, binW - 1), h - 1);
+        }
+      }
+
+      function _heatStripeBinFromEvent(e) {
+        const canvas = document.getElementById("dockHeatStripe");
+        if (!canvas || !ALL_COMMITS.length) return -1;
+        const rect = canvas.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const stripe = computeHeatStripe(ALL_COMMITS, {
+          resolution: "commit",
+          tzMode: "local",
+          metric: "lines",
+          bucketMode: STATE.bucketMode,
+        });
+        if (!stripe || !stripe.bins.length) return -1;
+        const binW = rect.width / stripe.bins.length;
+        return clamp(Math.floor(x / binW), 0, stripe.bins.length - 1);
+      }
+
+      function _showHeatTooltip(e) {
+        const idx = _heatStripeBinFromEvent(e);
+        const tooltip = document.getElementById("dockHeatTooltip");
+        if (!tooltip) return;
+        if (idx < 0) { tooltip.classList.add("hidden"); return; }
+
+        const stripe = computeHeatStripe(ALL_COMMITS, {
+          resolution: "commit",
+          tzMode: "local",
+          metric: "lines",
+          bucketMode: STATE.bucketMode,
+        });
+        if (!stripe) { tooltip.classList.add("hidden"); return; }
+        const bin = stripe.bins[idx];
+        if (!bin) { tooltip.classList.add("hidden"); return; }
+
+        // Build tooltip content
+        const lines = [];
+        if (bin.empty) {
+          lines.push("<em>No activity</em>");
+        } else {
+          const c = bin.repCommit;
+          if (c) lines.push(`<strong>${escapeHtml(c.short)}</strong> ${escapeHtml(c.subject || "").slice(0, 50)}`);
+          const b = bucketById(bin.dominant);
+          lines.push(`<span style="color:${b.color}">\u25CF</span> ${escapeHtml(b.name)} (dominant)`);
+          lines.push(`Mass: ${Math.round(bin.totalMass)} lines`);
+          // Top 3 buckets
+          const sorted = [...bin.perBucket.entries()].filter(([,v]) => v > 0).sort((a,b) => b[1] - a[1]).slice(0, 3);
+          if (sorted.length > 1) {
+            const details = sorted.map(([id, v]) => `${bucketById(id).name}: ${Math.round(v)}`).join(", ");
+            lines.push(`<span style="color:#64748b">${details}</span>`);
+          }
+        }
+        tooltip.innerHTML = lines.join("<br>");
+        tooltip.classList.remove("hidden");
+
+        // Position near cursor
+        const rect = tooltip.getBoundingClientRect();
+        const canvas = document.getElementById("dockHeatStripe");
+        const cRect = canvas.getBoundingClientRect();
+        let left = e.clientX - rect.width / 2;
+        left = Math.max(4, Math.min(left, window.innerWidth - rect.width - 4));
+        tooltip.style.left = left + "px";
+        tooltip.style.top = (cRect.top - rect.height - 6) + "px";
+      }
+
+      function _hideHeatTooltip() {
+        const tooltip = document.getElementById("dockHeatTooltip");
+        if (tooltip) tooltip.classList.add("hidden");
+      }
+
+      function _heatStripeClick(e) {
+        const idx = _heatStripeBinFromEvent(e);
+        if (idx < 0) return;
+        const stripe = computeHeatStripe(ALL_COMMITS, {
+          resolution: "commit",
+          tzMode: "local",
+          metric: "lines",
+          bucketMode: STATE.bucketMode,
+        });
+        if (!stripe) return;
+        const bin = stripe.bins[idx];
+        if (!bin || bin.repCommitIdx < 0) return;
+        selectCommitIdx(bin.repCommitIdx);
+      }
+
+      function _wireHeatStripe() {
+        const canvas = document.getElementById("dockHeatStripe");
+        if (!canvas) return;
+
+        canvas.addEventListener("mousemove", _showHeatTooltip);
+        canvas.addEventListener("mouseleave", _hideHeatTooltip);
+        canvas.addEventListener("click", _heatStripeClick);
+
+        // Mobile: tap-hold for tooltip, single tap for jump
+        let _touchTimer = 0;
+        let _touchMoved = false;
+        canvas.addEventListener("touchstart", (e) => {
+          _touchMoved = false;
+          _touchTimer = setTimeout(() => {
+            if (!_touchMoved && e.touches.length === 1) {
+              const touch = e.touches[0];
+              _showHeatTooltip({ clientX: touch.clientX, clientY: touch.clientY });
+            }
+          }, 400);
+        }, { passive: true });
+        canvas.addEventListener("touchmove", () => { _touchMoved = true; }, { passive: true });
+        canvas.addEventListener("touchend", (e) => {
+          clearTimeout(_touchTimer);
+          if (!_touchMoved && e.changedTouches.length === 1) {
+            const touch = e.changedTouches[0];
+            _heatStripeClick({ clientX: touch.clientX, clientY: touch.clientY });
+          }
+          setTimeout(_hideHeatTooltip, 1500);
+        });
+      }
+
       function syncDockAndDoc() {
         if (!ALL_COMMITS.length) return;
         DOC.idx = clamp(DOC.idx, 0, ALL_COMMITS.length - 1);
         initDockIfNeeded();
         drawDock();
+        renderHeatStripe();
         void updateDocUI();
       }
 
@@ -10557,6 +11533,164 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
           return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
         }
         return sum;
+      }
+
+
+      // -----------------------------------------------------------
+      // Heat Stripe: Compute Density + Dominant Bucket per Bin
+      // (bd-24q.13.1)
+      //
+      // For each bin, computes:
+      //   - totalMass: aggregate change mass (lines/tokens/lev/groups)
+      //   - perBucket: Map<bucketId, mass> contributions
+      //   - dominant: bucket id with highest contribution
+      //     (tie-break: highest mass, then lowest bucket id)
+      //   - repCommit: the commit with largest individual delta in bin
+      //   - repCommitIdx: its index in ALL_COMMITS
+      //
+      // Cached by dataset hash + bucketMode + resolution + tzMode + metric.
+      // -----------------------------------------------------------
+
+      const _heatStripeCache = new Map();
+
+      function computeHeatStripe(commits, { resolution = "commit", tzMode = "local", metric = "lines", bucketMode = "primary" } = {}) {
+        // Cache key
+        const cacheKey = `${WORKER_STATE.datasetHash}|${bucketMode}|${resolution}|${tzMode}|${metric}`;
+        const cached = _heatStripeCache.get(cacheKey);
+        if (cached) return cached;
+
+        // Build bins (reuse wall-clock builder or commit-mode)
+        let binLabels = [];
+        let binCommitArrays = [];
+
+        if (resolution === "commit") {
+          const binIdx = new Map();
+          for (const c of commits) {
+            const k = c.short;
+            let j = binIdx.get(k);
+            if (j === undefined) {
+              j = binLabels.length;
+              binIdx.set(k, j);
+              binLabels.push(k);
+              binCommitArrays.push([]);
+            }
+            binCommitArrays[j].push(c);
+          }
+        } else {
+          const wc = buildWallClockBins(commits, resolution, tzMode);
+          if (wc) {
+            binLabels = wc.labels;
+            binCommitArrays = wc.bins.map((b) => b.commits);
+          }
+        }
+
+        // Metric extractor for a single commit
+        const metricVal = (c) => {
+          if (metric === "groups") return 1;
+          if (metric === "lines") return Number(c.impact || 0);
+          if (metric === "tokens") return Number(METRICS.tokensChanged.get(c.hash) || 0);
+          if (metric === "lev") return Number(METRICS.lev.get(c.hash) || 0);
+          return 0;
+        };
+
+        // ALL_COMMITS hash->idx lookup for repCommitIdx
+        const hashToIdx = new Map();
+        for (let i = 0; i < ALL_COMMITS.length; i++) {
+          hashToIdx.set(ALL_COMMITS[i].hash, i);
+        }
+
+        const bins = [];
+
+        for (let bi = 0; bi < binLabels.length; bi++) {
+          const bc = binCommitArrays[bi];
+          const perBucket = new Map();
+          for (const b of BUCKETS) perBucket.set(b.id, 0);
+
+          let totalMass = 0;
+
+          for (const c of bc) {
+            if (metric === "groups") {
+              // Count group contributions per bucket
+              if (bucketMode === "primary") {
+                for (const g of c.changeGroups) {
+                  perBucket.set(g.primary, (perBucket.get(g.primary) || 0) + 1);
+                  totalMass += 1;
+                }
+              } else {
+                for (const g of c.changeGroups) {
+                  for (const lb of g.labels) {
+                    perBucket.set(lb, (perBucket.get(lb) || 0) + 1);
+                    totalMass += 1;
+                  }
+                }
+              }
+            } else {
+              const v = metricVal(c);
+              const groups = c.changeGroups.length || 1;
+              const perGroup = v / groups;
+
+              if (bucketMode === "primary") {
+                for (const g of c.changeGroups) {
+                  perBucket.set(g.primary, (perBucket.get(g.primary) || 0) + perGroup);
+                }
+              } else {
+                for (const g of c.changeGroups) {
+                  const labels = g.labels?.length ? g.labels : [10];
+                  const perLabel = perGroup / labels.length;
+                  for (const lb of labels) {
+                    perBucket.set(lb, (perBucket.get(lb) || 0) + perLabel);
+                  }
+                }
+              }
+              totalMass += v;
+            }
+          }
+
+          // Dominant bucket: highest contribution, tie-break lowest id
+          let dominant = BUCKETS[BUCKETS.length - 1].id; // default: Other
+          let maxContrib = 0;
+          for (const b of BUCKETS) {
+            const contrib = perBucket.get(b.id) || 0;
+            if (contrib > maxContrib || (contrib === maxContrib && b.id < dominant)) {
+              maxContrib = contrib;
+              dominant = b.id;
+            }
+          }
+
+          // Representative commit: highest individual metric value in bin
+          let repCommit = null;
+          let repCommitIdx = -1;
+          let repVal = -1;
+          for (const c of bc) {
+            const v = metricVal(c);
+            if (v > repVal) {
+              repVal = v;
+              repCommit = c;
+              repCommitIdx = hashToIdx.get(c.hash) ?? -1;
+            }
+          }
+
+          bins.push({
+            label: binLabels[bi],
+            totalMass,
+            perBucket,
+            dominant,
+            dominantColor: (bucketById(dominant) || {}).color || "#94a3b8",
+            repCommit,
+            repCommitIdx,
+            empty: bc.length === 0,
+          });
+        }
+
+        // Compute global max for normalization
+        let maxMass = 0;
+        for (const b of bins) {
+          if (b.totalMass > maxMass) maxMass = b.totalMass;
+        }
+
+        const result = { bins, maxMass, binCount: bins.length, cacheKey };
+        _heatStripeCache.set(cacheKey, result);
+        return result;
       }
 
       function renderCharts(commits) {
@@ -11267,9 +12401,9 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         document.getElementById("hazard").addEventListener("input", debounce(() => render(), 50));
 
         // Stack chart controls
-        document.getElementById("stackResolution")?.addEventListener("change", () => render());
-        document.getElementById("stackMetric")?.addEventListener("change", () => render());
-        document.getElementById("stackTimezone")?.addEventListener("change", () => render());
+        document.getElementById("stackResolution")?.addEventListener("change", () => { render(); syncUrlToState(); });
+        document.getElementById("stackMetric")?.addEventListener("change", () => { render(); syncUrlToState(); });
+        document.getElementById("stackTimezone")?.addEventListener("change", () => { render(); syncUrlToState(); });
 
         // Doc tabs + toggles
         document.getElementById("docTabSpec")?.addEventListener("click", () => setDocTab("spec"));
@@ -11293,6 +12427,24 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
           syncUrlToState();
           void updateDocUI();
         });
+
+        // Story mode toggle + navigation (bd-24q.4.2).
+        document.getElementById("btnStoryToggle")?.addEventListener("click", () => {
+          const rail = document.getElementById("storyRail");
+          if (rail) {
+            const show = rail.classList.toggle("hidden");
+            const btn = document.getElementById("btnStoryToggle");
+            if (btn) {
+              btn.classList.toggle("bg-slate-900", !show);
+              btn.classList.toggle("text-white", !show);
+              btn.classList.toggle("bg-white/70", show);
+              btn.classList.toggle("text-slate-900", show);
+            }
+            if (!show) renderStoryCards();
+          }
+        });
+        document.getElementById("storyPrev")?.addEventListener("click", () => storyPrev());
+        document.getElementById("storyNext")?.addEventListener("click", () => storyNext());
 
         document.getElementById("btnMiniMapToggle")?.addEventListener("click", () => {
           const mm = document.getElementById("miniMap");
@@ -11329,7 +12481,7 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
           void updateDocUI();
         });
 
-        // --- A/B Compare event listeners ---
+        // --- A/B Compare event listeners (bd-24q.1: typeahead pickers) ---
         document.getElementById("btnCompareToggle")?.addEventListener("click", () => {
           DOC.compareMode = !DOC.compareMode;
           const btn = document.getElementById("btnCompareToggle");
@@ -11338,22 +12490,68 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
           if (btn) { btn.classList.toggle("bg-slate-900", DOC.compareMode); btn.classList.toggle("text-white", DOC.compareMode); btn.classList.toggle("bg-white/70", !DOC.compareMode); btn.classList.toggle("text-slate-900", !DOC.compareMode); }
           if (bar) bar.classList.toggle("hidden", !DOC.compareMode);
           if (layoutBtn) layoutBtn.classList.toggle("hidden", !DOC.compareMode);
+          const sbsBtn = document.getElementById("btnSbsRendered");
+          if (sbsBtn) sbsBtn.classList.toggle("hidden", !DOC.compareMode);
+          if (!DOC.compareMode) { DOC.abViewMode = "diff"; _sbsRenderedKey = ""; }
           if (DOC.compareMode) { DOC.compareFromIdx = Math.max(0, DOC.idx - 1); DOC.compareToIdx = DOC.idx; populateCompareSelects(); }
           syncUrlToState();
           void updateDocUI();
         });
         document.getElementById("btnDiffLayout")?.addEventListener("click", () => {
           DOC.diffLayout = DOC.diffLayout === "side-by-side" ? "line-by-line" : "side-by-side";
+          DOC.abViewMode = "diff"; // switching diff layout exits rendered mode
           const btn = document.getElementById("btnDiffLayout");
           if (btn) btn.textContent = DOC.diffLayout === "side-by-side" ? "Side-by-Side" : "Unified";
+          updateSbsButtonStyles();
           syncUrlToState(); void updateDocUI();
+        });
+        // Side-by-side rendered markdown toggle (bd-24q.15.1).
+        document.getElementById("btnSbsRendered")?.addEventListener("click", () => {
+          DOC.abViewMode = DOC.abViewMode === "rendered" ? "diff" : "rendered";
+          updateSbsButtonStyles();
+          syncUrlToState(); void updateDocUI();
+        });
+        // Sync scroll toggle for side-by-side panes (bd-24q.15.1).
+        document.getElementById("btnSbsSyncScroll")?.addEventListener("click", () => {
+          DOC.sbsSyncScroll = !DOC.sbsSyncScroll;
+          const btn = document.getElementById("btnSbsSyncScroll");
+          if (btn) btn.innerHTML = DOC.sbsSyncScroll ? "Sync &#x2714;" : "Sync";
+          if (DOC.sbsSyncScroll) setupSbsSyncScroll();
+          else if (_sbsScrollCleanup) { _sbsScrollCleanup(); _sbsScrollCleanup = null; }
+        });
+        // Copy permalink for side-by-side rendered view (bd-24q.15.1).
+        document.getElementById("btnSbsCopyLink")?.addEventListener("click", () => {
+          syncUrlToState();
+          navigator.clipboard.writeText(location.href).then(() => {
+            const btn = document.getElementById("btnSbsCopyLink");
+            if (btn) { btn.textContent = "Copied!"; setTimeout(() => { btn.textContent = "Copy Link"; }, 1500); }
+          }).catch(() => {});
         });
         document.getElementById("btnSwapAB")?.addEventListener("click", () => {
           const tmp = DOC.compareFromIdx; DOC.compareFromIdx = DOC.compareToIdx; DOC.compareToIdx = tmp;
           populateCompareSelects(); syncUrlToState(); void updateDocUI();
         });
-        document.getElementById("compareFromSelect")?.addEventListener("change", (e) => { DOC.compareFromIdx = Number(e.target.value); syncUrlToState(); void updateDocUI(); });
-        document.getElementById("compareToSelect")?.addEventListener("change", (e) => { DOC.compareToIdx = Number(e.target.value); syncUrlToState(); void updateDocUI(); });
+        // Reset A/B to current commit (bd-24q.1).
+        document.getElementById("btnResetAB")?.addEventListener("click", () => {
+          DOC.compareFromIdx = Math.max(0, DOC.idx - 1);
+          DOC.compareToIdx = DOC.idx;
+          populateCompareSelects(); syncUrlToState(); void updateDocUI();
+        });
+        // Typeahead picker buttons open their dropdowns (bd-24q.1).
+        document.getElementById("pickerABtn")?.addEventListener("click", (e) => { e.stopPropagation(); openPicker("pickerA"); });
+        document.getElementById("pickerBBtn")?.addEventListener("click", (e) => { e.stopPropagation(); openPicker("pickerB"); });
+        wirePickerSearch("pickerA");
+        wirePickerSearch("pickerB");
+        // Close picker dropdowns on outside click.
+        document.addEventListener("click", (e) => {
+          for (const id of ["pickerA", "pickerB"]) {
+            const picker = document.getElementById(id);
+            const dropdown = document.getElementById(id + "Dropdown");
+            if (picker && dropdown && !dropdown.classList.contains("hidden") && !picker.contains(e.target)) {
+              closePicker(id);
+            }
+          }
+        });
 
         document.getElementById("btnComputeAll")?.addEventListener("click", () => {
           void computeAllMetrics();
@@ -11475,9 +12673,11 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         chartDonut?.resize();
         chartBocpd?.resize();
         drawDock();
+        renderHeatStripe();
       });
 
       wireUI();
+      _wireHeatStripe();
       (async function boot() {
         await loadEvolutionDataset();
 
@@ -11549,7 +12749,9 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
           if (cmpBtn) { cmpBtn.classList.toggle("bg-slate-900", DOC.compareMode); cmpBtn.classList.toggle("text-white", DOC.compareMode); cmpBtn.classList.toggle("bg-white/70", !DOC.compareMode); cmpBtn.classList.toggle("text-slate-900", !DOC.compareMode); }
           if (cmpBar) cmpBar.classList.toggle("hidden", !DOC.compareMode);
           if (layoutBtn) { layoutBtn.classList.toggle("hidden", !DOC.compareMode); if (DOC.compareMode) layoutBtn.textContent = DOC.diffLayout === "side-by-side" ? "Side-by-Side" : "Unified"; }
-          if (DOC.compareMode) populateCompareSelects();
+          const sbsRndBtn = document.getElementById("btnSbsRendered");
+          if (sbsRndBtn) sbsRndBtn.classList.toggle("hidden", !DOC.compareMode);
+          if (DOC.compareMode) { populateCompareSelects(); updateSbsButtonStyles(); }
           setDocTab(DOC.tab);
           selectCommitIdx(DOC.idx);
           render();
