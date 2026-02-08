@@ -825,6 +825,102 @@ without abort storms, and formalizing the TxnSlot acquire/publish protocol.
 
 ---
 
+## Deep Review Subset C (2026-02-07 18:58–19:16 ET)
+
+This window is a tight continuation of the coordinator-IPC + SHM-liveness thread:
+canonical wire framing/response tagging, permit binding, and the correctness
+critical rule “never reclaim a live TAG_CLAIMING claimer”.
+
+| # | Commit | Time (ISO) | + / - | Impact | Subject |
+|---:|---|---|---:|---:|---|
+| 1 | `b1c1e72` | `2026-02-07T18:58:48-05:00` | `+56 / -11` | `67` | spec: tighten coordinator IPC framing |
+| 2 | `e600497` | `2026-02-07T19:15:51-05:00` | `+81 / -25` | `106` | spec: harden claiming liveness and IPC ordering |
+| 3 | `6d5d36a` | `2026-02-07T19:16:12-05:00` | `+1 / -1` | `2` | spec: update Round 16 audit notes |
+
+### `b1c1e72` (2026-02-07T18:58:48-05:00) — coordinator IPC framing hardening + canonical response tags + TxnId alloc pseudocode fix
+
+**stats:** `+56 / -11` (impact `67`)
+
+#### Group 1 — Coordinator IPC: Reject Bad Frames Early + Bind Permits + Canonical Tagged Responses
+- **primary_bucket:** 4 (Architecture Fixes)
+- **buckets:** 4, 7, 1
+- **confidence:** 0.78
+- **diff_notes:**
+  - Adds explicit framing validity rules: `len_be` in `[12, 4 MiB]`, `version_be==1`, unknown kinds rejected; enumerates `kind_be` values (RESERVE/SUBMIT_*/RESPONSE/PING/PONG).
+  - Makes `permit_id` a connection-scoped, single-use capability: SUBMIT must reference a prior RESERVE on the same connection; unknown/reused permits rejected.
+  - Makes response payloads fully canonical with explicit `(tag + padding + body)` wrappers for ReserveResp/NativePublishResp/WalCommitResp/RowIdReserveResp.
+- **why:**
+  - Eliminates “undefined behavior” surface area in the IPC codec and prevents cross-connection permit confusion that would otherwise become a reliability/security footgun.
+
+#### Group 2 — Fix TxnId Allocation Pseudocode: `next_txn_id` Lives in Shared Memory
+- **primary_bucket:** 1 (Logic/Math Fixes)
+- **buckets:** 1, 5
+- **confidence:** 0.9
+- **diff_notes:**
+  - Corrects `begin()` pseudocode to read/modify `manager.shm.next_txn_id`, not `manager.next_txn_id`.
+- **why:**
+  - Avoids a spec/implementation divergence where the pseudocode implies a per-process counter (which would violate cross-process uniqueness).
+
+#### Group 3 — Scrivening: Document Version Bump to 1.32 (Round 15 Audit Summary)
+- **primary_bucket:** 5 (Scrivening)
+- **buckets:** 5, 9
+- **confidence:** 0.8
+- **diff_notes:**
+  - Updates the footer audit note to include Round 15 framing/kind/permit binding and canonical tagging changes.
+
+### `e600497` (2026-02-07T19:15:51-05:00) — TAG_CLAIMING liveness safety + stale serialized-writer indicator retry loop + canonical set ordering
+
+**stats:** `+81 / -25` (impact `106`)
+
+#### Group 1 — TAG_CLAIMING Liveness: Publish PID Identity Before Any Potentially-Blocking Step (and Never Reclaim Live Claimers)
+- **primary_bucket:** 4 (Architecture Fixes)
+- **buckets:** 4, 1, 7
+- **confidence:** 0.85
+- **diff_notes:**
+  - Requires writing `pid/pid_birth/lease_expiry` immediately after Phase 1 claim and **before** snapshot capture (seqlock spin is “potentially blocking”).
+  - Tightens cleanup_orphaned_slots: if CLAIMING and pid/birth are published and `process_alive(pid,birth)`, it MUST NOT reclaim; introduces a more conservative timeout when pid/birth are still 0.
+  - Tightens freeing discipline: clear `commit_seq` and liveness fields (`pid/pid_birth/lease_expiry`) before publishing `txn_id=0`.
+- **why:**
+  - This is a correctness-critical cross-process safety rule: reclaiming an alive claimer permits “resumed-claimer shared-memory scribbles” after the slot is freed and re-claimed.
+
+#### Group 2 — `check_serialized_writer_exclusion`: Retry on CAS Failure to Avoid Returning Ok During Token Turnover
+- **primary_bucket:** 1 (Logic/Math Fixes)
+- **buckets:** 1, 4, 7
+- **confidence:** 0.8
+- **diff_notes:**
+  - Wraps stale-token clearing in a loop: if CAS(tok->0) fails, retry because either another checker cleared it or a new serialized writer installed a fresh token.
+- **why:**
+  - Prevents a narrow but real race: a concurrent writer must not return Ok in the same window a new serialized writer becomes active.
+
+#### Group 3 — Canonical Ordering Rules for Set-Like Fields in IPC Payloads
+- **primary_bucket:** 7 (Standard Engineering)
+- **buckets:** 7, 4
+- **confidence:** 0.75
+- **diff_notes:**
+  - Requires ObjectId arrays (witness refs/edge refs/merge refs) sorted lexicographically and deduped; requires conflict page arrays sorted+deduped; requires spill_pages sorted by pgno with no duplicates.
+- **why:**
+  - Canonical ordering shrinks the state space for testing, improves reproducibility, and prevents “same meaning, different bytes” bugs in deterministic codecs.
+
+#### Group 4 — Scrivening: Footer Audit Note to Round 16 + Last Updated Date to 2026-02-08
+- **primary_bucket:** 5 (Scrivening)
+- **buckets:** 5, 9
+- **confidence:** 0.75
+- **diff_notes:**
+  - Updates doc version to 1.33 with Round 16 audit notes; advances *Last updated* to `2026-02-08`.
+
+### `6d5d36a` (2026-02-07T19:16:12-05:00) — Round 16 audit note wording fix
+
+**stats:** `+1 / -1` (impact `2`)
+
+#### Group 1 — Scrivening: Audit Note Expanded to Include TAG_CLAIMING Liveness Rule
+- **primary_bucket:** 5 (Scrivening)
+- **buckets:** 5, 9
+- **confidence:** 0.9
+- **diff_notes:**
+  - Updates the Round 16 audit note to explicitly mention early pid/birth publication + “don’t reclaim live claimers” as part of the round’s scope.
+
+---
+
 ## TODO (Next Deep-Review Targets)
 
 - Continue deep-review for the remaining commits in Subset A not covered above:
