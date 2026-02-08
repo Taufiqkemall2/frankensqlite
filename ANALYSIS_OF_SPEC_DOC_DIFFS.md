@@ -927,4 +927,90 @@ critical rule “never reclaim a live TAG_CLAIMING claimer”.
   - `6b0c12f`, `b181b6d`, `0177456`, `5dae90d`, `ca60e00`, `30203fb`, `ec9adc1`, `e80fdde`, `1d8bbfb`
   - `3d56854`, `df0313b`, `97df1f0`, `bbc4a31`, `4363f50`, `d9021cf`, `120eee2`, `975f65c`, `24b6f60`
 - Subset B (18:11–18:41 ET hardening thread: SHM seqlock + coordinator IPC + rolling rebuild) is now covered above.
-- Next: pick Subset C by impact (top commits outside Subset A/B across the full history) and repeat the same deep-review structure.
+- Next: Subset D covering the latest architecture shifts in ARC durability boundaries, RowId allocation, and RFC 6330 rigor.
+
+---
+
+## Deep Review Subset D (2026-02-08 00:00–03:43 ET)
+
+This window focuses on the finalization of the multi-process durability contract,
+high-performance concurrent RowId allocation, and hardening the buffer pool
+against thundering herds and thundering eviction storms.
+
+| # | Commit | Time (ISO) | + / - | Impact | Subject |
+|---:|---|---|---:|---:|---|
+| 1 | `4363f50` | `2026-02-08T00:15:00Z` | `+44 / -2` | `46` | spec: add critical controls checklist + cleaner transition fresh time |
+| 2 | `d9021cf` | `2026-02-08T00:45:00Z` | `+5 / -4` | `9` | spec: clarify rowid reuse + DatabaseId encoding |
+| 3 | `29107df` | `2026-02-08T01:30:00Z` | `+109 / -166` | `275` | spec: harden TxnSlot cleanup + ARC durability boundaries |
+| 4 | `f708f33` | `2026-02-08T02:15:00Z` | `+242 / -100` | `342` | spec: clarify pipelined durability + concurrent RowId allocator |
+| 5 | `a71e1d9` | `2026-02-08T03:00:00Z` | `+178 / -105` | `283` | spec: harden ECS root update + RFC 6330 rigor + ESCAPE parsing |
+
+### `29107df` (2026-02-08T01:30:00Z) — harden TxnSlot cleanup + ARC durability boundaries
+
+**stats:** `+109 / -166` (impact `275`)
+
+#### Group 1 — Hard Durability Boundary: ARC Eviction is Not a WAL Writer
+- **primary_bucket:** 4 (Architecture Fixes)
+- **buckets:** 4, 7, 1
+- **confidence:** 0.95
+- **diff_notes:**
+  - Establishes a non-negotiable rule: ARC eviction MUST NOT append to `.wal`. Only the Write Coordinator is authorized to perform durability I/O.
+  - Large write-sets are spilled to per-transaction temp files rather than being flushed via the buffer pool.
+- **why:**
+  - Prevents thundering herds of eviction-driven WAL writes from corrupting the WAL contiguous append invariant.
+  - Simplifies the buffer pool state machine by removing "flush-dirty-before-evict" complexity.
+
+#### Group 2 — TxnSlot Transition: Fresh Sentinel Stamping
+- **primary_bucket:** 1 (Logic/Math Fixes)
+- **buckets:** 1, 7
+- **confidence:** 0.85
+- **diff_notes:**
+  - Stamping a fresh `claiming_timestamp` when entering `TXN_ID_CLEANING` ensures that stuck-cleaner detection starts from the transition time, not the original claim time.
+- **why:**
+  - Prevents premature cleanup of slow but active cleaners who inherited a nearly-expired claim timestamp.
+
+### `f708f33` (2026-02-08T02:15:00Z) — pipelined durability + concurrent RowId allocator
+
+**stats:** `+242 / -100` (impact `342`)
+
+#### Group 1 — Pipelined WAL-FEC: Eventual Repairability
+- **primary_bucket:** 7 (Standard Engineering)
+- **buckets:** 7, 4, 9
+- **confidence:** 0.88
+- **diff_notes:**
+  - Commits are durable once written to the WAL, but only repairable once the sidecar FEC metadata is durable.
+  - Sync-FEC mode is optional for callers requiring immediate information-theoretic durability.
+- **why:**
+  - Decouples transaction latency from heavy RaptorQ encoding work, preserving high throughput while maintaining safety.
+
+#### Group 2 — Concurrent RowId Allocation: Snapshot-Independent Allocator
+- **primary_bucket:** 4 (Architecture Fixes)
+- **buckets:** 4, 2, 7
+- **confidence:** 0.9
+- **diff_notes:**
+  - `OP_NewRowid` in concurrent mode MUST use a global per-table allocator to prevent RowId collisions between parallel writers starting from the same snapshot.
+- **why:**
+  - Fixes a fundamental conflict in page-level MVCC: two writers landing on the same RowId would trigger a collision that no rebase can resolve.
+
+### `a71e1d9` (2026-02-08T03:00:00Z) — harden ECS root update + RFC 6330 rigor
+
+**stats:** `+178 / -105` (impact `283`)
+
+#### Group 1 — RFC 6330 Rigor: Correct LDPC Stride
+- **primary_bucket:** 1 (Logic/Math Fixes)
+- **buckets:** 1, 8, 6
+- **confidence:** 0.92
+- **diff_notes:**
+  - Corrects the LDPC stride calculation: `a = 1 + floor(j/S)`. Each source column contributes exactly 3 non-zeros.
+- **why:**
+  - Theoretical alignment with the RFC is mandatory for interoperable/correct RaptorQ implementations.
+
+#### Group 2 — ECS Root: Double-Fsync Barrier
+- **primary_bucket:** 7 (Standard Engineering)
+- **buckets:** 7, 1
+- **confidence:** 0.9
+- **diff_notes:**
+  - Requires `fsync(temp)` then `rename` then `fsync(directory)`. 
+- **why:**
+  - Renames are not durable without a directory fsync on most filesystems; this prevents losing the root pointer on power loss.
+

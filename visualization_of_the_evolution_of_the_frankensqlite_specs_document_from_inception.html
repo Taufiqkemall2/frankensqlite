@@ -3,12 +3,12 @@
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>FrankenSQLite | Spec Evolution</title>
+    <title>FrankenSQLite | The Spec Reanimation</title>
     <meta name="description" content="Interactive evolution of the FrankenSQLite comprehensive specification." />
     
     <!-- OpenGraph & Favicon -->
     <meta property="og:title" content="FrankenSQLite Spec Evolution" />
-    <meta property="og:description" content="137 commits · 10,791 lines · 12 sessions of deep architectural design." />
+    <meta property="og:description" content="137 commits · 10,791 lines · 12 sessions of architectural reanimation." />
     <meta property="og:image" content="og-image.png" />
     <meta name="twitter:card" content="summary_large_image" />
     <meta name="twitter:image" content="twitter-image.png" />
@@ -16,27 +16,29 @@
 
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Inter:wght@400;600;800&display=swap" rel="stylesheet" />
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700;800&family=Inter:wght@300;400;600;700;800&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github-dark.min.css" />
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/diff2html/bundles/css/diff2html.min.css" />
     <style>
         :root {
-            --bg: #0a0c10;
-            --panel: #0d1117;
-            --sidebar: #010409;
-            --fg: #e6edf3;
-            --fg-dim: #848d97;
-            --primary: #33ff00; /* Classic Terminal Green */
-            --primary-dim: rgba(51, 255, 0, 0.2);
-            --accent: #bd00ff; /* Purple for "Alien Math" */
-            --border: #30363d;
-            --border-bright: #484f58;
+            --bg: #020202;
+            --panel: #080808;
+            --sidebar: #000000;
+            --fg: #e0e0e0;
+            --fg-dim: #4a7a4a;
+            --primary: #39ff14; /* Radioactive Green */
+            --primary-dim: rgba(57, 255, 20, 0.1);
+            --accent: #ff003c; /* Blood Red */
+            --electric: #00f2ff; /* Tesla Blue */
+            --border: #1a221a;
+            --border-bright: #39ff14;
             --font-mono: 'JetBrains Mono', monospace;
             --font-sans: 'Inter', sans-serif;
-            --glow: 0 0 15px rgba(51, 255, 0, 0.15);
+            --glow: 0 0 15px rgba(57, 255, 20, 0.2);
+            --stripe-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
         }
 
-        * { box-sizing: border-box; }
+        * { box-sizing: border-box; -webkit-font-smoothing: antialiased; }
         
         body {
             background-color: var(--bg);
@@ -49,631 +51,192 @@
             flex-direction: column;
         }
 
-        /* Background Effects */
-        body::before {
-            content: "";
+        /* --- Background / Ambient Effects --- */
+        body::after {
+            content: " ";
             position: fixed;
             inset: 0;
-            background-image: 
-                radial-gradient(circle at 50% -20%, rgba(51, 255, 0, 0.05), transparent 70%),
-                linear-gradient(var(--bg) 50%, transparent 50%);
-            background-size: 100% 100%, 100% 4px;
-            pointer-events: none;
-            z-index: -1;
-        }
-
-        /* --- Header --- */
-        .app-header {
-            height: 60px;
-            background: var(--sidebar);
-            border-bottom: 1px solid var(--border);
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            padding: 0 24px;
-            flex-shrink: 0;
-            z-index: 100;
-        }
-
-        .brand {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-        }
-
-        .brand img {
-            height: 32px;
-            border-radius: 4px;
-        }
-
-        .brand h1 {
-            font-size: 1.1rem;
-            font-weight: 800;
-            letter-spacing: 0.05em;
-            margin: 0;
-            text-transform: uppercase;
-            color: var(--primary);
-            text-shadow: var(--glow);
-        }
-
-        .kpis {
-            display: flex;
-            gap: 24px;
-        }
-
-        .kpi {
-            display: flex;
-            flex-direction: column;
-            align-items: flex-start;
-        }
-
-        .kpi-label {
-            font-size: 10px;
-            text-transform: uppercase;
-            color: var(--fg-dim);
-            font-family: var(--font-mono);
-            letter-spacing: 0.1em;
-        }
-
-        .kpi-value {
-            font-size: 14px;
-            font-weight: 700;
-            color: var(--fg);
-            font-family: var(--font-mono);
-        }
-
-        /* --- Main Layout --- */
-        .app-body {
-            flex: 1;
-            display: flex;
-            overflow: hidden;
-        }
-
-        /* Sidebar */
-        .sidebar {
-            width: 340px;
-            background: var(--sidebar);
-            border-right: 1px solid var(--border);
-            display: flex;
-            flex-direction: column;
-            flex-shrink: 0;
-            transition: all 0.3s ease;
-        }
-
-        .sidebar-header {
-            padding: 16px;
-            border-bottom: 1px solid var(--border);
-            background: rgba(255,255,255,0.02);
-        }
-
-        .search-box {
-            position: relative;
-            margin-bottom: 12px;
-        }
-
-        .search-box input {
-            width: 100%;
-            background: #000;
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            padding: 8px 12px;
-            color: var(--fg);
-            font-family: var(--font-mono);
-            font-size: 12px;
-            outline: none;
-        }
-
-        .search-box input:focus {
-            border-color: var(--primary);
-            box-shadow: 0 0 0 2px var(--primary-dim);
-        }
-
-        .filter-group {
-            display: flex;
-            flex-direction: column;
-            gap: 8px;
-        }
-
-        .commit-list {
-            flex: 1;
-            overflow-y: auto;
-            padding: 8px;
-        }
-
-        .commit-card {
-            padding: 12px;
-            border-radius: 6px;
-            margin-bottom: 4px;
-            cursor: pointer;
-            border: 1px solid transparent;
-            transition: all 0.2s;
-            position: relative;
-        }
-
-        .commit-card:hover {
-            background: rgba(255,255,255,0.05);
-            border-color: var(--border-bright);
-        }
-
-        .commit-card.selected {
-            background: rgba(51, 255, 0, 0.05);
-            border-color: var(--primary);
-            box-shadow: inset 4px 0 0 var(--primary);
-        }
-
-        .commit-card-header {
-            display: flex;
-            justify-content: space-between;
-            margin-bottom: 4px;
-            font-size: 10px;
-            font-family: var(--font-mono);
-            color: var(--fg-dim);
-        }
-
-        .commit-card-subject {
-            font-size: 12px;
-            font-weight: 500;
-            line-height: 1.4;
-            display: -webkit-box;
-            -webkit-line-clamp: 2;
-            -webkit-box-orient: vertical;
-            overflow: hidden;
-        }
-
-        .commit-card-meta {
-            margin-top: 6px;
-            display: flex;
-            gap: 8px;
-            font-size: 10px;
-            font-family: var(--font-mono);
-        }
-
-        .tag {
-            padding: 1px 4px;
-            border-radius: 3px;
-            font-size: 9px;
-            text-transform: uppercase;
-        }
-
-        /* Content Area */
-        .main-content {
-            flex: 1;
-            display: flex;
-            flex-direction: column;
-            background: var(--bg);
-            overflow: hidden;
-        }
-
-        .content-header {
-            height: 48px;
-            background: var(--panel);
-            border-bottom: 1px solid var(--border);
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            padding: 0 16px;
-            flex-shrink: 0;
-        }
-
-        .tabs {
-            display: flex;
-            gap: 4px;
-        }
-
-        .tab {
-            padding: 6px 16px;
-            font-size: 12px;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-            cursor: pointer;
-            border-radius: 4px;
-            color: var(--fg-dim);
-            transition: all 0.2s;
-        }
-
-        .tab:hover {
-            color: var(--fg);
-            background: rgba(255,255,255,0.05);
-        }
-
-        .tab.active {
-            color: var(--primary);
-            background: var(--primary-dim);
-        }
-
-        .viewport {
-            flex: 1;
-            overflow: hidden;
-            position: relative;
-        }
-
-        .scroll-pane {
-            height: 100%;
-            overflow-y: auto;
-            padding: 40px;
-            scroll-behavior: smooth;
-        }
-
-        /* --- Spec View (Showpiece) --- */
-        .spec-container {
-            max-width: 900px;
-            margin: 0 auto;
-            background: var(--panel);
-            border: 1px solid var(--border);
-            border-radius: 12px;
-            padding: 60px 80px;
-            box-shadow: 0 20px 50px rgba(0,0,0,0.4);
-            color: #d1d5db; /* High contrast but soft */
-            font-size: 16px;
-            line-height: 1.7;
-        }
-
-        .spec-container h1, .spec-container h2, .spec-container h3 {
-            color: var(--primary);
-            font-family: var(--font-mono);
-            font-weight: 700;
-            margin-top: 2.5em;
-            margin-bottom: 1em;
-            border-bottom: 1px solid var(--border);
-            padding-bottom: 0.5em;
-        }
-
-        .spec-container h1 { font-size: 2.2em; border-bottom-width: 2px; }
-        .spec-container h2 { font-size: 1.6em; }
-        
-        .spec-container p { margin-bottom: 1.5em; }
-
-        .spec-container code {
-            font-family: var(--font-mono);
-            background: rgba(0,0,0,0.3);
-            color: var(--accent);
-            padding: 2px 6px;
-            border-radius: 4px;
-            font-size: 0.9em;
-        }
-
-        .spec-container pre {
-            background: #010409;
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 20px;
-            margin: 2em 0;
-            overflow-x: auto;
-        }
-
-        .spec-container blockquote {
-            border-left: 4px solid var(--primary);
-            margin-left: 0;
-            padding-left: 20px;
-            font-style: italic;
-            color: var(--fg-dim);
-        }
-
-        .spec-container table {
-            width: 100%;
-            border-collapse: collapse;
-            margin: 2em 0;
-            font-size: 14px;
-        }
-
-        .spec-container th, .spec-container td {
-            border: 1px solid var(--border);
-            padding: 12px;
-            text-align: left;
-        }
-
-        .spec-container th {
-            background: rgba(255,255,255,0.03);
-            color: var(--primary);
-        }
-
-        /* --- Timeline View --- */
-        .timeline-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            grid-template-rows: 1fr 1fr;
-            gap: 24px;
-            height: 100%;
-            padding: 24px;
-        }
-
-        .chart-card {
-            background: var(--panel);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 16px;
-            display: flex;
-            flex-direction: column;
-            overflow: hidden;
-        }
-
-        .chart-card-title {
-            font-size: 11px;
-            font-family: var(--font-mono);
-            color: var(--fg-dim);
-            text-transform: uppercase;
-            letter-spacing: 0.1em;
-            margin-bottom: 16px;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-
-        .chart-card-title::before {
-            content: "";
-            width: 8px;
-            height: 8px;
-            background: var(--primary);
-            border-radius: 2px;
-        }
-
-        .chart-view {
-            flex: 1;
-            min-height: 0;
-        }
-
-        /* --- Dock --- */
-        .dock {
-            height: 70px;
-            background: var(--sidebar);
-            border-top: 1px solid var(--border);
-            display: flex;
-            align-items: center;
-            padding: 0 24px;
-            gap: 20px;
-            flex-shrink: 0;
-            z-index: 100;
-        }
-
-        .playback-controls {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-
-        .btn-icon {
-            background: transparent;
-            border: 1px solid var(--border);
-            color: var(--fg);
-            width: 32px;
-            height: 32px;
-            border-radius: 6px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            cursor: pointer;
-            transition: all 0.2s;
-        }
-
-        .btn-icon:hover {
-            border-color: var(--primary);
-            color: var(--primary);
-            background: var(--primary-dim);
-        }
-
-        .btn-play {
-            width: 80px;
-            font-weight: 800;
-            font-size: 12px;
-            text-transform: uppercase;
-        }
-
-        .timeline-slider {
-            flex: 1;
-            position: relative;
-            height: 32px;
-            display: flex;
-            align-items: center;
-        }
-
-        .slider-canvas {
-            position: absolute;
-            inset: 0;
-            width: 100%;
-            height: 100%;
+            background: 
+                linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.15) 50%),
+                linear-gradient(90deg, rgba(255, 0, 0, 0.01), rgba(0, 255, 0, 0.01), rgba(0, 0, 255, 0.01));
+            z-index: 9999;
+            background-size: 100% 4px, 4px 100%;
             pointer-events: none;
             opacity: 0.3;
         }
 
-        input[type="range"] {
-            width: 100%;
-            background: transparent;
-            -webkit-appearance: none;
-            cursor: pointer;
-            z-index: 2;
-        }
-
-        input[type="range"]::-webkit-slider-runnable-track {
-            height: 4px;
-            background: var(--border-bright);
-            border-radius: 2px;
-        }
-
-        input[type="range"]::-webkit-slider-thumb {
-            -webkit-appearance: none;
-            width: 12px;
-            height: 12px;
-            border-radius: 50%;
-            background: var(--primary);
-            margin-top: -4px;
-            box-shadow: 0 0 10px var(--primary);
-        }
-
-        .dock-meta {
-            width: 250px;
+        /* --- Header --- */
+        .app-header {
+            height: 64px;
+            background: var(--sidebar);
+            border-bottom: 1px solid var(--border);
             display: flex;
-            flex-direction: column;
-            gap: 2px;
-        }
-
-        .dock-subject {
-            font-size: 12px;
-            font-weight: 600;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-        }
-
-        .dock-details {
-            font-size: 10px;
-            font-family: var(--font-mono);
-            color: var(--fg-dim);
-        }
-
-        /* --- Overlays --- */
-        #loadingOverlay {
-            position: fixed;
-            inset: 0;
-            background: var(--bg);
-            z-index: 9999;
-            display: flex;
-            flex-direction: column;
             align-items: center;
-            justify-content: center;
-            transition: opacity 0.5s ease;
+            justify-content: space-between;
+            padding: 0 32px;
+            flex-shrink: 0;
+            z-index: 100;
+            position: relative;
+            box-shadow: var(--stripe-shadow);
         }
 
-        .loader {
-            width: 40px;
-            height: 40px;
-            border: 3px solid var(--primary-dim);
-            border-top-color: var(--primary);
-            border-radius: 50%;
-            animation: spin 1s linear infinite;
-        }
+        .brand { display: flex; align-items: center; gap: 16px; }
+        .brand img { height: 44px; border-radius: 4px; filter: grayscale(0.2) contrast(1.1); }
+        .brand h1 { font-size: 1.1rem; font-weight: 800; letter-spacing: 0.02em; margin: 0; color: var(--primary); text-shadow: var(--glow); }
 
-        @keyframes spin { 100% { transform: rotate(360deg); } }
+        .kpis { display: flex; gap: 40px; }
+        .kpi { display: flex; flex-direction: column; }
+        .kpi-label { font-size: 9px; text-transform: uppercase; color: var(--fg-dim); letter-spacing: 0.1em; font-weight: 700; }
+        .kpi-value { font-size: 15px; font-weight: 800; color: var(--fg); font-family: var(--font-mono); }
+
+        /* --- App Body --- */
+        .app-body { flex: 1; display: flex; overflow: hidden; }
+
+        .sidebar { width: 380px; background: var(--sidebar); border-right: 1px solid var(--border); display: flex; flex-direction: column; flex-shrink: 0; }
+        .sidebar-header { padding: 24px; border-bottom: 1px solid var(--border); }
+        .search-box input { width: 100%; background: #050505; border: 1px solid var(--border); border-radius: 6px; padding: 12px 16px; color: var(--primary); font-family: var(--font-mono); font-size: 13px; outline: none; }
+        .commit-list { flex: 1; overflow-y: auto; padding: 12px; }
+
+        .commit-card { padding: 16px; border-radius: 8px; margin-bottom: 8px; cursor: pointer; border: 1px solid transparent; transition: all 0.2s ease; background: rgba(255,255,255,0.02); }
+        .commit-card:hover { background: rgba(255,255,255,0.05); }
+        .commit-card.selected { background: var(--primary-dim); border-color: var(--primary); box-shadow: var(--glow); }
+        .commit-card-header { display: flex; justify-content: space-between; margin-bottom: 10px; font-size: 11px; font-weight: 700; font-family: var(--font-mono); color: var(--primary); }
+        .commit-card-subject { font-size: 13px; font-weight: 500; line-height: 1.5; color: #fff; margin-bottom: 12px; }
+
+        /* --- Main Content --- */
+        .main-content { flex: 1; display: flex; flex-direction: column; background: #030303; overflow: hidden; }
+        .content-header { height: 56px; background: var(--panel); border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; padding: 0 24px; }
+        .tabs { display: flex; gap: 8px; }
+        .tab { padding: 8px 20px; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; cursor: pointer; color: var(--fg-dim); border-radius: 6px; }
+        .tab.active { color: var(--bg); background: var(--primary); box-shadow: 0 4px 12px rgba(57, 255, 20, 0.3); }
+
+        .viewport { flex: 1; position: relative; overflow: hidden; }
+        .scroll-pane { height: 100%; overflow-y: auto; padding: 60px 40px; scroll-behavior: smooth; }
+
+        .spec-container { max-width: 880px; margin: 0 auto; background: #000; border: 1px solid var(--border); border-radius: 12px; padding: 80px 100px; box-shadow: 0 30px 60px rgba(0,0,0,0.8); }
+        .spec-content { font-family: var(--font-sans); font-size: 18px; line-height: 1.8; color: #d0d0d0; font-weight: 300; }
+        .spec-content h1, .spec-content h2, .spec-content h3 { color: var(--primary); font-family: var(--font-mono); border-bottom: 1px solid var(--border); padding-bottom: 12px; margin-top: 2.5em; }
+
+        /* --- Dock --- */
+        .dock { height: 180px; background: var(--sidebar); border-top: 1px solid var(--border); display: flex; flex-direction: column; padding: 12px 32px; z-index: 1000; }
+        .dock-top { display: flex; align-items: center; gap: 24px; flex: 1; }
+        .btn-core { background: transparent; border: 1px solid var(--border); color: var(--primary); font-family: var(--font-mono); font-weight: 800; padding: 10px 16px; border-radius: 6px; cursor: pointer; text-transform: uppercase; letter-spacing: 0.1em; }
+        .btn-play { background: var(--primary); color: #000; min-width: 120px; }
+
+        .evolution-map { flex: 1; height: 90px; background: #050505; border: 1px solid #111; border-radius: 8px; position: relative; cursor: crosshair; }
+        .map-canvas { width: 100%; height: 100%; display: block; }
+        .map-slider { position: absolute; inset: 0; -webkit-appearance: none; background: transparent; margin: 0; z-index: 10; }
+        .map-slider::-webkit-slider-thumb { -webkit-appearance: none; width: 2px; height: 90px; background: #fff; box-shadow: 0 0 15px #fff; }
+
+        /* --- HUD --- */
+        .hud-nerve-center { width: 340px; background: rgba(255,255,255,0.03); border: 1px solid var(--border); border-radius: 8px; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+        .hud-row { display: flex; justify-content: space-between; align-items: center; }
+        .hud-label { font-size: 8px; font-weight: 800; color: var(--fg-dim); text-transform: uppercase; }
+        .hud-value { font-size: 12px; font-weight: 800; font-family: var(--font-mono); color: #fff; }
+        
+        .categorical-dna { display: flex; height: 6px; background: #111; border-radius: 3px; overflow: hidden; width: 100%; margin-top: 4px; }
+        .dna-segment { height: 100%; transition: width 0.3s ease; }
+
+        #loadingOverlay { position: fixed; inset: 0; background: #000; z-index: 10000; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+        .pulse { width: 200px; height: 2px; background: #111; position: relative; overflow: hidden; }
+        .pulse::after { content: ""; position: absolute; width: 100px; height: 100%; background: var(--primary); left: -100px; animation: p 1.5s infinite; }
+        @keyframes p { 100% { left: 300px; } }
 
         .hidden { display: none !important; }
-        .h-full { height: 100%; }
 
-        /* Scrollbar */
-        ::-webkit-scrollbar { width: 8px; height: 8px; }
-        ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 10px; }
-        ::-webkit-scrollbar-thumb:hover { background: var(--border-bright); }
-
-        /* Markdown Highlighting Adjustments */
-        .hljs { background: transparent !important; padding: 0; }
-        .diff2html { background: transparent !important; border: none !important; }
-        .d2h-file-header { display: none !important; }
-        .d2h-wrapper { background: #010409 !important; border-radius: 8px !important; overflow: hidden !important; }
-
+        /* --- Error Screen --- */
+        .error-container { max-width: 600px; padding: 40px; border: 1px solid var(--accent); background: rgba(255, 0, 60, 0.05); border-radius: 12px; text-align: center; }
+        .error-title { color: var(--accent); font-family: var(--font-mono); font-size: 24px; margin-bottom: 20px; font-weight: 800; }
+        .error-text { font-size: 14px; line-height: 1.6; color: #ccc; margin-bottom: 30px; }
+        .code-block { background: #000; padding: 15px; border-radius: 6px; font-family: var(--font-mono); color: var(--primary); text-align: left; font-size: 12px; margin-bottom: 20px; border: 1px solid var(--border); }
     </style>
 </head>
 <body>
 
 <div id="loadingOverlay">
-    <div class="loader"></div>
-    <div style="margin-top: 20px; font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.2em; color: var(--primary);">INITIALIZING CORES...</div>
+    <div class="pulse"></div>
+    <div style="font-family: var(--font-mono); font-size: 10px; color: var(--primary); margin-top: 20px; letter-spacing: 0.5em;">REANIMATING_DNA</div>
 </div>
 
 <header class="app-header">
     <div class="brand">
         <img src="frankensqlite_illustration.webp" alt="Logo">
-        <h1>FrankenSQLite <span style="font-weight: 300; color: var(--fg-dim); font-size: 0.8em;">Spec Evolution</span></h1>
+        <h1>FrankenSQLite // Evolutionary_DNA</h1>
     </div>
-    
     <div class="kpis">
-        <div class="kpi">
-            <span class="kpi-label">Commits</span>
-            <span id="kpiCommits" class="kpi-value">-</span>
-        </div>
-        <div class="kpi">
-            <span class="kpi-label">Total Impact</span>
-            <span id="kpiLines" class="kpi-value">-</span>
-        </div>
-        <div class="kpi">
-            <span class="kpi-label">Sessions</span>
-            <span id="kpiSessions" class="kpi-value">12</span>
-        </div>
+        <div class="kpi"><span class="kpi-label">Entries</span><span id="kpiCommits" class="kpi-value">-</span></div>
+        <div class="kpi"><span class="kpi-label">Final_Mass</span><span id="kpiLines" class="kpi-value">-</span></div>
     </div>
-
     <div style="display: flex; gap: 12px;">
-        <button class="tab" onclick="window.open('https://github.com/Dicklesworthstone/frankensqlite')">GitHub</button>
-        <button id="btnGalaxy" class="tab" style="border: 1px solid var(--accent); color: var(--accent);">Galaxy Mode</button>
+        <button class="btn-core" id="btnSync">DNA_SYNC: STABLE</button>
+        <button class="btn-core" style="color: var(--accent); border-color: var(--accent);" onclick="window.open('https://github.com/Dicklesworthstone/frankensqlite')">GOTO_SOURCE</button>
     </div>
 </header>
 
 <div class="app-body">
     <aside class="sidebar">
-        <div class="sidebar-header">
-            <div class="search-box">
-                <input id="searchInput" type="text" placeholder="Filter history...">
-            </div>
-            <div class="filter-group">
-                <div style="display: flex; justify-content: space-between; font-size: 10px; color: var(--fg-dim);">
-                    <span>MIN IMPACT</span>
-                    <span id="impactVal">0</span>
-                </div>
-                <input id="impactFilter" type="range" min="0" max="500" value="0">
-            </div>
-        </div>
-        <div id="commitList" class="commit-list">
-            <!-- Commits populated by JS -->
-        </div>
+        <div class="sidebar-header"><div class="search-box"><input id="searchInput" type="text" placeholder="FILTER_EVOLUTION_LOGS..."></div></div>
+        <div id="commitList" class="commit-list"></div>
     </aside>
 
     <main class="main-content">
         <div class="content-header">
             <div class="tabs">
-                <div id="tabSpec" class="tab active">Specification</div>
-                <div id="tabTimeline" class="tab">Analytics</div>
-                <div id="tabDiff" class="tab">Patch Delta</div>
+                <div id="tabSpec" class="tab active">THE_LEDGER</div>
+                <div id="tabTimeline" class="tab">ANALYTICS</div>
+                <div id="tabDiff" class="tab">DELTA_SLICE</div>
             </div>
-            <div id="activeCommitLabel" style="font-size: 11px; font-family: var(--font-mono); color: var(--primary);"></div>
+            <div id="activeLabel" style="font-size: 10px; font-family: var(--font-mono); color: var(--fg-dim);"></div>
         </div>
 
         <div class="viewport">
-            <!-- SPEC VIEW -->
             <div id="viewSpec" class="scroll-pane">
-                <div id="specContent" class="spec-container">
-                    <!-- Markdown rendered here -->
+                <div id="specContainer" class="spec-container">
+                    <div id="specContent" class="spec-content"></div>
                 </div>
             </div>
 
-            <!-- ANALYTICS VIEW -->
-            <div id="viewTimeline" class="hidden h-full">
-                <div class="timeline-grid">
-                    <div class="chart-card">
-                        <div class="chart-card-title">Evolutionary Velocity</div>
-                        <div id="chartVelocity" class="chart-view"></div>
-                    </div>
-                    <div class="chart-card">
-                        <div class="chart-card-title">Impact Distribution</div>
-                        <div id="chartDistribution" class="chart-view"></div>
-                    </div>
-                    <div class="chart-card" style="grid-column: span 2;">
-                        <div class="chart-card-title">Conceptual Burndown (Lines of Code)</div>
-                        <div id="chartBurndown" class="chart-view"></div>
+            <div id="viewTimeline" class="hidden" style="height: 100%; overflow-y: auto;">
+                <div class="analytics-grid">
+                    <div class="lab-card"><div class="lab-card-title">MUTATION_VELOCITY</div><div id="chartVelocity" style="flex:1"></div></div>
+                    <div class="lab-card"><div class="lab-card-title">CATEGORICAL_COMPOSITION</div><div id="chartDistribution" style="flex:1"></div></div>
+                    <div class="lab-card" style="grid-column: span 2;">
+                        <div class="lab-card-title" id="massTitle">ACCUMULATED_MASS (DAILY)</div>
+                        <div style="position: absolute; top: 32px; right: 32px;" class="tabs">
+                            <button class="tab" id="btnDay">1D</button><button class="tab" id="btnHour">1H</button><button class="tab" id="btn15m">15M</button><button class="tab" id="btn5m">5M</button>
+                        </div>
+                        <div id="chartMass" style="height: 320px;"></div>
                     </div>
                 </div>
             </div>
-
-            <!-- DIFF VIEW -->
-            <div id="viewDiff" class="hidden scroll-pane">
-                <div id="diffContent" style="max-width: 1000px; margin: 0 auto;"></div>
-            </div>
+            <div id="viewDiff" class="hidden scroll-pane"><div id="diffContent" style="max-width: 1000px; margin: 0 auto;"></div></div>
         </div>
     </main>
 </div>
 
 <footer class="dock">
-    <div class="playback-controls">
-        <button id="btnPrev" class="btn-icon">◀</button>
-        <button id="btnPlay" class="btn-icon btn-play">Play</button>
-        <button id="btnNext" class="btn-icon">▶</button>
-    </div>
-    
-    <div class="timeline-slider">
-        <canvas id="sliderCanvas" class="slider-canvas"></canvas>
-        <input id="commitSlider" type="range" min="0" max="100" value="0">
-    </div>
+    <div class="dock-top">
+        <div style="display: flex; gap: 8px;">
+            <button id="btnPrev" class="btn-core">PREV</button>
+            <button id="btnPlay" class="btn-core btn-play">REANIMATE</button>
+            <button id="btnNext" class="btn-core">NEXT</button>
+        </div>
+        
+        <div class="evolution-map">
+            <canvas id="mapCanvas" class="map-canvas"></canvas>
+            <input id="commitSlider" class="map-slider" type="range" min="0" max="100" value="0">
+        </div>
 
-    <div class="dock-meta">
-        <div id="dockSubject" class="dock-subject">-</div>
-        <div id="dockDetails" class="dock-details">-</div>
+        <div class="hud-nerve-center">
+            <div class="hud-row"><span class="hud-label">Entry_Identity</span><span class="hud-value" id="hudHash">-</span></div>
+            <div class="hud-row"><span class="hud-label">Mass_Delta</span><span class="hud-value" id="hudImpact">-</span></div>
+            <div class="hud-label" style="margin-top: 4px;">Categorical_Mutation_DNA</div>
+            <div id="hudDna" class="categorical-dna"></div>
+        </div>
+    </div>
+    <div style="height: 32px; display: flex; align-items: center; border-top: 1px solid #111; margin-top: 8px;">
+        <div id="dockSubject" style="font-size: 12px; font-weight: 600; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1;">-</div>
+        <div id="dockDetails" style="font-size: 9px; font-family: var(--font-mono); color: var(--fg-dim); text-transform: uppercase;">-</div>
     </div>
 </footer>
 
@@ -688,125 +251,134 @@
 
 <script type="module">
     const DB_URL = "spec_evolution_v1.sqlite3";
-    
     const BUCKETS = [
-        { id: 1, name: "Logic/Math", color: "#39ff14" }, 
-        { id: 2, name: "SQLite Legacy", color: "#adff2f" },
-        { id: 3, name: "Asupersync", color: "#00ff00" }, 
-        { id: 4, name: "Arch Fixes", color: "#ff003c" },
-        { id: 5, name: "Scrivening", color: "#94a3b8" }, 
-        { id: 6, name: "Context", color: "#d946ef" },
-        { id: 7, name: "Standard Eng", color: "#00f2ff" }, 
-        { id: 8, name: "Alien Math", color: "#bf00ff" },
-        { id: 9, name: "Clarification", color: "#00ffcc" }, 
-        { id: 10, name: "Other", color: "#475569" }
+        { id: 1, name: "Logic/Math", color: "#39ff14" }, { id: 2, name: "SQLite Legacy", color: "#adff2f" },
+        { id: 3, name: "Asupersync", color: "#00ff00" }, { id: 4, name: "Arch Fixes", color: "#ff003c" },
+        { id: 5, name: "Scrivening", color: "#666" }, { id: 6, name: "Context", color: "#d946ef" },
+        { id: 7, name: "Standard Eng", color: "#00f2ff" }, { id: 8, name: "Alien Math", color: "#bf00ff" },
+        { id: 9, name: "Clarification", color: "#00ffcc" }, { id: 10, name: "Other", color: "#475569" }
     ];
 
     let DB = null;
     let COMMITS = [];
-    let FILTERED = [];
-    let PATCH_CACHE = new Map();
+    let GROUPS = new Map();
     let DOC_CACHE = new Map();
+    let PATCH_CACHE = new Map();
     let BASE_DOC = "";
     
-    const STATE = { 
-        idx: 0, 
-        q: "", 
-        minImpact: 0, 
-        tab: "spec",
-        isPlaying: false,
-        playInterval: null
-    };
+    const STATE = { idx: 0, q: "", tab: "spec", isPlaying: false, timeBucket: "day" };
 
     async function init() {
         try {
-            const SQL = await window.initSqlJs({ 
-                locateFile: file => `https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/${file}` 
-            });
-            const res = await fetch(DB_URL);
-            const buf = await res.arrayBuffer();
-            DB = new SQL.Database(new Uint8Array(buf));
+            const SQL = await window.initSqlJs({ locateFile: file => `https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/${file}` });
             
+            let buf;
+            try {
+                const res = await fetch(DB_URL);
+                if (!res.ok) throw new Error("Fetch failed");
+                buf = await res.arrayBuffer();
+            } catch (e) {
+                if (window.location.protocol === 'file:') {
+                    showLocalFileError();
+                    return;
+                }
+                throw e;
+            }
+
+            DB = new SQL.Database(new Uint8Array(buf));
             const baseRes = DB.exec("SELECT text FROM base_doc LIMIT 1");
             if (baseRes.length) BASE_DOC = baseRes[0].values[0][0];
             
             loadCommits();
+            loadGroups();
             setupEventListeners();
-            
-            // Initial render
             updateFiltered();
             renderCommitList();
+            drawMap();
             await selectCommit(COMMITS.length - 1);
-            
             hideLoader();
         } catch (e) {
             console.error(e);
-            document.getElementById("loadingOverlay").innerHTML = `<div style="color:red">INITIALIZATION FAILED<br>${e}</div>`;
+            document.getElementById("loadingOverlay").innerHTML = `
+                <div class="error-container">
+                    <div class="error-title">REANIMATION_FAILURE</div>
+                    <div class="error-text">The neural core could not be initialized. This is likely due to a security restriction in your browser when opening local files.</div>
+                    <div class="code-block">Error: ${e.message}</div>
+                    <div class="error-text">To view this masterpiece locally, serve it using a local web server:</div>
+                    <div class="code-block">python3 -m http.server 8000</div>
+                    <button class="btn-core" onclick="window.location.reload()">RETRY</button>
+                </div>
+            `;
         }
+    }
+
+    function showLocalFileError() {
+        document.getElementById("loadingOverlay").innerHTML = `
+            <div class="error-container">
+                <div class="error-title">CORS_PROTOCOL_VIOLATION</div>
+                <div class="error-text">Modern browsers block access to the SQLite database when opening HTML files directly from the disk (file:// protocol).</div>
+                <div class="error-text">Please serve this directory using a local web server to enable the full reanimation experience:</div>
+                <div class="code-block"># Option 1: Python<br>python3 -m http.server 8000<br><br># Option 2: Node.js<br>npx serve .</div>
+                <div class="error-text">Then visit: <span style="color:var(--primary)">http://localhost:8000</span></div>
+            </div>
+        `;
     }
 
     function loadCommits() {
         const res = DB.exec("SELECT idx, hash, short, date_iso, author, subject, add_lines, del_lines, impact, primary_bucket, labels_json FROM commits ORDER BY idx ASC");
         if (!res.length) return;
-        COMMITS = res[0].values.map(r => ({ 
-            idx: r[0], hash: r[1], short: r[2], date: r[3], author: r[4], 
-            subject: r[5], add: r[6], del: r[7], impact: r[8], 
-            primary: r[9], labels: JSON.parse(r[10] || "[]") 
-        }));
-        
+        COMMITS = res[0].values.map(r => ({ idx: r[0], hash: r[1], short: r[2], date: r[3], author: r[4], subject: r[5], add: r[6], del: r[7], impact: r[8], primary: r[9], labels: JSON.parse(r[10]) }));
         document.getElementById("commitSlider").max = COMMITS.length - 1;
         document.getElementById("kpiCommits").textContent = COMMITS.length;
-        document.getElementById("kpiLines").textContent = COMMITS.reduce((s, c) => s + c.impact, 0).toLocaleString();
     }
 
-    function updateFiltered() {
-        const q = STATE.q.toLowerCase();
-        FILTERED = COMMITS.filter(c => {
-            if (c.impact < STATE.minImpact) return false;
-            if (q && !c.subject.toLowerCase().includes(q) && !c.hash.includes(q)) return false;
-            return true;
+    function loadGroups() {
+        const res = DB.exec("SELECT commit_hash, labels_json FROM change_groups");
+        if (!res.length) return;
+        res[0].values.forEach(r => {
+            const hash = r[0];
+            const labels = JSON.parse(r[1]);
+            if (!GROUPS.has(hash)) GROUPS.set(hash, []);
+            GROUPS.get(hash).push(...labels);
         });
-    }
-
-    function renderCommitList() {
-        const container = document.getElementById("commitList");
-        container.innerHTML = FILTERED.slice().reverse().map(c => {
-            const bucket = BUCKETS.find(b => b.id === c.primary) || BUCKETS[9];
-            const isSelected = c.idx === STATE.idx ? "selected" : "";
-            return `
-                <div class="commit-card ${isSelected}" onclick="window.selectCommit(${c.idx})">
-                    <div class="commit-card-header">
-                        <span>#${c.idx} · ${c.short}</span>
-                        <span>${dayjs(c.date).format("MMM DD")}</span>
-                    </div>
-                    <div class="commit-card-subject">${escapeHtml(c.subject)}</div>
-                    <div class="commit-card-meta">
-                        <span style="color: ${bucket.color}">${bucket.name}</span>
-                        <span style="color: var(--primary)">+${c.add}</span>
-                        <span style="color: #ff003c">-${c.del}</span>
-                    </div>
-                </div>
-            `;
-        }).join("");
     }
 
     window.selectCommit = async function(idx) {
         STATE.idx = Math.max(0, Math.min(COMMITS.length - 1, idx));
         document.getElementById("commitSlider").value = STATE.idx;
-        
         const c = COMMITS[STATE.idx];
         document.getElementById("dockSubject").textContent = c.subject;
-        document.getElementById("dockDetails").textContent = `${c.short} · ${c.author} · ${dayjs(c.date).format("YYYY-MM-DD HH:mm")}`;
-        document.getElementById("activeCommitLabel").textContent = `VIEWING COMMIT #${STATE.idx} [${c.short}]`;
+        document.getElementById("dockDetails").textContent = `HASH: ${c.short} // BY: ${c.author} // TIME: ${dayjs(c.date).format("YYYY-MM-DD HH:mm:ss")}`;
+        document.getElementById("activeLabel").textContent = `ENTRY_${STATE.idx} // OFFSET_${c.short}`;
+        document.getElementById("hudHash").textContent = c.short;
+        document.getElementById("hudImpact").textContent = `+${c.add} / -${c.del}`;
         
+        renderDNA(c);
         renderCommitList();
-        drawSliderCanvas();
         await updateView();
-        
-        // Auto-scroll sidebar to selected
-        const selected = document.querySelector(".commit-card.selected");
-        if (selected) selected.scrollIntoView({ block: "nearest", behavior: "smooth" });
+        const sel = document.querySelector(".commit-card.selected");
+        if (sel) sel.scrollIntoView({ block: "nearest", behavior: "smooth" });
     };
+
+    function renderDNA(c) {
+        const dna = document.getElementById("hudDna");
+        dna.innerHTML = "";
+        const labels = GROUPS.get(c.hash) || c.labels;
+        if (!labels.length) {
+            const seg = document.createElement("div"); seg.className = "dna-segment"; seg.style.width = "100%"; seg.style.background = BUCKETS[9].color;
+            dna.appendChild(seg); return;
+        }
+        const counts = {}; labels.forEach(l => counts[l] = (counts[l] || 0) + 1);
+        const total = labels.length;
+        Object.keys(counts).forEach(l => {
+            const bucket = BUCKETS.find(b => b.id == l) || BUCKETS[9];
+            const seg = document.createElement("div");
+            seg.className = "dna-segment";
+            seg.style.width = (counts[l] / total * 100) + "%";
+            seg.style.background = bucket.color;
+            dna.appendChild(seg);
+        });
+    }
 
     async function updateView() {
         if (STATE.tab === "spec") await renderSpec();
@@ -815,257 +387,155 @@
     }
 
     async function renderSpec() {
-        const container = document.getElementById("specContent");
-        container.innerHTML = '<div style="color: var(--fg-dim); font-family: var(--font-mono); font-size: 12px;">RECONSTRUCTING DOCUMENT STATE...</div>';
-        
+        const el = document.getElementById("specContent");
+        el.innerHTML = '<div style="color: var(--primary); font-family: var(--font-mono); font-size: 11px;">RECONSTRUCTING_TISSUE_STATE...</div>';
         const text = await reconstructSnapshot(STATE.idx);
-        const md = window.markdownit({ 
-            html: true,
-            highlight: (str, lang) => {
-                if (lang && hljs.getLanguage(lang)) {
-                    try { return hljs.highlight(str, { language: lang }).value; } catch (__) {}
-                }
-                return ''; 
-            }
-        });
-        
-        container.innerHTML = DOMPurify.sanitize(md.render(text));
+        const md = window.markdownit({ html: true, highlight: (str, lang) => (lang && hljs.getLanguage(lang)) ? hljs.highlight(str, { language: lang }).value : '' });
+        el.innerHTML = DOMPurify.sanitize(md.render(text));
+        document.getElementById("kpiLines").textContent = text.split("\n").length.toLocaleString();
     }
 
-    async function renderDiff() {
-        const container = document.getElementById("diffContent");
-        const patch = await getPatch(STATE.idx);
-        if (!patch) { container.innerHTML = "No changes in this commit."; return; }
-        
-        container.innerHTML = Diff2Html.html(patch, {
-            drawFileList: false,
-            matching: 'lines',
-            outputFormat: 'line-by-line',
-            colorScheme: 'dark'
-        });
-    }
-
-    async function reconstructSnapshot(targetIdx) {
-        if (DOC_CACHE.has(targetIdx)) return DOC_CACHE.get(targetIdx);
-        
+    async function reconstructSnapshot(idx) {
+        if (DOC_CACHE.has(idx)) return DOC_CACHE.get(idx);
         let lines = BASE_DOC.split("\n");
-        for (let i = 1; i <= targetIdx; i++) {
-            const patch = await getPatch(i);
-            if (!patch) continue;
-            lines = applyPatch(lines, patch);
+        for (let i = 0; i <= idx; i++) {
+            const p = await getPatch(i);
+            if (p) lines = applyPatch(lines, p);
         }
-        
-        const result = lines.join("\n");
-        DOC_CACHE.set(targetIdx, result);
-        return result;
+        const res = lines.join("\n");
+        DOC_CACHE.set(idx, res);
+        return res;
     }
 
     function applyPatch(lines, patch) {
-        const hunks = parseHunks(patch);
-        const newLines = [...lines];
+        const out = [...lines];
+        const linesPatch = patch.split("\n");
         let offset = 0;
-        
-        hunks.forEach(hunk => {
-            const start = hunk.oldStart - 1 + offset;
-            const newSegment = hunk.lines
-                .filter(l => !l.startsWith("-"))
-                .map(l => l.startsWith("+") ? l.slice(1) : l.slice(1));
-            
-            newLines.splice(start, hunk.oldCount, ...newSegment);
-            offset += (hunk.newCount - hunk.oldCount);
-        });
-        return newLines;
-    }
-
-    function parseHunks(patch) {
-        const hunks = [];
-        const lines = patch.split("\n");
-        let currentHunk = null;
-        
-        lines.forEach(line => {
-            if (line.startsWith("@@")) {
-                if (currentHunk) hunks.push(currentHunk);
-                const m = line.match(/@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
+        linesPatch.forEach(l => {
+            if (l.startsWith("@@")) {
+                const m = l.match(/@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
                 if (m) {
-                    currentHunk = {
-                        oldStart: parseInt(m[1]),
-                        oldCount: parseInt(m[2] || "1"),
-                        newStart: parseInt(m[3]),
-                        newCount: parseInt(m[4] || "1"),
-                        lines: []
-                    };
+                    const os = parseInt(m[1]), oc = parseInt(m[2] || "1");
+                    const start = os - 1 + offset;
+                    const newSeg = [];
+                    let j = linesPatch.indexOf(l) + 1;
+                    while (j < linesPatch.length && !linesPatch[j].startsWith("@@")) {
+                        const row = linesPatch[j];
+                        if (row.startsWith("+")) newSeg.push(row.slice(1));
+                        else if (!row.startsWith("-")) newSeg.push(row.slice(1));
+                        j++;
+                    }
+                    out.splice(start, oc, ...newSeg);
+                    offset += (parseInt(m[4] || "1") - oc);
                 }
-            } else if (currentHunk && !line.startsWith("---") && !line.startsWith("+++") && !line.startsWith("index")) {
-                currentHunk.lines.push(line);
             }
         });
-        if (currentHunk) hunks.push(currentHunk);
-        return hunks;
+        return out;
     }
 
     async function getPatch(idx) {
         if (PATCH_CACHE.has(idx)) return PATCH_CACHE.get(idx);
         const res = DB.exec("SELECT patch FROM patches WHERE idx = ?", [idx]);
         const p = res.length ? res[0].values[0][0] : "";
-        PATCH_CACHE.set(idx, p);
-        return p;
+        PATCH_CACHE.set(idx, p); return p;
     }
 
-    /* --- Charts --- */
-    let charts = {};
-    function renderCharts() {
-        const chartThemes = {
-            backgroundColor: 'transparent',
-            textStyle: { fontFamily: 'JetBrains Mono', color: '#848d97' },
-            grid: { top: 30, bottom: 30, left: 40, right: 20 },
-            xAxis: { axisLine: { lineStyle: { color: '#30363d' } }, splitLine: { show: false } },
-            yAxis: { axisLine: { lineStyle: { color: '#30363d' } }, splitLine: { lineStyle: { color: '#21262d', type: 'dashed' } } }
-        };
-
-        // Velocity Chart
-        if (!charts.velocity) charts.velocity = echarts.init(document.getElementById("chartVelocity"));
-        charts.velocity.setOption({
-            ...chartThemes,
-            tooltip: { trigger: 'axis' },
-            series: [{
-                data: COMMITS.map(c => [c.date, c.impact]),
-                type: 'line',
-                smooth: true,
-                symbol: 'none',
-                lineStyle: { color: '#33ff00', width: 2 },
-                areaStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [{ offset: 0, color: 'rgba(51, 255, 0, 0.2)' }, { offset: 1, color: 'transparent' }]) }
-            }]
-        });
-
-        // Distribution Chart
-        if (!charts.dist) charts.dist = echarts.init(document.getElementById("chartDistribution"));
-        const counts = {}; COMMITS.forEach(c => counts[c.primary] = (counts[c.primary] || 0) + 1);
-        charts.dist.setOption({
-            ...chartThemes,
-            tooltip: { trigger: 'item' },
-            series: [{
-                type: 'pie',
-                radius: ['50%', '80%'],
-                itemStyle: { borderRadius: 4 },
-                label: { show: false },
-                data: BUCKETS.map(b => ({ value: counts[b.id] || 0, name: b.name, itemStyle: { color: b.color } }))
-            }]
-        });
-
-        // Burndown Chart
-        if (!charts.burndown) charts.burndown = echarts.init(document.getElementById("chartBurndown"));
-        let total = 0;
-        const burndownData = COMMITS.map(c => { total += c.impact; return [c.date, total]; });
-        charts.burndown.setOption({
-            ...chartThemes,
-            xAxis: { type: 'time' },
-            tooltip: { trigger: 'axis' },
-            series: [{
-                data: burndownData,
-                type: 'line',
-                step: 'end',
-                symbol: 'none',
-                lineStyle: { color: '#bd00ff', width: 2 },
-                areaStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [{ offset: 0, color: 'rgba(189, 0, 255, 0.1)' }, { offset: 1, color: 'transparent' }]) }
-            }]
-        });
+    async function renderDiff() {
+        const el = document.getElementById("diffContent");
+        const p = await getPatch(STATE.idx);
+        el.innerHTML = p ? Diff2Html.html(p, { drawFileList: false, matching: 'lines', outputFormat: 'line-by-line', colorScheme: 'dark' }) : "SYSTEM_STABLE";
     }
 
-    function drawSliderCanvas() {
-        const cvs = document.getElementById("sliderCanvas");
+    function drawMap() {
+        const cvs = document.getElementById("mapCanvas");
         const ctx = cvs.getContext("2d");
         const w = cvs.width = cvs.clientWidth;
         const h = cvs.height = cvs.clientHeight;
-        
         ctx.clearRect(0, 0, w, h);
         const barW = w / COMMITS.length;
-        
         COMMITS.forEach((c, i) => {
-            const bucket = BUCKETS.find(b => b.id === c.primary) || BUCKETS[9];
-            ctx.fillStyle = bucket.color;
-            ctx.globalAlpha = 0.5;
-            const hh = Math.max(2, (c.impact / 500) * h);
-            ctx.fillRect(i * barW, h - hh, Math.max(1, barW - 1), hh);
+            const labels = GROUPS.get(c.hash) || c.labels;
+            const buckets = labels.length ? labels : [10];
+            const segH = h / buckets.length;
+            buckets.forEach((l, j) => {
+                const b = BUCKETS.find(x => x.id == l) || BUCKETS[9];
+                ctx.fillStyle = b.color;
+                ctx.globalAlpha = 0.6;
+                ctx.fillRect(i * barW, j * segH, barW - 1, segH);
+            });
+            if (c.impact > 200) { ctx.fillStyle = "#fff"; ctx.globalAlpha = 0.4; ctx.fillRect(i * barW, 0, barW - 1, h); }
         });
+    }
+
+    let charts = {};
+    function renderCharts() {
+        const t = { backgroundColor: 'transparent', textStyle: { fontFamily: 'JetBrains Mono', color: '#4a7a4a' }, grid: { top: 30, bottom: 30, left: 40, right: 20 }, xAxis: { axisLine: { lineStyle: { color: '#1a221a' } }, splitLine: { show: false } }, yAxis: { axisLine: { lineStyle: { color: '#1a221a' } }, splitLine: { lineStyle: { color: '#111', type: 'dashed' } } } };
+        if (!charts.velocity) charts.velocity = echarts.init(document.getElementById("chartVelocity"));
+        charts.velocity.setOption({ ...t, tooltip: { trigger: 'axis' }, series: [{ data: COMMITS.map(c => [c.date, c.impact]), type: 'line', smooth: true, lineStyle: { color: '#39ff14' }, areaStyle: { color: 'rgba(57, 255, 20, 0.1)' } }] });
+        if (!charts.dist) charts.dist = echarts.init(document.getElementById("chartDistribution"));
+        const counts = {}; COMMITS.forEach(c => counts[c.primary] = (counts[c.primary] || 0) + 1);
+        charts.dist.setOption({ ...t, tooltip: { trigger: 'item' }, series: [{ type: 'pie', radius: ['40%', '70%'], data: BUCKETS.map(b => ({ value: counts[b.id] || 0, name: b.name, itemStyle: { color: b.color } })) }] });
+        renderMass();
+    }
+
+    function renderMass() {
+        if (!charts.mass) charts.mass = echarts.init(document.getElementById("chartMass"));
+        const buckets = groupCommits(STATE.timeBucket);
+        const labels = Object.keys(buckets).sort();
+        const series = BUCKETS.map(b => ({ name: b.name, type: 'bar', stack: 'total', itemStyle: { color: b.color }, data: labels.map(l => buckets[l][b.id] || 0) }));
+        const t = { backgroundColor: 'transparent', textStyle: { fontFamily: 'JetBrains Mono', color: '#4a7a4a' }, grid: { top: 30, bottom: 30, left: 40, right: 20 }, xAxis: { axisLine: { lineStyle: { color: '#1a221a' } }, splitLine: { show: false } }, yAxis: { axisLine: { lineStyle: { color: '#1a221a' } }, splitLine: { lineStyle: { color: '#111', type: 'dashed' } } } };
+        charts.mass.setOption({ ...t, tooltip: { trigger: 'axis' }, xAxis: { type: 'category', data: labels }, series }, true);
+    }
+
+    function groupCommits(unit) {
+        const res = {};
+        COMMITS.forEach(c => {
+            let k; const d = dayjs(c.date);
+            if (unit === "day") k = d.format("YYYY-MM-DD");
+            else if (unit === "hour") k = d.format("MM-DD HH:00");
+            else if (unit === "15m") k = d.format("MM-DD HH:") + (Math.floor(d.minute()/15)*15).toString().padStart(2,'0');
+            else k = d.format("MM-DD HH:") + (Math.floor(d.minute()/5)*5).toString().padStart(2,'0');
+            if (!res[k]) res[k] = {};
+            res[k][c.primary] = (res[k][c.primary] || 0) + c.impact;
+        });
+        return res;
     }
 
     function setupEventListeners() {
-        document.getElementById("searchInput").addEventListener("input", e => {
-            STATE.q = e.target.value;
-            updateFiltered();
-            renderCommitList();
-        });
-
-        document.getElementById("impactFilter").addEventListener("input", e => {
-            STATE.minImpact = parseInt(e.target.value);
-            document.getElementById("impactVal").textContent = STATE.minImpact;
-            updateFiltered();
-            renderCommitList();
-        });
-
-        document.getElementById("commitSlider").addEventListener("input", e => {
-            selectCommit(parseInt(e.target.value));
-        });
-
-        const tabs = ["Spec", "Timeline", "Diff"];
-        tabs.forEach(t => {
-            document.getElementById("tab" + t).addEventListener("click", () => {
-                tabs.forEach(tt => {
-                    document.getElementById("tab" + tt).classList.remove("active");
-                    document.getElementById("view" + tt).classList.add("hidden");
-                });
-                document.getElementById("tab" + t).classList.add("active");
-                document.getElementById("view" + t).classList.remove("hidden");
-                STATE.tab = t.toLowerCase();
-                updateView();
-            });
-        });
-
+        document.getElementById("searchInput").addEventListener("input", e => { STATE.q = e.target.value; updateFiltered(); renderCommitList(); });
+        document.getElementById("commitSlider").addEventListener("input", e => selectCommit(parseInt(e.target.value)));
+        ["Spec", "Timeline", "Diff"].forEach(t => document.getElementById("tab" + t).addEventListener("click", e => {
+            ["Spec", "Timeline", "Diff"].forEach(tt => { document.getElementById("tab" + tt).classList.remove("active"); document.getElementById("view" + tt).classList.add("hidden"); });
+            e.target.classList.add("active"); document.getElementById("view" + t).classList.remove("hidden");
+            STATE.tab = t.toLowerCase(); updateView();
+        }));
+        const scales = { "btnDay": "day", "btnHour": "hour", "btn15m": "15m", "btn5m": "5m" };
+        Object.keys(scales).forEach(id => document.getElementById(id).addEventListener("click", () => { STATE.timeBucket = scales[id]; renderMass(); }));
         document.getElementById("btnPlay").addEventListener("click", () => {
             STATE.isPlaying = !STATE.isPlaying;
-            document.getElementById("btnPlay").textContent = STATE.isPlaying ? "Pause" : "Play";
-            if (STATE.isPlaying) {
-                STATE.playInterval = setInterval(() => {
-                    if (STATE.idx < COMMITS.length - 1) selectCommit(STATE.idx + 1);
-                    else {
-                        clearInterval(STATE.playInterval);
-                        STATE.isPlaying = false;
-                        document.getElementById("btnPlay").textContent = "Play";
-                    }
-                }, 150);
-            } else {
-                clearInterval(STATE.playInterval);
-            }
+            document.getElementById("btnPlay").textContent = STATE.isPlaying ? "STABILIZE" : "REANIMATE";
+            if (STATE.isPlaying) STATE.playInterval = setInterval(() => { if (STATE.idx < COMMITS.length - 1) selectCommit(STATE.idx + 1); else { clearInterval(STATE.playInterval); STATE.isPlaying = false; document.getElementById("btnPlay").textContent = "REANIMATE"; } }, 200);
+            else clearInterval(STATE.playInterval);
         });
-
         document.getElementById("btnPrev").addEventListener("click", () => selectCommit(STATE.idx - 1));
         document.getElementById("btnNext").addEventListener("click", () => selectCommit(STATE.idx + 1));
-        
-        window.addEventListener("resize", () => {
-            drawSliderCanvas();
-            Object.values(charts).forEach(c => c.resize());
-        });
-        
-        document.addEventListener("keydown", e => {
-            if (e.target.tagName === "INPUT") return;
-            if (e.key === "ArrowLeft") selectCommit(STATE.idx - 1);
-            if (e.key === "ArrowRight") selectCommit(STATE.idx + 1);
-            if (e.key === " ") { e.preventDefault(); document.getElementById("btnPlay").click(); }
-        });
+        window.addEventListener("resize", () => { drawMap(); Object.values(charts).forEach(c => c.resize()); });
     }
 
-    function hideLoader() {
-        const el = document.getElementById("loadingOverlay");
-        el.style.opacity = '0';
-        setTimeout(() => el.classList.add("hidden"), 500);
+    function updateFiltered() { const q = STATE.q.toLowerCase(); FILTERED = COMMITS.filter(c => !q || c.subject.toLowerCase().includes(q) || c.hash.includes(q)); }
+    function renderCommitList() {
+        const container = document.getElementById("commitList");
+        container.innerHTML = FILTERED.slice().reverse().map(c => {
+            const b = BUCKETS.find(x => x.id === c.primary) || BUCKETS[9];
+            const sel = c.idx === STATE.idx ? "selected" : "";
+            return `<div class="commit-card ${sel}" onclick="window.selectCommit(${c.idx})"><div class="commit-card-header"><span>ENT_${c.idx} // ${c.short}</span><span style="color: var(--fg-dim)">${dayjs(c.date).format("MMM DD")}</span></div><div class="commit-card-subject">${escapeHtml(c.subject)}</div><div class="commit-card-meta"><span style="color:${b.color}">${b.name}</span><span style="color:var(--primary)">+${c.add}</span><span style="color:var(--accent)">-${c.del}</span></div></div>`;
+        }).join("");
     }
 
-    function escapeHtml(text) {
-        return text ? text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") : "";
-    }
+    function hideLoader() { document.getElementById("loadingOverlay").style.opacity = '0'; setTimeout(() => document.getElementById("loadingOverlay").classList.add("hidden"), 800); }
+    function escapeHtml(text) { return text ? text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") : ""; }
 
     init();
 </script>
-
 </body>
 </html>
