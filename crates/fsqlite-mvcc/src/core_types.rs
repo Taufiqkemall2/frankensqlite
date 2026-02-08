@@ -13,6 +13,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use parking_lot::{Mutex, RwLock};
 use smallvec::SmallVec;
 
+use crate::cache_aligned::CacheAligned;
 use fsqlite_types::{
     CommitSeq, IntentLog, PageData, PageNumber, PageSize, PageVersion, Snapshot, TxnEpoch, TxnId,
     TxnSlot, TxnToken, WitnessKey,
@@ -197,12 +198,16 @@ type PageNumberBuildHasher = BuildHasherDefault<PageNumberHasher>;
 /// Number of shards in the lock table (power of 2 for fast modular indexing).
 pub const LOCK_TABLE_SHARDS: usize = 64;
 
+/// A single cache-line-aligned lock table shard.
+type LockShard = CacheAligned<Mutex<HashMap<PageNumber, TxnId, PageNumberBuildHasher>>>;
+
 /// In-process page-level exclusive write locks.
 ///
 /// Sharded into [`LOCK_TABLE_SHARDS`] buckets to reduce contention.
 /// Each shard maps `PageNumber -> TxnId` for the transaction holding the lock.
+/// Shards are wrapped in [`CacheAligned`] to prevent false sharing (§1.5).
 pub struct InProcessPageLockTable {
-    shards: Box<[Mutex<HashMap<PageNumber, TxnId, PageNumberBuildHasher>>; LOCK_TABLE_SHARDS]>,
+    shards: Box<[LockShard; LOCK_TABLE_SHARDS]>,
 }
 
 impl InProcessPageLockTable {
@@ -211,7 +216,9 @@ impl InProcessPageLockTable {
     pub fn new() -> Self {
         Self {
             shards: Box::new(std::array::from_fn(|_| {
-                Mutex::new(HashMap::with_hasher(PageNumberBuildHasher::default()))
+                CacheAligned::new(Mutex::new(HashMap::with_hasher(
+                    PageNumberBuildHasher::default(),
+                )))
             })),
         }
     }
@@ -509,11 +516,15 @@ impl Default for CommitLog {
 // CommitIndex
 // ---------------------------------------------------------------------------
 
+/// A single cache-line-aligned commit index shard.
+type CommitShard = CacheAligned<RwLock<HashMap<PageNumber, CommitSeq, PageNumberBuildHasher>>>;
+
 /// Index mapping each page to its latest committed `CommitSeq`.
 ///
 /// Sharded like the lock table for reduced contention.
+/// Shards are wrapped in [`CacheAligned`] to prevent false sharing (§1.5).
 pub struct CommitIndex {
-    shards: Box<[RwLock<HashMap<PageNumber, CommitSeq, PageNumberBuildHasher>>; LOCK_TABLE_SHARDS]>,
+    shards: Box<[CommitShard; LOCK_TABLE_SHARDS]>,
 }
 
 impl CommitIndex {
@@ -521,7 +532,9 @@ impl CommitIndex {
     pub fn new() -> Self {
         Self {
             shards: Box::new(std::array::from_fn(|_| {
-                RwLock::new(HashMap::with_hasher(PageNumberBuildHasher::default()))
+                CacheAligned::new(RwLock::new(HashMap::with_hasher(
+                    PageNumberBuildHasher::default(),
+                )))
             })),
         }
     }
@@ -1085,6 +1098,49 @@ mod tests {
         let pages: SmallVec<[PageNumber; 8]> =
             (1..=9).map(|i| PageNumber::new(i).unwrap()).collect();
         assert!(pages.spilled(), "9 pages should spill to heap");
+    }
+
+    // -- Cache-line alignment of shards (bd-22n.3) --
+
+    #[test]
+    fn test_lock_table_shards_cache_aligned() {
+        let table = InProcessPageLockTable::new();
+        // Each shard is CacheAligned, so adjacent shards are on different cache lines.
+        for i in 0..LOCK_TABLE_SHARDS.saturating_sub(1) {
+            let a = &table.shards[i] as *const _ as usize;
+            let b = &table.shards[i + 1] as *const _ as usize;
+            let gap = b - a;
+            assert!(
+                gap >= crate::cache_aligned::CACHE_LINE_BYTES,
+                "lock table shard {i} and {next} must be >= 64 bytes apart, got {gap}",
+                next = i + 1
+            );
+            assert_eq!(
+                a % crate::cache_aligned::CACHE_LINE_BYTES,
+                0,
+                "lock table shard {i} must be cache-line aligned"
+            );
+        }
+    }
+
+    #[test]
+    fn test_commit_index_shards_cache_aligned() {
+        let index = CommitIndex::new();
+        for i in 0..LOCK_TABLE_SHARDS.saturating_sub(1) {
+            let a = &index.shards[i] as *const _ as usize;
+            let b = &index.shards[i + 1] as *const _ as usize;
+            let gap = b - a;
+            assert!(
+                gap >= crate::cache_aligned::CACHE_LINE_BYTES,
+                "commit index shard {i} and {next} must be >= 64 bytes apart, got {gap}",
+                next = i + 1
+            );
+            assert_eq!(
+                a % crate::cache_aligned::CACHE_LINE_BYTES,
+                0,
+                "commit index shard {i} must be cache-line aligned"
+            );
+        }
     }
 
     // -- CommitIndex --

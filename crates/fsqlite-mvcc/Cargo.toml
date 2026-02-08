@@ -16,6 +16,7 @@ parking_lot = { workspace = true }
 smallvec = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 tracing = { workspace = true }
+xxhash-rust = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

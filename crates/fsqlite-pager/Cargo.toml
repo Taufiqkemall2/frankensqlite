@@ -12,6 +12,7 @@ fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
 fsqlite-vfs = { workspace = true }
 parking_lot = { workspace = true }
+xxhash-rust = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

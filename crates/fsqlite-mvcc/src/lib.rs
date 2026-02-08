@@ -3,11 +3,13 @@
 //! This crate is intentionally small in early phases: it defines the core MVCC
 //! primitives and the cross-process witness/lock-table coordination types.
 
+pub mod cache_aligned;
 pub mod core_types;
 pub mod invariants;
 pub mod lifecycle;
 pub mod witness_hierarchy;
 
+pub use cache_aligned::{CACHE_LINE_BYTES, CacheAligned, SharedTxnSlot};
 pub use core_types::{
     CommitIndex, CommitLog, CommitRecord, InProcessPageLockTable, LOCK_TABLE_SHARDS, PageBuf,
     Transaction, TransactionMode, TransactionState, VersionArena, VersionIdx,
