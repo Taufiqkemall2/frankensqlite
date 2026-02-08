@@ -2895,4 +2895,61 @@ mod tests {
             SqliteValue::Integer(42)
         );
     }
+
+    // ── bd-13r.8: Non-Deterministic Function Evaluation Semantics ──
+
+    #[test]
+    fn test_nondeterministic_functions_flagged() {
+        // These functions MUST be marked non-deterministic to prevent
+        // unsafe planner optimizations (hoisting, CSE).
+        assert!(!RandomFunc.is_deterministic());
+        assert!(!RandomblobFunc.is_deterministic());
+        assert!(!ChangesFunc.is_deterministic());
+        assert!(!TotalChangesFunc.is_deterministic());
+        assert!(!LastInsertRowidFunc.is_deterministic());
+    }
+
+    #[test]
+    fn test_deterministic_functions_flagged() {
+        // Deterministic functions are safe for constant folding/CSE.
+        assert!(AbsFunc.is_deterministic());
+        assert!(LengthFunc.is_deterministic());
+        assert!(TypeofFunc.is_deterministic());
+        assert!(UpperFunc.is_deterministic());
+        assert!(LowerFunc.is_deterministic());
+        assert!(HexFunc.is_deterministic());
+        assert!(CoalesceFunc.is_deterministic());
+        assert!(IifFunc.is_deterministic());
+    }
+
+    #[test]
+    fn test_random_produces_different_values() {
+        // random() should produce different values on successive calls
+        // (verifying per-call evaluation, not constant folding).
+        let a = RandomFunc.invoke(&[]).unwrap();
+        let b = RandomFunc.invoke(&[]).unwrap();
+        // With overwhelming probability, two random i64 values differ.
+        // If they're ever equal, it's a 1-in-2^64 coincidence.
+        assert_ne!(a.as_integer(), b.as_integer());
+    }
+
+    #[test]
+    fn test_registry_nondeterministic_lookup() {
+        let mut registry = FunctionRegistry::default();
+        register_builtins(&mut registry);
+
+        // Non-deterministic functions should be findable and flagged.
+        let random = registry.find_scalar("random", 0).unwrap();
+        assert!(!random.is_deterministic());
+
+        let changes = registry.find_scalar("changes", 0).unwrap();
+        assert!(!changes.is_deterministic());
+
+        let lir = registry.find_scalar("last_insert_rowid", 0).unwrap();
+        assert!(!lir.is_deterministic());
+
+        // Deterministic function check.
+        let abs = registry.find_scalar("abs", 1).unwrap();
+        assert!(abs.is_deterministic());
+    }
 }
