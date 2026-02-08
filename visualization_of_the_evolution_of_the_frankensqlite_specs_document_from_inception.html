@@ -187,6 +187,12 @@
         opacity: 1;
       }
 
+      /* ECharts container should not shrink weirdly */
+      .chart {
+        min-height: 280px;
+        contain: content;
+      }
+
       @media (max-width: 639px) {
         .glass,
         .glass-2 {
@@ -196,19 +202,13 @@
         .chart {
           min-height: 320px;
         }
-        #docMain {
+        #docMain:not(.hidden) {
           display: flex;
           flex-direction: column;
         }
         #docMain > aside {
           order: -1;
         }
-      }
-
-      /* ECharts container should not shrink weirdly */
-      .chart {
-        min-height: 280px;
-        contain: content;
       }
 
       #commitList {
@@ -7737,44 +7737,19 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
           return;
         }
 
-        // Full rebuild: insert all nodes, hide non-matching
+        // Full rebuild: insert all nodes via DocumentFragment (single reflow),
+        // toggle hidden based on filter match.
         wrap.innerHTML = "";
         wrap.dataset.mode = STATE.bucketMode;
         const frag = document.createDocumentFragment();
-        const BATCH_SIZE = 25;
-        let count = 0;
 
         for (const c of ALL_COMMITS) {
           const node = COMMIT_LIST_NODES.get(c.hash);
           if (!node) continue;
           node.classList.toggle("hidden", !filteredSet.has(c.hash));
-          if (count < BATCH_SIZE) {
-            frag.appendChild(node);
-          }
-          count++;
+          frag.appendChild(node);
         }
         wrap.appendChild(frag);
-
-        // Progressive: append remaining via requestIdleCallback
-        if (count > BATCH_SIZE) {
-          let idx = BATCH_SIZE;
-          const allArr = Array.from(ALL_COMMITS);
-          const appendBatch = (deadline) => {
-            while (idx < allArr.length && (deadline.timeRemaining() > 0 || idx - BATCH_SIZE < 10)) {
-              const c = allArr[idx];
-              const node = COMMIT_LIST_NODES.get(c.hash);
-              if (node) {
-                node.classList.toggle("hidden", !filteredSet.has(c.hash));
-                wrap.appendChild(node);
-              }
-              idx++;
-            }
-            if (idx < allArr.length) {
-              requestIdleCallback(appendBatch);
-            }
-          };
-          requestIdleCallback(appendBatch);
-        }
       }
 
       function renderGroup(g, i) {
@@ -7979,6 +7954,7 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
           dockToggle.addEventListener("click", () => {
             const hidden = dockBody.classList.toggle("hidden");
             dockToggle.textContent = hidden ? "\u25BC" : "\u25B2";
+            if (!hidden) drawDock(); // redraw canvas after un-collapsing
           });
         }
 
