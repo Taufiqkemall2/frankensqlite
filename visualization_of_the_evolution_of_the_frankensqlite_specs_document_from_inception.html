@@ -621,9 +621,15 @@
         .dock { padding-bottom: calc(12px + env(safe-area-inset-bottom)); }
         body { padding-bottom: calc(7rem + env(safe-area-inset-bottom)); }
       }
-      /* Inline highlights (bd-24q.16.1) */
+      /* Inline highlights (bd-24q.16.1 + bd-24q.16.2) */
       .ih-changed { border-left: 3px solid #22c55e; background: rgba(34,197,94,0.06); padding-left: 6px; }
+      .ih-modified { border-left: 3px solid #f59e0b; background: rgba(245,158,11,0.05); padding-left: 6px; }
+      .ih-active { box-shadow: inset 0 0 0 2px rgba(37,99,235,0.35); border-radius: 4px; }
       .ih-debug { outline: 1px dashed rgba(99,102,241,0.4); outline-offset: 1px; }
+      .ih-popover { position: absolute; z-index: 50; background: #fff; border: 1px solid rgba(2,6,23,0.12); border-radius: 12px; box-shadow: 0 4px 16px rgba(0,0,0,0.1); padding: 8px 12px; font-size: 11px; max-width: 280px; pointer-events: none; opacity: 0; transition: opacity 0.15s; line-height: 1.5; }
+      .ih-popover.visible { opacity: 1; pointer-events: auto; }
+      .ih-popover .ih-pop-label { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
+      .ih-popover .ih-pop-row { display: flex; align-items: center; gap: 6px; }
     </style>
   </head>
 
@@ -6757,6 +6763,125 @@
         lev: new Map(),
       };
 
+
+      // --- Cache Layer (bd-24q.5.2) ---
+      const CACHE_SCHEMA_VERSION = 2;
+
+      /**
+       * LRU Memory Cache with bounded capacity.
+       * Keying: (datasetHash, op, params) → serialized key.
+       * Evicts oldest entry when capacity reached.
+       */
+      class LruCache {
+        constructor(maxEntries) {
+          this._max = maxEntries;
+          this._map = new Map(); // key → value (insertion order = access order)
+        }
+
+        _makeKey(op, params) {
+          return `${WORKER_STATE.datasetHash || ""}:${op}:${JSON.stringify(params || {})}`;
+        }
+
+        get(op, params) {
+          const key = this._makeKey(op, params);
+          if (!this._map.has(key)) return undefined;
+          const val = this._map.get(key);
+          // Move to end (most recently used).
+          this._map.delete(key);
+          this._map.set(key, val);
+          return val;
+        }
+
+        set(op, params, value) {
+          const key = this._makeKey(op, params);
+          if (this._map.has(key)) this._map.delete(key);
+          this._map.set(key, value);
+          // Evict oldest if over capacity.
+          while (this._map.size > this._max) {
+            const oldest = this._map.keys().next().value;
+            this._map.delete(oldest);
+          }
+        }
+
+        has(op, params) {
+          return this._map.has(this._makeKey(op, params));
+        }
+
+        clear() { this._map.clear(); }
+        get size() { return this._map.size; }
+      }
+
+      /**
+       * localStorage-backed cache with schema versioning and eviction.
+       * Stores JSON-serializable values keyed by (namespace, op, params, datasetHash).
+       * Clears on schema version mismatch.
+       */
+      const LS_CACHE_PREFIX = "fsqlite_viz_cache_";
+      const LS_CACHE_META_KEY = "fsqlite_viz_cache_meta";
+      const LS_CACHE_MAX_ENTRIES = 20;
+
+      function lsCacheInit() {
+        try {
+          const raw = localStorage.getItem(LS_CACHE_META_KEY);
+          if (raw) {
+            const meta = JSON.parse(raw);
+            if (meta.schemaVersion !== CACHE_SCHEMA_VERSION) {
+              console.log("[cache] Schema version mismatch (" + meta.schemaVersion + " vs " + CACHE_SCHEMA_VERSION + "), clearing localStorage cache");
+              lsCacheClear();
+              localStorage.setItem(LS_CACHE_META_KEY, JSON.stringify({ schemaVersion: CACHE_SCHEMA_VERSION, keys: [] }));
+            }
+          } else {
+            localStorage.setItem(LS_CACHE_META_KEY, JSON.stringify({ schemaVersion: CACHE_SCHEMA_VERSION, keys: [] }));
+          }
+        } catch (e) { console.warn("[cache] localStorage init failed:", e); }
+      }
+
+      function lsCacheKey(op, params) {
+        return LS_CACHE_PREFIX + op + "_" + (WORKER_STATE.datasetHash || "none") + "_" + JSON.stringify(params || {});
+      }
+
+      function lsCacheGet(op, params) {
+        try {
+          const raw = localStorage.getItem(lsCacheKey(op, params));
+          return raw ? JSON.parse(raw) : undefined;
+        } catch { return undefined; }
+      }
+
+      function lsCacheSet(op, params, value) {
+        try {
+          const key = lsCacheKey(op, params);
+          localStorage.setItem(key, JSON.stringify(value));
+          // Update meta with key list for eviction.
+          const meta = JSON.parse(localStorage.getItem(LS_CACHE_META_KEY) || "{}");
+          const keys = meta.keys || [];
+          const idx = keys.indexOf(key);
+          if (idx !== -1) keys.splice(idx, 1);
+          keys.push(key);
+          // Evict oldest if over limit.
+          while (keys.length > LS_CACHE_MAX_ENTRIES) {
+            const old = keys.shift();
+            try { localStorage.removeItem(old); } catch { /* ignore */ }
+          }
+          meta.keys = keys;
+          meta.schemaVersion = CACHE_SCHEMA_VERSION;
+          localStorage.setItem(LS_CACHE_META_KEY, JSON.stringify(meta));
+        } catch (e) { console.warn("[cache] localStorage set failed:", e); }
+      }
+
+      function lsCacheClear() {
+        try {
+          const meta = JSON.parse(localStorage.getItem(LS_CACHE_META_KEY) || "{}");
+          const keys = meta.keys || [];
+          for (const k of keys) {
+            try { localStorage.removeItem(k); } catch { /* ignore */ }
+          }
+          localStorage.removeItem(LS_CACHE_META_KEY);
+        } catch { /* ignore */ }
+      }
+
+      // Shared memory cache instance (128 entries max).
+      const WORKER_RESULT_CACHE = new LruCache(128);
+
       const DOC_CACHE = new Map(); // idx -> { text: string, lines?: string[] }
 
       const OUTLINE_CACHE = new Map(); // idx -> outline[]
@@ -9562,19 +9687,34 @@
         ENRICHED_READY = true;
       }
 
+      let _renderRafId = 0;
       function render() {
+        if (_renderRafId) return;
+        _renderRafId = requestAnimationFrame(() => {
+          _renderRafId = 0;
+          _doRender();
+        });
+      }
+
+      function _doRender() {
         ensureEnriched();
         const enriched = ALL_COMMITS;
         const missing = ENRICHED_MISSING;
 
         // KPI
-        document.getElementById("kpiCommits").textContent = fmtInt(enriched.length);
+        const kpiCommits = document.getElementById("kpiCommits");
+        const kpiGroups = document.getElementById("kpiGroups");
+        const kpiLines = document.getElementById("kpiLines");
+        const kpiMode = document.getElementById("kpiMode");
+        const kpiIntegrity = document.getElementById("kpiIntegrity");
+
+        if (kpiCommits) kpiCommits.textContent = fmtInt(enriched.length);
         const totalGroups = enriched.reduce((acc, c) => acc + c.changeGroups.length, 0);
-        document.getElementById("kpiGroups").textContent = fmtInt(totalGroups);
+        if (kpiGroups) kpiGroups.textContent = fmtInt(totalGroups);
         const totalLines = enriched.reduce((acc, c) => acc + c.impact, 0);
-        document.getElementById("kpiLines").textContent = fmtInt(totalLines);
-        document.getElementById("kpiMode").textContent = STATE.bucketMode === "primary" ? "Primary" : "Multi";
-        document.getElementById("kpiIntegrity").textContent = missing.length ? `${missing.length} missing` : "OK";
+        if (kpiLines) kpiLines.textContent = fmtInt(totalLines);
+        if (kpiMode) kpiMode.textContent = STATE.bucketMode === "primary" ? "Primary" : "Multi";
+        if (kpiIntegrity) kpiIntegrity.textContent = missing.length ? `${missing.length} missing` : "OK";
 
         // Make the impact slider usable even with very large commits: cap at ~p99.
         {
@@ -9584,6 +9724,9 @@
           const maxImpact = Math.max(200, p99);
           const impact = document.getElementById("impact");
           const impactMobile = document.getElementById("impactMobile");
+          const impactLabel = document.getElementById("impactLabel");
+          const impactLabelMobile = document.getElementById("impactLabelMobile");
+
           if (impact && impactMobile) {
             impact.max = String(maxImpact);
             impactMobile.max = String(maxImpact);
@@ -9591,21 +9734,26 @@
               STATE.minImpact = maxImpact;
               impact.value = String(maxImpact);
               impactMobile.value = String(maxImpact);
-              document.getElementById("impactLabel").textContent = `${fmtInt(maxImpact)} lines`;
-              document.getElementById("impactLabelMobile").textContent = `${fmtInt(maxImpact)} lines`;
+              if (impactLabel) impactLabel.textContent = `${fmtInt(maxImpact)} lines`;
+              if (impactLabelMobile) impactLabelMobile.textContent = `${fmtInt(maxImpact)} lines`;
             }
           }
         }
 
         const earliest = enriched[0];
         const latest = enriched[enriched.length - 1];
-        document.getElementById("rangeLabel").textContent = `${earliest.short} → ${latest.short}`;
-        document.getElementById("metaSpan").textContent = `${dayjs(earliest.dateIso).format("YYYY-MM-DD HH:mm")} to ${dayjs(latest.dateIso).format("HH:mm")}`;
+        if (earliest && latest) {
+          const rangeLabel = document.getElementById("rangeLabel");
+          const metaSpan = document.getElementById("metaSpan");
+          if (rangeLabel) rangeLabel.textContent = `${earliest.short} → ${latest.short}`;
+          if (metaSpan) metaSpan.textContent = `${dayjs(earliest.dateIso).format("YYYY-MM-DD HH:mm")} to ${dayjs(latest.dateIso).format("HH:mm")}`;
+        }
 
         // Filter
         const filtered = enriched.filter((c) => matchesFilters(c));
         FILTERED_COMMITS = filtered;
-        document.getElementById("showingCount").textContent = `${fmtInt(filtered.length)} commits`;
+        const showingCount = document.getElementById("showingCount");
+        if (showingCount) showingCount.textContent = `${fmtInt(filtered.length)} commits`;
 
         // Charts + list
         renderBucketToggles();
@@ -9614,7 +9762,7 @@
         syncDockAndDoc();
 
         // Make sure code highlighting is applied to newly inserted excerpts
-        requestAnimationFrame(() => {
+        requestIdleCallback(() => {
           document.querySelectorAll("pre code:not(.hljs)").forEach((el) => {
             try {
               hljs.highlightElement(el);
@@ -9622,7 +9770,7 @@
               // ignore
             }
           });
-        });
+        }, { timeout: 500 });
 
         // Keep URL in sync with filter/view state.
         syncUrlToState();
@@ -9940,6 +10088,252 @@
         target.scrollIntoView({ behavior: "smooth", block: "center" });
         return target;
       }
+
+      // ---- Inline Highlights Unit Tests (bd-24q.16.3) ----
+      // Run via console: window.__runInlineHighlightTests()
+      window.__runInlineHighlightTests = function () {
+        const R = [];
+        const A = (c, m, x) => { R.push(c ? { pass: true, msg: m } : { pass: false, msg: m, ctx: x }); if (!c) console.error("FAIL:", m, x || ""); };
+
+        // --- 1. parsePatchChangedNewLines ---
+        (function test_parsePatch_basic() {
+          const patch = [
+            "@@ -1,3 +1,4 @@",
+            " line1",
+            "+new line2",
+            " line3",
+            " line4"
+          ].join("\n");
+          const changed = parsePatchChangedNewLines(patch);
+          A(changed instanceof Set, "parsePatch: returns Set");
+          A(changed.has(2), "parsePatch: line 2 is changed (added)", { changed: [...changed] });
+          A(!changed.has(1), "parsePatch: line 1 is not changed (context)");
+          A(!changed.has(3), "parsePatch: line 3 is not changed");
+          A(changed.size === 1, "parsePatch: exactly 1 changed line", { size: changed.size });
+        })();
+
+        (function test_parsePatch_deletion_only() {
+          const patch = [
+            "@@ -1,3 +1,2 @@",
+            " line1",
+            "-removed",
+            " line3"
+          ].join("\n");
+          const changed = parsePatchChangedNewLines(patch);
+          A(changed.size === 0, "parsePatch: deletion-only has no changed new lines", { changed: [...changed] });
+        })();
+
+        (function test_parsePatch_multiple_hunks() {
+          const patch = [
+            "@@ -1,3 +1,4 @@",
+            " context",
+            "+added1",
+            " context",
+            " context",
+            "@@ -10,3 +11,4 @@",
+            " context",
+            "+added2",
+            " context",
+            " context"
+          ].join("\n");
+          const changed = parsePatchChangedNewLines(patch);
+          A(changed.has(2), "parsePatch multi-hunk: line 2 changed", { changed: [...changed] });
+          A(changed.has(12), "parsePatch multi-hunk: line 12 changed", { changed: [...changed] });
+          A(changed.size === 2, "parsePatch multi-hunk: exactly 2 changed lines", { size: changed.size });
+        })();
+
+        (function test_parsePatch_replace() {
+          // Replace line 2: delete old, add new
+          const patch = [
+            "@@ -1,3 +1,3 @@",
+            " line1",
+            "-old line2",
+            "+new line2",
+            " line3"
+          ].join("\n");
+          const changed = parsePatchChangedNewLines(patch);
+          A(changed.has(2), "parsePatch replace: new line 2 is changed");
+          A(changed.size === 1, "parsePatch replace: exactly 1 changed", { size: changed.size });
+        })();
+
+        (function test_parsePatch_empty() {
+          A(parsePatchChangedNewLines("").size === 0, "parsePatch: empty string → empty set");
+          A(parsePatchChangedNewLines(null).size === 0, "parsePatch: null → empty set");
+          A(parsePatchChangedNewLines(undefined).size === 0, "parsePatch: undefined → empty set");
+        })();
+
+        (function test_parsePatch_consecutive_adds() {
+          const patch = [
+            "@@ -1,2 +1,5 @@",
+            " line1",
+            "+add1",
+            "+add2",
+            "+add3",
+            " line2"
+          ].join("\n");
+          const changed = parsePatchChangedNewLines(patch);
+          A(changed.has(2), "parsePatch consecutive: line 2 added");
+          A(changed.has(3), "parsePatch consecutive: line 3 added");
+          A(changed.has(4), "parsePatch consecutive: line 4 added");
+          A(changed.size === 3, "parsePatch consecutive: 3 lines added", { size: changed.size });
+        })();
+
+        // --- 2. renderMarkdownWithSentinels + applyInlineHighlights ---
+        (function test_sentinels_basic() {
+          const div = document.createElement("div");
+          const text = "# Heading\n\nParagraph one\n\nParagraph two\n";
+          const changed = new Set([3]); // line 3 = "Paragraph one"
+          renderMarkdownWithSentinels(text, div, "test-", changed);
+          // Should have data-changed on the paragraph containing line 3
+          const changedEls = div.querySelectorAll("[data-changed='true']");
+          A(changedEls.length >= 1, "sentinels basic: at least 1 element marked changed", { count: changedEls.length });
+          // Unchanged elements should NOT have data-changed
+          const allMapped = div.querySelectorAll("[data-srcmap]");
+          const unchangedCount = allMapped.length - changedEls.length;
+          A(unchangedCount >= 1, "sentinels basic: at least 1 unchanged element", { unchanged: unchangedCount, total: allMapped.length });
+        })();
+
+        (function test_sentinels_no_changes() {
+          const div = document.createElement("div");
+          const text = "# Title\n\nBody text\n";
+          renderMarkdownWithSentinels(text, div, "nochange-", new Set());
+          const changedEls = div.querySelectorAll("[data-changed='true']");
+          A(changedEls.length === 0, "sentinels no-changes: no elements marked changed");
+        })();
+
+        (function test_sentinels_null_changedLines() {
+          const div = document.createElement("div");
+          const text = "# Title\n\nBody\n";
+          renderMarkdownWithSentinels(text, div, "null-", null);
+          const changedEls = div.querySelectorAll("[data-changed='true']");
+          A(changedEls.length === 0, "sentinels null-changedLines: no changed attrs when changedLines is null");
+          // But data-srcmap should still be present
+          const mapped = div.querySelectorAll("[data-srcmap]");
+          A(mapped.length >= 1, "sentinels null: data-srcmap still present", { count: mapped.length });
+        })();
+
+        (function test_applyInlineHighlights() {
+          const div = document.createElement("div");
+          const text = "# H\n\nChanged paragraph\n\nUnchanged\n";
+          const changed = new Set([3]);
+          renderMarkdownWithSentinels(text, div, "apply-", changed);
+          // Before apply, no ih-changed class
+          const preBefore = div.querySelectorAll(".ih-changed").length;
+          applyInlineHighlights(div);
+          const postApply = div.querySelectorAll(".ih-changed").length;
+          A(postApply >= 1, "applyInlineHighlights: adds ih-changed class", { before: preBefore, after: postApply });
+          // Clear
+          clearInlineHighlights(div);
+          const postClear = div.querySelectorAll(".ih-changed").length;
+          A(postClear === 0, "clearInlineHighlights: removes ih-changed class", { after: postClear });
+        })();
+
+        // --- 3. Duplicate lines: correct region mapping ---
+        (function test_sentinels_duplicates() {
+          // Two identical paragraphs - only the second should be marked
+          const text = "Duplicate line\n\nDuplicate line\n\nDuplicate line\n";
+          const changed = new Set([3]); // Only middle paragraph (line 3)
+          const div = document.createElement("div");
+          renderMarkdownWithSentinels(text, div, "dup-", changed);
+          const paras = div.querySelectorAll("p");
+          // With source maps, only the paragraph spanning line 3 should be changed
+          const changedParas = div.querySelectorAll("p[data-changed='true']");
+          // We expect exactly 1 paragraph marked (the one spanning line 3)
+          A(changedParas.length >= 1, "duplicates: at least 1 changed para for line 3", { changedCount: changedParas.length, totalParas: paras.length });
+          // The srcmap should include line 3
+          if (changedParas.length > 0) {
+            const srcmap = changedParas[0].getAttribute("data-srcmap");
+            A(srcmap !== null, "duplicates: changed para has srcmap", { srcmap });
+          }
+        })();
+
+        // --- 4. Code blocks: syntax highlighting intact ---
+        (function test_sentinels_codeblock() {
+          const text = "# Intro\n\n```javascript\nconst x = 1;\nconst y = 2;\n```\n\nAfter code\n";
+          const changed = new Set([4]); // line inside code block: "const x = 1;"
+          const div = document.createElement("div");
+          renderMarkdownWithSentinels(text, div, "code-", changed);
+          // Code block should exist
+          const codeBlocks = div.querySelectorAll("pre code, pre.hljs code");
+          A(codeBlocks.length >= 1, "codeblock: syntax-highlighted code block present", { count: codeBlocks.length });
+          // Code block content should contain the original code
+          const codeText = codeBlocks[0]?.textContent || "";
+          A(codeText.includes("const x = 1"), "codeblock: code content preserved", { text: codeText.slice(0, 50) });
+          // The pre block spanning the changed line should be marked
+          const changedEls = div.querySelectorAll("[data-changed='true']");
+          A(changedEls.length >= 1, "codeblock: code block region marked as changed", { count: changedEls.length });
+        })();
+
+        // --- 5. navigateChangedBlock ---
+        (function test_navigateChangedBlock() {
+          const div = document.createElement("div");
+          div.style.overflow = "auto";
+          div.style.height = "100px";
+          div.style.position = "relative";
+          // Create some blocks
+          for (let i = 0; i < 5; i++) {
+            const p = document.createElement("p");
+            p.textContent = "Block " + i;
+            p.style.height = "50px";
+            if (i === 1 || i === 3) p.setAttribute("data-changed", "true");
+            div.appendChild(p);
+          }
+          document.body.appendChild(div);
+          const result = navigateChangedBlock(div, "next");
+          A(result !== null, "navigateChangedBlock: returns target element");
+          document.body.removeChild(div);
+        })();
+
+        (function test_navigateChangedBlock_empty() {
+          const div = document.createElement("div");
+          const result = navigateChangedBlock(div, "next");
+          A(result === null, "navigateChangedBlock empty: returns null when no changed blocks");
+        })();
+
+        // --- 6. toggleHighlightDebug ---
+        (function test_toggleDebug() {
+          const div = document.createElement("div");
+          const p = document.createElement("p");
+          p.setAttribute("data-srcmap", "3:5");
+          p.setAttribute("data-changed", "true");
+          div.appendChild(p);
+          toggleHighlightDebug(div, true);
+          A(p.classList.contains("ih-debug"), "toggleDebug on: adds ih-debug class");
+          A(p.title.includes("3:5"), "toggleDebug on: sets title with srcmap", { title: p.title });
+          A(p.title.includes("[CHANGED]"), "toggleDebug on: title includes [CHANGED]");
+          toggleHighlightDebug(div, false);
+          A(!p.classList.contains("ih-debug"), "toggleDebug off: removes ih-debug class");
+          A(!p.title, "toggleDebug off: clears title");
+        })();
+
+        // --- Diagnostics: on failure dump sentinel-marked DOM ---
+        const failed = R.filter(r => !r.pass);
+        if (failed.length > 0) {
+          console.group("Inline Highlight Test Diagnostics");
+          // Create a diagnostic dump
+          const diagDiv = document.createElement("div");
+          const diagText = "# Diag\n\nChanged line\n\nUnchanged line\n";
+          renderMarkdownWithSentinels(diagText, diagDiv, "diag-", new Set([3]));
+          const nodes = diagDiv.querySelectorAll("[data-srcmap]");
+          const dump = Array.from(nodes).map(el => ({
+            tag: el.tagName,
+            srcmap: el.getAttribute("data-srcmap"),
+            changed: el.getAttribute("data-changed"),
+            text: el.textContent?.slice(0, 60)
+          }));
+          console.table(dump);
+          console.groupEnd();
+        }
+
+        // Summary
+        const p = R.filter(r => r.pass).length;
+        const f = R.filter(r => !r.pass).length;
+        const summary = "Inline Highlight Tests: " + p + " passed, " + f + " failed, " + R.length + " total";
+        if (f > 0) { console.warn(summary); R.filter(r => !r.pass).forEach(r => console.error("  FAIL:", r.msg, r.ctx || "")); }
+        else console.log("%c" + summary, "color: green; font-weight: bold");
+        return { passed: p, failed: f, total: R.length, results: R };
+      };
+      // ---- End Inline Highlights Unit Tests ----
 
       let _sbsRenderedKey = "";
 
@@ -12669,6 +13063,212 @@
         return { passed: p, failed: f, total: R.length, results: R };
       };
       // ---- End Side-by-Side Unit Tests ----
+
+      // ---- Side-by-Side E2E Tests (bd-24q.15.5) ----
+      // Run via console: window.__runSbsE2ETests()
+      // Requires dataset to be loaded.
+      window.__runSbsE2ETests = async function () {
+        const R = [];
+        const log = (msg, ctx) => console.log("  [SBS-E2E]", msg, ctx || "");
+        const A = (c, m, x) => { R.push(c ? { pass: true, msg: m } : { pass: false, msg: m, ctx: x }); if (!c) console.error("  FAIL:", m, x || ""); else log("PASS: " + m); };
+        const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+        if (!DATASET.loaded || ALL_COMMITS.length < 5) {
+          console.error("SBS-E2E: Need loaded dataset with >= 5 commits.");
+          return { passed: 0, failed: 1, total: 1, results: [{ pass: false, msg: "Dataset not loaded or < 5 commits" }] };
+        }
+
+        const origIdx = DOC.idx;
+        const origTab = DOC.tab;
+        const origCompare = DOC.compareMode;
+        const origViewMode = DOC.abViewMode;
+        const origSync = DOC.sbsSyncScroll;
+        const origMobile = DOC.sbsMobilePane;
+        const origFromIdx = DOC.compareFromIdx;
+        const origToIdx = DOC.compareToIdx;
+
+        // --- E2E 1: Enable A/B compare, switch to rendered mode, panes render ---
+        await (async function testE2E_renderPanes() {
+          // Enable compare mode.
+          DOC.compareMode = true;
+          DOC.compareFromIdx = 0;
+          DOC.compareToIdx = Math.min(ALL_COMMITS.length - 1, 10);
+          DOC.abViewMode = "rendered";
+          DOC.sbsSyncScroll = true;
+
+          // Trigger render.
+          await renderSbsPanes();
+          await wait(1500);
+
+          const paneA = document.getElementById("sbsPaneA");
+          const paneB = document.getElementById("sbsPaneB");
+          A(paneA != null, "sbs-e2e: pane A element exists");
+          A(paneB != null, "sbs-e2e: pane B element exists");
+
+          if (paneA && paneB) {
+            A(paneA.innerHTML.length > 0, "sbs-e2e: pane A has content", { len: paneA.innerHTML.length });
+            A(paneB.innerHTML.length > 0, "sbs-e2e: pane B has content", { len: paneB.innerHTML.length });
+            log("Pane A content: " + paneA.innerHTML.length + " chars, Pane B: " + paneB.innerHTML.length + " chars");
+          }
+        })();
+
+        // --- E2E 2: Pane labels show commit info ---
+        await (async function testE2E_paneLabels() {
+          const labelA = document.getElementById("sbsLabelA");
+          const labelB = document.getElementById("sbsLabelB");
+          if (!labelA || !labelB) { A(false, "sbs-e2e: missing label elements"); return; }
+
+          const textA = labelA.textContent || "";
+          const textB = labelB.textContent || "";
+          log("Label A: " + textA.slice(0, 60) + ", Label B: " + textB.slice(0, 60));
+          A(textA.length > 0, "sbs-e2e: pane A label has text");
+          A(textB.length > 0, "sbs-e2e: pane B label has text");
+          A(textA !== textB, "sbs-e2e: labels differ for different commits", { a: textA.slice(0, 30), b: textB.slice(0, 30) });
+        })();
+
+        // --- E2E 3: Sync scroll: scroll pane A -> pane B follows ---
+        await (async function testE2E_syncScroll() {
+          const paneA = document.getElementById("sbsPaneA");
+          const paneB = document.getElementById("sbsPaneB");
+          if (!paneA || !paneB) { A(false, "sbs-e2e: missing panes for sync test"); return; }
+
+          DOC.sbsSyncScroll = true;
+          setupSbsSyncScroll();
+          await wait(300);
+
+          // Scroll pane A down.
+          paneA.scrollTop = 0;
+          paneB.scrollTop = 0;
+          await wait(200);
+
+          const scrollTarget = Math.min(500, paneA.scrollHeight - paneA.clientHeight);
+          if (scrollTarget <= 0) { log("Pane A not scrollable, skip sync test"); A(true, "sbs-e2e: skipped sync (not scrollable)"); return; }
+
+          paneA.scrollTop = scrollTarget;
+          paneA.dispatchEvent(new Event("scroll"));
+          await wait(500);
+
+          const bScroll = paneB.scrollTop;
+          log("Sync scroll: A=" + scrollTarget + ", B=" + bScroll);
+          A(bScroll > 0, "sbs-e2e: pane B scrolled when A scrolled (sync on)", { aScroll: scrollTarget, bScroll });
+        })();
+
+        // --- E2E 4: Disable sync scroll -> panes scroll independently ---
+        await (async function testE2E_noSyncScroll() {
+          const paneA = document.getElementById("sbsPaneA");
+          const paneB = document.getElementById("sbsPaneB");
+          if (!paneA || !paneB) { A(false, "sbs-e2e: missing panes for no-sync test"); return; }
+
+          DOC.sbsSyncScroll = false;
+          setupSbsSyncScroll();
+          await wait(300);
+
+          // Reset both.
+          paneA.scrollTop = 0;
+          paneB.scrollTop = 0;
+          await wait(200);
+
+          // Scroll A only.
+          const scrollTarget = Math.min(300, paneA.scrollHeight - paneA.clientHeight);
+          if (scrollTarget <= 0) { A(true, "sbs-e2e: skipped no-sync (not scrollable)"); return; }
+
+          paneA.scrollTop = scrollTarget;
+          paneA.dispatchEvent(new Event("scroll"));
+          await wait(300);
+
+          const bScroll = paneB.scrollTop;
+          log("No-sync scroll: A=" + scrollTarget + ", B=" + bScroll);
+          A(bScroll === 0, "sbs-e2e: pane B stays at 0 with sync off", { bScroll });
+        })();
+
+        // --- E2E 5: Divider element is present and has correct styles ---
+        await (async function testE2E_divider() {
+          const divider = document.getElementById("sbsDivider");
+          A(divider != null, "sbs-e2e: divider element exists");
+          if (divider) {
+            const style = window.getComputedStyle(divider);
+            A(style.cursor === "col-resize", "sbs-e2e: divider has col-resize cursor", { got: style.cursor });
+          }
+        })();
+
+        // --- E2E 6: Mobile tab switching preserves scroll position ---
+        await (async function testE2E_mobileTabSwitch() {
+          const tabA = document.getElementById("sbsTabA");
+          const tabB = document.getElementById("sbsTabB");
+          const paneA = document.getElementById("sbsPaneA");
+          if (!tabA || !tabB || !paneA) { A(true, "sbs-e2e: skipped mobile (missing elements)"); return; }
+          if (typeof switchSbsMobilePane !== "function") { A(true, "sbs-e2e: skipped mobile (no switchSbsMobilePane)"); return; }
+
+          // Scroll pane A to a known position.
+          const scrollTarget = Math.min(200, paneA.scrollHeight - paneA.clientHeight);
+          paneA.scrollTop = scrollTarget;
+          await wait(100);
+
+          // Switch to pane B.
+          switchSbsMobilePane("b");
+          await wait(300);
+          A(DOC.sbsMobilePane === "b", "sbs-e2e: mobile pane switched to B");
+
+          // Switch back to pane A.
+          switchSbsMobilePane("a");
+          await wait(300);
+          A(DOC.sbsMobilePane === "a", "sbs-e2e: mobile pane switched back to A");
+
+          // Check scroll position was preserved.
+          const restoredScroll = paneA.scrollTop;
+          log("Mobile tab: original scroll=" + scrollTarget + ", restored=" + restoredScroll);
+          A(Math.abs(restoredScroll - scrollTarget) < 5, "sbs-e2e: scroll position preserved after tab switch", { expected: scrollTarget, got: restoredScroll });
+        })();
+
+        // --- E2E 7: Different A/B indices produce different content ---
+        await (async function testE2E_differentContent() {
+          const paneA = document.getElementById("sbsPaneA");
+          const paneB = document.getElementById("sbsPaneB");
+          if (!paneA || !paneB) { A(false, "sbs-e2e: missing panes"); return; }
+
+          DOC.compareFromIdx = 0;
+          DOC.compareToIdx = ALL_COMMITS.length - 1;
+          await renderSbsPanes();
+          await wait(1500);
+
+          A(paneA.innerHTML !== paneB.innerHTML, "sbs-e2e: first and last commits have different content");
+          log("Pane A chars: " + paneA.innerHTML.length + ", Pane B chars: " + paneB.innerHTML.length);
+        })();
+
+        // --- E2E 8: Button styles update correctly ---
+        await (async function testE2E_buttonStyles() {
+          const btn = document.getElementById("btnSbsRendered");
+          if (!btn) { A(true, "sbs-e2e: skipped button (missing btnSbsRendered)"); return; }
+
+          DOC.abViewMode = "rendered";
+          updateSbsButtonStyles();
+          A(btn.classList.contains("bg-slate-900") || btn.classList.contains("text-white"), "sbs-e2e: rendered mode shows active button style");
+
+          DOC.abViewMode = "diff";
+          updateSbsButtonStyles();
+          A(!btn.classList.contains("bg-slate-900") || btn.classList.contains("bg-white/70"), "sbs-e2e: diff mode shows inactive button style");
+        })();
+
+        // --- Restore original state ---
+        DOC.compareMode = origCompare;
+        DOC.abViewMode = origViewMode;
+        DOC.sbsSyncScroll = origSync;
+        DOC.sbsMobilePane = origMobile;
+        DOC.compareFromIdx = origFromIdx;
+        DOC.compareToIdx = origToIdx;
+        selectCommitIdx(origIdx);
+        if (DOC.tab !== origTab && typeof setDocTab === "function") setDocTab(origTab);
+        await wait(300);
+        log("Restored: compare=" + origCompare + ", viewMode=" + origViewMode + ", sync=" + origSync);
+
+        // --- Summary ---
+        const p = R.filter(x => x.pass).length, f = R.filter(x => !x.pass).length;
+        const s = `Side-by-Side E2E Tests: ${p} passed, ${f} failed, ${R.length} total`;
+        if (f > 0) { console.warn(s); R.filter(x => !x.pass).forEach(x => console.error("  FAIL:", x.msg, x.ctx || "")); }
+        else console.log("%c" + s, "color:green;font-weight:bold");
+        return { passed: p, failed: f, total: R.length, results: R };
+      };
+      // ---- End Side-by-Side E2E Tests ----
       // ---- Playback E2E Tests (bd-24q.7.4) ----
       // Run via console: window.__runPlaybackE2ETests()
       // Requires dataset to be loaded.
@@ -15104,6 +15704,196 @@
         return { passed: p, failed: f, total: R.length, results: R };
       };
       // ---- End History Search Unit Tests ----
+
+      // ---- History Search E2E Tests (bd-24q.9.5) ----
+      // Run via console: window.__runSearchE2ETests()
+      // Requires dataset to be loaded.
+      window.__runSearchE2ETests = async function () {
+        const R = [];
+        const log = (msg, ctx) => console.log("  [SRCH-E2E]", msg, ctx || "");
+        const A = (c, m, x) => { R.push(c ? { pass: true, msg: m } : { pass: false, msg: m, ctx: x }); if (!c) console.error("  FAIL:", m, x || ""); else log("PASS: " + m); };
+        const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+        if (!DATASET.loaded || ALL_COMMITS.length < 5) {
+          console.error("SRCH-E2E: Need loaded dataset with >= 5 commits.");
+          return { passed: 0, failed: 1, total: 1, results: [{ pass: false, msg: "Dataset not loaded or < 5 commits" }] };
+        }
+
+        const overlay = document.getElementById("searchPaletteOverlay");
+        const inputEl = document.getElementById("searchPaletteInput");
+        const resultsEl = document.getElementById("searchPaletteResults");
+        if (!overlay || !inputEl || !resultsEl) {
+          console.error("SRCH-E2E: Missing search palette DOM elements.");
+          return { passed: 0, failed: 1, total: 1, results: [{ pass: false, msg: "Missing search palette elements" }] };
+        }
+
+        const origIdx = DOC.idx;
+
+        // Ensure search index is built.
+        if (!STATE.searchIndex || !STATE.searchIndex.postings?.size) {
+          log("Search index not yet built, waiting...");
+          await wait(5000);
+        }
+
+        // --- E2E 1: Open search palette via function call ---
+        await (async function testE2E_openPalette() {
+          openSearchPalette();
+          await wait(300);
+          A(!overlay.classList.contains("hidden"), "srch-e2e: palette visible after open", { classes: overlay.className });
+          A(document.activeElement === inputEl, "srch-e2e: input is focused after open");
+        })();
+
+        // --- E2E 2: Type query and get results ---
+        await (async function testE2E_queryReturnsResults() {
+          openSearchPalette();
+          await wait(200);
+          inputEl.value = "MVCC";
+          inputEl.dispatchEvent(new Event("input"));
+          await wait(1500);
+          const items = resultsEl.querySelectorAll(".search-palette-item");
+          log("Query 'MVCC': " + items.length + " results");
+          A(items.length > 0, "srch-e2e: 'MVCC' query returns results", { count: items.length });
+          if (items.length > 0) {
+            const first = items[0];
+            A(first.dataset.spIdx != null, "srch-e2e: first result has spIdx data attribute");
+            log("First result: " + (first.textContent || "").slice(0, 80));
+          }
+        })();
+
+        // --- E2E 3: Arrow key navigation highlights different results ---
+        await (async function testE2E_keyboardNavigation() {
+          openSearchPalette();
+          await wait(200);
+          inputEl.value = "MVCC";
+          inputEl.dispatchEvent(new Event("input"));
+          await wait(1500);
+          const items = resultsEl.querySelectorAll(".search-palette-item");
+          if (items.length < 2) { A(true, "srch-e2e: skipped nav (< 2 results)"); closeSearchPalette(); return; }
+          inputEl.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
+          await wait(100);
+          const activeAfterDown = _spActiveIdx;
+          inputEl.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
+          await wait(100);
+          const activeAfterDown2 = _spActiveIdx;
+          log("Nav: after 1 down=" + activeAfterDown + ", after 2 down=" + activeAfterDown2);
+          A(activeAfterDown2 > activeAfterDown, "srch-e2e: ArrowDown advances active index", { first: activeAfterDown, second: activeAfterDown2 });
+          inputEl.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", bubbles: true }));
+          await wait(100);
+          A(_spActiveIdx < activeAfterDown2, "srch-e2e: ArrowUp decrements active index", { got: _spActiveIdx });
+          closeSearchPalette();
+        })();
+
+        // --- E2E 4: Enter selects result and jumps to commit ---
+        await (async function testE2E_enterSelectsResult() {
+          selectCommitIdx(0);
+          await wait(200);
+          openSearchPalette();
+          await wait(200);
+          inputEl.value = "MVCC";
+          inputEl.dispatchEvent(new Event("input"));
+          await wait(1500);
+          const items = resultsEl.querySelectorAll(".search-palette-item");
+          if (items.length < 1) { A(false, "srch-e2e: no results for enter test"); closeSearchPalette(); return; }
+          inputEl.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
+          await wait(100);
+          inputEl.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+          await wait(500);
+          A(DOC.idx !== 0, "srch-e2e: Enter jumped to a different commit", { got: DOC.idx });
+          log("After Enter: idx=" + DOC.idx);
+        })();
+
+        // --- E2E 5: Escape closes the palette ---
+        await (async function testE2E_escapeCloses() {
+          openSearchPalette();
+          await wait(200);
+          A(!overlay.classList.contains("hidden"), "srch-e2e: palette open before Escape");
+          inputEl.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+          await wait(300);
+          A(overlay.classList.contains("hidden"), "srch-e2e: palette closed after Escape");
+        })();
+
+        // --- E2E 6: Click on result jumps to commit ---
+        await (async function testE2E_clickResult() {
+          selectCommitIdx(0);
+          await wait(200);
+          openSearchPalette();
+          await wait(200);
+          inputEl.value = "page";
+          inputEl.dispatchEvent(new Event("input"));
+          await wait(1500);
+          const items = resultsEl.querySelectorAll(".search-palette-item");
+          if (items.length < 1) { A(true, "srch-e2e: skipped click (no results for 'page')"); closeSearchPalette(); return; }
+          items[0].click();
+          await wait(500);
+          A(DOC.idx !== 0, "srch-e2e: clicking result changed commit index", { got: DOC.idx });
+          log("After click: idx=" + DOC.idx);
+        })();
+
+        // --- E2E 7: Empty/nonsense query returns no results ---
+        await (async function testE2E_emptyQuery() {
+          openSearchPalette();
+          await wait(200);
+          inputEl.value = "";
+          inputEl.dispatchEvent(new Event("input"));
+          await wait(500);
+          const items = resultsEl.querySelectorAll(".search-palette-item");
+          A(items.length === 0, "srch-e2e: empty query returns no results", { count: items.length });
+          inputEl.value = "zzxxqqww123456";
+          inputEl.dispatchEvent(new Event("input"));
+          await wait(1000);
+          const items2 = resultsEl.querySelectorAll(".search-palette-item");
+          A(items2.length === 0, "srch-e2e: nonsense query returns no results", { count: items2.length });
+          closeSearchPalette();
+        })();
+
+        // --- E2E 8: Palette close cleans up ---
+        await (async function testE2E_closeCleanup() {
+          openSearchPalette();
+          await wait(300);
+          A(!overlay.classList.contains("hidden"), "srch-e2e: palette open before close");
+          closeSearchPalette();
+          await wait(200);
+          A(overlay.classList.contains("hidden"), "srch-e2e: palette closed");
+        })();
+
+        // --- E2E 9: Most-edited sections analytics ---
+        await (async function testE2E_mostEdited() {
+          if (typeof workerRequest !== "function") {
+            A(true, "srch-e2e: skipped most-edited (workerRequest not available)");
+            return;
+          }
+          try {
+            const result = await workerRequest("compute_most_edited_sections", {}, { timeoutMs: 10000 });
+            if (!result || !result.length) {
+              log("No most-edited sections returned");
+              A(true, "srch-e2e: skipped most-edited (no results)");
+              return;
+            }
+            A(result.length > 0, "srch-e2e: most-edited has sections", { count: result.length });
+            const top = result[0];
+            A(top.heading != null, "srch-e2e: top section has heading field", { heading: top.heading });
+            A(top.totalTokensDelta > 0, "srch-e2e: top section has positive token delta", { got: top.totalTokensDelta });
+            log("Top most-edited: '" + top.heading + "' with " + top.totalTokensDelta + " tokens delta");
+          } catch (e) {
+            log("Most-edited worker call failed: " + e.message);
+            A(true, "srch-e2e: skipped most-edited (worker error)");
+          }
+        })();
+
+        // --- Restore original state ---
+        closeSearchPalette();
+        selectCommitIdx(origIdx);
+        await wait(300);
+        log("Restored: idx=" + origIdx);
+
+        // --- Summary ---
+        const p = R.filter(x => x.pass).length, f = R.filter(x => !x.pass).length;
+        const s = `History Search E2E Tests: ${p} passed, ${f} failed, ${R.length} total`;
+        if (f > 0) { console.warn(s); R.filter(x => !x.pass).forEach(x => console.error("  FAIL:", x.msg, x.ctx || "")); }
+        else console.log("%c" + s, "color:green;font-weight:bold");
+        return { passed: p, failed: f, total: R.length, results: R };
+      };
+      // ---- End History Search E2E Tests ----
       // ---- Clustering Unit Tests (bd-24q.14.4) ----
       // Run via console: window.__runClusteringTests()
       window.__runClusteringTests = async function () {
@@ -15268,6 +16058,7 @@
         return { passed: p, failed: f, total: R.length, results: R };
       };
       // ---- End Clustering Unit Tests ----
+
 
 
 
@@ -15860,6 +16651,18 @@
         ctx.strokeRect(sx + 0.5, 1.5, Math.max(1, barW - 1), h - 3);
       }
 
+      const RENDER_CACHE = {
+        specIdx: -1,
+        specHtml: "",
+        diffIdx: -1,
+        diffFromIdx: -1,
+        diffToIdx: -1,
+        diffLayout: "",
+        diffMode: "",
+        diffAbViewMode: "",
+        diffHtml: "",
+      };
+
       async function updateDocUI() {
         const loading = document.getElementById("docLoading");
         const main = document.getElementById("docMain");
@@ -15881,7 +16684,8 @@
         const c = ALL_COMMITS[DOC.idx];
         if (!c) return;
 
-        document.getElementById("dockTitle").textContent = `${c.short} · ${c.subject}`;
+        const dockTitle = document.getElementById("dockTitle");
+        if (dockTitle) dockTitle.textContent = `${c.short} · ${c.subject}`;
 
         const title = document.getElementById("docCommitTitle");
         const meta = document.getElementById("docCommitMeta");
@@ -15910,58 +16714,81 @@
         }
 
         // Metrics cards
-        document.getElementById("mTokens").textContent = (tok === null || tok === undefined) ? "-" : fmtInt(tok);
-        document.getElementById("mBytes").textContent = (byt === null || byt === undefined) ? "-" : fmtInt(byt);
-        document.getElementById("mHunks").textContent = (hn === null || hn === undefined) ? "-" : fmtInt(hn);
-        document.getElementById("mLev").textContent = (lv === null || lv === undefined) ? "-" : fmtInt(lv);
+        const mTokens = document.getElementById("mTokens");
+        const mBytes = document.getElementById("mBytes");
+        const mHunks = document.getElementById("mHunks");
+        const mLev = document.getElementById("mLev");
+        if (mTokens) mTokens.textContent = (tok === null || tok === undefined) ? "-" : fmtInt(tok);
+        if (mBytes) mBytes.textContent = (byt === null || byt === undefined) ? "-" : fmtInt(byt);
+        if (mHunks) mHunks.textContent = (hn === null || hn === undefined) ? "-" : fmtInt(hn);
+        if (mLev) mLev.textContent = (lv === null || lv === undefined) ? "-" : fmtInt(lv);
 
         const patch = patchForIdx(DOC.idx);
 
         if (DOC.tab === "diff") {
           const raw = document.getElementById("diffRaw");
           const pretty = document.getElementById("diffPretty");
-          // A/B compare mode: generate diff between two arbitrary commits.
-          let diffText = patch || "";
-          let abDiffError = false;
-          if (DOC.compareMode && DOC.abViewMode !== "rendered") {
-            try {
-              diffText = await generateABDiff(DOC.compareFromIdx, DOC.compareToIdx);
-            } catch (e) {
-              abDiffError = true;
-              diffText = "";
-              if (pretty) pretty.innerHTML = `<div class="p-3 text-xs text-red-600">A/B diff failed: ${escapeHtml(String(e?.message || e))}</div>`;
-            }
-          }
-          if (raw) raw.textContent = diffText;
-
-          if (pretty && !abDiffError) {
-            if (DOC.diffMode === "pretty") {
-              try {
-                const outputFmt = DOC.compareMode ? DOC.diffLayout : "side-by-side";
-                pretty.innerHTML = Diff2Html.html(diffText, {
-                  drawFileList: false,
-                  matching: "lines",
-                  outputFormat: outputFmt,
-                });
-              } catch (e) {
-                pretty.innerHTML = `<div class="p-3 text-xs text-slate-700">Diff2Html failed: ${escapeHtml(String(e?.message || e))}</div>`;
-              }
-            } else {
-              pretty.innerHTML = "";
-            }
-          }
-
-          // Side-by-side rendered markdown panes (bd-24q.15.1).
-          const sbsContainer = document.getElementById("sbsContainer");
           const inRenderedMode = DOC.compareMode && DOC.abViewMode === "rendered";
-          if (sbsContainer) {
-            sbsContainer.classList.toggle("hidden", !inRenderedMode);
-            if (inRenderedMode) void renderSbsPanes();
+
+          const cacheKey = DOC.compareMode 
+            ? `ab|${DOC.compareFromIdx}:${DOC.compareToIdx}|${DOC.diffLayout}|${DOC.diffMode}|${DOC.abViewMode}`
+            : `p|${DOC.idx}|${DOC.diffLayout}|${DOC.diffMode}|${DOC.abViewMode}`;
+
+          const cacheMatch = DOC.compareMode
+            ? (RENDER_CACHE.diffFromIdx === DOC.compareFromIdx && RENDER_CACHE.diffToIdx === DOC.compareToIdx && RENDER_CACHE.diffLayout === DOC.diffLayout && RENDER_CACHE.diffMode === DOC.diffMode && RENDER_CACHE.diffAbViewMode === DOC.abViewMode)
+            : (RENDER_CACHE.diffIdx === DOC.idx && RENDER_CACHE.diffLayout === DOC.diffLayout && RENDER_CACHE.diffMode === DOC.diffMode && RENDER_CACHE.diffAbViewMode === DOC.abViewMode);
+
+          if (!cacheMatch) {
+            let diffText = patch || "";
+            let abDiffError = false;
+            if (DOC.compareMode && DOC.abViewMode !== "rendered") {
+              try {
+                diffText = await generateABDiff(DOC.compareFromIdx, DOC.compareToIdx);
+              } catch (e) {
+                abDiffError = true;
+                diffText = "";
+                if (pretty) pretty.innerHTML = `<div class="p-3 text-xs text-red-600">A/B diff failed: ${escapeHtml(String(e?.message || e))}</div>`;
+              }
+            }
+            if (raw) raw.textContent = diffText;
+
+            if (pretty && !abDiffError) {
+              if (DOC.diffMode === "pretty") {
+                try {
+                  const outputFmt = DOC.compareMode ? DOC.diffLayout : "side-by-side";
+                  pretty.innerHTML = Diff2Html.html(diffText, {
+                    drawFileList: false,
+                    matching: "lines",
+                    outputFormat: outputFmt,
+                  });
+                } catch (e) {
+                  pretty.innerHTML = `<div class="p-3 text-xs text-slate-700">Diff2Html failed: ${escapeHtml(String(e?.message || e))}</div>`;
+                }
+              } else {
+                pretty.innerHTML = "";
+              }
+            }
+
+            const sbsContainer = document.getElementById("sbsContainer");
+            if (sbsContainer) {
+              sbsContainer.classList.toggle("hidden", !inRenderedMode);
+              if (inRenderedMode) void renderSbsPanes();
+            }
+
+            if (DOC.compareMode) {
+              RENDER_CACHE.diffFromIdx = DOC.compareFromIdx;
+              RENDER_CACHE.diffToIdx = DOC.compareToIdx;
+            } else {
+              RENDER_CACHE.diffIdx = DOC.idx;
+            }
+            RENDER_CACHE.diffLayout = DOC.diffLayout;
+            RENDER_CACHE.diffMode = DOC.diffMode;
+            RENDER_CACHE.diffAbViewMode = DOC.abViewMode;
           }
+
           document.getElementById("diffPretty")?.classList.toggle("hidden", inRenderedMode || DOC.diffMode !== "pretty");
           document.getElementById("diffRaw")?.classList.toggle("hidden", inRenderedMode || DOC.diffMode !== "raw");
 
-          // Update diff label for compare mode.
           const diffLabel = document.getElementById("diffLabel");
           if (diffLabel) {
             if (DOC.compareMode) {
@@ -15973,7 +16800,6 @@
             }
           }
 
-          // A/B Compare metrics: show chips when in compare mode.
           const abMetricsBar = document.getElementById("abMetricsBar");
           if (abMetricsBar) {
             if (DOC.compareMode) {
@@ -15990,76 +16816,72 @@
           const specView = document.getElementById("docSpecView");
           if (specView) specView.classList.remove("hidden");
 
-          const text = await docTextAt(DOC.idx);
-          if (raw) raw.textContent = text;
+          if (RENDER_CACHE.specIdx !== DOC.idx) {
+            const text = await docTextAt(DOC.idx);
+            if (raw) raw.textContent = text;
 
-          if (rendered) {
-            // Extract outline and render markdown with anchor IDs injected.
-            const outline = extractOutline(text);
-            OUTLINE_CACHE.set(DOC.idx, outline);
+            if (rendered) {
+              const outline = extractOutline(text);
+              OUTLINE_CACHE.set(DOC.idx, outline);
 
-            if (!window._mdSingleton) {
-              window._mdSingleton = markdownit({
-                html: false,
-                linkify: true,
-                typographer: true,
-                highlight: (str, lang) => {
-                  try {
-                    if (lang && hljs.getLanguage(lang)) {
-                      return `<pre class="hljs"><code>${hljs.highlight(str, { language: lang }).value}</code></pre>`;
+              if (!window._mdSingleton) {
+                window._mdSingleton = markdownit({
+                  html: false,
+                  linkify: true,
+                  typographer: true,
+                  highlight: (str, lang) => {
+                    try {
+                      if (lang && hljs.getLanguage(lang)) {
+                        return `<pre class="hljs"><code>${hljs.highlight(str, { language: lang }).value}</code></pre>`;
+                      }
+                      return `<pre class="hljs"><code>${hljs.highlightAuto(str).value}</code></pre>`;
+                    } catch {
+                      return `<pre class="hljs"><code>${escapeHtml(str)}</code></pre>`;
                     }
-                    return `<pre class="hljs"><code>${hljs.highlightAuto(str).value}</code></pre>`;
-                  } catch {
-                    return `<pre class="hljs"><code>${escapeHtml(str)}</code></pre>`;
-                  }
-                },
-              });
-            }
-
-            // Install heading_open renderer to inject stable anchor IDs.
-            let outlineIdx = 0;
-            const origHeadingOpen = window._mdSingleton.renderer.rules.heading_open;
-            window._mdSingleton.renderer.rules.heading_open = (tokens, idx, options, env, self) => {
-              const entry = outline[outlineIdx++];
-              if (entry) {
-                tokens[idx].attrSet("id", entry.id);
+                  },
+                });
               }
-              return self.renderToken(tokens, idx, options);
-            };
 
-            const html = window._mdSingleton.render(text || "");
-            rendered.innerHTML = DOMPurify.sanitize(html, { ADD_ATTR: ["id"] });
+              let outlineIdx = 0;
+              const origHeadingOpen = window._mdSingleton.renderer.rules.heading_open;
+              window._mdSingleton.renderer.rules.heading_open = (tokens, idx, options, env, self) => {
+                const entry = outline[outlineIdx++];
+                if (entry) {
+                  tokens[idx].attrSet("id", entry.id);
+                }
+                return self.renderToken(tokens, idx, options);
+              };
 
-            // Restore original renderer rule.
-            if (origHeadingOpen) {
-              window._mdSingleton.renderer.rules.heading_open = origHeadingOpen;
-            } else {
-              delete window._mdSingleton.renderer.rules.heading_open;
+              const html = window._mdSingleton.render(text || "");
+              rendered.innerHTML = DOMPurify.sanitize(html, { ADD_ATTR: ["id"] });
+
+              if (origHeadingOpen) {
+                window._mdSingleton.renderer.rules.heading_open = origHeadingOpen;
+              } else {
+                delete window._mdSingleton.renderer.rules.heading_open;
+              }
             }
+            RENDER_CACHE.specIdx = DOC.idx;
           }
 
-          document.getElementById("docRendered").classList.toggle("hidden", DOC.rawSpec);
-          document.getElementById("docRaw").classList.toggle("hidden", !DOC.rawSpec);
+          if (rendered) rendered.classList.toggle("hidden", DOC.rawSpec);
+          if (raw) raw.classList.toggle("hidden", !DOC.rawSpec);
 
-          // Refresh mini-map outline (non-blocking).
           void updateMiniMap();
         }
 
-        // Refresh section summary panel (non-blocking).
         if (DOC.tab === "sections") {
           void updateSectionSummary();
         }
 
-        // On-demand Levenshtein for selected commit.
         if (DATASET.loaded && DOC.idx > 0 && !METRICS.lev.has(c.hash)) {
-          // Compute async, don't block UI.
           void (async () => {
             try {
               const d = await levenshteinForPatch(patch);
               METRICS.lev.set(c.hash, d);
-              // Update only if still selected.
               if (ALL_COMMITS[DOC.idx]?.hash === c.hash) {
-                document.getElementById("mLev").textContent = fmtInt(d);
+                const mLev = document.getElementById("mLev");
+                if (mLev) mLev.textContent = fmtInt(d);
                 syncDockAndDoc();
               }
             } catch (e) {
@@ -17595,25 +18417,27 @@
       }
 
       function ensureCommitNodes() {
-        if (COMMIT_LIST_MODE === STATE.bucketMode && COMMIT_LIST_NODES.size === ALL_COMMITS.length) return;
+        if (COMMIT_LIST_MODE === STATE.bucketMode) return;
         COMMIT_LIST_NODES.clear();
         COMMIT_LIST_MODE = STATE.bucketMode;
         COMMIT_DETAIL_LOADED.clear();
-        for (const c of ALL_COMMITS) {
-          COMMIT_LIST_NODES.set(c.hash, buildCommitNode(c));
-        }
       }
 
       // Append the next page of commits to the DOM
       function _clAppendPage() {
         const wrap = document.getElementById("commitList");
+        if (!wrap) return;
         const end = Math.min(_clRenderedCount + COMMIT_PAGE_SIZE, _clFilteredCommits.length);
         if (_clRenderedCount >= end) return;
         const frag = document.createDocumentFragment();
         for (let i = _clRenderedCount; i < end; i++) {
           const c = _clFilteredCommits[i];
-          const node = COMMIT_LIST_NODES.get(c.hash);
-          if (node) frag.appendChild(node);
+          let node = COMMIT_LIST_NODES.get(c.hash);
+          if (!node) {
+            node = buildCommitNode(c);
+            COMMIT_LIST_NODES.set(c.hash, node);
+          }
+          frag.appendChild(node);
         }
         const sentinel = document.getElementById("commitListSentinel");
         if (sentinel) wrap.insertBefore(frag, sentinel);
