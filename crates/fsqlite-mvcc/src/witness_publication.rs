@@ -24,8 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use fsqlite_types::{
-    CommitMarker, CommitProof, CommitSeq, DependencyEdge, ObjectId, ReadWitness, TxnId,
-    WriteWitness,
+    CommitMarker, CommitProof, CommitSeq, DependencyEdge, ReadWitness, TxnId, WriteWitness,
 };
 use tracing::{debug, error, info, warn};
 
@@ -121,8 +120,6 @@ struct PendingPublication {
     writes: Vec<WriteWitness>,
     /// Dependency edges written so far.
     edges: Vec<DependencyEdge>,
-    /// Commit proof (set during commit).
-    proof: Option<CommitProof>,
 }
 
 /// Inner state of the witness publisher, behind `Arc<Mutex<...>>`.
@@ -144,8 +141,10 @@ impl WitnessPublisherInner {
         if let Some(mut pub_) = pending.remove(&id.0) {
             pub_.phase = PublicationPhase::Aborted;
             drop(pending);
-            let mut aborted = self.aborted.lock().expect("aborted lock poisoned");
-            aborted.push(id.0);
+            self.aborted
+                .lock()
+                .expect("aborted lock poisoned")
+                .push(id.0);
             info!(
                 reservation_id = id.0,
                 txn_id = pub_.txn_id.get(),
@@ -210,7 +209,6 @@ impl WitnessPublisher {
             reads: Vec::new(),
             writes: Vec::new(),
             edges: Vec::new(),
-            proof: None,
         };
         {
             let mut pending = self.inner.pending.lock().expect("pending lock poisoned");
@@ -239,6 +237,7 @@ impl WitnessPublisher {
     ///
     /// Returns `PublicationError::InvalidPhase` if the token has already been
     /// committed or aborted.
+    #[allow(clippy::significant_drop_tightening)]
     pub fn write(
         &self,
         token: &mut ReservationToken,
@@ -252,17 +251,19 @@ impl WitnessPublisher {
                 actual: token.phase,
             });
         }
-        let mut pending = self.inner.pending.lock().expect("pending lock poisoned");
-        let Some(pub_) = pending.get_mut(&token.id.0) else {
-            return Err(PublicationError::ReservationNotFound(token.id));
-        };
         let read_count = reads.len();
         let write_count = writes.len();
         let edge_count = edges.len();
-        pub_.reads.extend(reads);
-        pub_.writes.extend(writes);
-        pub_.edges.extend(edges);
-        pub_.phase = PublicationPhase::Writing;
+        {
+            let mut pending = self.inner.pending.lock().expect("pending lock poisoned");
+            let Some(pub_) = pending.get_mut(&token.id.0) else {
+                return Err(PublicationError::ReservationNotFound(token.id));
+            };
+            pub_.reads.extend(reads);
+            pub_.writes.extend(writes);
+            pub_.edges.extend(edges);
+            pub_.phase = PublicationPhase::Writing;
+        }
         token.phase = PublicationPhase::Writing;
         debug!(
             reservation_id = token.id.0,
@@ -270,9 +271,6 @@ impl WitnessPublisher {
             new_reads = read_count,
             new_writes = write_count,
             new_edges = edge_count,
-            total_reads = pub_.reads.len(),
-            total_writes = pub_.writes.len(),
-            total_edges = pub_.edges.len(),
             "publication write phase"
         );
         Ok(())
@@ -287,6 +285,7 @@ impl WitnessPublisher {
     /// # Errors
     ///
     /// Returns error if the token is in an invalid phase.
+    #[allow(clippy::significant_drop_tightening)]
     pub fn commit(
         &self,
         token: &mut ReservationToken,
@@ -298,27 +297,27 @@ impl WitnessPublisher {
                 actual: token.phase,
             });
         }
-        let mut pending = self.inner.pending.lock().expect("pending lock poisoned");
-        let Some(mut pub_) = pending.remove(&token.id.0) else {
-            return Err(PublicationError::ReservationNotFound(token.id));
-        };
-        pub_.phase = PublicationPhase::Committed;
-        pub_.proof = Some(commit_proof.clone());
-
-        let committed = CommittedPublication {
-            reservation_id: token.id,
-            txn_id: pub_.txn_id,
-            reads: pub_.reads,
-            writes: pub_.writes,
-            edges: pub_.edges,
-            proof: commit_proof,
+        let committed = {
+            let mut pending = self.inner.pending.lock().expect("pending lock poisoned");
+            let Some(pub_) = pending.remove(&token.id.0) else {
+                return Err(PublicationError::ReservationNotFound(token.id));
+            };
+            CommittedPublication {
+                reservation_id: token.id,
+                txn_id: pub_.txn_id,
+                reads: pub_.reads,
+                writes: pub_.writes,
+                edges: pub_.edges,
+                proof: commit_proof,
+            }
         };
 
         // Publish: make visible to readers.
-        {
-            let mut committed_list = self.inner.committed.lock().expect("committed lock poisoned");
-            committed_list.push(committed.clone());
-        }
+        self.inner
+            .committed
+            .lock()
+            .expect("committed lock poisoned")
+            .push(committed.clone());
 
         token.phase = PublicationPhase::Committed;
         token.consumed = true;
@@ -351,7 +350,11 @@ impl WitnessPublisher {
     /// Query: get all committed publications (visible evidence).
     #[must_use]
     pub fn committed_publications(&self) -> Vec<CommittedPublication> {
-        let committed = self.inner.committed.lock().expect("committed lock poisoned");
+        let committed = self
+            .inner
+            .committed
+            .lock()
+            .expect("committed lock poisoned");
         committed.clone()
     }
 
@@ -386,7 +389,11 @@ impl Default for WitnessPublisher {
 impl std::fmt::Debug for WitnessPublisher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let pending = self.inner.pending.lock().expect("pending lock poisoned");
-        let committed = self.inner.committed.lock().expect("committed lock poisoned");
+        let committed = self
+            .inner
+            .committed
+            .lock()
+            .expect("committed lock poisoned");
         let aborted = self.inner.aborted.lock().expect("aborted lock poisoned");
         f.debug_struct("WitnessPublisher")
             .field("pending", &pending.len())
@@ -572,13 +579,13 @@ impl WitnessGcCoordinator {
         safe_gc_seq: CommitSeq,
         witness_commit_seqs: &[CommitSeq],
     ) -> GcEligibility {
-        let eligible: Vec<_> = witness_commit_seqs
+        let eligible_count = witness_commit_seqs
             .iter()
             .filter(|&&seq| seq.get() < safe_gc_seq.get())
-            .collect();
-        let eligible_count = eligible.len();
+            .count();
 
         // Retention policy: keep the most recent `retention_count` even if eligible.
+        #[allow(clippy::cast_possible_truncation)]
         let retained_count = if self.retention_count > 0 {
             eligible_count.min(self.retention_count as usize)
         } else {
@@ -610,9 +617,9 @@ impl WitnessGcCoordinator {
         if old_epoch == 0 {
             return true;
         }
-        !active_slots.iter().any(|s| {
-            s.is_concurrent && s.witness_epoch == old_epoch
-        })
+        !active_slots
+            .iter()
+            .any(|s| s.is_concurrent && s.witness_epoch == old_epoch)
     }
 
     /// Apply GC to a `ColdWitnessStore` (§5.6.4.8).
@@ -634,20 +641,20 @@ impl WitnessGcCoordinator {
         let before_edges = store.dependency_edges.len();
 
         // Prune read witnesses.
-        store.read_witnesses.retain(|w| {
-            commit_seq_lookup(w.txn).map_or(true, |seq| seq.get() >= safe_gc_seq.get())
-        });
+        store
+            .read_witnesses
+            .retain(|w| commit_seq_lookup(w.txn).is_none_or(|seq| seq.get() >= safe_gc_seq.get()));
         // Prune write witnesses.
-        store.write_witnesses.retain(|w| {
-            commit_seq_lookup(w.txn).map_or(true, |seq| seq.get() >= safe_gc_seq.get())
-        });
+        store
+            .write_witnesses
+            .retain(|w| commit_seq_lookup(w.txn).is_none_or(|seq| seq.get() >= safe_gc_seq.get()));
         // Prune dependency edges (both endpoints must be prunable).
         store.dependency_edges.retain(|e| {
             let from_seq = commit_seq_lookup(e.from);
             let to_seq = commit_seq_lookup(e.to);
             // Keep if either endpoint is still needed.
-            from_seq.map_or(true, |s| s.get() >= safe_gc_seq.get())
-                || to_seq.map_or(true, |s| s.get() >= safe_gc_seq.get())
+            from_seq.is_none_or(|s| s.get() >= safe_gc_seq.get())
+                || to_seq.is_none_or(|s| s.get() >= safe_gc_seq.get())
         });
 
         let pruned = (before_reads - store.read_witnesses.len())
@@ -770,9 +777,7 @@ impl ProofCarryingValidator for DefaultProofValidator {
                     // it's safe (no cycle). We trust the proof unless the edges
                     // form a 3-node cycle.
                     if edges.iter().any(|e3| e3.from == e2.to && e3.to == e1.from) {
-                        error!(
-                            "dangerous cycle detected in proof-carrying commit"
-                        );
+                        error!("dangerous cycle detected in proof-carrying commit");
                         return ValidationVerdict::Invalid;
                     }
                 }
@@ -799,7 +804,7 @@ impl ProofCarryingValidator for DefaultProofValidator {
 mod tests {
     use super::*;
     use crate::hot_witness_index::ColdWitnessStore;
-    use fsqlite_types::{PageNumber, WitnessKey};
+    use fsqlite_types::{ObjectId, PageNumber, WitnessKey};
 
     fn txn(id: u64) -> TxnId {
         TxnId::new(id).unwrap()
@@ -825,8 +830,8 @@ mod tests {
         CommitMarker {
             commit_seq: CommitSeq::new(commit_seq),
             commit_time_unix_ns: 1_000_000,
-            capsule_object_id: ObjectId::zero(),
-            proof_object_id: ObjectId::zero(),
+            capsule_object_id: ObjectId::from_bytes([0u8; 16]),
+            proof_object_id: ObjectId::from_bytes([0u8; 16]),
             prev_marker: None,
             integrity_hash: [0u8; 16],
         }
@@ -947,10 +952,8 @@ mod tests {
         drop(publisher);
 
         // "Recovery" — deserialize.
-        let recovered_reads: Vec<ReadWitness> =
-            serde_json::from_str(&serialized_reads).unwrap();
-        let recovered_writes: Vec<WriteWitness> =
-            serde_json::from_str(&serialized_writes).unwrap();
+        let recovered_reads: Vec<ReadWitness> = serde_json::from_str(&serialized_reads).unwrap();
+        let recovered_writes: Vec<WriteWitness> = serde_json::from_str(&serialized_writes).unwrap();
 
         assert_eq!(recovered_reads.len(), 1);
         assert_eq!(recovered_reads[0].txn, t1);
@@ -1051,10 +1054,7 @@ mod tests {
             witness_epoch: 5, // Pinned at epoch 5.
         };
 
-        assert!(
-            slot.is_concurrent,
-            "concurrent mode must be set"
-        );
+        assert!(slot.is_concurrent, "concurrent mode must be set");
         assert_eq!(
             slot.witness_epoch, 5,
             "witness_epoch must be pinned at BEGIN"
@@ -1408,7 +1408,7 @@ mod tests {
         let pcc = ProofCarryingCommit {
             marker: make_marker(100),
             proof: make_proof(100, vec![edge.clone()]),
-            reads: Vec::new(), // Missing read for txn(1)!
+            reads: Vec::new(),  // Missing read for txn(1)!
             writes: Vec::new(), // Missing write for txn(2)!
             edges: vec![edge],
         };
