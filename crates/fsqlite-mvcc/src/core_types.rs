@@ -1107,8 +1107,8 @@ mod tests {
         let table = InProcessPageLockTable::new();
         // Each shard is CacheAligned, so adjacent shards are on different cache lines.
         for i in 0..LOCK_TABLE_SHARDS.saturating_sub(1) {
-            let a = &table.shards[i] as *const _ as usize;
-            let b = &table.shards[i + 1] as *const _ as usize;
+            let a = &raw const table.shards[i] as usize;
+            let b = &raw const table.shards[i + 1] as usize;
             let gap = b - a;
             assert!(
                 gap >= crate::cache_aligned::CACHE_LINE_BYTES,
@@ -1127,8 +1127,8 @@ mod tests {
     fn test_commit_index_shards_cache_aligned() {
         let index = CommitIndex::new();
         for i in 0..LOCK_TABLE_SHARDS.saturating_sub(1) {
-            let a = &index.shards[i] as *const _ as usize;
-            let b = &index.shards[i + 1] as *const _ as usize;
+            let a = &raw const index.shards[i] as usize;
+            let b = &raw const index.shards[i + 1] as usize;
             let gap = b - a;
             assert!(
                 gap >= crate::cache_aligned::CACHE_LINE_BYTES,
