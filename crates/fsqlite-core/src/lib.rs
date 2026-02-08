@@ -4,6 +4,7 @@
 //! It is intentionally non-blocking: overflow is rejected with `SQLITE_BUSY`
 //! (`FrankenError::Busy`) instead of queue-and-wait semantics.
 
+pub mod commit_repair;
 pub mod region;
 
 use std::num::NonZeroUsize;
