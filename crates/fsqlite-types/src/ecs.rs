@@ -8,6 +8,7 @@
 
 use std::fmt;
 
+use crate::encoding::{append_u32_le, append_u64_le, read_u32_le, read_u64_le, write_u64_le};
 use crate::glossary::{OTI_WIRE_SIZE, Oti};
 
 /// Domain separation prefix for ECS ObjectIds (spec: `"fsqlite:ecs:v1"`).
@@ -260,14 +261,14 @@ impl SymbolRecord {
         buf.push(SYMBOL_RECORD_VERSION);
         buf.extend_from_slice(self.object_id.as_bytes());
         buf.extend_from_slice(&self.oti.to_bytes());
-        buf.extend_from_slice(&self.esi.to_le_bytes());
+        append_u32_le(&mut buf, self.esi);
         let expected_len = usize::try_from(self.oti.t).expect("OTI.t fits in usize");
         debug_assert_eq!(
             self.symbol_data.len(),
             expected_len,
             "symbol_data length must equal OTI.t"
         );
-        buf.extend_from_slice(&self.oti.t.to_le_bytes());
+        append_u32_le(&mut buf, self.oti.t);
         buf.extend_from_slice(&self.symbol_data);
         buf.push(self.flags.bits());
         buf
@@ -328,7 +329,9 @@ impl SymbolRecord {
         let mut keyed_hasher = blake3::Hasher::new_keyed(epoch_key);
         keyed_hasher.update(SYMBOL_AUTH_DOMAIN);
         keyed_hasher.update(pre_hash);
-        keyed_hasher.update(&frame_xxh3.to_le_bytes());
+        let mut frame_hash_bytes = [0u8; 8];
+        write_u64_le(&mut frame_hash_bytes, frame_xxh3).expect("fixed u64 field");
+        keyed_hasher.update(&frame_hash_bytes);
         let digest = keyed_hasher.finalize();
         let mut tag = [0u8; 16];
         tag.copy_from_slice(&digest.as_bytes()[..16]);
@@ -353,15 +356,15 @@ impl SymbolRecord {
         buf.push(SYMBOL_RECORD_VERSION);
         buf.extend_from_slice(self.object_id.as_bytes());
         buf.extend_from_slice(&self.oti.to_bytes());
-        buf.extend_from_slice(&self.esi.to_le_bytes());
-        buf.extend_from_slice(&self.oti.t.to_le_bytes());
+        append_u32_le(&mut buf, self.esi);
+        append_u32_le(&mut buf, self.oti.t);
 
         // Payload
         buf.extend_from_slice(&self.symbol_data);
 
         // Trailer
         buf.push(self.flags.bits());
-        buf.extend_from_slice(&self.frame_xxh3.to_le_bytes());
+        append_u64_le(&mut buf, self.frame_xxh3);
         buf.extend_from_slice(&self.auth_tag);
 
         debug_assert_eq!(buf.len(), total);
@@ -404,8 +407,8 @@ impl SymbolRecord {
             Oti::from_bytes(&data[21..43]).expect("already checked length >= HEADER_BEFORE_DATA");
 
         // ESI + symbol_size
-        let esi = u32::from_le_bytes(data[43..47].try_into().expect("4 bytes"));
-        let symbol_size = u32::from_le_bytes(data[47..51].try_into().expect("4 bytes"));
+        let esi = read_u32_le(&data[43..47]).expect("fixed u32 field");
+        let symbol_size = read_u32_le(&data[47..51]).expect("fixed u32 field");
 
         // Key invariant: symbol_size == OTI.T
         if symbol_size != oti.t {
@@ -437,11 +440,7 @@ impl SymbolRecord {
 
         // Trailer
         let flags = SymbolRecordFlags::from_bits_truncate(data[data_end]);
-        let frame_xxh3 = u64::from_le_bytes(
-            data[data_end + 1..data_end + 9]
-                .try_into()
-                .expect("8 bytes"),
-        );
+        let frame_xxh3 = read_u64_le(&data[data_end + 1..data_end + 9]).expect("fixed u64 field");
         let auth_tag: [u8; 16] = data[data_end + 9..data_end + 25]
             .try_into()
             .expect("16 bytes");
@@ -550,7 +549,7 @@ impl VersionPointer {
         let has_base: u8 = u8::from(self.base_hint.is_some());
         let cap = VERSION_POINTER_MIN_WIRE + if has_base == 1 { 16 } else { 0 };
         let mut buf = Vec::with_capacity(cap);
-        buf.extend_from_slice(&self.commit_seq.to_le_bytes());
+        append_u64_le(&mut buf, self.commit_seq);
         buf.extend_from_slice(self.patch_object.as_bytes());
         buf.push(self.patch_kind as u8);
         buf.push(has_base);
@@ -566,7 +565,7 @@ impl VersionPointer {
         if data.len() < VERSION_POINTER_MIN_WIRE {
             return None;
         }
-        let commit_seq = u64::from_le_bytes(data[0..8].try_into().ok()?);
+        let commit_seq = read_u64_le(&data[0..8])?;
         let patch_object = ObjectId::from_bytes(data[8..24].try_into().ok()?);
         let patch_kind = PatchKind::from_byte(data[24])?;
         let has_base = data[25];
@@ -672,12 +671,13 @@ impl BloomFilter {
     }
 
     fn double_hash(page_raw: u32) -> (u32, u32) {
-        let bytes = page_raw.to_le_bytes();
+        let mut bytes = [0u8; 4];
+        crate::encoding::write_u32_le(&mut bytes, page_raw).expect("fixed u32 field");
         let h1 = xxhash_rust::xxh3::xxh3_64(&bytes);
         let mut h2 = {
             let digest = blake3::hash(&bytes);
             let b = digest.as_bytes();
-            u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            read_u32_le(&b[..4]).expect("blake3 digest prefix is 4 bytes")
         };
         // A zero step size degenerates double hashing into a single probe.
         if h2 == 0 {
@@ -856,6 +856,7 @@ impl ManifestSegment {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoding::{read_u32_le, read_u64_le};
 
     #[test]
     fn test_object_id_blake3_derivation() {
@@ -1363,6 +1364,86 @@ mod tests {
         let bytes = vp.to_bytes();
         assert_eq!(bytes.len(), VERSION_POINTER_MIN_WIRE);
         assert!(VersionPointer::from_bytes(&bytes).is_some());
+    }
+
+    #[test]
+    fn test_native_ecs_structures_little_endian() {
+        let rec = test_record(64);
+        let bytes = rec.to_bytes();
+        assert_eq!(read_u32_le(&bytes[43..47]), Some(rec.esi));
+        assert_eq!(read_u32_le(&bytes[47..51]), Some(rec.oti.t));
+        let frame_offset = HEADER_BEFORE_DATA + rec.symbol_data.len() + 1;
+        assert_eq!(
+            read_u64_le(&bytes[frame_offset..frame_offset + 8]),
+            Some(rec.frame_xxh3)
+        );
+
+        let vp = make_vp(0x0102_0304_0506_0708, 0xAA, PatchKind::SparseXor);
+        let vp_bytes = vp.to_bytes();
+        assert_eq!(
+            read_u64_le(&vp_bytes[0..8]),
+            Some(0x0102_0304_0506_0708),
+            "version pointer commit_seq must remain little-endian"
+        );
+    }
+
+    #[test]
+    fn test_canonical_encoding_unique() {
+        let rec = test_record(48);
+        let encoded_a = rec.to_bytes();
+        let encoded_b = rec.to_bytes();
+        assert_eq!(
+            encoded_a, encoded_b,
+            "same symbol record must encode identically"
+        );
+
+        let different = make_vp(2, 0x11, PatchKind::FullImage);
+        let different_encoded = different.to_bytes();
+        assert_ne!(
+            encoded_a, different_encoded,
+            "different structures must not share canonical byte encodings"
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_encode_decode() {
+        let oti = test_oti(512);
+        let oti_bytes = oti.to_bytes();
+        let oti_decoded = Oti::from_bytes(&oti_bytes).expect("OTI roundtrip must succeed");
+        assert_eq!(oti, oti_decoded);
+
+        let rec = test_record(128);
+        let rec_bytes = rec.to_bytes();
+        let rec_decoded =
+            SymbolRecord::from_bytes(&rec_bytes).expect("symbol record roundtrip must succeed");
+        assert_eq!(rec, rec_decoded);
+
+        let vp = make_vp(99, 0x55, PatchKind::IntentLog);
+        let vp_bytes = vp.to_bytes();
+        let vp_decoded =
+            VersionPointer::from_bytes(&vp_bytes).expect("version pointer roundtrip must succeed");
+        assert_eq!(vp, vp_decoded);
+    }
+
+    #[test]
+    fn test_no_adhoc_byte_shuffling() {
+        let source = include_str!("ecs.rs");
+        let production = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+        assert!(
+            !production.contains("to_le_bytes("),
+            "production ECS serialization should use canonical helpers"
+        );
+        assert!(
+            !production.contains("from_le_bytes("),
+            "production ECS decoding should use canonical helpers"
+        );
+        assert!(
+            production.contains("append_u32_le")
+                && production.contains("append_u64_le")
+                && production.contains("read_u32_le")
+                && production.contains("read_u64_le"),
+            "expected canonical helper usage markers missing"
+        );
     }
 
     #[test]

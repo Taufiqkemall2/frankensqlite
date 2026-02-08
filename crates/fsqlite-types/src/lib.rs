@@ -1,5 +1,6 @@
 pub mod cx;
 pub mod ecs;
+pub mod encoding;
 pub mod flags;
 pub mod glossary;
 pub mod limits;
@@ -14,12 +15,13 @@ pub use ecs::{
     SymbolRecordError, SymbolRecordFlags,
 };
 pub use glossary::{
-    ArcCache, Budget, CommitCapsule, CommitMarker, CommitProof, CommitSeq, DecodeProof,
-    DependencyEdge, EpochId, IdempotencyKey, IndexId, IntentLog, IntentOp, OTI_WIRE_SIZE, Oti,
-    Outcome, PageHistory, PageVersion, RangeKey, ReadWitness, Region, RemoteCap, RootManifest,
-    RowId, Saga, SchemaEpoch, Snapshot, SymbolAuthMasterKeyCap, SymbolValidityWindow, TableId,
-    TxnEpoch, TxnId, TxnSlot, TxnToken, VersionPointer, WitnessIndexSegment, WitnessKey,
-    WriteWitness,
+    ArcCache, BtreeRef, Budget, ColumnIdx, CommitCapsule, CommitMarker, CommitProof, CommitSeq,
+    DecodeProof, DependencyEdge, EpochId, IdempotencyKey, IndexId, IntentFootprint, IntentLog,
+    IntentOp, IntentOpKind, OTI_WIRE_SIZE, Oti, Outcome, PageHistory, PageVersion, RangeKey,
+    ReadWitness, RebaseBinaryOp, RebaseExpr, RebaseUnaryOp, Region, RemoteCap, RootManifest, RowId,
+    Saga, SchemaEpoch, SemanticKeyKind, SemanticKeyRef, Snapshot, StructuralEffects,
+    SymbolAuthMasterKeyCap, SymbolValidityWindow, TableId, TxnEpoch, TxnId, TxnSlot, TxnToken,
+    VersionPointer, WitnessIndexSegment, WitnessKey, WriteWitness,
 };
 pub use value::SqliteValue;
 
@@ -473,7 +475,7 @@ impl DatabaseHeader {
             return Err(DatabaseHeaderError::InvalidMagic);
         }
 
-        let page_size_raw = u16::from_be_bytes([buf[16], buf[17]]);
+        let page_size_raw = encoding::read_u16_be(&buf[16..18]).expect("fixed u16 field");
         let page_size_u32 = match page_size_raw {
             1 => 65_536,
             0 => return Err(DatabaseHeaderError::InvalidPageSize { raw: page_size_raw }),
@@ -514,12 +516,12 @@ impl DatabaseHeader {
             });
         }
 
-        let change_counter = u32::from_be_bytes([buf[24], buf[25], buf[26], buf[27]]);
-        let page_count = u32::from_be_bytes([buf[28], buf[29], buf[30], buf[31]]);
-        let freelist_trunk = u32::from_be_bytes([buf[32], buf[33], buf[34], buf[35]]);
-        let freelist_count = u32::from_be_bytes([buf[36], buf[37], buf[38], buf[39]]);
-        let schema_cookie = u32::from_be_bytes([buf[40], buf[41], buf[42], buf[43]]);
-        let schema_format = u32::from_be_bytes([buf[44], buf[45], buf[46], buf[47]]);
+        let change_counter = encoding::read_u32_be(&buf[24..28]).expect("fixed u32 field");
+        let page_count = encoding::read_u32_be(&buf[28..32]).expect("fixed u32 field");
+        let freelist_trunk = encoding::read_u32_be(&buf[32..36]).expect("fixed u32 field");
+        let freelist_count = encoding::read_u32_be(&buf[36..40]).expect("fixed u32 field");
+        let schema_cookie = encoding::read_u32_be(&buf[40..44]).expect("fixed u32 field");
+        let schema_format = encoding::read_u32_be(&buf[44..48]).expect("fixed u32 field");
 
         // This project intentionally does not support legacy schema formats.
         // See README: "What We Deliberately Exclude".
@@ -527,10 +529,10 @@ impl DatabaseHeader {
             return Err(DatabaseHeaderError::InvalidSchemaFormat { raw: schema_format });
         }
 
-        let default_cache_size = i32::from_be_bytes([buf[48], buf[49], buf[50], buf[51]]);
-        let largest_root_page = u32::from_be_bytes([buf[52], buf[53], buf[54], buf[55]]);
+        let default_cache_size = encoding::read_i32_be(&buf[48..52]).expect("fixed i32 field");
+        let largest_root_page = encoding::read_u32_be(&buf[52..56]).expect("fixed u32 field");
 
-        let text_encoding_raw = u32::from_be_bytes([buf[56], buf[57], buf[58], buf[59]]);
+        let text_encoding_raw = encoding::read_u32_be(&buf[56..60]).expect("fixed u32 field");
         let text_encoding = match text_encoding_raw {
             1 => TextEncoding::Utf8,
             2 => TextEncoding::Utf16le,
@@ -542,11 +544,11 @@ impl DatabaseHeader {
             }
         };
 
-        let user_version = u32::from_be_bytes([buf[60], buf[61], buf[62], buf[63]]);
-        let incremental_vacuum = u32::from_be_bytes([buf[64], buf[65], buf[66], buf[67]]);
-        let application_id = u32::from_be_bytes([buf[68], buf[69], buf[70], buf[71]]);
-        let version_valid_for = u32::from_be_bytes([buf[92], buf[93], buf[94], buf[95]]);
-        let sqlite_version = u32::from_be_bytes([buf[96], buf[97], buf[98], buf[99]]);
+        let user_version = encoding::read_u32_be(&buf[60..64]).expect("fixed u32 field");
+        let incremental_vacuum = encoding::read_u32_be(&buf[64..68]).expect("fixed u32 field");
+        let application_id = encoding::read_u32_be(&buf[68..72]).expect("fixed u32 field");
+        let version_valid_for = encoding::read_u32_be(&buf[92..96]).expect("fixed u32 field");
+        let sqlite_version = encoding::read_u32_be(&buf[96..100]).expect("fixed u32 field");
 
         Ok(Self {
             page_size,
@@ -640,13 +642,15 @@ impl DatabaseHeader {
         out[..DATABASE_HEADER_MAGIC.len()].copy_from_slice(DATABASE_HEADER_MAGIC);
 
         // Page size (big-endian u16) where 1 encodes 65536.
-        let page_size_be = if self.page_size.get() == 65_536 {
-            1u16.to_be_bytes()
+        let page_size_raw = if self.page_size.get() == 65_536 {
+            1u16
         } else {
             #[allow(clippy::cast_possible_truncation)]
-            (self.page_size.get() as u16).to_be_bytes()
+            {
+                self.page_size.get() as u16
+            }
         };
-        out[16..18].copy_from_slice(&page_size_be);
+        encoding::write_u16_be(&mut out[16..18], page_size_raw).expect("fixed u16 field");
 
         out[18] = self.write_version;
         out[19] = self.read_version;
@@ -657,29 +661,29 @@ impl DatabaseHeader {
         out[22] = 32;
         out[23] = 32;
 
-        out[24..28].copy_from_slice(&self.change_counter.to_be_bytes());
-        out[28..32].copy_from_slice(&self.page_count.to_be_bytes());
-        out[32..36].copy_from_slice(&self.freelist_trunk.to_be_bytes());
-        out[36..40].copy_from_slice(&self.freelist_count.to_be_bytes());
-        out[40..44].copy_from_slice(&self.schema_cookie.to_be_bytes());
-        out[44..48].copy_from_slice(&self.schema_format.to_be_bytes());
-        out[48..52].copy_from_slice(&self.default_cache_size.to_be_bytes());
-        out[52..56].copy_from_slice(&self.largest_root_page.to_be_bytes());
+        encoding::write_u32_be(&mut out[24..28], self.change_counter).expect("fixed u32 field");
+        encoding::write_u32_be(&mut out[28..32], self.page_count).expect("fixed u32 field");
+        encoding::write_u32_be(&mut out[32..36], self.freelist_trunk).expect("fixed u32 field");
+        encoding::write_u32_be(&mut out[36..40], self.freelist_count).expect("fixed u32 field");
+        encoding::write_u32_be(&mut out[40..44], self.schema_cookie).expect("fixed u32 field");
+        encoding::write_u32_be(&mut out[44..48], self.schema_format).expect("fixed u32 field");
+        encoding::write_i32_be(&mut out[48..52], self.default_cache_size).expect("fixed i32 field");
+        encoding::write_u32_be(&mut out[52..56], self.largest_root_page).expect("fixed u32 field");
 
         let text_encoding_u32 = match self.text_encoding {
             TextEncoding::Utf8 => 1u32,
             TextEncoding::Utf16le => 2u32,
             TextEncoding::Utf16be => 3u32,
         };
-        out[56..60].copy_from_slice(&text_encoding_u32.to_be_bytes());
+        encoding::write_u32_be(&mut out[56..60], text_encoding_u32).expect("fixed u32 field");
 
-        out[60..64].copy_from_slice(&self.user_version.to_be_bytes());
-        out[64..68].copy_from_slice(&self.incremental_vacuum.to_be_bytes());
-        out[68..72].copy_from_slice(&self.application_id.to_be_bytes());
+        encoding::write_u32_be(&mut out[60..64], self.user_version).expect("fixed u32 field");
+        encoding::write_u32_be(&mut out[64..68], self.incremental_vacuum).expect("fixed u32 field");
+        encoding::write_u32_be(&mut out[68..72], self.application_id).expect("fixed u32 field");
 
         // Bytes 72..92 are reserved for future expansion. We always write zeros.
-        out[92..96].copy_from_slice(&self.version_valid_for.to_be_bytes());
-        out[96..100].copy_from_slice(&self.sqlite_version.to_be_bytes());
+        encoding::write_u32_be(&mut out[92..96], self.version_valid_for).expect("fixed u32 field");
+        encoding::write_u32_be(&mut out[96..100], self.sqlite_version).expect("fixed u32 field");
 
         Ok(())
     }

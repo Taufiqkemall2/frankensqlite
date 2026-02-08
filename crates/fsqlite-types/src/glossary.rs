@@ -7,6 +7,9 @@
 use std::fmt;
 use std::num::NonZeroU64;
 
+use crate::encoding::{
+    append_u16_le, append_u32_le, append_u64_le, read_u16_le, read_u32_le, read_u64_le,
+};
 use crate::{ObjectId, PageData, PageNumber};
 
 /// Monotonically increasing transaction identifier.
@@ -260,12 +263,15 @@ impl Oti {
     /// Serialize to canonical little-endian bytes.
     #[must_use]
     pub fn to_bytes(self) -> [u8; OTI_WIRE_SIZE] {
+        let mut as_vec = Vec::with_capacity(OTI_WIRE_SIZE);
+        append_u64_le(&mut as_vec, self.f);
+        append_u16_le(&mut as_vec, self.al);
+        append_u32_le(&mut as_vec, self.t);
+        append_u32_le(&mut as_vec, self.z);
+        append_u32_le(&mut as_vec, self.n);
+
         let mut buf = [0u8; OTI_WIRE_SIZE];
-        buf[0..8].copy_from_slice(&self.f.to_le_bytes());
-        buf[8..10].copy_from_slice(&self.al.to_le_bytes());
-        buf[10..14].copy_from_slice(&self.t.to_le_bytes());
-        buf[14..18].copy_from_slice(&self.z.to_le_bytes());
-        buf[18..22].copy_from_slice(&self.n.to_le_bytes());
+        buf.copy_from_slice(&as_vec);
         buf
     }
 
@@ -278,11 +284,11 @@ impl Oti {
             return None;
         }
         Some(Self {
-            f: u64::from_le_bytes(data[0..8].try_into().ok()?),
-            al: u16::from_le_bytes(data[8..10].try_into().ok()?),
-            t: u32::from_le_bytes(data[10..14].try_into().ok()?),
-            z: u32::from_le_bytes(data[14..18].try_into().ok()?),
-            n: u32::from_le_bytes(data[18..22].try_into().ok()?),
+            f: read_u64_le(&data[0..8])?,
+            al: read_u16_le(&data[8..10])?,
+            t: read_u32_le(&data[10..14])?,
+            z: read_u32_le(&data[14..18])?,
+            n: read_u32_le(&data[18..22])?,
         })
     }
 }
@@ -450,10 +456,34 @@ pub struct CommitProof {
 #[repr(transparent)]
 pub struct TableId(u32);
 
+impl TableId {
+    #[inline]
+    pub const fn new(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    #[inline]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
 /// Identifier for an index b-tree root (logical, not physical file page).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[repr(transparent)]
 pub struct IndexId(u32);
+
+impl IndexId {
+    #[inline]
+    pub const fn new(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    #[inline]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
 
 /// RowId / INTEGER PRIMARY KEY key space (SQLite uses signed 64-bit).
 #[derive(
@@ -462,9 +492,251 @@ pub struct IndexId(u32);
 #[repr(transparent)]
 pub struct RowId(i64);
 
-/// Semantic operation log entry used for deterministic rebase.
+impl RowId {
+    /// Maximum RowId value: 2^63 - 1.
+    pub const MAX: Self = Self(i64::MAX);
+
+    #[inline]
+    pub const fn new(raw: i64) -> Self {
+        Self(raw)
+    }
+
+    #[inline]
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+}
+
+/// Column index within a table (0-based).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[repr(transparent)]
+pub struct ColumnIdx(u32);
+
+impl ColumnIdx {
+    #[inline]
+    pub const fn new(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    #[inline]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §5.10.1 Intent Logs — Semantic Operations + Footprints
+// ---------------------------------------------------------------------------
+
+/// Reference to a B-tree (either table or index).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum BtreeRef {
+    Table(TableId),
+    Index(IndexId),
+}
+
+/// Kind of semantic key reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum SemanticKeyKind {
+    TableRow,
+    IndexEntry,
+}
+
+/// Semantic key reference with a stable BLAKE3-based digest.
+///
+/// `key_digest = Trunc128(BLAKE3("fsqlite:btree:key:v1" || kind || btree_id || canonical_key_bytes))`
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct SemanticKeyRef {
+    pub btree: BtreeRef,
+    pub kind: SemanticKeyKind,
+    pub key_digest: [u8; 16],
+}
+
+impl SemanticKeyRef {
+    /// Domain separation prefix for the key digest.
+    const DOMAIN_SEP: &'static [u8] = b"fsqlite:btree:key:v1";
+
+    /// Compute the key digest from kind, btree id, and canonical key bytes.
+    #[must_use]
+    pub fn compute_digest(
+        kind: SemanticKeyKind,
+        btree: BtreeRef,
+        canonical_key_bytes: &[u8],
+    ) -> [u8; 16] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(Self::DOMAIN_SEP);
+        hasher.update(&[match kind {
+            SemanticKeyKind::TableRow => 0,
+            SemanticKeyKind::IndexEntry => 1,
+        }]);
+        match btree {
+            BtreeRef::Table(id) => {
+                hasher.update(&[0]);
+                hasher.update(&id.get().to_le_bytes());
+            }
+            BtreeRef::Index(id) => {
+                hasher.update(&[1]);
+                hasher.update(&id.get().to_le_bytes());
+            }
+        }
+        hasher.update(canonical_key_bytes);
+        let hash = hasher.finalize();
+        let bytes = hash.as_bytes();
+        let mut digest = [0u8; 16];
+        digest.copy_from_slice(&bytes[..16]);
+        digest
+    }
+
+    /// Construct a `SemanticKeyRef` by computing the digest.
+    #[must_use]
+    pub fn new(btree: BtreeRef, kind: SemanticKeyKind, canonical_key_bytes: &[u8]) -> Self {
+        let key_digest = Self::compute_digest(kind, btree, canonical_key_bytes);
+        Self {
+            btree,
+            kind,
+            key_digest,
+        }
+    }
+}
+
+bitflags::bitflags! {
+    /// Structural side effects that make operations non-commutative.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct StructuralEffects: u32 {
+        /// No structural effects (simple leaf operations).
+        const NONE = 0;
+        /// A B-tree page was split.
+        const PAGE_SPLIT = 1;
+        /// A B-tree page was merged.
+        const PAGE_MERGE = 2;
+        /// Multi-page balance operation.
+        const BALANCE_MULTI_PAGE = 4;
+        /// An overflow page was allocated.
+        const OVERFLOW_ALLOC = 8;
+        /// An overflow chain was mutated.
+        const OVERFLOW_MUTATE = 16;
+        /// The freelist was modified.
+        const FREELIST_MUTATE = 32;
+        /// The pointer map was modified.
+        const POINTER_MAP_MUTATE = 64;
+        /// Cells were moved during defragmentation.
+        const DEFRAG_MOVE_CELLS = 128;
+    }
+}
+
+impl serde::Serialize for StructuralEffects {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.bits().serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for StructuralEffects {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let bits = u32::deserialize(deserializer)?;
+        Self::from_bits(bits).ok_or_else(|| {
+            serde::de::Error::custom(format!("invalid StructuralEffects bits: {bits:#x}"))
+        })
+    }
+}
+
+impl Default for StructuralEffects {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+/// Semantic read/write footprint of an intent operation (§5.10.1).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum IntentOp {
+pub struct IntentFootprint {
+    pub reads: Vec<SemanticKeyRef>,
+    pub writes: Vec<SemanticKeyRef>,
+    pub structural: StructuralEffects,
+}
+
+impl IntentFootprint {
+    /// Create an empty footprint with no effects.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            reads: Vec::new(),
+            writes: Vec::new(),
+            structural: StructuralEffects::NONE,
+        }
+    }
+}
+
+impl Default for IntentFootprint {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+/// Replayable expression AST for deterministic rebase (§5.10.1).
+///
+/// Allowed forms are intentionally strict: only proven-deterministic
+/// expressions may appear. Enforced by `expr_is_rebase_safe()`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum RebaseExpr {
+    /// Reference to a column in the current row.
+    ColumnRef(ColumnIdx),
+    /// A literal value.
+    Literal(crate::SqliteValue),
+    /// A unary operation.
+    UnaryOp {
+        op: RebaseUnaryOp,
+        operand: Box<Self>,
+    },
+    /// A binary operation.
+    BinaryOp {
+        op: RebaseBinaryOp,
+        left: Box<Self>,
+        right: Box<Self>,
+    },
+    /// A deterministic function call.
+    FunctionCall { name: String, args: Vec<Self> },
+    /// CAST(expr AS type).
+    Cast { expr: Box<Self>, type_name: String },
+    /// CASE WHEN ... THEN ... ELSE ... END.
+    Case {
+        operand: Option<Box<Self>>,
+        when_clauses: Vec<(Self, Self)>,
+        else_clause: Option<Box<Self>>,
+    },
+    /// COALESCE(expr, expr, ...).
+    Coalesce(Vec<Self>),
+    /// NULLIF(expr, expr).
+    NullIf { left: Box<Self>, right: Box<Self> },
+    /// String concatenation (||).
+    Concat { left: Box<Self>, right: Box<Self> },
+}
+
+/// Unary operators allowed in rebase expressions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum RebaseUnaryOp {
+    Negate,
+    BitwiseNot,
+    Not,
+}
+
+/// Binary operators allowed in rebase expressions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum RebaseBinaryOp {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Remainder,
+    BitwiseAnd,
+    BitwiseOr,
+    ShiftLeft,
+    ShiftRight,
+}
+
+/// The kind of semantic operation in an intent log entry.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum IntentOpKind {
     Insert {
         table: TableId,
         key: RowId,
@@ -489,9 +761,23 @@ pub enum IntentOp {
         key: Vec<u8>,
         rowid: RowId,
     },
+    /// Column-level rebase expressions for deterministic rebase (§5.10.1).
+    UpdateExpression {
+        table: TableId,
+        key: RowId,
+        column_updates: Vec<(ColumnIdx, RebaseExpr)>,
+    },
 }
 
-/// Transaction intent log.
+/// A single entry in the transaction intent log (§5.10.1).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct IntentOp {
+    pub schema_epoch: u64,
+    pub footprint: IntentFootprint,
+    pub op: IntentOpKind,
+}
+
+/// Transaction intent log: an ordered sequence of semantic operations.
 pub type IntentLog = Vec<IntentOp>;
 
 /// History of versions for a page, used by debugging and invariant checks.
@@ -707,6 +993,16 @@ mod tests {
         assert_debug_clone::<TableId>();
         assert_debug_clone::<IndexId>();
         assert_debug_clone::<RowId>();
+        assert_debug_clone::<ColumnIdx>();
+        assert_debug_clone::<BtreeRef>();
+        assert_debug_clone::<SemanticKeyKind>();
+        assert_debug_clone::<SemanticKeyRef>();
+        assert_debug_clone::<StructuralEffects>();
+        assert_debug_clone::<IntentFootprint>();
+        assert_debug_clone::<RebaseExpr>();
+        assert_debug_clone::<RebaseUnaryOp>();
+        assert_debug_clone::<RebaseBinaryOp>();
+        assert_debug_clone::<IntentOpKind>();
         assert_debug_clone::<IntentOp>();
         assert_debug_clone::<PageHistory>();
         assert_debug_clone::<ArcCache>();

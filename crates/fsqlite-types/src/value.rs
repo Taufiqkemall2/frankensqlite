@@ -7,7 +7,7 @@ use crate::TypeAffinity;
 ///
 /// Corresponds to C SQLite's `sqlite3_value` / `Mem` type. SQLite has five
 /// fundamental storage classes: NULL, INTEGER, REAL, TEXT, and BLOB.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum SqliteValue {
     /// SQL NULL.
     Null,
