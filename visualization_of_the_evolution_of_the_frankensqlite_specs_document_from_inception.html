@@ -474,27 +474,49 @@
         }
         .legend-overlay.active { opacity: 1; pointer-events: auto; }
         .legend-card {
-            width: min(520px, 92vw);
+            width: min(760px, 92vw);
             background: var(--bg-surface-2);
             border: 1px solid var(--border);
             border-radius: var(--radius-lg);
-            padding: 20px;
+            padding: 24px;
             box-shadow: 0 24px 60px rgba(0,0,0,0.6);
         }
         .legend-grid {
             display: grid;
             grid-template-columns: repeat(2, minmax(0, 1fr));
-            gap: 10px;
+            gap: 12px;
         }
         .legend-item {
             display: flex;
-            align-items: center;
-            gap: 10px;
-            padding: 10px 10px;
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 6px;
+            padding: 12px;
             border: 1px solid var(--border);
             border-radius: var(--radius-sm);
             background: rgba(255,255,255,0.02);
-            font-size: 13px;
+            transition: border-color 0.2s ease, background 0.2s ease;
+        }
+        .legend-item:hover {
+            border-color: var(--border-hover);
+            background: rgba(255,255,255,0.04);
+        }
+        .legend-item-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .legend-item-name {
+            font-weight: 700;
+            color: var(--text-1);
+            font-family: var(--font-mono);
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        .legend-item-desc {
+            font-size: 11px;
+            line-height: 1.5;
             color: var(--text-2);
         }
         .legend-dot {
@@ -503,6 +525,13 @@
             border-radius: 999px;
             box-shadow: 0 0 12px rgba(0,0,0,0.4);
             flex-shrink: 0;
+        }
+
+        /* Responsive Legend */
+        @media (max-width: 640px) {
+            .legend-grid {
+                grid-template-columns: 1fr;
+            }
         }
 
         /* --- Focus Mode --- */
@@ -779,11 +808,16 @@
 
     const DB_URL = "spec_evolution_v1.sqlite3";
     const BUCKETS = [
-        { id: 1, name: "Logic", color: "#39ff14" }, { id: 2, name: "SQLite", color: "#adff2f" },
-        { id: 3, name: "Async", color: "#00ff00" }, { id: 4, name: "Arch", color: "#ff003c" },
-        { id: 5, name: "Meta", color: "#71717a" }, { id: 6, name: "Context", color: "#d946ef" },
-        { id: 7, name: "Eng", color: "#06b6d4" }, { id: 8, name: "Math", color: "#8b5cf6" },
-        { id: 9, name: "Clarify", color: "#14b8a6" }, { id: 10, name: "Other", color: "#52525b" }
+        { id: 1, name: "Logic", color: "#39ff14", desc: "Fixing mistakes in logic, math, or reasoning." },
+        { id: 2, name: "SQLite", color: "#adff2f", desc: "Correcting inaccurate statements about the legacy SQLite codebase." },
+        { id: 3, name: "Async", color: "#00ff00", desc: "Correcting inaccurate statements about the asupersync library." },
+        { id: 4, name: "Arch", color: "#ff003c", desc: "Fixing conceptual errors or architectural mistakes." },
+        { id: 5, name: "Meta", color: "#71717a", desc: "Ministerial/scrivening fixes (renumbering, references, etc.)." },
+        { id: 6, name: "Context", color: "#d946ef", desc: "Adding background information or context for completeness." },
+        { id: 7, name: "Eng", color: "#06b6d4", desc: "Standard computer engineering improvements (cache, concurrency, etc.)." },
+        { id: 8, name: "Math", color: "#8b5cf6", desc: "Application of esoteric math and advanced 'alien artifact' theory." },
+        { id: 9, name: "Clarify", color: "#14b8a6", desc: "Further elaboration or clarification without substantive changes." },
+        { id: 10, name: "Other", color: "#52525b", desc: "General changes that don't fit into specific categories." }
     ];
 
     let DB = null;
@@ -980,8 +1014,11 @@
         const grid = document.getElementById("legendGrid");
         grid.innerHTML = BUCKETS.map(b => `
             <div class="legend-item">
-                <div class="legend-dot" style="background: ${b.color}"></div>
-                <span>${b.name}</span>
+                <div class="legend-item-header">
+                    <div class="legend-dot" style="background: ${b.color}"></div>
+                    <span class="legend-item-name">${b.name}</span>
+                </div>
+                <div class="legend-item-desc">${b.desc}</div>
             </div>
         `).join("");
         

@@ -14,8 +14,8 @@ use parking_lot::{Mutex, RwLock};
 use smallvec::SmallVec;
 
 use fsqlite_types::{
-    CommitSeq, IntentLog, PageNumber, PageSize, PageVersion, Snapshot, TxnEpoch, TxnId, TxnSlot,
-    TxnToken, WitnessKey,
+    CommitSeq, IntentLog, PageData, PageNumber, PageSize, PageVersion, Snapshot, TxnEpoch, TxnId,
+    TxnSlot, TxnToken, WitnessKey,
 };
 
 // ---------------------------------------------------------------------------
@@ -330,6 +330,8 @@ pub struct Transaction {
     pub snapshot: Snapshot,
     pub snapshot_established: bool,
     pub write_set: Vec<PageNumber>,
+    /// Maps each page in the write set to its current data.
+    pub write_set_data: HashMap<PageNumber, PageData>,
     pub intent_log: IntentLog,
     pub page_locks: HashSet<PageNumber>,
     pub state: TransactionState,
@@ -363,6 +365,7 @@ impl Transaction {
             snapshot,
             snapshot_established: true,
             write_set: Vec::new(),
+            write_set_data: HashMap::new(),
             intent_log: Vec::new(),
             page_locks: HashSet::new(),
             state: TransactionState::Active,

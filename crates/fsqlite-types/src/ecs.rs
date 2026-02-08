@@ -554,7 +554,7 @@ impl VersionPointer {
         buf.extend_from_slice(self.patch_object.as_bytes());
         buf.push(self.patch_kind as u8);
         buf.push(has_base);
-        if let Some(ref base) = self.base_hint {
+        if let Some(base) = self.base_hint {
             buf.extend_from_slice(base.as_bytes());
         }
         buf
@@ -674,11 +674,15 @@ impl BloomFilter {
     fn double_hash(page_raw: u32) -> (u32, u32) {
         let bytes = page_raw.to_le_bytes();
         let h1 = xxhash_rust::xxh3::xxh3_64(&bytes);
-        let h2 = {
+        let mut h2 = {
             let digest = blake3::hash(&bytes);
             let b = digest.as_bytes();
             u32::from_le_bytes([b[0], b[1], b[2], b[3]])
         };
+        // A zero step size degenerates double hashing into a single probe.
+        if h2 == 0 {
+            h2 = 1;
+        }
         #[allow(clippy::cast_possible_truncation)]
         let h1_trunc = h1 as u32;
         (h1_trunc, h2)
@@ -696,13 +700,17 @@ pub struct PageVersionIndexSegment {
     /// Inclusive end of the commit range covered.
     pub end_seq: u64,
     /// Sorted entries mapping page numbers to version pointers.
+    ///
+    /// Sorted by `(page_number, commit_seq)` ascending. Multiple entries per
+    /// page are allowed (a page may be updated multiple times within the
+    /// segment's commit range).
     pub entries: Vec<(crate::PageNumber, VersionPointer)>,
     /// Bloom filter for fast "not present" checks.
     pub bloom: BloomFilter,
 }
 
 impl PageVersionIndexSegment {
-    /// Create a new segment from entries. Sorts entries by page number and
+    /// Create a new segment from entries. Sorts entries by `(page, commit_seq)` and
     /// builds the bloom filter automatically.
     #[must_use]
     pub fn new(
@@ -710,7 +718,7 @@ impl PageVersionIndexSegment {
         end_seq: u64,
         mut entries: Vec<(crate::PageNumber, VersionPointer)>,
     ) -> Self {
-        entries.sort_by_key(|(pgno, _)| pgno.get());
+        entries.sort_by_key(|(pgno, vp)| (pgno.get(), vp.commit_seq));
 
         #[allow(clippy::cast_possible_truncation)]
         let count = entries.len() as u32;
@@ -737,18 +745,26 @@ impl PageVersionIndexSegment {
         if !self.bloom.maybe_contains(page) {
             return None;
         }
-        // Binary search on sorted entries
-        self.entries
-            .binary_search_by_key(&page.get(), |(pgno, _)| pgno.get())
-            .ok()
-            .and_then(|idx| {
-                let (_, ref vp) = self.entries[idx];
-                if vp.commit_seq <= snapshot_high {
-                    Some(vp)
-                } else {
-                    None
-                }
-            })
+
+        let page_raw = page.get();
+        let start = self
+            .entries
+            .partition_point(|(pgno, _)| pgno.get() < page_raw);
+        let end = self
+            .entries
+            .partition_point(|(pgno, _)| pgno.get() <= page_raw);
+        let slice = self.entries.get(start..end)?;
+        if slice.is_empty() {
+            return None;
+        }
+
+        // Find the newest commit_seq <= snapshot_high.
+        let idx = slice.partition_point(|(_, vp)| vp.commit_seq <= snapshot_high);
+        if idx == 0 {
+            None
+        } else {
+            Some(&slice[idx - 1].1)
+        }
     }
 }
 
@@ -1161,6 +1177,200 @@ mod tests {
     #[test]
     fn test_oti_from_bytes_too_short() {
         assert!(Oti::from_bytes(&[0u8; 10]).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // §3.6 Native Index Types tests
+    // -----------------------------------------------------------------------
+
+    fn make_oid(seed: u8) -> ObjectId {
+        ObjectId::from_bytes([seed; 16])
+    }
+
+    fn make_page(n: u32) -> crate::PageNumber {
+        crate::PageNumber::new(n).expect("non-zero")
+    }
+
+    fn make_vp(seq: u64, seed: u8, kind: PatchKind) -> VersionPointer {
+        VersionPointer {
+            commit_seq: seq,
+            patch_object: make_oid(seed),
+            patch_kind: kind,
+            base_hint: None,
+        }
+    }
+
+    #[test]
+    fn test_version_pointer_serialization_roundtrip() {
+        for kind in [
+            PatchKind::FullImage,
+            PatchKind::IntentLog,
+            PatchKind::SparseXor,
+        ] {
+            let vp = VersionPointer {
+                commit_seq: 42,
+                patch_object: make_oid(0xAA),
+                patch_kind: kind,
+                base_hint: None,
+            };
+            let bytes = vp.to_bytes();
+            let vp2 = VersionPointer::from_bytes(&bytes).unwrap();
+            assert_eq!(vp, vp2);
+
+            let vp_with_base = VersionPointer {
+                base_hint: Some(make_oid(0xBB)),
+                ..vp
+            };
+            let bytes2 = vp_with_base.to_bytes();
+            let vp3 = VersionPointer::from_bytes(&bytes2).unwrap();
+            assert_eq!(vp_with_base, vp3);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn test_page_version_index_segment_lookup() {
+        let entries: Vec<_> = (1..=50u32)
+            .map(|i| {
+                let pgno = make_page(i);
+                let vp = make_vp(u64::from(i) + 10, i as u8, PatchKind::FullImage);
+                (pgno, vp)
+            })
+            .collect();
+
+        let seg = PageVersionIndexSegment::new(10, 60, entries);
+
+        let result = seg.lookup(make_page(25), 60);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().commit_seq, 35);
+
+        assert!(seg.lookup(make_page(25), 30).is_none());
+        assert!(seg.lookup(make_page(99), 60).is_none());
+    }
+
+    #[test]
+    fn test_page_version_index_segment_lookup_picks_latest_leq_snapshot() {
+        let page = make_page(7);
+        let vp10 = make_vp(10, 0x10, PatchKind::FullImage);
+        let vp15 = make_vp(15, 0x20, PatchKind::IntentLog);
+        let vp20 = make_vp(20, 0x30, PatchKind::SparseXor);
+        let seg =
+            PageVersionIndexSegment::new(10, 20, vec![(page, vp10), (page, vp15), (page, vp20)]);
+
+        assert!(seg.lookup(page, 9).is_none());
+        assert_eq!(seg.lookup(page, 10), Some(&vp10));
+        assert_eq!(seg.lookup(page, 14), Some(&vp10));
+        assert_eq!(seg.lookup(page, 15), Some(&vp15));
+        assert_eq!(seg.lookup(page, 19), Some(&vp15));
+        assert_eq!(seg.lookup(page, 20), Some(&vp20));
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn test_page_version_index_segment_bloom_filter() {
+        let entries: Vec<_> = (1..=100u32)
+            .map(|i| {
+                (
+                    make_page(i),
+                    make_vp(u64::from(i), i as u8, PatchKind::FullImage),
+                )
+            })
+            .collect();
+        let seg = PageVersionIndexSegment::new(1, 100, entries);
+
+        // Zero false negatives
+        for i in 1..=100u32 {
+            assert!(
+                seg.bloom.maybe_contains(make_page(i)),
+                "bloom must not have false negatives for page {i}"
+            );
+        }
+
+        // False positive rate check
+        let mut false_positives = 0u32;
+        for i in 101..=1100u32 {
+            if seg.bloom.maybe_contains(make_page(i)) {
+                false_positives += 1;
+            }
+        }
+        let fp_rate = f64::from(false_positives) / 1000.0;
+        assert!(fp_rate < 0.05, "bloom FP rate {fp_rate:.3} exceeds 5%");
+    }
+
+    #[test]
+    fn test_object_locator_segment_rebuild() {
+        let pairs = vec![
+            (make_oid(1), vec![SymbolLogOffset(0), SymbolLogOffset(100)]),
+            (make_oid(2), vec![SymbolLogOffset(200)]),
+            (
+                make_oid(3),
+                vec![SymbolLogOffset(300), SymbolLogOffset(400)],
+            ),
+        ];
+        let seg = ObjectLocatorSegment::new(pairs);
+
+        let scan_pairs = vec![
+            (make_oid(1), SymbolLogOffset(100)),
+            (make_oid(3), SymbolLogOffset(300)),
+            (make_oid(1), SymbolLogOffset(0)),
+            (make_oid(2), SymbolLogOffset(200)),
+            (make_oid(3), SymbolLogOffset(400)),
+        ];
+        let rebuilt = ObjectLocatorSegment::rebuild_from_scan(scan_pairs);
+
+        assert_eq!(seg.lookup(&make_oid(1)), rebuilt.lookup(&make_oid(1)));
+        assert_eq!(seg.lookup(&make_oid(2)), rebuilt.lookup(&make_oid(2)));
+        assert_eq!(seg.lookup(&make_oid(3)), rebuilt.lookup(&make_oid(3)));
+        assert!(seg.lookup(&make_oid(99)).is_none());
+    }
+
+    #[test]
+    fn test_manifest_segment_bootstrap() {
+        let seg = ManifestSegment::new(vec![
+            (1, 100, make_oid(0x10)),
+            (101, 200, make_oid(0x20)),
+            (201, 300, make_oid(0x30)),
+        ]);
+
+        assert_eq!(seg.lookup(50), Some(&make_oid(0x10)));
+        assert_eq!(seg.lookup(100), Some(&make_oid(0x10)));
+        assert_eq!(seg.lookup(101), Some(&make_oid(0x20)));
+        assert_eq!(seg.lookup(250), Some(&make_oid(0x30)));
+        assert_eq!(seg.lookup(300), Some(&make_oid(0x30)));
+        assert!(seg.lookup(0).is_none());
+        assert!(seg.lookup(301).is_none());
+    }
+
+    #[test]
+    fn test_version_pointer_references_content_addressed() {
+        let vp = make_vp(42, 0xCC, PatchKind::FullImage);
+        assert_eq!(vp.patch_object.as_bytes().len(), ObjectId::LEN);
+    }
+
+    #[test]
+    fn test_patch_kind_from_byte() {
+        assert_eq!(PatchKind::from_byte(0), Some(PatchKind::FullImage));
+        assert_eq!(PatchKind::from_byte(1), Some(PatchKind::IntentLog));
+        assert_eq!(PatchKind::from_byte(2), Some(PatchKind::SparseXor));
+        assert!(PatchKind::from_byte(3).is_none());
+        assert!(PatchKind::from_byte(255).is_none());
+    }
+
+    #[test]
+    fn test_version_pointer_too_short() {
+        assert!(VersionPointer::from_bytes(&[0u8; 10]).is_none());
+        let vp = make_vp(1, 1, PatchKind::FullImage);
+        let bytes = vp.to_bytes();
+        assert_eq!(bytes.len(), VERSION_POINTER_MIN_WIRE);
+        assert!(VersionPointer::from_bytes(&bytes).is_some());
+    }
+
+    #[test]
+    fn test_symbol_log_offset_ordering() {
+        let a = SymbolLogOffset::new(10);
+        let b = SymbolLogOffset::new(20);
+        assert!(a < b);
+        assert_eq!(a.get(), 10);
     }
 }
 

@@ -5,6 +5,7 @@
 
 pub mod core_types;
 pub mod invariants;
+pub mod lifecycle;
 pub mod witness_hierarchy;
 
 pub use core_types::{
@@ -14,6 +15,7 @@ pub use core_types::{
 pub use invariants::{
     SerializedWriteMutex, TxnManager, VersionStore, idx_to_version_pointer, visible,
 };
+pub use lifecycle::{BeginKind, CommitResponse, MvccError, Savepoint, TransactionManager};
 pub use witness_hierarchy::{
     HotWitnessIndexDerivationV1, HotWitnessIndexSizingV1, WitnessHierarchyConfigV1,
     WitnessHotIndexManifestV1, WitnessSizingError,

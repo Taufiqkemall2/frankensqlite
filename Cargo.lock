@@ -353,6 +353,7 @@ dependencies = [
  "fsqlite-error",
  "parking_lot",
  "proptest",
+ "serde_json",
  "tempfile",
 ]
 
@@ -434,7 +435,6 @@ name = "fsqlite-wal"
 version = "0.1.0"
 dependencies = [
  "fsqlite-error",
- "fsqlite-pager",
  "fsqlite-types",
  "fsqlite-vfs",
 ]
