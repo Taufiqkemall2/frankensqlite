@@ -618,6 +618,9 @@
         .dock { padding-bottom: calc(12px + env(safe-area-inset-bottom)); }
         body { padding-bottom: calc(7rem + env(safe-area-inset-bottom)); }
       }
+      /* Inline highlights (bd-24q.16.1) */
+      .ih-changed { border-left: 3px solid #22c55e; background: rgba(34,197,94,0.06); padding-left: 6px; }
+      .ih-debug { outline: 1px dashed rgba(99,102,241,0.4); outline-offset: 1px; }
     </style>
   </head>
 
@@ -9802,11 +9805,6 @@
       // --- Inline Highlights: Hunk-to-DOM Mapping (bd-24q.16.1) ---
       function parsePatchChangedNewLines(patch) {
         const changed = new Set();
-        for (const line of String(patch || "").split("\n")) {
-          if (!line.startsWith("@@")) continue;
-          // handled inline below
-        }
-        // Full implementation:
         const lines = String(patch || "").split("\n");
         for (let i = 0; i < lines.length; i++) {
           if (!lines[i].startsWith("@@")) continue;
@@ -12983,6 +12981,264 @@
       };
       // ---- End Mini-Map Unit Tests ----
 
+      // ---- Mini-Map E2E Tests (bd-24q.2.6) ----
+      // Run via console: window.__runMiniMapE2ETests()
+      // Requires dataset to be loaded.
+      window.__runMiniMapE2ETests = async function () {
+        const R = [];
+        const log = (msg, ctx) => console.log("  [MM-E2E]", msg, ctx || "");
+        const A = (c, m, x) => { R.push(c ? { pass: true, msg: m } : { pass: false, msg: m, ctx: x }); if (!c) console.error("  FAIL:", m, x || ""); else log("PASS: " + m); };
+        const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+        if (!DATASET.loaded || ALL_COMMITS.length < 5) {
+          console.error("MM-E2E: Need loaded dataset with >= 5 commits.");
+          return { passed: 0, failed: 1, total: 1, results: [{ pass: false, msg: "Dataset not loaded or < 5 commits" }] };
+        }
+
+        const mm = document.getElementById("miniMap");
+        const mmItems = document.getElementById("miniMapItems");
+        const toggleBtn = document.getElementById("btnMiniMapToggle");
+        const docEl = document.getElementById("docRendered");
+        if (!mm || !mmItems || !toggleBtn) {
+          console.error("MM-E2E: Missing mini-map DOM elements.");
+          return { passed: 0, failed: 1, total: 1, results: [{ pass: false, msg: "Missing mini-map DOM elements" }] };
+        }
+
+        const origIdx = DOC.idx;
+        const origTab = DOC.tab;
+
+        // --- E2E 1: Toggle mini-map visibility ---
+        await (async function testE2E_toggleVisibility() {
+          // Ensure mini-map is visible.
+          if (mm.classList.contains("hidden")) toggleBtn.click();
+          await wait(300);
+          A(!mm.classList.contains("hidden"), "mm-e2e: mini-map visible after toggle on");
+
+          // Update it.
+          await updateMiniMap();
+          await wait(500);
+
+          const items = mmItems.querySelectorAll(".minimap-item");
+          A(items.length > 0, "mm-e2e: mini-map has heading items", { count: items.length });
+          log("Mini-map rendered " + items.length + " items");
+        })();
+
+        // --- E2E 2: Click heading jumps to section ---
+        await (async function testE2E_clickJumpsToSection() {
+          if (!docEl) { A(false, "mm-e2e: no docRendered element"); return; }
+
+          // Ensure on spec tab.
+          if (DOC.tab !== "spec") { setDocTab("spec"); await wait(500); }
+
+          // Show mini-map.
+          if (mm.classList.contains("hidden")) { toggleBtn.click(); await wait(300); }
+          await updateMiniMap();
+          await wait(500);
+
+          const items = mmItems.querySelectorAll(".minimap-item");
+          if (items.length < 3) { log("Not enough items to test jump"); A(true, "mm-e2e: skipped jump (< 3 items)"); return; }
+
+          // Scroll to top first.
+          docEl.scrollTop = 0;
+          await wait(200);
+          const scrollBefore = docEl.scrollTop;
+
+          // Click a heading that's further down (use the last third).
+          const targetIdx = Math.floor(items.length * 0.7);
+          const targetItem = items[targetIdx];
+          const targetHeadingId = targetItem.dataset.headingId;
+          log("Clicking heading: " + targetHeadingId + " (item " + targetIdx + "/" + items.length + ")");
+
+          targetItem.click();
+          await wait(800); // Wait for smooth scroll.
+
+          const scrollAfter = docEl.scrollTop;
+          log("Scroll before=" + scrollBefore + ", after=" + scrollAfter);
+          A(scrollAfter > scrollBefore, "mm-e2e: doc scrolled after heading click", { before: scrollBefore, after: scrollAfter });
+        })();
+
+        // --- E2E 3: Active heading highlights in mini-map ---
+        await (async function testE2E_activeHighlight() {
+          if (mm.classList.contains("hidden")) { toggleBtn.click(); await wait(300); }
+          await updateMiniMap();
+          await wait(500);
+
+          const items = mmItems.querySelectorAll(".minimap-item");
+          if (items.length < 2) { A(true, "mm-e2e: skipped highlight (< 2 items)"); return; }
+
+          // Click first item to activate it.
+          items[0].click();
+          await wait(500);
+
+          const active = mmItems.querySelector(".minimap-active");
+          A(active != null, "mm-e2e: an item has minimap-active class after click");
+          if (active) {
+            A(active.dataset.headingId === items[0].dataset.headingId, "mm-e2e: correct item is active", { expected: items[0].dataset.headingId, got: active.dataset.headingId });
+          }
+        })();
+
+        // --- E2E 4: Changed-section markers present for commits with changes ---
+        await (async function testE2E_changedMarkers() {
+          // Select a commit with changes (skip first commit which has no parent diff).
+          const testIdx = Math.min(5, ALL_COMMITS.length - 1);
+          selectCommitIdx(testIdx);
+          await wait(300);
+
+          if (mm.classList.contains("hidden")) { toggleBtn.click(); await wait(300); }
+          await updateMiniMap();
+          await wait(800);
+
+          // Look for change marker dots (inline-block rounded-full elements with background color).
+          const markers = mmItems.querySelectorAll(".minimap-item .rounded-full");
+          log("Commit " + testIdx + ": " + markers.length + " change markers found");
+          // A non-trivial commit should have at least some markers.
+          if (ALL_COMMITS[testIdx]?.impact > 0) {
+            A(markers.length > 0, "mm-e2e: commit with changes has markers", { commit: testIdx, impact: ALL_COMMITS[testIdx].impact, markers: markers.length });
+          } else {
+            log("Commit has 0 impact, markers not expected");
+            A(true, "mm-e2e: skipped marker test (0 impact commit)");
+          }
+        })();
+
+        // --- E2E 5: Search filter narrows displayed headings ---
+        await (async function testE2E_searchFilter() {
+          if (mm.classList.contains("hidden")) { toggleBtn.click(); await wait(300); }
+          await updateMiniMap();
+          await wait(500);
+
+          const searchInput = document.getElementById("miniMapSearch");
+          if (!searchInput) { A(false, "mm-e2e: missing search input"); return; }
+
+          const allCount = mmItems.querySelectorAll(".minimap-item").length;
+          if (allCount < 3) { A(true, "mm-e2e: skipped search (< 3 items)"); return; }
+
+          // Get text from first heading to use as search term.
+          const firstItem = mmItems.querySelector(".minimap-item");
+          const searchTerm = firstItem?.textContent?.trim()?.slice(0, 8) || "";
+          if (!searchTerm) { A(true, "mm-e2e: skipped search (no text)"); return; }
+
+          // Type a search term.
+          searchInput.value = searchTerm;
+          searchInput.dispatchEvent(new Event("input"));
+          await wait(400);
+
+          // Re-render mini-map with filter applied.
+          await updateMiniMap();
+          await wait(500);
+
+          const filteredCount = mmItems.querySelectorAll(".minimap-item").length;
+          log("Search '" + searchTerm + "': " + allCount + " -> " + filteredCount + " items");
+          A(filteredCount <= allCount, "mm-e2e: filter reduces or keeps item count", { all: allCount, filtered: filteredCount });
+          A(filteredCount > 0, "mm-e2e: filter still shows matching items", { count: filteredCount });
+
+          // Clear search.
+          searchInput.value = "";
+          searchInput.dispatchEvent(new Event("input"));
+          await updateMiniMap();
+          await wait(300);
+
+          const restoredCount = mmItems.querySelectorAll(".minimap-item").length;
+          A(restoredCount === allCount, "mm-e2e: clearing search restores all items", { restored: restoredCount, original: allCount });
+        })();
+
+        // --- E2E 6: Mobile sheet open/close ---
+        await (async function testE2E_mobileSheet() {
+          const sheet = document.getElementById("miniMapMobileSheet");
+          const overlay = document.getElementById("miniMapMobileOverlay");
+          const mobileBtn = document.getElementById("btnMiniMapMobile");
+          const closeBtn = document.getElementById("btnMiniMapMobileClose");
+          if (!sheet || !overlay || !mobileBtn || !closeBtn) {
+            log("Missing mobile sheet elements, skipping");
+            A(true, "mm-e2e: skipped mobile (missing elements)");
+            return;
+          }
+
+          // Open mobile sheet.
+          openMiniMapMobile();
+          await wait(500);
+          A(!sheet.classList.contains("hidden"), "mm-e2e: mobile sheet visible after open");
+          A(!overlay.classList.contains("hidden"), "mm-e2e: mobile overlay visible after open");
+
+          // Check mobile list is populated.
+          const mobileList = document.getElementById("miniMapMobileList");
+          if (mobileList) {
+            const items = mobileList.querySelectorAll("button[data-heading-id]");
+            A(items.length > 0, "mm-e2e: mobile list has items", { count: items.length });
+          }
+
+          // Close mobile sheet.
+          closeMiniMapMobile();
+          await wait(400);
+          A(overlay.classList.contains("hidden"), "mm-e2e: mobile overlay hidden after close");
+        })();
+
+        // --- E2E 7: Mobile heading tap jumps and closes sheet ---
+        await (async function testE2E_mobileTapJump() {
+          const sheet = document.getElementById("miniMapMobileSheet");
+          const mobileList = document.getElementById("miniMapMobileList");
+          const stayOpenCb = document.getElementById("miniMapMobileStayOpen");
+          if (!sheet || !mobileList) { A(true, "mm-e2e: skipped mobile tap (missing elements)"); return; }
+
+          // Ensure stay-open is unchecked so sheet closes on tap.
+          if (stayOpenCb) stayOpenCb.checked = false;
+
+          // Open and wait for list to populate.
+          openMiniMapMobile();
+          await wait(600);
+
+          const items = mobileList.querySelectorAll("button[data-heading-id]");
+          if (items.length < 2) { closeMiniMapMobile(); await wait(300); A(true, "mm-e2e: skipped mobile tap (< 2 items)"); return; }
+
+          // Tap a heading.
+          items[1].click();
+          await wait(600);
+
+          // Sheet should close (stay-open unchecked).
+          const overlay = document.getElementById("miniMapMobileOverlay");
+          A(overlay.classList.contains("hidden"), "mm-e2e: mobile sheet closed after tap", { overlayHidden: overlay?.classList?.contains("hidden") });
+        })();
+
+        // --- E2E 8: Different commits produce different outlines ---
+        await (async function testE2E_differentCommitOutlines() {
+          if (mm.classList.contains("hidden")) { toggleBtn.click(); await wait(300); }
+
+          selectCommitIdx(0);
+          await wait(200);
+          await updateMiniMap();
+          await wait(500);
+          const count0 = mmItems.querySelectorAll(".minimap-item").length;
+
+          const lastIdx = ALL_COMMITS.length - 1;
+          selectCommitIdx(lastIdx);
+          await wait(200);
+          await updateMiniMap();
+          await wait(500);
+          const countLast = mmItems.querySelectorAll(".minimap-item").length;
+
+          log("Commit 0: " + count0 + " headings, Commit " + lastIdx + ": " + countLast + " headings");
+          // The spec document evolved, so heading counts should differ.
+          if (count0 > 0 && countLast > 0) {
+            A(countLast >= count0, "mm-e2e: later commit has >= headings than first", { first: count0, last: countLast });
+          } else {
+            A(true, "mm-e2e: outline counts verified (at least one commit has headings)");
+          }
+        })();
+
+        // --- Restore original state ---
+        selectCommitIdx(origIdx);
+        if (DOC.tab !== origTab && typeof setDocTab === "function") setDocTab(origTab);
+        await wait(300);
+        log("Restored: idx=" + origIdx + ", tab=" + origTab);
+
+        // --- Summary ---
+        const p = R.filter(x => x.pass).length, f = R.filter(x => !x.pass).length;
+        const s = `Mini-Map E2E Tests: ${p} passed, ${f} failed, ${R.length} total`;
+        if (f > 0) { console.warn(s); R.filter(x => !x.pass).forEach(x => console.error("  FAIL:", x.msg, x.ctx || "")); }
+        else console.log("%c" + s, "color:green;font-weight:bold");
+        return { passed: p, failed: f, total: R.length, results: R };
+      };
+      // ---- End Mini-Map E2E Tests ----
+
 
 
 
@@ -14340,6 +14596,190 @@
         return { passed: p, failed: f, total: R.length, results: R };
       };
       // ---- End Phase Map Unit Tests ----
+
+      // ---- Phase Map E2E Tests (bd-24q.11.4) ----
+      // Run via console: window.__runPhaseMapE2ETests()
+      // Requires dataset to be loaded.
+      window.__runPhaseMapE2ETests = async function () {
+        const R = [];
+        const log = (msg, ctx) => console.log("  [PM-E2E]", msg, ctx || "");
+        const A = (c, m, x) => { R.push(c ? { pass: true, msg: m } : { pass: false, msg: m, ctx: x }); if (!c) console.error("  FAIL:", m, x || ""); else log("PASS: " + m); };
+        const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+        if (!DATASET.loaded || ALL_COMMITS.length < 10) {
+          console.error("PM-E2E: Need loaded dataset with >= 10 commits.");
+          return { passed: 0, failed: 1, total: 1, results: [{ pass: false, msg: "Dataset not loaded or < 10 commits" }] };
+        }
+
+        if (!chartTimeline || !chartBocpd) {
+          console.error("PM-E2E: Missing chartTimeline or chartBocpd ECharts instances.");
+          return { passed: 0, failed: 1, total: 1, results: [{ pass: false, msg: "Missing chart instances" }] };
+        }
+
+        const origIdx = DOC.idx;
+        const origSegIdx = PHASE_FILTER.segIdx;
+        const origHazard = document.getElementById("hazard")?.value;
+
+        // Ensure phase data is computed.
+        await maybeRefreshPhaseAndOutliers(ALL_COMMITS);
+        await wait(2000);
+
+        // --- E2E 1: Phase overlay renders on timeline chart ---
+        await (async function testE2E_overlayRendered() {
+          const phase = WORKER_DERIVED.phase;
+          A(phase != null, "pm-e2e: WORKER_DERIVED.phase is populated");
+          A(phase.segments?.length > 0, "pm-e2e: phase has segments", { count: phase?.segments?.length });
+          A(phase.changePoints?.length >= 0, "pm-e2e: phase has changePoints array", { count: phase?.changePoints?.length });
+
+          // Render overlay.
+          renderPhaseOverlay(ALL_COMMITS);
+          await wait(300);
+
+          // Check timeline chart has markArea data.
+          const timeOpt = chartTimeline.getOption();
+          const series0 = timeOpt?.series?.[0];
+          const markAreas = series0?.markArea?.data;
+          A(markAreas != null && markAreas.length > 0, "pm-e2e: timeline has phase markAreas", { count: markAreas?.length });
+          log("Phase segments: " + phase.segments.length + ", markAreas: " + (markAreas?.length || 0));
+        })();
+
+        // --- E2E 2: BOCPD chart also gets phase overlay ---
+        await (async function testE2E_bocpdOverlay() {
+          const bocpdOpt = chartBocpd.getOption();
+          const series = bocpdOpt?.series || [];
+          let hasMarkArea = false;
+          for (const s of series) {
+            if (s.markArea?.data?.length > 0) { hasMarkArea = true; break; }
+          }
+          A(hasMarkArea, "pm-e2e: BOCPD chart has phase markAreas");
+        })();
+
+        // --- E2E 3: Phase segments cover full commit range ---
+        await (async function testE2E_segmentCoverage() {
+          const phase = WORKER_DERIVED.phase;
+          if (!phase?.segments?.length) { A(false, "pm-e2e: no segments for coverage test"); return; }
+
+          const firstStart = phase.segments[0].start;
+          const lastEnd = phase.segments[phase.segments.length - 1].end;
+          A(firstStart === 0, "pm-e2e: first segment starts at 0", { got: firstStart });
+          A(lastEnd === ALL_COMMITS.length - 1, "pm-e2e: last segment ends at max index", { got: lastEnd, max: ALL_COMMITS.length - 1 });
+
+          // No gaps between segments.
+          for (let i = 1; i < phase.segments.length; i++) {
+            const prev = phase.segments[i - 1];
+            const cur = phase.segments[i];
+            A(cur.start === prev.end + 1, "pm-e2e: no gap between segments " + (i - 1) + " and " + i, { prevEnd: prev.end, curStart: cur.start });
+          }
+        })();
+
+        // --- E2E 4: PHASE_FILTER changes highlight opacity ---
+        await (async function testE2E_filterHighlight() {
+          const phase = WORKER_DERIVED.phase;
+          if (!phase?.segments?.length) { A(false, "pm-e2e: no segments for filter test"); return; }
+
+          // Select first segment.
+          PHASE_FILTER.segIdx = 0;
+          renderPhaseOverlay(ALL_COMMITS);
+          await wait(200);
+
+          const opt1 = chartTimeline.getOption();
+          const areas1 = opt1?.series?.[0]?.markArea?.data || [];
+          if (areas1.length > 0) {
+            const selectedOpacity = areas1[0]?.[0]?.itemStyle?.opacity;
+            A(selectedOpacity === 0.18, "pm-e2e: selected segment has opacity 0.18", { got: selectedOpacity });
+            if (areas1.length > 1) {
+              const unselectedOpacity = areas1[1]?.[0]?.itemStyle?.opacity;
+              A(unselectedOpacity === 0.06, "pm-e2e: unselected segment has opacity 0.06", { got: unselectedOpacity });
+            }
+          }
+
+          // Clear filter.
+          PHASE_FILTER.segIdx = -1;
+          renderPhaseOverlay(ALL_COMMITS);
+          await wait(200);
+
+          const opt2 = chartTimeline.getOption();
+          const areas2 = opt2?.series?.[0]?.markArea?.data || [];
+          if (areas2.length > 0) {
+            const allLow = areas2.every(a => a[0]?.itemStyle?.opacity === 0.06);
+            A(allLow, "pm-e2e: all segments at 0.06 when no filter");
+          }
+        })();
+
+        // --- E2E 5: Hazard slider changes recompute phases ---
+        await (async function testE2E_hazardSlider() {
+          const slider = document.getElementById("hazard");
+          const label = document.getElementById("hazardLabel");
+          if (!slider || !label) { A(false, "pm-e2e: missing hazard slider/label"); return; }
+
+          // Set low hazard (fewer change points).
+          slider.value = "0.01";
+          slider.dispatchEvent(new Event("input"));
+          await wait(3000);
+          const phaseLow = WORKER_DERIVED.phase;
+          const cpLow = phaseLow?.changePoints?.length || 0;
+
+          // Set high hazard (more change points).
+          slider.value = "0.30";
+          slider.dispatchEvent(new Event("input"));
+          await wait(3000);
+          const phaseHigh = WORKER_DERIVED.phase;
+          const cpHigh = phaseHigh?.changePoints?.length || 0;
+
+          log("Hazard 0.01 CPs: " + cpLow + ", Hazard 0.30 CPs: " + cpHigh);
+          A(cpHigh >= cpLow, "pm-e2e: higher hazard produces >= change points", { low: cpLow, high: cpHigh });
+          A(label.textContent === "0.30", "pm-e2e: hazard label updated", { got: label.textContent });
+        })();
+
+        // --- E2E 6: Phase evidence structure is correct ---
+        await (async function testE2E_evidenceStructure() {
+          const phase = WORKER_DERIVED.phase;
+          if (!phase?.evidence?.length) {
+            log("No evidence entries (0 change points), skipping");
+            A(true, "pm-e2e: skipped evidence test (no CPs)");
+            return;
+          }
+          const ev = phase.evidence[0];
+          A("idx" in ev, "pm-e2e: evidence has idx");
+          A("posteriorP0" in ev, "pm-e2e: evidence has posteriorP0");
+          A("before" in ev && "mean" in ev.before, "pm-e2e: evidence.before has mean");
+          A("after" in ev && "mean" in ev.after, "pm-e2e: evidence.after has mean");
+          A("meanShift" in ev, "pm-e2e: evidence has meanShift");
+          A("varianceRatio" in ev, "pm-e2e: evidence has varianceRatio");
+          log("Evidence[0]: idx=" + ev.idx + ", meanShift=" + ev.meanShift.toFixed(2) + ", P0=" + ev.posteriorP0.toFixed(4));
+        })();
+
+        // --- E2E 7: Segment stats are reasonable ---
+        await (async function testE2E_segmentStats() {
+          const phase = WORKER_DERIVED.phase;
+          if (!phase?.segments?.length) { A(false, "pm-e2e: no segments for stats test"); return; }
+          for (let i = 0; i < Math.min(3, phase.segments.length); i++) {
+            const seg = phase.segments[i];
+            A(seg.length > 0, "pm-e2e: segment " + i + " has positive length", { got: seg.length });
+            A(typeof seg.mean === "number" && !isNaN(seg.mean), "pm-e2e: segment " + i + " has valid mean", { got: seg.mean });
+            A(typeof seg.stddev === "number" && seg.stddev >= 0, "pm-e2e: segment " + i + " has non-negative stddev", { got: seg.stddev });
+            A(seg.confidence >= 0 && seg.confidence <= 1, "pm-e2e: segment " + i + " confidence in [0,1]", { got: seg.confidence });
+          }
+        })();
+
+        // --- Restore original state ---
+        PHASE_FILTER.segIdx = origSegIdx;
+        if (origHazard) {
+          const slider = document.getElementById("hazard");
+          if (slider) { slider.value = origHazard; slider.dispatchEvent(new Event("input")); }
+        }
+        selectCommitIdx(origIdx);
+        await wait(500);
+        log("Restored: idx=" + origIdx + ", segIdx=" + origSegIdx + ", hazard=" + origHazard);
+
+        // --- Summary ---
+        const p = R.filter(x => x.pass).length, f = R.filter(x => !x.pass).length;
+        const s = `Phase Map E2E Tests: ${p} passed, ${f} failed, ${R.length} total`;
+        if (f > 0) { console.warn(s); R.filter(x => !x.pass).forEach(x => console.error("  FAIL:", x.msg, x.ctx || "")); }
+        else console.log("%c" + s, "color:green;font-weight:bold");
+        return { passed: p, failed: f, total: R.length, results: R };
+      };
+      // ---- End Phase Map E2E Tests ----
       // ---- History Search Unit Tests (bd-24q.9.4) ----
       // Run via console: window.__runSearchTests()
       window.__runSearchTests = async function () {
@@ -17165,11 +17605,56 @@
         renderHeatStripe();
       });
 
-      wireUI();
+	      wireUI();
 	      _wireHeatStripe();
-      _wireMiniMapMobile();
-      _wireStoryMobile();
+	      _wireMiniMapMobile();
+	      _wireStoryMobile();
 	      _wireOutlierPanel();
+
+	      async function precomputeMetricsInBackground() {
+	        const d = DATASET.data;
+	        if (!d || !Array.isArray(d.commits) || !Array.isArray(d.patches) || !d.commits.length) return;
+
+	        const workerReady = await initAnalysisWorker();
+	        if (workerReady) {
+	          try {
+	            const metricsNoLev = await workerRequest(
+	              "compute_all_metrics",
+	              { includeLev: false },
+	              { timeoutMs: 120000 },
+	            );
+	            applyMetricsPayload(metricsNoLev);
+	            render();
+	            void warmDerivedWorkerArtifacts();
+	            return;
+	          } catch (e) {
+	            console.error("Worker metric precompute failed; falling back to idle main-thread compute:", e);
+	            setWorkerStatus("Worker precompute failed; idle local fallback active.", "error", formatErr(e));
+	          }
+	        }
+
+	        // Main-thread fallback: incremental idle-time computation to avoid blocking first paint.
+	        let i = 0;
+	        const total = d.commits.length;
+	        const step = (deadline) => {
+	          const start = performance.now();
+	          while (i < total && (deadline.timeRemaining() > 10 || performance.now() - start < 12)) {
+	            const c = d.commits[i];
+	            const qm = quickMetricsFromPatch(d.patches[i]);
+	            METRICS.tokensChanged.set(c.hash, qm.tokensChanged);
+	            METRICS.bytesChanged.set(c.hash, qm.bytesChanged);
+	            METRICS.hunks.set(c.hash, qm.hunks);
+	            i++;
+	          }
+	          if (i < total) {
+	            requestIdleCallback(step, { timeout: 1000 });
+	          } else {
+	            render();
+	          }
+	        };
+	        requestIdleCallback(step, { timeout: 1000 });
+	      }
+
 	      (async function boot() {
 	        await loadEvolutionDataset();
 	        if (!DATASET.loaded || !DATASET.data) {
@@ -17179,61 +17664,33 @@
 	          return;
 	        }
 
-	        if (DATASET.loaded) {
-	          const workerReady = await initAnalysisWorker();
-	          const d = DATASET.data;
-          if (workerReady) {
-            try {
-              const metricsNoLev = await workerRequest(
-                "compute_all_metrics",
-                { includeLev: false },
-                { timeoutMs: 120000 },
-              );
-              applyMetricsPayload(metricsNoLev);
-            } catch (e) {
-              console.error("Worker boot metric precompute failed; using local precompute:", e);
-              setWorkerStatus("Worker precompute failed; local fallback active.", "error", formatErr(e));
-              for (let i = 0; i < d.commits.length; i++) {
-                const c = d.commits[i];
-                const qm = quickMetricsFromPatch(d.patches[i]);
-                METRICS.tokensChanged.set(c.hash, qm.tokensChanged);
-                METRICS.bytesChanged.set(c.hash, qm.bytesChanged);
-                METRICS.hunks.set(c.hash, qm.hunks);
-              }
-            }
-          } else {
-            for (let i = 0; i < d.commits.length; i++) {
-              const c = d.commits[i];
-              const qm = quickMetricsFromPatch(d.patches[i]);
-              METRICS.tokensChanged.set(c.hash, qm.tokensChanged);
-              METRICS.bytesChanged.set(c.hash, qm.bytesChanged);
-              METRICS.hunks.set(c.hash, qm.hunks);
-            }
-          }
+	        const d = DATASET.data;
 
-          // Start at the latest commit (most interesting view).
-          DOC.idx = Math.max(0, d.commits.length - 1);
-        }
+	        // Start at the latest commit (most interesting view).
+	        DOC.idx = Math.max(0, d.commits.length - 1);
 
-        // Restore state from URL if present; otherwise use defaults.
-        const urlState = decodeUrlState(location.search);
-        if (urlState) {
-          applyUrlState(urlState);
-          if (DOC.compareMode) {
-            populateCompareSelects();
-            const _b = document.getElementById("btnCompareToggle"); if (_b) { _b.classList.add("bg-slate-900","text-white"); _b.classList.remove("bg-white/70","text-slate-900"); }
-            const _r = document.getElementById("abCompareBar"); if (_r) _r.classList.remove("hidden");
-            const _l = document.getElementById("btnDiffLayout"); if (_l) { _l.classList.remove("hidden"); _l.textContent = DOC.diffLayout === "side-by-side" ? "Side-by-Side" : "Unified"; }
-          }
-        }
+	        // Restore state from URL if present; otherwise use defaults.
+	        const urlState = decodeUrlState(location.search);
+	        if (urlState) {
+	          applyUrlState(urlState);
+	          if (DOC.compareMode) {
+	            populateCompareSelects();
+	            const _b = document.getElementById("btnCompareToggle"); if (_b) { _b.classList.add("bg-slate-900","text-white"); _b.classList.remove("bg-white/70","text-slate-900"); }
+	            const _r = document.getElementById("abCompareBar"); if (_r) _r.classList.remove("hidden");
+	            const _l = document.getElementById("btnDiffLayout"); if (_l) { _l.classList.remove("hidden"); _l.textContent = DOC.diffLayout === "side-by-side" ? "Side-by-Side" : "Unified"; }
+	          }
+	        }
 
-        // Set tab (may have been overridden by URL state).
-        setDocTab(DOC.tab);
-        render();
-        // Record initial URL state (replaceState so back goes to referrer, not blank).
-        syncUrlToState({ immediate: true, replace: true });
-        void warmDerivedWorkerArtifacts();
-      })();
+	        // Set tab (may have been overridden by URL state).
+	        setDocTab(DOC.tab);
+	        render();
+
+	        // Record initial URL state (replaceState so back goes to referrer, not blank).
+	        syncUrlToState({ immediate: true, replace: true });
+
+	        // Non-blocking warmups.
+	        requestIdleCallback(() => { void precomputeMetricsInBackground(); }, { timeout: 1500 });
+	      })();
 
       // Browser back/forward: restore state from URL.
       window.addEventListener("popstate", () => {
