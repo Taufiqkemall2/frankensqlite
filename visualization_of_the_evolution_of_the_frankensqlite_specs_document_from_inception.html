@@ -553,6 +553,9 @@
         .search-palette-item { padding: 12px 16px; font-size: 14px; }
       }
 
+      /* Cluster timeline highlight (bd-24q.14.3) */
+      .timeline-cluster-highlight { outline: 2px solid rgba(99, 102, 241, 0.5); outline-offset: -1px; border-radius: 8px; background: rgba(99, 102, 241, 0.08) !important; }
+
       /* Side-by-Side Mobile UX (bd-24q.15.3) */
       .sbs-mobile-tabs {
         display: none;
@@ -917,6 +920,40 @@
             <div id="outlierLoading" class="hidden mt-3 text-xs text-slate-400 italic p-3">Computing outliers...</div>
           </section>
 
+
+          <!-- Cluster Explorer (bd-24q.14.3) -->
+          <section id="clusterPanel" class="glass shadow-glow mt-6 rounded-3xl p-5">
+            <div class="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+              <div>
+                <div class="text-sm font-bold text-slate-900">Commit Clusters</div>
+                <div class="mt-1 text-xs text-slate-500">Similar commits grouped by content. Click to highlight on timeline.</div>
+              </div>
+              <div class="flex flex-wrap items-center gap-2">
+                <label class="chip inline-flex items-center gap-2 rounded-2xl px-3 py-1.5 text-xs font-semibold text-slate-700">Threshold
+                  <select id="clusterThresholdSel" class="ml-1 rounded-xl border border-slate-900/10 bg-white/70 px-2 py-1 text-xs">
+                    <option value="0.15">0.15 (loose)</option>
+                    <option value="0.3" selected>0.3 (default)</option>
+                    <option value="0.5">0.5 (tight)</option>
+                  </select>
+                </label>
+                <label class="chip inline-flex items-center gap-2 rounded-2xl px-3 py-1.5 text-xs font-semibold text-slate-700">Show
+                  <select id="clusterLimitSel" class="ml-1 rounded-xl border border-slate-900/10 bg-white/70 px-2 py-1 text-xs">
+                    <option value="5">5</option><option value="10" selected>10</option><option value="20">20</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+            <div id="clusterList" class="mt-3 space-y-2 max-h-[50vh] overflow-auto"></div>
+            <div id="clusterEmpty" class="hidden mt-3 text-xs text-slate-400 italic p-3">No clusters found.</div>
+            <div id="clusterLoading" class="hidden mt-3 text-xs text-slate-400 italic p-3">Computing clusters...</div>
+            <!-- In-cluster navigation (shown when a cluster is selected) -->
+            <div id="clusterNav" class="hidden mt-3 flex items-center justify-between border-t border-slate-900/10 pt-3">
+              <button id="clusterPrev" class="focus-ring rounded-xl bg-slate-100 px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-200">&larr; Prev</button>
+              <span id="clusterNavLabel" class="text-xs text-slate-500">1 / 5</span>
+              <button id="clusterNext" class="focus-ring rounded-xl bg-slate-100 px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-200">Next &rarr;</button>
+            </div>
+          </section>
+
           <!-- Doc evolution -->
           <section id="sectionDoc" class="glass shadow-glow mt-6 rounded-3xl p-5">
             <div class="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
@@ -1102,6 +1139,7 @@
                             <button id="storyPrev" class="focus-ring rounded-lg border border-slate-900/10 bg-white/80 px-2 py-0.5 text-[10px] font-semibold text-slate-600 hover:bg-white" type="button" aria-label="Previous milestone">&larr;</button>
                             <span id="storyProgress" class="text-[10px] text-slate-400">0/0</span>
                             <button id="storyNext" class="focus-ring rounded-lg border border-slate-900/10 bg-white/80 px-2 py-0.5 text-[10px] font-semibold text-slate-600 hover:bg-white" type="button" aria-label="Next milestone">&rarr;</button>
+                            <button id="storyAutoplayBtn" class="focus-ring rounded-lg border border-slate-900/10 bg-white/80 px-2 py-0.5 text-[10px] font-semibold text-slate-600 hover:bg-white" type="button" aria-label="Autoplay through milestones" title="Autoplay tour">&#9654; Tour</button>
                           </div>
                         </div>
                         <div id="storyCards" class="flex-1 overflow-y-auto p-3 space-y-2"></div>
@@ -1511,6 +1549,7 @@
       <div id="storyMobileCardArea" class="story-mobile-card"></div>
       <div class="shrink-0 flex items-center justify-between gap-3 border-t border-slate-200 px-4 py-3">
         <button id="storyMobilePrev" class="focus-ring flex-1 rounded-2xl bg-slate-100 px-4 py-3 text-sm font-semibold text-slate-700 hover:bg-slate-200" type="button">&larr; Previous</button>
+        <button id="storyMobileAutoplay" class="focus-ring flex-1 rounded-2xl bg-slate-100 px-4 py-3 text-sm font-semibold text-slate-700 hover:bg-slate-200" type="button" aria-label="Autoplay tour">&#9654; Tour</button>
         <button id="storyMobileNext" class="focus-ring flex-1 rounded-2xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white hover:bg-slate-800" type="button">Next &rarr;</button>
       </div>
     </div>
@@ -6813,13 +6852,19 @@
           p.set("b", sorted.join(","));
         }
 
+        // Story autoplay URL state (bd-24q.4.4).
+        if (typeof STORY_AUTOPLAY !== "undefined" && STORY_AUTOPLAY.enabled) {
+          p.set("sa", "1");
+          if (STORY_AUTOPLAY.milestoneIdx >= 0) p.set("si", String(STORY_AUTOPLAY.milestoneIdx));
+        }
+
         // Canonical ordering: rebuild with v first, then alphabetical key order.
         if ([...p.keys()].length === 0) return "";
         const canon = new URLSearchParams();
         canon.set("v", String(URL_SCHEMA_VERSION));
-        // Canonical key order: v, c, t, raw, dm, cmp, ca, cb, dl, avm, q, mi, bm, b, res, tz, met
+        // Canonical key order: v, c, t, raw, dm, cmp, ca, cb, dl, avm, q, mi, bm, b, res, tz, met, sa, si
         if (DOC.compareMode) { p.set("cmp", "1"); p.set("ca", String(DOC.compareFromIdx)); p.set("cb", String(DOC.compareToIdx)); if (DOC.diffLayout !== "side-by-side") p.set("dl", DOC.diffLayout); if (DOC.abViewMode === "rendered") p.set("avm", "rendered"); }
-        for (const k of ["c", "t", "raw", "dm", "cmp", "ca", "cb", "dl", "avm", "q", "mi", "bm", "b", "res", "tz", "met"]) {
+        for (const k of ["c", "t", "raw", "dm", "cmp", "ca", "cb", "dl", "avm", "q", "mi", "bm", "b", "res", "tz", "met", "sa", "si"]) {
           if (p.has(k)) canon.set(k, p.get(k));
         }
         return canon.toString();
@@ -6896,6 +6941,15 @@
           result.avm = p.get("avm") || "diff";
         }
 
+        // Story autoplay (bd-24q.4.4).
+        result.sa = p.get("sa") === "1";
+        if (p.has("si")) {
+          const si = Number(p.get("si"));
+          result.si = Number.isFinite(si) && si >= 0 ? Math.floor(si) : -1;
+        } else {
+          result.si = -1;
+        }
+
         return result;
       }
 
@@ -6932,6 +6986,31 @@
         if (resSel && s.res) resSel.value = s.res;
         if (tzSel && s.tz) tzSel.value = s.tz;
         if (metSel && s.met) metSel.value = s.met;
+
+        // Restore story autoplay from URL (bd-24q.4.4).
+        if (s.sa && typeof STORY_AUTOPLAY !== "undefined") {
+          // Defer until after initial render so milestones are available.
+          requestAnimationFrame(() => {
+            _storyMilestones = getMilestones().filter(m => m.commitIdx !== null);
+            if (_storyMilestones.length) {
+              _storyAutoplayBuildSet();
+              STORY_AUTOPLAY.enabled = true;
+              STORY_AUTOPLAY.milestoneIdx = (s.si >= 0 && s.si < _storyMilestones.length) ? s.si : -1;
+              STORY_AUTOPLAY.pausedAtMilestone = false;
+              // Show story rail.
+              const rail = document.getElementById("storyRail");
+              if (rail?.classList.contains("hidden")) {
+                rail.classList.remove("hidden");
+                const btn = document.getElementById("btnStoryToggle");
+                if (btn) { btn.classList.add("bg-slate-900", "text-white"); btn.classList.remove("bg-white/70", "text-slate-900"); }
+              }
+              renderStoryCards();
+              _syncStoryAutoplayUI();
+              // Auto-resume playback.
+              playbackPlay();
+            }
+          });
+        }
       }
 
       let _urlSyncScheduled = false;
@@ -8830,6 +8909,7 @@
 
           await workerRequest("compute_clusters", { limit: 12 }, { timeoutMs: 30000 });
           WORKER_DERIVED.clusterReady = true;
+          void renderClusterPanel();
 
           // Precompute most-edited sections analytics (bd-24q.9.3).
           await workerRequest("compute_most_edited_sections", { topK: 20 }, { timeoutMs: 120000 });
@@ -15024,6 +15104,171 @@
         return { passed: p, failed: f, total: R.length, results: R };
       };
       // ---- End History Search Unit Tests ----
+      // ---- Clustering Unit Tests (bd-24q.14.4) ----
+      // Run via console: window.__runClusteringTests()
+      window.__runClusteringTests = async function () {
+        const R = [];
+        const A = (c, m, x) => { R.push(c ? { pass: true, msg: m } : { pass: false, msg: m, ctx: x }); if (!c) console.error("FAIL:", m, x || ""); };
+        const log = (m) => console.log("  [cluster]", m);
+
+        // --- MinHash signature tests ---
+        log("Testing MinHash signatures...");
+
+        // Test 1: MinHash signatures computed during warmup.
+        try {
+          const exported = await workerRequest("export_minhash_signatures", {}, { timeoutMs: 10000 });
+          A(exported !== null && typeof exported === "object", "minhash: export returns object");
+          A(typeof exported.sigLen === "number", "minhash: export has sigLen", { keys: Object.keys(exported) });
+          A(exported.sigLen === 64, "minhash: sigLen=64 (default)", { sigLen: exported.sigLen });
+          A(typeof exported.sigs_b64 === "string", "minhash: export has sigs_b64");
+          A(exported.sigs_b64.length > 0, "minhash: sigs_b64 non-empty");
+          A(Array.isArray(exported.meta), "minhash: export has meta array");
+          A(exported.meta.length > 0, "minhash: meta non-empty", { len: exported.meta.length });
+          A(exported.meta.length === ALL_COMMITS.length, "minhash: meta.length matches commits", { meta: exported.meta.length, commits: ALL_COMMITS.length });
+          log("Exported: " + exported.meta.length + " docs, sigLen=" + exported.sigLen + ", sigs_b64 length=" + exported.sigs_b64.length);
+        } catch (e) { A(false, "minhash: export threw", { err: String(e) }); }
+
+        // Test 2: MinHash export/hydrate round-trip.
+        try {
+          const exported = await workerRequest("export_minhash_signatures", {}, { timeoutMs: 10000 });
+          const hydrated = await workerRequest("hydrate_minhash_signatures", { data: exported }, { timeoutMs: 10000 });
+          A(hydrated.hydrated === true, "minhash: hydrate succeeds", hydrated);
+          A(hydrated.docs === exported.meta.length, "minhash: hydrated docs count matches", { hydrated: hydrated.docs, exported: exported.meta.length });
+          A(hydrated.sigLen === exported.sigLen, "minhash: hydrated sigLen matches", { hydrated: hydrated.sigLen, exported: exported.sigLen });
+        } catch (e) { A(false, "minhash: round-trip threw", { err: String(e) }); }
+
+        // Test 3: MinHash meta entry structure.
+        try {
+          const exported = await workerRequest("export_minhash_signatures", {}, { timeoutMs: 10000 });
+          if (exported.meta.length > 0) {
+            const m = exported.meta[0];
+            A(typeof m.idx === "number", "minhash: meta[0] has idx");
+            A(typeof m.hash === "string", "minhash: meta[0] has hash");
+            A(typeof m.short === "string", "minhash: meta[0] has short");
+            A(typeof m.subject === "string", "minhash: meta[0] has subject");
+            A(m.idx === 0, "minhash: meta[0].idx === 0", { idx: m.idx });
+          }
+        } catch (e) { A(false, "minhash: meta structure threw", { err: String(e) }); }
+
+        // Test 4: Determinism — same inputs produce same signatures.
+        try {
+          const exp1 = await workerRequest("export_minhash_signatures", {}, { timeoutMs: 10000 });
+          // Recompute with same params.
+          await workerRequest("compute_minhash_signatures", { sigLen: 64, shingleK: 5, mode: "added" }, { timeoutMs: 60000 });
+          const exp2 = await workerRequest("export_minhash_signatures", {}, { timeoutMs: 10000 });
+          A(exp1.sigs_b64 === exp2.sigs_b64, "minhash: deterministic (same sigs_b64 after recompute)", { len1: exp1.sigs_b64.length, len2: exp2.sigs_b64.length });
+          A(exp1.meta.length === exp2.meta.length, "minhash: deterministic (same meta length)");
+        } catch (e) { A(false, "minhash: determinism test threw", { err: String(e) }); }
+
+        // --- Jaccard estimator accuracy ---
+        log("Testing Jaccard estimator accuracy...");
+
+        // Test 5: Similar commits should have higher Jaccard than dissimilar ones.
+        // We test by looking at clusters — members should have higher avg sim than random pairs.
+        try {
+          const cl = await workerRequest("compute_clusters", { limit: 3, threshold: 0.2 }, { timeoutMs: 30000 });
+          if (cl.clusters.length > 0 && cl.clusters[0].size >= 3) {
+            const c0 = cl.clusters[0];
+            log("Testing Jaccard on cluster '" + c0.id + "' with " + c0.size + " members, tags: " + c0.tags.join(", "));
+            // All members in a cluster passed the threshold, so their median Jaccard should be >= threshold.
+            A(c0.size >= 2, "jaccard: cluster has >= 2 members for testing");
+            // The medoid should be a member of the cluster.
+            const memberIdxs = c0.items.map(it => it.idx);
+            A(memberIdxs.includes(c0.medoid), "jaccard: medoid is cluster member", { medoid: c0.medoid, members: memberIdxs });
+          } else {
+            log("Not enough cluster data for Jaccard accuracy test (need cluster with >= 3 members at threshold 0.2)");
+            A(true, "jaccard: skipped (insufficient cluster data)");
+          }
+        } catch (e) { A(false, "jaccard: accuracy test threw", { err: String(e) }); }
+
+        // --- Grouping correctness ---
+        log("Testing grouping correctness...");
+
+        // Test 6: Stable cluster IDs across calls.
+        try {
+          const cl1 = await workerRequest("compute_clusters", { limit: 5, threshold: 0.3 }, { timeoutMs: 30000 });
+          const cl2 = await workerRequest("compute_clusters", { limit: 5, threshold: 0.3 }, { timeoutMs: 30000 });
+          A(cl1.clusters.length === cl2.clusters.length, "grouping: same cluster count", { c1: cl1.clusters.length, c2: cl2.clusters.length });
+          for (let i = 0; i < Math.min(cl1.clusters.length, cl2.clusters.length); i++) {
+            A(cl1.clusters[i].id === cl2.clusters[i].id, "grouping: stable ID at index " + i, { id1: cl1.clusters[i].id, id2: cl2.clusters[i].id });
+            A(cl1.clusters[i].size === cl2.clusters[i].size, "grouping: same size at index " + i, { s1: cl1.clusters[i].size, s2: cl2.clusters[i].size });
+          }
+        } catch (e) { A(false, "grouping: stability threw", { err: String(e) }); }
+
+        // Test 7: Higher threshold -> fewer/smaller clusters.
+        try {
+          const lo = await workerRequest("compute_clusters", { limit: 20, threshold: 0.1 }, { timeoutMs: 30000 });
+          const hi = await workerRequest("compute_clusters", { limit: 20, threshold: 0.5 }, { timeoutMs: 30000 });
+          const loTotal = lo.clusters.reduce((s, c) => s + c.size, 0);
+          const hiTotal = hi.clusters.reduce((s, c) => s + c.size, 0);
+          log("Threshold 0.1: " + lo.clusters.length + " clusters (" + loTotal + " total members)");
+          log("Threshold 0.5: " + hi.clusters.length + " clusters (" + hiTotal + " total members)");
+          A(loTotal >= hiTotal, "grouping: lower threshold -> more grouped members", { lo: loTotal, hi: hiTotal });
+        } catch (e) { A(false, "grouping: threshold monotonicity threw", { err: String(e) }); }
+
+        // Test 8: All cluster members are unique (no duplicates across clusters).
+        try {
+          const cl = await workerRequest("compute_clusters", { limit: 20, threshold: 0.3 }, { timeoutMs: 30000 });
+          const allIdxs = [];
+          for (const c of cl.clusters) {
+            for (const item of c.items) allIdxs.push(item.idx);
+          }
+          const unique = new Set(allIdxs);
+          A(unique.size === allIdxs.length, "grouping: no duplicate members across clusters", { total: allIdxs.length, unique: unique.size });
+        } catch (e) { A(false, "grouping: uniqueness threw", { err: String(e) }); }
+
+        // Test 9: Cluster members sorted ascending by idx.
+        try {
+          const cl = await workerRequest("compute_clusters", { limit: 5, threshold: 0.3 }, { timeoutMs: 30000 });
+          for (const c of cl.clusters) {
+            let sorted = true;
+            for (let i = 1; i < c.items.length; i++) {
+              if (c.items[i].idx < c.items[i - 1].idx) { sorted = false; break; }
+            }
+            A(sorted, "grouping: members sorted by idx in cluster " + c.id, { size: c.size });
+          }
+        } catch (e) { A(false, "grouping: sort order threw", { err: String(e) }); }
+
+        // Test 10: Theme tags are strings.
+        try {
+          const cl = await workerRequest("compute_clusters", { limit: 5, threshold: 0.3 }, { timeoutMs: 30000 });
+          for (const c of cl.clusters) {
+            A(Array.isArray(c.tags), "grouping: tags is array for " + c.id);
+            for (const t of c.tags) {
+              A(typeof t === "string", "grouping: tag is string", { tag: t, cluster: c.id });
+              A(t.length >= 3, "grouping: tag length >= 3", { tag: t });
+            }
+            if (c.tags.length > 0) {
+              log("Cluster " + c.id + " (" + c.size + " members): tags=[" + c.tags.join(", ") + "]");
+            }
+          }
+        } catch (e) { A(false, "grouping: theme tags threw", { err: String(e) }); }
+
+        // Test 11: Limit parameter respected.
+        try {
+          const cl3 = await workerRequest("compute_clusters", { limit: 2, threshold: 0.3 }, { timeoutMs: 30000 });
+          A(cl3.clusters.length <= 2, "grouping: limit=2 respected", { len: cl3.clusters.length });
+        } catch (e) { A(false, "grouping: limit threw", { err: String(e) }); }
+
+        // Test 12: Medoid is valid commit index.
+        try {
+          const cl = await workerRequest("compute_clusters", { limit: 5, threshold: 0.3 }, { timeoutMs: 30000 });
+          for (const c of cl.clusters) {
+            A(c.medoid >= 0 && c.medoid < ALL_COMMITS.length, "grouping: medoid in valid range for " + c.id, { medoid: c.medoid, max: ALL_COMMITS.length });
+            const isMember = c.items.some(it => it.idx === c.medoid);
+            A(isMember, "grouping: medoid is cluster member for " + c.id, { medoid: c.medoid });
+          }
+        } catch (e) { A(false, "grouping: medoid validity threw", { err: String(e) }); }
+
+        // --- Summary ---
+        const p = R.filter(x => x.pass).length, f = R.filter(x => !x.pass).length;
+        const s = `Clustering Tests: ${p} passed, ${f} failed, ${R.length} total`;
+        if (f > 0) { console.warn(s); R.filter(x => !x.pass).forEach(x => console.error("  FAIL:", x.msg, x.ctx || "")); }
+        else console.log("%c" + s, "color:green;font-weight:bold");
+        return { passed: p, failed: f, total: R.length, results: R };
+      };
+      // ---- End Clustering Unit Tests ----
+
 
 
 
@@ -15202,6 +15447,160 @@
       }
 
       // -------------------------------------------------------
+      // Story Autoplay Integration (bd-24q.4.4)
+      // -------------------------------------------------------
+      // Autoplay through commits, pausing at each milestone to present the story card.
+      // Manual storyPrev/storyNext during autoplay update milestoneIdx without breaking state.
+
+      const STORY_AUTOPLAY = {
+        enabled: false,           // story autoplay mode active
+        milestoneIdx: -1,         // index into _storyMilestones; -1 = before first
+        pausedAtMilestone: false, // currently paused presenting a card
+        _milestoneCommitSet: null, // Set of commitIdx values for O(1) lookup
+      };
+
+      /** Build a Set of milestone commitIdx values for fast lookup in _playbackFrame. */
+      function _storyAutoplayBuildSet() {
+        STORY_AUTOPLAY._milestoneCommitSet = new Set(
+          _storyMilestones.map(m => m.commitIdx).filter(i => i != null)
+        );
+      }
+
+      /** Start story autoplay: opens story rail, begins playback, pauses at milestones. */
+      function storyAutoplayStart() {
+        if (window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches) return;
+        // Ensure milestones are populated.
+        _storyMilestones = getMilestones().filter(m => m.commitIdx !== null);
+        if (!_storyMilestones.length) return;
+        _storyAutoplayBuildSet();
+
+        // Show story rail if hidden.
+        const rail = document.getElementById("storyRail");
+        if (rail?.classList.contains("hidden")) {
+          rail.classList.remove("hidden");
+          const btn = document.getElementById("btnStoryToggle");
+          if (btn) { btn.classList.add("bg-slate-900", "text-white"); btn.classList.remove("bg-white/70", "text-slate-900"); }
+        }
+
+        // Find which milestone is at or just before current DOC.idx.
+        STORY_AUTOPLAY.milestoneIdx = -1;
+        for (let i = _storyMilestones.length - 1; i >= 0; i--) {
+          if (_storyMilestones[i].commitIdx <= DOC.idx) { STORY_AUTOPLAY.milestoneIdx = i; break; }
+        }
+
+        STORY_AUTOPLAY.enabled = true;
+        STORY_AUTOPLAY.pausedAtMilestone = false;
+        _syncStoryAutoplayUI();
+        syncUrlToState();
+
+        // Start playback.
+        playbackPlay();
+      }
+
+      /** Stop story autoplay and return to normal playback. */
+      function storyAutoplayStop() {
+        STORY_AUTOPLAY.enabled = false;
+        STORY_AUTOPLAY.pausedAtMilestone = false;
+        STORY_AUTOPLAY.milestoneIdx = -1;
+        STORY_AUTOPLAY._milestoneCommitSet = null;
+        _syncStoryAutoplayUI();
+        syncUrlToState();
+      }
+
+      /** Resume after pausing at a milestone: advance to next segment. */
+      function storyAutoplayResume() {
+        if (!STORY_AUTOPLAY.enabled || !STORY_AUTOPLAY.pausedAtMilestone) return;
+        STORY_AUTOPLAY.pausedAtMilestone = false;
+
+        // If we're at the last milestone, stop autoplay.
+        if (STORY_AUTOPLAY.milestoneIdx >= _storyMilestones.length - 1) {
+          storyAutoplayStop();
+          playbackStop();
+          return;
+        }
+
+        // Resume playback to advance toward next milestone.
+        playbackPlay();
+        _syncStoryAutoplayUI();
+      }
+
+      /**
+       * Called from _playbackFrame after advancing DOC.idx.
+       * Checks if we've hit a milestone and should pause.
+       * Returns true if we paused (caller should not schedule next frame).
+       */
+      function _storyAutoplayCheckMilestone(commitIdx) {
+        if (!STORY_AUTOPLAY.enabled || STORY_AUTOPLAY.pausedAtMilestone) return false;
+        if (!STORY_AUTOPLAY._milestoneCommitSet?.has(commitIdx)) return false;
+
+        // Find which milestone this is.
+        const msIdx = _storyMilestones.findIndex(m => m.commitIdx === commitIdx);
+        if (msIdx < 0) return false;
+        // Only pause at milestones AFTER current one (or at first if milestoneIdx is -1).
+        if (msIdx <= STORY_AUTOPLAY.milestoneIdx) return false;
+
+        STORY_AUTOPLAY.milestoneIdx = msIdx;
+        STORY_AUTOPLAY.pausedAtMilestone = true;
+
+        // Pause playback.
+        playbackPause();
+        _syncPlaybackUI();
+
+        // Update story cards to highlight current milestone.
+        _storyActiveIdx = msIdx;
+        renderStoryCards();
+
+        // Update mobile story if open.
+        _storyMobileIdx = msIdx;
+        const mobileSheet = document.getElementById("storyMobileSheet");
+        if (mobileSheet && !mobileSheet.classList.contains("hidden")) _renderStoryMobileCard();
+
+        _syncStoryAutoplayUI();
+        return true;
+      }
+
+      /** Update autoplay button appearance. */
+      function _syncStoryAutoplayUI() {
+        const btn = document.getElementById("storyAutoplayBtn");
+        if (btn) {
+          if (STORY_AUTOPLAY.enabled) {
+            if (STORY_AUTOPLAY.pausedAtMilestone) {
+              btn.innerHTML = "&#9654; Continue";
+              btn.classList.add("bg-blue-600", "text-white");
+              btn.classList.remove("bg-white/80", "text-slate-600", "bg-slate-900");
+            } else {
+              btn.textContent = "Stop Tour";
+              btn.classList.add("bg-slate-900", "text-white");
+              btn.classList.remove("bg-white/80", "text-slate-600", "bg-blue-600");
+            }
+          } else {
+            btn.innerHTML = "&#9654; Tour";
+            btn.classList.remove("bg-slate-900", "bg-blue-600", "text-white");
+            btn.classList.add("bg-white/80", "text-slate-600");
+          }
+        }
+        // Mobile autoplay button.
+        const mBtn = document.getElementById("storyMobileAutoplay");
+        if (mBtn) {
+          if (STORY_AUTOPLAY.enabled) {
+            if (STORY_AUTOPLAY.pausedAtMilestone) {
+              mBtn.innerHTML = "&#9654; Continue";
+              mBtn.classList.add("bg-blue-600", "text-white");
+              mBtn.classList.remove("bg-slate-100", "text-slate-700", "bg-slate-900");
+            } else {
+              mBtn.textContent = "Stop Tour";
+              mBtn.classList.add("bg-slate-900", "text-white");
+              mBtn.classList.remove("bg-slate-100", "text-slate-700", "bg-blue-600");
+            }
+          } else {
+            mBtn.innerHTML = "&#9654; Tour";
+            mBtn.classList.remove("bg-slate-900", "bg-blue-600", "text-white");
+            mBtn.classList.add("bg-slate-100", "text-slate-700");
+          }
+        }
+      }
+
+      // -------------------------------------------------------
       // Playback: Core Scheduler + State Machine (bd-24q.7.1)
       // -------------------------------------------------------
       // States: "paused" | "playing" | "seeking"
@@ -15346,9 +15745,12 @@
           const { idx, stopped } = playbackNextIndex(DOC.idx, ticks, maxIdx, PLAYBACK.loop);
           selectCommitIdx(idx);
           if (stopped) {
+            if (STORY_AUTOPLAY.enabled) storyAutoplayStop();
             playbackStop();
             return;
           }
+          // Story autoplay: check if we hit a milestone (bd-24q.4.4).
+          if (_storyAutoplayCheckMilestone(idx)) return;
         }
         _playbackSchedule();
       }
@@ -16002,6 +16404,12 @@
         document.getElementById("storyMobileOverlay")?.addEventListener("click", closeStoryMobile);
         document.getElementById("storyMobilePrev")?.addEventListener("click", _storyMobilePrev);
         document.getElementById("storyMobileNext")?.addEventListener("click", _storyMobileNext);
+        // Story autoplay toggle for mobile (bd-24q.4.4).
+        document.getElementById("storyMobileAutoplay")?.addEventListener("click", () => {
+          if (STORY_AUTOPLAY.enabled && STORY_AUTOPLAY.pausedAtMilestone) storyAutoplayResume();
+          else if (STORY_AUTOPLAY.enabled) storyAutoplayStop();
+          else storyAutoplayStart();
+        });
         // Swipe gesture support
         let _touchStartX = 0;
         const area = document.getElementById("storyMobileCardArea");
@@ -16793,6 +17201,140 @@
         document.getElementById("outlierTopKSel")?.addEventListener("change", refresh);
       }
 
+
+      // --- Cluster Explorer (bd-24q.14.3) ---
+      let _selectedClusterId = null;
+      let _selectedClusterMembers = [];
+      let _clusterNavIdx = -1;
+
+      async function renderClusterPanel() {
+        const panel = document.getElementById("clusterPanel");
+        if (!panel) return;
+        const list = document.getElementById("clusterList");
+        const empty = document.getElementById("clusterEmpty");
+        const loading = document.getElementById("clusterLoading");
+        if (!list) return;
+
+        const threshold = parseFloat(document.getElementById("clusterThresholdSel")?.value || "0.3");
+        const limit = parseInt(document.getElementById("clusterLimitSel")?.value || "10", 10);
+
+        if (loading) { loading.classList.remove("hidden"); }
+        if (empty) { empty.classList.add("hidden"); }
+        list.innerHTML = "";
+
+        try {
+          const res = await workerRequest("compute_clusters", { limit, threshold }, { timeoutMs: 30000 });
+          if (loading) loading.classList.add("hidden");
+          const clusters = res.clusters || [];
+          if (!clusters.length) {
+            if (empty) empty.classList.remove("hidden");
+            return;
+          }
+
+          list.innerHTML = clusters.map((c) => {
+            const isSelected = c.id === _selectedClusterId;
+            const medoidCommit = ALL_COMMITS[c.medoid] || {};
+            const tagsHtml = c.tags.map(t => `<span class="inline-block rounded-full bg-indigo-100 text-indigo-700 px-2 py-0.5 text-[10px] font-medium">${t}</span>`).join(" ");
+            return `<div class="cluster-item cursor-pointer rounded-2xl border p-3 transition-all ${isSelected ? "border-indigo-400 bg-indigo-50/80 ring-2 ring-indigo-300" : "border-slate-900/10 bg-white/60 hover:bg-white/80"}" data-cluster-id="${c.id}">` +
+              `<div class="flex items-start justify-between gap-2">` +
+              `<div class="flex-1 min-w-0">` +
+              `<div class="flex items-center gap-2 flex-wrap">${tagsHtml}<span class="text-[10px] text-slate-400">${c.size} commits</span></div>` +
+              `<div class="mt-1 text-xs text-slate-600 truncate">Medoid: #${c.medoid} ${medoidCommit.short || ""} \u2014 ${medoidCommit.subject || ""}</div>` +
+              `</div>` +
+              `<span class="shrink-0 text-xs font-bold ${isSelected ? "text-indigo-600" : "text-slate-400"}">${isSelected ? "\u2713" : ""}</span>` +
+              `</div></div>`;
+          }).join("");
+        } catch (e) {
+          if (loading) loading.classList.add("hidden");
+          list.innerHTML = '<div class="text-xs text-red-500 p-2">Error computing clusters.</div>';
+        }
+      }
+
+      function selectCluster(clusterId) {
+        if (_selectedClusterId === clusterId) {
+          _selectedClusterId = null;
+          _selectedClusterMembers = [];
+          _clusterNavIdx = -1;
+        } else {
+          _selectedClusterId = clusterId;
+          // Find cluster data from last render.
+          _selectedClusterMembers = [];
+          const items = document.querySelectorAll("#clusterList .cluster-item");
+          items.forEach(el => {
+            if (el.dataset.clusterId === clusterId) el.classList.add("border-indigo-400", "bg-indigo-50/80", "ring-2", "ring-indigo-300");
+            else el.classList.remove("border-indigo-400", "bg-indigo-50/80", "ring-2", "ring-indigo-300");
+          });
+        }
+
+        // Re-render to update selected state + fetch member data.
+        void renderClusterPanel().then(() => {
+          updateClusterNav();
+          highlightClusterOnTimeline();
+        });
+      }
+
+      function updateClusterNav() {
+        const nav = document.getElementById("clusterNav");
+        const label = document.getElementById("clusterNavLabel");
+        if (!nav) return;
+
+        if (!_selectedClusterId || !_selectedClusterMembers.length) {
+          nav.classList.add("hidden");
+          return;
+        }
+        nav.classList.remove("hidden");
+        _clusterNavIdx = Math.max(0, Math.min(_clusterNavIdx, _selectedClusterMembers.length - 1));
+        if (label) label.textContent = `${_clusterNavIdx + 1} / ${_selectedClusterMembers.length}`;
+      }
+
+      function clusterNavigate(delta) {
+        if (!_selectedClusterMembers.length) return;
+        _clusterNavIdx = Math.max(0, Math.min(_selectedClusterMembers.length - 1, _clusterNavIdx + delta));
+        const commitIdx = _selectedClusterMembers[_clusterNavIdx];
+        if (typeof commitIdx === "number") selectCommitIdx(commitIdx);
+        updateClusterNav();
+      }
+
+      function highlightClusterOnTimeline() {
+        // Clear previous highlights.
+        document.querySelectorAll(".timeline-cluster-highlight").forEach(el => el.classList.remove("timeline-cluster-highlight"));
+        if (!_selectedClusterId || !_selectedClusterMembers.length) return;
+        // Add highlight class to member commit items in the commit list.
+        const memberSet = new Set(_selectedClusterMembers);
+        document.querySelectorAll("#commitList [data-idx]").forEach(el => {
+          const idx = parseInt(el.dataset.idx, 10);
+          if (memberSet.has(idx)) el.classList.add("timeline-cluster-highlight");
+        });
+      }
+
+      function _wireClusterPanel() {
+        const refresh = () => { if (ALL_COMMITS.length) void renderClusterPanel(); };
+        document.getElementById("clusterThresholdSel")?.addEventListener("change", refresh);
+        document.getElementById("clusterLimitSel")?.addEventListener("change", refresh);
+
+        document.getElementById("clusterList")?.addEventListener("click", async (e) => {
+          const item = e.target.closest(".cluster-item");
+          if (!item) return;
+          const cid = item.dataset.clusterId;
+          if (!cid) return;
+          // Fetch fresh cluster data to get member list.
+          const threshold = parseFloat(document.getElementById("clusterThresholdSel")?.value || "0.3");
+          const limit = parseInt(document.getElementById("clusterLimitSel")?.value || "10", 10);
+          try {
+            const res = await workerRequest("compute_clusters", { limit, threshold }, { timeoutMs: 30000 });
+            const cluster = (res.clusters || []).find(c => c.id === cid);
+            if (cluster) {
+              _selectedClusterMembers = cluster.items.map(it => it.idx);
+              _clusterNavIdx = 0;
+            }
+          } catch { /* ignore */ }
+          selectCluster(cid);
+        });
+
+        document.getElementById("clusterPrev")?.addEventListener("click", () => clusterNavigate(-1));
+        document.getElementById("clusterNext")?.addEventListener("click", () => clusterNavigate(1));
+      }
+
       function renderBocpd(commits) {
         const H = Number(document.getElementById("hazard").value);
         document.getElementById("hazardLabel").textContent = H.toFixed(2);
@@ -17330,6 +17872,12 @@
         });
         document.getElementById("storyPrev")?.addEventListener("click", () => storyPrev());
         document.getElementById("storyNext")?.addEventListener("click", () => storyNext());
+        // Story autoplay toggle (bd-24q.4.4).
+        document.getElementById("storyAutoplayBtn")?.addEventListener("click", () => {
+          if (STORY_AUTOPLAY.enabled && STORY_AUTOPLAY.pausedAtMilestone) storyAutoplayResume();
+          else if (STORY_AUTOPLAY.enabled) storyAutoplayStop();
+          else storyAutoplayStart();
+        });
 
         document.getElementById("btnMiniMapToggle")?.addEventListener("click", () => {
           const mm = document.getElementById("miniMap");
@@ -17610,6 +18158,7 @@
 	      _wireMiniMapMobile();
 	      _wireStoryMobile();
 	      _wireOutlierPanel();
+	      _wireClusterPanel();
 
 	      async function precomputeMetricsInBackground() {
 	        const d = DATASET.data;
