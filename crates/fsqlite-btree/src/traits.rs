@@ -137,146 +137,154 @@ pub trait BtreeCursorOps: sealed::Sealed {
 }
 
 // ---------------------------------------------------------------------------
+// Exported test mock (cross-crate)
+// ---------------------------------------------------------------------------
+
+/// Test/mock cursor exported for cross-crate tests.
+#[derive(Debug, Default)]
+pub struct MockBtreeCursor {
+    at_eof: bool,
+    current_rowid: i64,
+    entries: Vec<(i64, Vec<u8>)>,
+    pos: usize,
+}
+
+impl MockBtreeCursor {
+    /// Create a mock cursor with pre-seeded `(rowid, payload)` entries.
+    #[must_use]
+    pub fn new(entries: Vec<(i64, Vec<u8>)>) -> Self {
+        Self {
+            at_eof: entries.is_empty(),
+            current_rowid: entries.first().map_or(0, |e| e.0),
+            entries,
+            pos: 0,
+        }
+    }
+}
+
+impl sealed::Sealed for MockBtreeCursor {}
+
+#[allow(clippy::missing_errors_doc)]
+impl BtreeCursorOps for MockBtreeCursor {
+    fn index_move_to(&mut self, _cx: &Cx, key: &[u8]) -> Result<SeekResult> {
+        // Simple linear scan for testing.
+        for (i, (_, data)) in self.entries.iter().enumerate() {
+            if data.as_slice() == key {
+                self.pos = i;
+                self.at_eof = false;
+                self.current_rowid = self.entries[i].0;
+                return Ok(SeekResult::Found);
+            }
+        }
+        self.at_eof = true;
+        Ok(SeekResult::NotFound)
+    }
+
+    fn table_move_to(&mut self, _cx: &Cx, rowid: i64) -> Result<SeekResult> {
+        for (i, (rid, _)) in self.entries.iter().enumerate() {
+            if *rid == rowid {
+                self.pos = i;
+                self.at_eof = false;
+                self.current_rowid = rowid;
+                return Ok(SeekResult::Found);
+            }
+        }
+        self.at_eof = true;
+        Ok(SeekResult::NotFound)
+    }
+
+    fn first(&mut self, _cx: &Cx) -> Result<bool> {
+        if self.entries.is_empty() {
+            self.at_eof = true;
+            return Ok(false);
+        }
+        self.pos = 0;
+        self.at_eof = false;
+        self.current_rowid = self.entries[0].0;
+        Ok(true)
+    }
+
+    fn last(&mut self, _cx: &Cx) -> Result<bool> {
+        if self.entries.is_empty() {
+            self.at_eof = true;
+            return Ok(false);
+        }
+        self.pos = self.entries.len() - 1;
+        self.at_eof = false;
+        self.current_rowid = self.entries[self.pos].0;
+        Ok(true)
+    }
+
+    fn next(&mut self, _cx: &Cx) -> Result<bool> {
+        if self.pos + 1 >= self.entries.len() {
+            self.at_eof = true;
+            return Ok(false);
+        }
+        self.pos += 1;
+        self.current_rowid = self.entries[self.pos].0;
+        Ok(true)
+    }
+
+    fn prev(&mut self, _cx: &Cx) -> Result<bool> {
+        if self.pos == 0 {
+            return Ok(false);
+        }
+        self.pos -= 1;
+        self.current_rowid = self.entries[self.pos].0;
+        Ok(true)
+    }
+
+    fn index_insert(&mut self, _cx: &Cx, key: &[u8]) -> Result<()> {
+        let next_rowid = self.entries.last().map_or(1, |e| e.0 + 1);
+        self.entries.push((next_rowid, key.to_vec()));
+        Ok(())
+    }
+
+    fn table_insert(&mut self, _cx: &Cx, rowid: i64, data: &[u8]) -> Result<()> {
+        self.entries.push((rowid, data.to_vec()));
+        self.current_rowid = rowid;
+        self.at_eof = false;
+        Ok(())
+    }
+
+    fn delete(&mut self, _cx: &Cx) -> Result<()> {
+        if !self.at_eof && self.pos < self.entries.len() {
+            self.entries.remove(self.pos);
+            if self.pos >= self.entries.len() {
+                self.at_eof = true;
+            } else {
+                self.current_rowid = self.entries[self.pos].0;
+            }
+        }
+        Ok(())
+    }
+
+    fn payload(&self, _cx: &Cx) -> Result<Vec<u8>> {
+        if self.at_eof {
+            return Err(fsqlite_error::FrankenError::internal("cursor at EOF"));
+        }
+        Ok(self.entries[self.pos].1.clone())
+    }
+
+    fn rowid(&self, _cx: &Cx) -> Result<i64> {
+        if self.at_eof {
+            return Err(fsqlite_error::FrankenError::internal("cursor at EOF"));
+        }
+        Ok(self.current_rowid)
+    }
+
+    fn eof(&self) -> bool {
+        self.at_eof
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// In-crate mock proving the sealed trait can be implemented here.
-    struct MockCursor {
-        at_eof: bool,
-        current_rowid: i64,
-        entries: Vec<(i64, Vec<u8>)>,
-        pos: usize,
-    }
-
-    impl MockCursor {
-        fn new(entries: Vec<(i64, Vec<u8>)>) -> Self {
-            Self {
-                at_eof: entries.is_empty(),
-                current_rowid: entries.first().map_or(0, |e| e.0),
-                entries,
-                pos: 0,
-            }
-        }
-    }
-
-    impl sealed::Sealed for MockCursor {}
-
-    impl BtreeCursorOps for MockCursor {
-        fn index_move_to(&mut self, _cx: &Cx, key: &[u8]) -> Result<SeekResult> {
-            // Simple linear scan for testing.
-            for (i, (_, data)) in self.entries.iter().enumerate() {
-                if data.as_slice() == key {
-                    self.pos = i;
-                    self.at_eof = false;
-                    self.current_rowid = self.entries[i].0;
-                    return Ok(SeekResult::Found);
-                }
-            }
-            self.at_eof = true;
-            Ok(SeekResult::NotFound)
-        }
-
-        fn table_move_to(&mut self, _cx: &Cx, rowid: i64) -> Result<SeekResult> {
-            for (i, (rid, _)) in self.entries.iter().enumerate() {
-                if *rid == rowid {
-                    self.pos = i;
-                    self.at_eof = false;
-                    self.current_rowid = rowid;
-                    return Ok(SeekResult::Found);
-                }
-            }
-            self.at_eof = true;
-            Ok(SeekResult::NotFound)
-        }
-
-        fn first(&mut self, _cx: &Cx) -> Result<bool> {
-            if self.entries.is_empty() {
-                self.at_eof = true;
-                return Ok(false);
-            }
-            self.pos = 0;
-            self.at_eof = false;
-            self.current_rowid = self.entries[0].0;
-            Ok(true)
-        }
-
-        fn last(&mut self, _cx: &Cx) -> Result<bool> {
-            if self.entries.is_empty() {
-                self.at_eof = true;
-                return Ok(false);
-            }
-            self.pos = self.entries.len() - 1;
-            self.at_eof = false;
-            self.current_rowid = self.entries[self.pos].0;
-            Ok(true)
-        }
-
-        fn next(&mut self, _cx: &Cx) -> Result<bool> {
-            if self.pos + 1 >= self.entries.len() {
-                self.at_eof = true;
-                return Ok(false);
-            }
-            self.pos += 1;
-            self.current_rowid = self.entries[self.pos].0;
-            Ok(true)
-        }
-
-        fn prev(&mut self, _cx: &Cx) -> Result<bool> {
-            if self.pos == 0 {
-                return Ok(false);
-            }
-            self.pos -= 1;
-            self.current_rowid = self.entries[self.pos].0;
-            Ok(true)
-        }
-
-        fn index_insert(&mut self, _cx: &Cx, key: &[u8]) -> Result<()> {
-            let next_rowid = self.entries.last().map_or(1, |e| e.0 + 1);
-            self.entries.push((next_rowid, key.to_vec()));
-            Ok(())
-        }
-
-        fn table_insert(&mut self, _cx: &Cx, rowid: i64, data: &[u8]) -> Result<()> {
-            self.entries.push((rowid, data.to_vec()));
-            self.current_rowid = rowid;
-            self.at_eof = false;
-            Ok(())
-        }
-
-        fn delete(&mut self, _cx: &Cx) -> Result<()> {
-            if !self.at_eof && self.pos < self.entries.len() {
-                self.entries.remove(self.pos);
-                if self.pos >= self.entries.len() {
-                    self.at_eof = true;
-                } else {
-                    self.current_rowid = self.entries[self.pos].0;
-                }
-            }
-            Ok(())
-        }
-
-        fn payload(&self, _cx: &Cx) -> Result<Vec<u8>> {
-            if self.at_eof {
-                return Err(fsqlite_error::FrankenError::internal("cursor at EOF"));
-            }
-            Ok(self.entries[self.pos].1.clone())
-        }
-
-        fn rowid(&self, _cx: &Cx) -> Result<i64> {
-            if self.at_eof {
-                return Err(fsqlite_error::FrankenError::internal("cursor at EOF"));
-            }
-            Ok(self.current_rowid)
-        }
-
-        fn eof(&self) -> bool {
-            self.at_eof
-        }
-    }
 
     #[test]
     fn test_btree_cursor_ops_sealed_mock() {
@@ -285,7 +293,7 @@ mod tests {
             (2, b"bob".to_vec()),
             (3, b"charlie".to_vec()),
         ];
-        let mut cursor = MockCursor::new(entries);
+        let mut cursor = MockBtreeCursor::new(entries);
         let cx = Cx::new();
 
         // Navigate forward.
@@ -310,7 +318,7 @@ mod tests {
             (20, b"twenty".to_vec()),
             (30, b"thirty".to_vec()),
         ];
-        let mut cursor = MockCursor::new(entries);
+        let mut cursor = MockBtreeCursor::new(entries);
         let cx = Cx::new();
 
         assert!(cursor.table_move_to(&cx, 20).unwrap().is_found());
@@ -322,7 +330,7 @@ mod tests {
 
     #[test]
     fn test_btree_cursor_insert_delete() {
-        let mut cursor = MockCursor::new(vec![]);
+        let mut cursor = MockBtreeCursor::new(vec![]);
         let cx = Cx::new();
 
         assert!(!cursor.first(&cx).unwrap());
@@ -342,7 +350,7 @@ mod tests {
     #[test]
     fn test_btree_cursor_navigate_backward() {
         let entries = vec![(1, b"a".to_vec()), (2, b"b".to_vec()), (3, b"c".to_vec())];
-        let mut cursor = MockCursor::new(entries);
+        let mut cursor = MockBtreeCursor::new(entries);
         let cx = Cx::new();
 
         assert!(cursor.last(&cx).unwrap());
@@ -364,7 +372,7 @@ mod tests {
             (2, b"beta".to_vec()),
             (3, b"gamma".to_vec()),
         ];
-        let mut cursor = MockCursor::new(entries);
+        let mut cursor = MockBtreeCursor::new(entries);
         let cx = Cx::new();
 
         assert!(cursor.index_move_to(&cx, b"beta").unwrap().is_found());
