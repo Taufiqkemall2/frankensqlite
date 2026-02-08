@@ -45,6 +45,10 @@ fn lock_err() -> FrankenError {
     FrankenError::internal("MemoryVfs lock poisoned")
 }
 
+fn checkpoint_or_abort(cx: &Cx) -> Result<()> {
+    cx.checkpoint().map_err(|_| FrankenError::Abort)
+}
+
 impl Vfs for MemoryVfs {
     type File = MemoryFile;
 
@@ -55,10 +59,11 @@ impl Vfs for MemoryVfs {
     #[allow(clippy::significant_drop_tightening)]
     fn open(
         &self,
-        _cx: &Cx,
+        cx: &Cx,
         path: Option<&Path>,
         flags: VfsOpenFlags,
     ) -> Result<(Self::File, VfsOpenFlags)> {
+        checkpoint_or_abort(cx)?;
         let mut inner = self.inner.lock().map_err(|_| lock_err())?;
 
         let resolved_path = if let Some(p) = path {
@@ -156,7 +161,8 @@ impl VfsFile for MemoryFile {
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    fn read(&mut self, _cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+    fn read(&mut self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        checkpoint_or_abort(cx)?;
         let storage = self.storage.lock().map_err(|_| lock_err())?;
 
         let offset = offset as usize;
@@ -182,7 +188,8 @@ impl VfsFile for MemoryFile {
     }
 
     #[allow(clippy::cast_possible_truncation, clippy::significant_drop_tightening)]
-    fn write(&mut self, _cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+    fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+        checkpoint_or_abort(cx)?;
         let mut storage = self.storage.lock().map_err(|_| lock_err())?;
 
         let offset = offset as usize;

@@ -12,6 +12,53 @@
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+/// `xShmLock` flag: unlock the requested slot range.
+pub const SQLITE_SHM_UNLOCK: u32 = 0x01;
+/// `xShmLock` flag: lock the requested slot range.
+pub const SQLITE_SHM_LOCK: u32 = 0x02;
+/// `xShmLock` flag: shared lock mode for the requested slot range.
+pub const SQLITE_SHM_SHARED: u32 = 0x04;
+/// `xShmLock` flag: exclusive lock mode for the requested slot range.
+pub const SQLITE_SHM_EXCLUSIVE: u32 = 0x08;
+
+/// Legacy SQLite WAL lock slot for writer coordination.
+pub const WAL_WRITE_LOCK: u32 = 0;
+/// Legacy SQLite WAL lock slot for checkpoint coordination.
+pub const WAL_CKPT_LOCK: u32 = 1;
+/// Legacy SQLite WAL lock slot for recovery coordination.
+pub const WAL_RECOVER_LOCK: u32 = 2;
+/// Legacy SQLite WAL lock slot base for reader slots.
+pub const WAL_READ_LOCK_BASE: u32 = 3;
+/// Number of legacy SQLite WAL reader lock slots.
+pub const WAL_NREADER: u32 = 5;
+/// Number of legacy SQLite WAL reader lock slots (`usize` form).
+pub const WAL_NREADER_USIZE: usize = 5;
+/// Total number of legacy SQLite WAL lock slots.
+pub const WAL_TOTAL_LOCKS: u32 = WAL_READ_LOCK_BASE + WAL_NREADER;
+
+/// Legacy SQLite POSIX SHM lock-byte base offset in the `*-shm` file.
+const SQLITE_SHM_LOCK_BASE: u64 = 120;
+
+/// Return the lock slot for `WAL_READ_LOCK(i)`.
+#[must_use]
+pub const fn wal_read_lock_slot(index: u32) -> Option<u32> {
+    if index < WAL_NREADER {
+        Some(WAL_READ_LOCK_BASE + index)
+    } else {
+        None
+    }
+}
+
+/// Return the byte offset in the `*-shm` lock area for a WAL lock slot.
+#[must_use]
+pub const fn wal_lock_byte(slot: u32) -> Option<u64> {
+    if slot < WAL_TOTAL_LOCKS {
+        Some(SQLITE_SHM_LOCK_BASE + slot as u64)
+    } else {
+        None
+    }
+}
+
 /// A handle to a mapped shared-memory region.
 ///
 /// Provides safe, bounds-checked byte-level access to SHM regions used for
@@ -186,5 +233,19 @@ mod tests {
         let region = ShmRegion::from_vec(data);
         assert_eq!(region.len(), 4);
         assert_eq!(&*region.lock(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_wal_lock_slots_and_bytes() {
+        assert_eq!(WAL_WRITE_LOCK, 0);
+        assert_eq!(WAL_CKPT_LOCK, 1);
+        assert_eq!(WAL_RECOVER_LOCK, 2);
+        assert_eq!(wal_read_lock_slot(0), Some(3));
+        assert_eq!(wal_read_lock_slot(4), Some(7));
+        assert_eq!(wal_read_lock_slot(5), None);
+
+        assert_eq!(wal_lock_byte(WAL_WRITE_LOCK), Some(120));
+        assert_eq!(wal_lock_byte(7), Some(127));
+        assert_eq!(wal_lock_byte(8), None);
     }
 }

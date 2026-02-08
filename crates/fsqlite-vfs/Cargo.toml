@@ -12,6 +12,7 @@ fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
 nix = { workspace = true }
 libc = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

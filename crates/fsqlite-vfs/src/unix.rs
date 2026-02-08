@@ -30,8 +30,31 @@ use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
+#[cfg(test)]
+use tracing::debug;
+use tracing::{error, warn};
 
+use crate::shm::{
+    SQLITE_SHM_EXCLUSIVE, SQLITE_SHM_LOCK, SQLITE_SHM_SHARED, SQLITE_SHM_UNLOCK, ShmRegion,
+    WAL_NREADER_USIZE, WAL_TOTAL_LOCKS, WAL_WRITE_LOCK, wal_lock_byte, wal_read_lock_slot,
+};
 use crate::traits::{Vfs, VfsFile};
+
+fn checkpoint_or_abort(cx: &Cx) -> Result<()> {
+    cx.checkpoint().map_err(|_| FrankenError::Abort)
+}
+
+#[cfg(test)]
+macro_rules! lock_debug {
+    ($($arg:tt)*) => {
+        debug!($($arg)*);
+    };
+}
+
+#[cfg(not(test))]
+macro_rules! lock_debug {
+    ($($arg:tt)*) => {{};};
+}
 
 // ---------------------------------------------------------------------------
 // Lock byte constants (must match C SQLite for file-level compatibility)
@@ -207,6 +230,92 @@ fn global_inode_table() -> &'static InodeTable {
 }
 
 // ---------------------------------------------------------------------------
+// SHM table — per-process SHM region/lock coalescing
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+struct ShmSlotState {
+    shared_holders: HashMap<u64, u32>,
+    exclusive_owner: Option<u64>,
+}
+
+#[derive(Debug)]
+struct ShmInfo {
+    file: Arc<File>,
+    regions: HashMap<u32, ShmRegion>,
+    slots: Vec<ShmSlotState>,
+    owner_refs: HashMap<u64, u32>,
+    read_marks: [u32; WAL_NREADER_USIZE],
+}
+
+impl ShmInfo {
+    fn new(file: Arc<File>) -> Self {
+        let slot_count = usize::try_from(WAL_TOTAL_LOCKS).expect("WAL lock count fits in usize");
+        Self {
+            file,
+            regions: HashMap::new(),
+            slots: std::iter::repeat_with(ShmSlotState::default)
+                .take(slot_count)
+                .collect(),
+            owner_refs: HashMap::new(),
+            read_marks: [0; WAL_NREADER_USIZE],
+        }
+    }
+
+    fn read_marks(&self) -> [u32; WAL_NREADER_USIZE] {
+        self.read_marks
+    }
+}
+
+struct ShmTable {
+    map: Mutex<HashMap<PathBuf, Arc<Mutex<ShmInfo>>>>,
+}
+
+impl ShmTable {
+    fn new() -> Self {
+        Self {
+            map: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn get_or_create(&self, path: PathBuf, file: Arc<File>) -> Arc<Mutex<ShmInfo>> {
+        let mut map = self.map.lock().expect("shm table lock poisoned");
+        Arc::clone(
+            map.entry(path)
+                .or_insert_with(|| Arc::new(Mutex::new(ShmInfo::new(file)))),
+        )
+    }
+
+    fn remove_if_orphaned(&self, path: &Path) {
+        let mut map = self.map.lock().expect("shm table lock poisoned");
+        if let Some(entry) = map.get(path) {
+            let info = entry.lock().expect("shm info lock poisoned");
+            if info.owner_refs.is_empty() {
+                drop(info);
+                map.remove(path);
+            }
+        }
+    }
+}
+
+fn global_shm_table() -> &'static ShmTable {
+    static TABLE: OnceLock<ShmTable> = OnceLock::new();
+    TABLE.get_or_init(ShmTable::new)
+}
+
+static SHM_OWNER_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn next_shm_owner_id() -> u64 {
+    SHM_OWNER_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+fn sqlite_shm_path(path: &Path) -> PathBuf {
+    let mut shm = path.as_os_str().to_owned();
+    shm.push("-shm");
+    PathBuf::from(shm)
+}
+
+// ---------------------------------------------------------------------------
 // UnixVfs
 // ---------------------------------------------------------------------------
 
@@ -267,6 +376,7 @@ impl Vfs for UnixVfs {
                         info.n_ref += 1;
                         Arc::clone(&info.file)
                     };
+                    let shm_path = sqlite_shm_path(&resolved);
 
                     let unix_file = UnixFile {
                         file,
@@ -275,6 +385,9 @@ impl Vfs for UnixVfs {
                         delete_on_close: flags.contains(VfsOpenFlags::DELETEONCLOSE),
                         inode_key,
                         inode_info,
+                        shm_owner_id: next_shm_owner_id(),
+                        shm_path,
+                        shm_info: None,
                     };
 
                     let mut out_flags = flags;
@@ -323,6 +436,7 @@ impl Vfs for UnixVfs {
             // Temp files are always created read-write.
             out_flags |= VfsOpenFlags::READWRITE;
         }
+        let shm_path = sqlite_shm_path(&resolved);
 
         let unix_file = UnixFile {
             file,
@@ -331,6 +445,9 @@ impl Vfs for UnixVfs {
             delete_on_close: flags.contains(VfsOpenFlags::DELETEONCLOSE),
             inode_key,
             inode_info,
+            shm_owner_id: next_shm_owner_id(),
+            shm_path,
+            shm_info: None,
         };
 
         Ok((unix_file, out_flags))
@@ -438,9 +555,414 @@ pub struct UnixFile {
     delete_on_close: bool,
     inode_key: InodeKey,
     inode_info: Arc<Mutex<InodeInfo>>,
+    shm_owner_id: u64,
+    shm_path: PathBuf,
+    shm_info: Option<Arc<Mutex<ShmInfo>>>,
 }
 
 impl UnixFile {
+    fn ensure_shm_info(&mut self) -> Result<Arc<Mutex<ShmInfo>>> {
+        if let Some(info) = &self.shm_info {
+            return Ok(Arc::clone(info));
+        }
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&self.shm_path)
+            .map_err(FrankenError::Io)?;
+        let info = global_shm_table().get_or_create(self.shm_path.clone(), Arc::new(file));
+        {
+            let mut guard = info.lock().expect("shm info lock poisoned");
+            *guard.owner_refs.entry(self.shm_owner_id).or_insert(0) += 1;
+        }
+        self.shm_info = Some(Arc::clone(&info));
+        Ok(info)
+    }
+
+    fn release_shm_owner_state(&mut self, delete: bool) -> Result<()> {
+        let Some(info_arc) = self.shm_info.take() else {
+            if delete {
+                drop(fs::remove_file(&self.shm_path));
+            }
+            return Ok(());
+        };
+
+        {
+            let mut info = info_arc.lock().expect("shm info lock poisoned");
+            let mut first_error: Option<FrankenError> = None;
+            let shm_file = Arc::clone(&info.file);
+
+            for slot in 0..WAL_TOTAL_LOCKS {
+                #[allow(clippy::cast_possible_truncation)]
+                let slot_idx = slot as usize;
+                let slot_state = &mut info.slots[slot_idx];
+
+                if slot_state.exclusive_owner == Some(self.shm_owner_id) {
+                    let Some(lock_byte) = wal_lock_byte(slot) else {
+                        continue;
+                    };
+                    if slot_state.shared_holders.is_empty() {
+                        if let Err(err) = posix_unlock(&*shm_file, lock_byte, 1) {
+                            if first_error.is_none() {
+                                first_error = Some(err);
+                            }
+                        }
+                    }
+                    slot_state.exclusive_owner = None;
+                }
+
+                if slot_state
+                    .shared_holders
+                    .remove(&self.shm_owner_id)
+                    .is_some()
+                {
+                    let Some(lock_byte) = wal_lock_byte(slot) else {
+                        continue;
+                    };
+                    if slot_state.exclusive_owner.is_none() && slot_state.shared_holders.is_empty()
+                    {
+                        if let Err(err) = posix_unlock(&*shm_file, lock_byte, 1) {
+                            if first_error.is_none() {
+                                first_error = Some(err);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(count) = info.owner_refs.get_mut(&self.shm_owner_id) {
+                if *count > 1 {
+                    *count -= 1;
+                } else {
+                    info.owner_refs.remove(&self.shm_owner_id);
+                }
+            }
+
+            let error_to_return = first_error;
+            drop(info);
+            if let Some(err) = error_to_return {
+                return Err(err);
+            }
+        }
+
+        if delete {
+            drop(fs::remove_file(&self.shm_path));
+        }
+        global_shm_table().remove_if_orphaned(&self.shm_path);
+        Ok(())
+    }
+
+    fn observed_mode(slot_state: &ShmSlotState) -> &'static str {
+        if slot_state.exclusive_owner.is_some() {
+            "exclusive"
+        } else if slot_state.shared_holders.is_empty() {
+            "unlocked"
+        } else {
+            "shared"
+        }
+    }
+
+    fn log_lock_conflict(
+        slot: u32,
+        requested_mode: &'static str,
+        observed_mode: &'static str,
+        read_marks: [u32; WAL_NREADER_USIZE],
+    ) {
+        warn!(
+            slot,
+            lock_byte = wal_lock_byte(slot),
+            requested_mode,
+            observed_mode,
+            ?read_marks,
+            "legacy shm lock protocol conflict"
+        );
+    }
+
+    fn acquire_shm_shared_slot(&self, info: &mut ShmInfo, slot: u32) -> Result<()> {
+        let Some(lock_byte) = wal_lock_byte(slot) else {
+            error!(slot, "invalid SHM slot for shared lock");
+            return Err(FrankenError::LockFailed {
+                detail: format!("invalid SHM slot {slot}"),
+            });
+        };
+        let slot_idx = usize::try_from(slot).expect("slot index must fit usize");
+        let read_marks = info.read_marks();
+        let slot_state = &mut info.slots[slot_idx];
+
+        if let Some(owner) = slot_state.exclusive_owner {
+            if owner != self.shm_owner_id {
+                Self::log_lock_conflict(
+                    slot,
+                    "shared",
+                    Self::observed_mode(slot_state),
+                    read_marks,
+                );
+                return Err(FrankenError::Busy);
+            }
+            // Same owner already holds exclusive; no extra transition required.
+            return Ok(());
+        }
+
+        let total_shared = slot_state.shared_holders.values().copied().sum::<u32>();
+        if total_shared == 0 && !posix_lock(&*info.file, libc::F_RDLCK, lock_byte, 1)? {
+            Self::log_lock_conflict(slot, "shared", Self::observed_mode(slot_state), read_marks);
+            return Err(FrankenError::Busy);
+        }
+
+        *slot_state
+            .shared_holders
+            .entry(self.shm_owner_id)
+            .or_insert(0) += 1;
+        lock_debug!(
+            slot,
+            lock_byte,
+            requested_mode = "shared",
+            observed_mode = Self::observed_mode(slot_state),
+            ?read_marks,
+            "acquired shm shared lock"
+        );
+        Ok(())
+    }
+
+    fn acquire_shm_exclusive_slot(&self, info: &mut ShmInfo, slot: u32) -> Result<()> {
+        let Some(lock_byte) = wal_lock_byte(slot) else {
+            error!(slot, "invalid SHM slot for exclusive lock");
+            return Err(FrankenError::LockFailed {
+                detail: format!("invalid SHM slot {slot}"),
+            });
+        };
+        let slot_idx = usize::try_from(slot).expect("slot index must fit usize");
+        let read_marks = info.read_marks();
+        let slot_state = &mut info.slots[slot_idx];
+
+        if slot_state.exclusive_owner == Some(self.shm_owner_id) {
+            return Ok(());
+        }
+        if slot_state.exclusive_owner.is_some() {
+            Self::log_lock_conflict(
+                slot,
+                "exclusive",
+                Self::observed_mode(slot_state),
+                read_marks,
+            );
+            return Err(FrankenError::Busy);
+        }
+
+        let shared_from_others = slot_state
+            .shared_holders
+            .iter()
+            .any(|(owner, count)| *owner != self.shm_owner_id && *count > 0);
+        if shared_from_others {
+            Self::log_lock_conflict(
+                slot,
+                "exclusive",
+                Self::observed_mode(slot_state),
+                read_marks,
+            );
+            return Err(FrankenError::Busy);
+        }
+
+        slot_state.shared_holders.remove(&self.shm_owner_id);
+        if !posix_lock(&*info.file, libc::F_WRLCK, lock_byte, 1)? {
+            Self::log_lock_conflict(
+                slot,
+                "exclusive",
+                Self::observed_mode(slot_state),
+                read_marks,
+            );
+            return Err(FrankenError::Busy);
+        }
+
+        slot_state.exclusive_owner = Some(self.shm_owner_id);
+        lock_debug!(
+            slot,
+            lock_byte,
+            requested_mode = "exclusive",
+            observed_mode = Self::observed_mode(slot_state),
+            ?read_marks,
+            "acquired shm exclusive lock"
+        );
+        Ok(())
+    }
+
+    fn release_shm_shared_slot(&self, info: &mut ShmInfo, slot: u32) -> Result<()> {
+        let Some(lock_byte) = wal_lock_byte(slot) else {
+            error!(slot, "invalid SHM slot for shared unlock");
+            return Err(FrankenError::LockFailed {
+                detail: format!("invalid SHM slot {slot}"),
+            });
+        };
+        let slot_idx = usize::try_from(slot).expect("slot index must fit usize");
+        let read_marks = info.read_marks();
+        let slot_state = &mut info.slots[slot_idx];
+        let Some(holder_count) = slot_state.shared_holders.get_mut(&self.shm_owner_id) else {
+            Self::log_lock_conflict(
+                slot,
+                "unlock-shared",
+                Self::observed_mode(slot_state),
+                read_marks,
+            );
+            return Err(FrankenError::LockFailed {
+                detail: format!(
+                    "owner {} does not hold shared slot {slot}",
+                    self.shm_owner_id
+                ),
+            });
+        };
+
+        if *holder_count > 1 {
+            *holder_count -= 1;
+        } else {
+            slot_state.shared_holders.remove(&self.shm_owner_id);
+        }
+
+        if slot_state.exclusive_owner.is_none() && slot_state.shared_holders.is_empty() {
+            posix_unlock(&*info.file, lock_byte, 1)?;
+        }
+
+        lock_debug!(
+            slot,
+            lock_byte,
+            requested_mode = "unlock-shared",
+            observed_mode = Self::observed_mode(slot_state),
+            ?read_marks,
+            "released shm shared lock"
+        );
+        Ok(())
+    }
+
+    fn release_shm_exclusive_slot(&self, info: &mut ShmInfo, slot: u32) -> Result<()> {
+        let Some(lock_byte) = wal_lock_byte(slot) else {
+            error!(slot, "invalid SHM slot for exclusive unlock");
+            return Err(FrankenError::LockFailed {
+                detail: format!("invalid SHM slot {slot}"),
+            });
+        };
+        let slot_idx = usize::try_from(slot).expect("slot index must fit usize");
+        let read_marks = info.read_marks();
+        let slot_state = &mut info.slots[slot_idx];
+        if slot_state.exclusive_owner != Some(self.shm_owner_id) {
+            Self::log_lock_conflict(
+                slot,
+                "unlock-exclusive",
+                Self::observed_mode(slot_state),
+                read_marks,
+            );
+            return Err(FrankenError::LockFailed {
+                detail: format!(
+                    "owner {} does not hold exclusive slot {slot}",
+                    self.shm_owner_id
+                ),
+            });
+        }
+
+        slot_state.exclusive_owner = None;
+        if slot_state.shared_holders.is_empty() {
+            posix_unlock(&*info.file, lock_byte, 1)?;
+        } else if !posix_lock(&*info.file, libc::F_RDLCK, lock_byte, 1)? {
+            Self::log_lock_conflict(
+                slot,
+                "unlock-exclusive",
+                Self::observed_mode(slot_state),
+                read_marks,
+            );
+            return Err(FrankenError::Busy);
+        }
+
+        lock_debug!(
+            slot,
+            lock_byte,
+            requested_mode = "unlock-exclusive",
+            observed_mode = Self::observed_mode(slot_state),
+            ?read_marks,
+            "released shm exclusive lock"
+        );
+        Ok(())
+    }
+
+    fn validate_shm_request(offset: u32, n: u32) -> Result<()> {
+        if n == 0 {
+            return Err(FrankenError::LockFailed {
+                detail: "shm_lock called with n=0".to_string(),
+            });
+        }
+        let Some(end) = offset.checked_add(n) else {
+            return Err(FrankenError::LockFailed {
+                detail: "shm_lock range overflow".to_string(),
+            });
+        };
+        if end > WAL_TOTAL_LOCKS {
+            return Err(FrankenError::LockFailed {
+                detail: format!("shm_lock range {offset}..{end} exceeds WAL lock table"),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn compat_reader_acquire_wal_read_lock(
+        &mut self,
+        cx: &Cx,
+        reader_slot: u32,
+        snapshot_mark: u32,
+    ) -> Result<bool> {
+        let Some(slot) = wal_read_lock_slot(reader_slot) else {
+            return Err(FrankenError::LockFailed {
+                detail: format!("invalid WAL reader slot {reader_slot}"),
+            });
+        };
+
+        let shm_info = self.ensure_shm_info()?;
+        let needs_update = {
+            let info = shm_info.lock().expect("shm info lock poisoned");
+            let slot_idx = usize::try_from(reader_slot).expect("reader slot fits usize");
+            info.read_marks[slot_idx] != snapshot_mark
+        };
+
+        if !needs_update {
+            self.shm_lock(cx, slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_SHARED)?;
+            return Ok(false);
+        }
+
+        // Legacy protocol: EXCLUSIVE only for aReadMark mutation, then downgrade to SHARED.
+        self.shm_lock(cx, slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)?;
+        {
+            let mut info = shm_info.lock().expect("shm info lock poisoned");
+            let slot_idx = usize::try_from(reader_slot).expect("reader slot fits usize");
+            info.read_marks[slot_idx] = snapshot_mark;
+        }
+        self.shm_lock(cx, slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE)?;
+        self.shm_lock(cx, slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_SHARED)?;
+        Ok(true)
+    }
+
+    pub fn compat_writer_hold_wal_write_lock(&mut self, cx: &Cx) -> Result<()> {
+        self.shm_lock(
+            cx,
+            WAL_WRITE_LOCK,
+            1,
+            SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+        )
+    }
+
+    pub fn compat_writer_release_wal_write_lock(&mut self, cx: &Cx) -> Result<()> {
+        self.shm_lock(
+            cx,
+            WAL_WRITE_LOCK,
+            1,
+            SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+        )
+    }
+
+    #[must_use]
+    pub fn compat_read_marks(&self) -> Option<[u32; WAL_NREADER_USIZE]> {
+        self.shm_info
+            .as_ref()
+            .map(|info| info.lock().expect("shm info lock poisoned").read_marks())
+    }
+
     fn unlock_with_level(
         lock_level: &mut LockLevel,
         info: &mut InodeInfo,
@@ -512,6 +1034,7 @@ impl VfsFile for UnixFile {
         if self.lock_level != LockLevel::None {
             self.unlock(cx, LockLevel::None)?;
         }
+        self.release_shm_owner_state(self.delete_on_close)?;
 
         // Decrement refcount.
         {
@@ -527,7 +1050,8 @@ impl VfsFile for UnixFile {
         Ok(())
     }
 
-    fn read(&mut self, _cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+    fn read(&mut self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        checkpoint_or_abort(cx)?;
         let mut total = 0_usize;
         while total < buf.len() {
             #[allow(clippy::cast_possible_truncation)]
@@ -550,7 +1074,8 @@ impl VfsFile for UnixFile {
         Ok(total)
     }
 
-    fn write(&mut self, _cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+    fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+        checkpoint_or_abort(cx)?;
         let mut total = 0_usize;
         while total < buf.len() {
             #[allow(clippy::cast_possible_truncation)]
@@ -718,22 +1243,113 @@ impl VfsFile for UnixFile {
     fn shm_map(
         &mut self,
         _cx: &Cx,
-        _region: u32,
-        _size: u32,
-        _extend: bool,
+        region: u32,
+        size: u32,
+        extend: bool,
     ) -> Result<crate::shm::ShmRegion> {
-        // SHM support will be added in a later phase (WAL mode).
-        Err(FrankenError::Unsupported)
+        if size == 0 {
+            return Err(FrankenError::LockFailed {
+                detail: "shm_map size must be > 0".to_string(),
+            });
+        }
+
+        let shm_info = self.ensure_shm_info()?;
+        let mut info = shm_info.lock().expect("shm info lock poisoned");
+        if let Some(existing) = info.regions.get(&region) {
+            return Ok(existing.clone());
+        }
+        if !extend {
+            return Err(FrankenError::CannotOpen {
+                path: self.shm_path.clone(),
+            });
+        }
+
+        let map_size = usize::try_from(size).map_err(|_| FrankenError::LockFailed {
+            detail: format!("shm_map size too large: {size}"),
+        })?;
+        let new_region = ShmRegion::new(map_size);
+        let region_count = u64::from(region) + 1;
+        let target_len =
+            region_count
+                .checked_mul(u64::from(size))
+                .ok_or_else(|| FrankenError::LockFailed {
+                    detail: "shm_map file length overflow".to_string(),
+                })?;
+        info.file.set_len(target_len).map_err(FrankenError::Io)?;
+        info.regions.insert(region, new_region.clone());
+        drop(info);
+        Ok(new_region)
     }
 
-    fn shm_lock(&mut self, _cx: &Cx, _offset: u32, _n: u32, _flags: u32) -> Result<()> {
-        Err(FrankenError::Unsupported)
+    fn shm_lock(&mut self, _cx: &Cx, offset: u32, n: u32, flags: u32) -> Result<()> {
+        Self::validate_shm_request(offset, n)?;
+        let lock_requested = flags & SQLITE_SHM_LOCK != 0;
+        let unlock_requested = flags & SQLITE_SHM_UNLOCK != 0;
+        if lock_requested == unlock_requested {
+            error!(
+                offset,
+                n, flags, "invalid shm_lock request: exactly one of LOCK/UNLOCK is required"
+            );
+            return Err(FrankenError::LockFailed {
+                detail: "invalid shm_lock flags (must set exactly one of LOCK/UNLOCK)".to_string(),
+            });
+        }
+
+        let shared_mode = flags & SQLITE_SHM_SHARED != 0;
+        let exclusive_mode = flags & SQLITE_SHM_EXCLUSIVE != 0;
+        if shared_mode == exclusive_mode {
+            error!(
+                offset,
+                n, flags, "invalid shm_lock request: exactly one of SHARED/EXCLUSIVE is required"
+            );
+            return Err(FrankenError::LockFailed {
+                detail: "invalid shm_lock flags (must set exactly one of SHARED/EXCLUSIVE)"
+                    .to_string(),
+            });
+        }
+
+        let shm_info = self.ensure_shm_info()?;
+        let mut info = shm_info.lock().expect("shm info lock poisoned");
+
+        if lock_requested {
+            let mut acquired = Vec::new();
+            for slot in offset..offset + n {
+                let result = if exclusive_mode {
+                    self.acquire_shm_exclusive_slot(&mut info, slot)
+                } else {
+                    self.acquire_shm_shared_slot(&mut info, slot)
+                };
+                match result {
+                    Ok(()) => acquired.push(slot),
+                    Err(err) => {
+                        for acquired_slot in acquired.into_iter().rev() {
+                            if exclusive_mode {
+                                let _ = self.release_shm_exclusive_slot(&mut info, acquired_slot);
+                            } else {
+                                let _ = self.release_shm_shared_slot(&mut info, acquired_slot);
+                            }
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        for slot in offset..offset + n {
+            if exclusive_mode {
+                self.release_shm_exclusive_slot(&mut info, slot)?;
+            } else {
+                self.release_shm_shared_slot(&mut info, slot)?;
+            }
+        }
+        Ok(())
     }
 
     fn shm_barrier(&self) {}
 
-    fn shm_unmap(&mut self, _cx: &Cx, _delete: bool) -> Result<()> {
-        Ok(())
+    fn shm_unmap(&mut self, _cx: &Cx, delete: bool) -> Result<()> {
+        self.release_shm_owner_state(delete)
     }
 }
 
@@ -744,6 +1360,7 @@ impl VfsFile for UnixFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::{Command, Output};
 
     fn make_temp_path(name: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -753,6 +1370,33 @@ mod tests {
 
     fn open_flags_create() -> VfsOpenFlags {
         VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE
+    }
+
+    fn sqlite3_available() -> bool {
+        Command::new("sqlite3").arg("--version").output().is_ok()
+    }
+
+    fn sqlite3_exec(db_path: &Path, sql: &str) -> Output {
+        Command::new("sqlite3")
+            .arg(db_path)
+            .arg(sql)
+            .output()
+            .expect("sqlite3 command should execute")
+    }
+
+    fn setup_sqlite_wal_db(path: &Path) {
+        let setup = sqlite3_exec(
+            path,
+            "PRAGMA journal_mode=WAL; \
+             DROP TABLE IF EXISTS t; \
+             CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); \
+             INSERT INTO t(v) VALUES('alpha'),('beta');",
+        );
+        assert!(
+            setup.status.success(),
+            "sqlite3 setup failed: {}",
+            String::from_utf8_lossy(&setup.stderr)
+        );
     }
 
     // -- Basic I/O --
@@ -1024,5 +1668,256 @@ mod tests {
         vfs.randomness(&cx, &mut buf1);
         vfs.randomness(&cx, &mut buf2);
         assert_ne!(buf1, buf2, "randomness should produce different outputs");
+    }
+
+    #[test]
+    fn test_unix_vfs_lock_is_per_connection_in_process() {
+        // fcntl locks are per-process. SQLite semantics are per-connection.
+        // Verify we enforce per-connection exclusivity within a process.
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("multi_handle_lock.db");
+
+        let (mut f1, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let (mut f2, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+
+        // Connection 1 takes reserved.
+        f1.lock(&cx, LockLevel::Shared).unwrap();
+        f1.lock(&cx, LockLevel::Reserved).unwrap();
+
+        // Connection 2 should observe a reserved lock held by "another" connection.
+        assert!(
+            f2.check_reserved_lock(&cx).unwrap(),
+            "second handle should see reserved lock held by first handle"
+        );
+
+        // And it should not be able to acquire RESERVED itself.
+        f2.lock(&cx, LockLevel::Shared).unwrap();
+        assert!(f2.lock(&cx, LockLevel::Reserved).is_err());
+
+        f1.unlock(&cx, LockLevel::None).unwrap();
+        assert!(!f2.check_reserved_lock(&cx).unwrap());
+    }
+
+    #[test]
+    fn test_compat_reader_acquires_wal_read_lock() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("compat_reader_join.db");
+        let (mut reader1, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let (mut reader2, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+
+        let updated = reader1
+            .compat_reader_acquire_wal_read_lock(&cx, 0, 41)
+            .unwrap();
+        assert!(updated, "first reader must seed aReadMark[0]");
+
+        let joined = reader2
+            .compat_reader_acquire_wal_read_lock(&cx, 0, 41)
+            .unwrap();
+        assert!(
+            !joined,
+            "second reader should join existing aReadMark[0] with SHARED lock"
+        );
+
+        let read_marks = reader1.compat_read_marks().expect("shm state should exist");
+        assert_eq!(read_marks[0], 41);
+
+        let slot = wal_read_lock_slot(0).expect("reader slot 0 should exist");
+        reader2
+            .shm_lock(&cx, slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED)
+            .unwrap();
+        reader1
+            .shm_lock(&cx, slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_compat_reader_exclusive_for_update() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("compat_reader_update.db");
+        let (mut reader1, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let (mut reader2, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+
+        let first_update = reader1
+            .compat_reader_acquire_wal_read_lock(&cx, 0, 7)
+            .unwrap();
+        assert!(first_update);
+
+        let slot = wal_read_lock_slot(0).expect("reader slot 0 should exist");
+        reader1
+            .shm_lock(&cx, slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED)
+            .unwrap();
+
+        let second_update = reader1
+            .compat_reader_acquire_wal_read_lock(&cx, 0, 9)
+            .unwrap();
+        assert!(
+            second_update,
+            "reader must take EXCLUSIVE briefly to update aReadMark then downgrade"
+        );
+        assert_eq!(reader1.compat_read_marks().expect("shm state exists")[0], 9);
+
+        let joined = reader2
+            .compat_reader_acquire_wal_read_lock(&cx, 0, 9)
+            .unwrap();
+        assert!(!joined, "reader2 should join updated aReadMark");
+
+        reader2
+            .shm_lock(&cx, slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED)
+            .unwrap();
+        reader1
+            .shm_lock(&cx, slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_compat_writer_holds_wal_write_lock() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("compat_writer_lock.db");
+        let (mut coordinator, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let (mut contender, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+
+        coordinator.compat_writer_hold_wal_write_lock(&cx).unwrap();
+        let contender_err = contender
+            .compat_writer_hold_wal_write_lock(&cx)
+            .unwrap_err();
+        assert!(
+            matches!(contender_err, FrankenError::Busy),
+            "contender should observe SQLITE_BUSY while coordinator holds WAL_WRITE_LOCK"
+        );
+
+        coordinator
+            .compat_writer_release_wal_write_lock(&cx)
+            .unwrap();
+        contender.compat_writer_hold_wal_write_lock(&cx).unwrap();
+        contender.compat_writer_release_wal_write_lock(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_legacy_sqlite_reader_coexists() {
+        if !sqlite3_available() {
+            return;
+        }
+
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("legacy_reader_coexists.db");
+        setup_sqlite_wal_db(&path);
+
+        let (mut coordinator, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        coordinator.compat_writer_hold_wal_write_lock(&cx).unwrap();
+
+        let reader_output = sqlite3_exec(&path, "PRAGMA busy_timeout=0; SELECT COUNT(*) FROM t;");
+        assert!(
+            reader_output.status.success(),
+            "legacy sqlite reader should coexist while coordinator holds WAL_WRITE_LOCK; stderr={}",
+            String::from_utf8_lossy(&reader_output.stderr)
+        );
+        let count_text = String::from_utf8_lossy(&reader_output.stdout);
+        assert!(
+            count_text.contains('2'),
+            "expected reader to observe table rows; stdout={count_text}"
+        );
+
+        coordinator
+            .compat_writer_release_wal_write_lock(&cx)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_legacy_sqlite_writer_gets_busy() {
+        if !sqlite3_available() {
+            return;
+        }
+
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("legacy_writer_busy.db");
+        setup_sqlite_wal_db(&path);
+
+        let (mut coordinator, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        coordinator.compat_writer_hold_wal_write_lock(&cx).unwrap();
+
+        let writer_output = sqlite3_exec(
+            &path,
+            "PRAGMA busy_timeout=0; \
+             BEGIN IMMEDIATE; INSERT INTO t(v) VALUES('blocked'); COMMIT;",
+        );
+        assert!(
+            !writer_output.status.success(),
+            "legacy writer must fail with SQLITE_BUSY while coordinator holds WAL_WRITE_LOCK"
+        );
+        let busy_text = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&writer_output.stdout),
+            String::from_utf8_lossy(&writer_output.stderr)
+        )
+        .to_ascii_lowercase();
+        assert!(
+            busy_text.contains("database is locked") || busy_text.contains("busy"),
+            "expected sqlite busy/locked message, got: {busy_text}"
+        );
+
+        coordinator
+            .compat_writer_release_wal_write_lock(&cx)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_e2e_hybrid_shm_interop_with_c_sqlite() {
+        if !sqlite3_available() {
+            return;
+        }
+
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("hybrid_shm_interop_e2e.db");
+        setup_sqlite_wal_db(&path);
+
+        let (mut coordinator, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        coordinator.compat_writer_hold_wal_write_lock(&cx).unwrap();
+
+        // Reader interop while coordinator holds WAL_WRITE_LOCK.
+        let read_output = sqlite3_exec(&path, "PRAGMA busy_timeout=0; SELECT SUM(id) FROM t;");
+        assert!(
+            read_output.status.success(),
+            "reader should succeed during coordinator lifetime; stderr={}",
+            String::from_utf8_lossy(&read_output.stderr)
+        );
+        let read_text = String::from_utf8_lossy(&read_output.stdout);
+        assert!(
+            read_text.contains('3'),
+            "expected deterministic SUM(id)=3 from initial rows; stdout={read_text}"
+        );
+
+        // Writer must observe SQLITE_BUSY while coordinator lock is held.
+        let blocked_write = sqlite3_exec(
+            &path,
+            "PRAGMA busy_timeout=0; \
+             BEGIN IMMEDIATE; INSERT INTO t(v) VALUES('blocked'); COMMIT;",
+        );
+        assert!(
+            !blocked_write.status.success(),
+            "legacy writer must be excluded while coordinator WAL_WRITE_LOCK is held"
+        );
+
+        coordinator
+            .compat_writer_release_wal_write_lock(&cx)
+            .unwrap();
+
+        // After release, legacy writer should proceed.
+        let allowed_write = sqlite3_exec(
+            &path,
+            "PRAGMA busy_timeout=0; \
+             BEGIN IMMEDIATE; INSERT INTO t(v) VALUES('allowed'); COMMIT;",
+        );
+        assert!(
+            allowed_write.status.success(),
+            "legacy writer should proceed after coordinator releases WAL_WRITE_LOCK; stderr={}",
+            String::from_utf8_lossy(&allowed_write.stderr)
+        );
     }
 }
