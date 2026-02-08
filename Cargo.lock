@@ -356,8 +356,10 @@ dependencies = [
  "fsqlite-vfs",
  "parking_lot",
  "proptest",
+ "serde",
  "serde_json",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -373,6 +375,7 @@ dependencies = [
  "serde",
  "smallvec",
  "tracing",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -384,6 +387,7 @@ dependencies = [
  "fsqlite-vfs",
  "parking_lot",
  "proptest",
+ "xxhash-rust",
 ]
 
 [[package]]

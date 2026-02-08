@@ -237,6 +237,15 @@
 
         .commit-card:hover { background: rgba(255,255,255,0.03); border-color: var(--border); }
         .commit-card.selected { background: rgba(255,255,255,0.04); border-color: rgba(57,255,20,0.35); }
+        
+        @keyframes pulse-active {
+            0% { border-color: rgba(57,255,20,0.35); box-shadow: 0 0 0 0 rgba(57,255,20,0.1); }
+            50% { border-color: rgba(57,255,20,0.8); box-shadow: 0 0 12px 0 rgba(57,255,20,0.2); }
+            100% { border-color: rgba(57,255,20,0.35); box-shadow: 0 0 0 0 rgba(57,255,20,0.1); }
+        }
+        .commit-card.selected.playing {
+            animation: pulse-active 1.5s infinite var(--ease-in-out);
+        }
 
         .commit-card-header {
             display: flex;
@@ -697,11 +706,78 @@
             .brand h1 span { display: none; }
         }
 
+        /* --- Artifact & Scanlines --- */
+        .scanlines {
+            position: fixed;
+            inset: 0;
+            background: linear-gradient(
+                to bottom,
+                transparent 50%,
+                rgba(0, 0, 0, 0.1) 50%
+            );
+            background-size: 100% 4px;
+            z-index: 9999;
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 0.5s ease;
+        }
+        body.focus-mode .scanlines { opacity: 1; }
+
+        @keyframes glitch {
+            0% { transform: translate(0); text-shadow: none; }
+            20% { transform: translate(-2px, 1px); text-shadow: 2px 0 var(--accent-error), -2px 0 var(--accent-info); }
+            40% { transform: translate(2px, -1px); text-shadow: -2px 0 var(--accent-error), 2px 0 var(--accent-info); }
+            60% { transform: translate(-1px, 0); }
+            100% { transform: translate(0); }
+        }
+
+        body.focus-mode .diff-highlight:hover {
+            animation: glitch 0.3s infinite;
+            color: #fff;
+            background: rgba(57, 255, 20, 0.25);
+        }
+
+        /* --- Filters --- */
+        #bucketFilters {
+            display: flex;
+            gap: 6px;
+            overflow-x: auto;
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--border);
+            background: rgba(5,5,5,0.2);
+            scrollbar-width: none;
+            -ms-overflow-style: none;
+        }
+        #bucketFilters::-webkit-scrollbar { display: none; }
+
+        .filter-pill {
+            flex-shrink: 0;
+            padding: 4px 10px;
+            border-radius: 99px;
+            font-size: 10px;
+            font-weight: 700;
+            cursor: pointer;
+            border: 1px solid var(--border);
+            color: var(--text-3);
+            transition: all 0.2s var(--ease-out-expo);
+            user-select: none;
+            background: transparent;
+        }
+        .filter-pill:hover { color: var(--text-2); border-color: var(--border-hover); }
+        .filter-pill.active { border-color: currentColor; background: rgba(255,255,255,0.03); }
+
+        /* Esoteric Math Glitch in Legend */
+        .legend-item:nth-child(8):hover .legend-item-name {
+            animation: glitch 0.4s infinite;
+            color: var(--primary);
+        }
+
         /* Cleanup unwanted elements */
         .system-hud, .dna-hud, .metrics-hud, #flashlight, .aberration, .arc-container { display: none !important; }
     </style>
 </head>
 <body data-flashlight="false">
+<div class="scanlines"></div>
 
 <div id="loadingOverlay">
     <div class="vital-pulse"></div>
@@ -744,7 +820,10 @@
                 <div id="tabTimeline" class="tab">DIAGNOSTICS</div>
                 <div id="tabDiff" class="tab">DELTA</div>
             </div>
-            <div id="activeLabel" style="font-size: 10px; font-family: var(--font-mono); color: var(--text-3);"></div>
+            <div style="display: flex; align-items: center; gap: 12px;">
+                <button id="btnDiffMode" class="btn-lab hidden" style="border-color: var(--text-4);">MODE: LINE</button>
+                <div id="activeLabel" style="font-size: 10px; font-family: var(--font-mono); color: var(--text-3);"></div>
+            </div>
         </div>
 
         <div class="viewport">
@@ -829,7 +908,16 @@
     let METRICS = [];
     let BASE_DOC = "";
     
-    const STATE = { idx: 0, q: "", tab: "spec", timeBucket: "day" };
+    const STATE = { 
+        idx: 0, 
+        q: "", 
+        tab: "spec", 
+        timeBucket: "day", 
+        playing: false, 
+        playInterval: null,
+        activeBuckets: new Set(),
+        diffMode: 'line-by-line' 
+    };
 
     // --- Initialization ---
 
@@ -847,18 +935,33 @@
             loadCommits();
             loadGroups();
             setupEventListeners();
+            initBucketFilters();
             syncNeuralFilters();
             await computeSynapticMetrics();
             
             // Initial Render
-            renderCommitList(true); // true = animate entry
+            renderCommitList(true);
             drawSynapticMap();
             
-            if (COMMITS.length > 0) {
-                await selectCommit(COMMITS.length - 1, false);
+            // Deep Linking
+            const hash = window.location.hash;
+            let startIdx = COMMITS.length - 1;
+            if (hash.startsWith("#entry-")) {
+                const requested = parseInt(hash.replace("#entry-", ""));
+                if (!isNaN(requested)) startIdx = requested;
             }
             
+            await selectCommit(startIdx, true);
+            
             hideLoader();
+            
+            window.addEventListener("hashchange", () => {
+                const newHash = window.location.hash;
+                if (newHash.startsWith("#entry-")) {
+                    const idx = parseInt(newHash.replace("#entry-", ""));
+                    if (!isNaN(idx) && idx !== STATE.idx) selectCommit(idx, true);
+                }
+            });
         } catch (e) {
             console.error(e);
             document.getElementById("loadingOverlay").innerHTML = `<div style="color:var(--accent-error); font-family:var(--font-mono); font-size:12px;">INIT_FAILURE: ${e.message}</div>`;
@@ -901,21 +1004,17 @@
     // --- Interactions ---
 
     window.selectCommit = async function(idx, animateScroll = true) {
-        const prevIdx = STATE.idx;
-        STATE.idx = Math.max(0, Math.min(COMMITS.length - 1, idx));
+        const targetIdx = Math.max(0, Math.min(COMMITS.length - 1, idx));
+        if (targetIdx === STATE.idx && document.querySelector(".commit-card.selected")) {
+             await updateView();
+             return;
+        }
+        
+        STATE.idx = targetIdx;
         document.getElementById("commitSlider").value = STATE.idx;
+        history.replaceState(null, null, `#entry-${STATE.idx}`);
         
         const c = COMMITS[STATE.idx];
-        
-        // Update selection UI
-        document.querySelectorAll(".commit-card").forEach(el => el.classList.remove("selected"));
-        const newSel = document.querySelector(`.commit-card[data-idx="${STATE.idx}"]`);
-        if (newSel) {
-            newSel.classList.add("selected");
-            if (animateScroll) newSel.scrollIntoView({ block: "nearest", behavior: "smooth" });
-        }
-
-        // Update Dock/Header info
         const subjectEl = document.getElementById("dockSubject");
         if (subjectEl) subjectEl.textContent = c.subject;
         const detailsEl = document.getElementById("dockDetails");
@@ -925,8 +1024,62 @@
         if (activeLabel) activeLabel.textContent = `LOG_ENTRY_${STATE.idx} // ${c.short}`;
 
         renderCommitList();
+        const newSel = document.querySelector(`.commit-card[data-idx="${STATE.idx}"]`);
+        if (newSel && animateScroll) newSel.scrollIntoView({ block: "nearest", behavior: "smooth" });
+
         await updateView();
     };
+
+    function initBucketFilters() {
+        const filterContainer = document.createElement("div");
+        filterContainer.id = "bucketFilters";
+        filterContainer.innerHTML = BUCKETS.map(b => `
+            <div class="filter-pill" data-id="${b.id}" style="color: ${b.color}cc">
+                ${b.name}
+            </div>
+        `).join("");
+        
+        const sidebarHeader = document.querySelector(".sidebar-header");
+        sidebarHeader.appendChild(filterContainer);
+
+        filterContainer.querySelectorAll(".filter-pill").forEach(pill => {
+            pill.addEventListener("click", () => {
+                const id = parseInt(pill.dataset.id);
+                if (STATE.activeBuckets.has(id)) {
+                    STATE.activeBuckets.delete(id);
+                    pill.classList.remove("active");
+                } else {
+                    STATE.activeBuckets.add(id);
+                    pill.classList.add("active");
+                }
+                syncNeuralFilters();
+                renderCommitList();
+            });
+        });
+    }
+
+    function togglePlay() {
+        const btn = document.getElementById("btnPlay");
+        if (STATE.playing) {
+            if (STATE.playInterval) clearInterval(STATE.playInterval);
+            STATE.playing = false;
+            btn.textContent = "REANIMATE";
+            btn.style.color = "var(--text-2)";
+            renderCommitList();
+        } else {
+            STATE.playing = true;
+            btn.textContent = "SUSPEND";
+            btn.style.color = "var(--primary)";
+            renderCommitList();
+            STATE.playInterval = setInterval(() => {
+                if (STATE.idx < COMMITS.length - 1) {
+                    selectCommit(STATE.idx + 1);
+                } else {
+                    togglePlay();
+                }
+            }, 1500);
+        }
+    }
 
     async function updateView() {
         const container = document.getElementById("view" + STATE.tab.charAt(0).toUpperCase() + STATE.tab.slice(1));
@@ -1105,7 +1258,12 @@
         const el = document.getElementById("diffContent");
         const p = await getPatch(STATE.idx);
         if (!p) { el.innerHTML = "<div style='padding:20px; color:var(--text-3)'>NO DELTA</div>"; return; }
-        const diffHtml = Diff2Html.html(p, { drawFileList: false, matching: 'lines', outputFormat: 'line-by-line', colorScheme: 'dark' });
+        const diffHtml = Diff2Html.html(p, { 
+            drawFileList: false, 
+            matching: 'lines', 
+            outputFormat: STATE.diffMode, 
+            colorScheme: 'dark' 
+        });
         el.innerHTML = DOMPurify.sanitize(diffHtml);
     }
 
@@ -1115,9 +1273,13 @@
         const container = document.getElementById("commitList");
         container.innerHTML = FILTERED.slice().reverse().map(c => {
             const b = BUCKETS.find(x => x.id === c.primary) || BUCKETS[9];
-            const sel = c.idx === STATE.idx ? "selected" : "";
+            const isSelected = c.idx === STATE.idx;
+            const classes = ["commit-card"];
+            if (isSelected) classes.push("selected");
+            if (isSelected && STATE.playing) classes.push("playing");
+
             return `
-                <div class="commit-card ${sel}" data-idx="${c.idx}" onclick="window.selectCommit(${c.idx}); document.getElementById('sidebar').classList.remove('active');">
+                <div class="${classes.join(" ")}" data-idx="${c.idx}" onclick="window.selectCommit(${c.idx}); document.getElementById('sidebar').classList.remove('active');">
                     <div class="commit-card-header">
                         <span>#${c.idx}</span>
                         <span>${dayjs(c.date).format("MMM DD")}</span>
@@ -1176,8 +1338,20 @@
                 e.target.classList.add("active"); 
                 document.getElementById("view" + t).classList.remove("hidden");
                 STATE.tab = t.toLowerCase(); 
+                
+                // Show/Hide diff mode toggle
+                const diffBtn = document.getElementById("btnDiffMode");
+                if (STATE.tab === "diff") diffBtn.classList.remove("hidden");
+                else diffBtn.classList.add("hidden");
+
                 updateView();
             });
+        });
+
+        document.getElementById("btnDiffMode").addEventListener("click", (e) => {
+            STATE.diffMode = STATE.diffMode === 'line-by-line' ? 'side-by-side' : 'line-by-line';
+            e.target.textContent = STATE.diffMode === 'line-by-line' ? 'MODE: LINE' : 'MODE: SIDE';
+            renderDiff();
         });
 
         // Mobile Sidebar
@@ -1196,6 +1370,11 @@
 
         window.addEventListener("resize", () => { drawSynapticMap(); Object.values(charts).forEach(c => c.resize()); });
         
+        // Playback Control
+        const btnPlay = document.getElementById("btnPlay");
+        btnPlay.classList.remove("btn-play"); // Reveal it
+        btnPlay.addEventListener("click", togglePlay);
+
         // Focus Mode
         document.getElementById("btnFocus").addEventListener("click", toggleFocusMode);
         document.getElementById("btnFocusExit").addEventListener("click", toggleFocusMode);
@@ -1203,7 +1382,14 @@
         initLegend();
     }
 
-    function syncNeuralFilters() { const q = STATE.q.toLowerCase(); FILTERED = COMMITS.filter(c => !q || c.subject.toLowerCase().includes(q) || c.hash.includes(q)); }
+    function syncNeuralFilters() { 
+        const q = STATE.q.toLowerCase(); 
+        FILTERED = COMMITS.filter(c => {
+            const matchesText = !q || c.subject.toLowerCase().includes(q) || c.hash.includes(q);
+            const matchesBucket = STATE.activeBuckets.size === 0 || STATE.activeBuckets.has(c.primary);
+            return matchesText && matchesBucket;
+        }); 
+    }
     
     function hideLoader() {
         const loader = document.getElementById("loadingOverlay");
