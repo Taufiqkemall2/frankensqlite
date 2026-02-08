@@ -45,21 +45,6 @@
             height: 100dvh;
             display: flex;
             flex-direction: column;
-            /* Apply the CRT filter to the entire body */
-            filter: url(#crt-filter);
-        }
-
-        /* --- GPU Accelerated Background --- */
-        .lab-grid {
-            position: fixed;
-            inset: 0;
-            background-image: 
-                linear-gradient(var(--border) 1px, transparent 1px),
-                linear-gradient(90deg, var(--border) 1px, transparent 1px);
-            background-size: 40px 40px;
-            opacity: 0.2;
-            pointer-events: none;
-            z-index: -1;
         }
 
         .main-container {
@@ -69,6 +54,8 @@
             flex-direction: column;
             position: relative;
             z-index: 1;
+            /* Apply the CRT filter here instead of body */
+            filter: url(#crt-filter);
         }
 
         /* --- Advanced CRT FX --- */
