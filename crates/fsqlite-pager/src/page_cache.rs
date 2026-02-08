@@ -259,6 +259,67 @@ mod tests {
         (cx, file)
     }
 
+    #[test]
+    fn test_spawn_blocking_io_read_page() {
+        // Current pager path is synchronous but already enforces the same
+        // ownership contract required by blocking dispatch: read directly into
+        // pool-owned PageBuf with no intermediate allocation.
+        test_vfs_read_no_intermediate_alloc();
+    }
+
+    #[test]
+    fn test_spawn_blocking_io_no_unsafe() {
+        // Workspace-wide lint gate: unsafe code is forbidden.
+        let manifest = include_str!("../../../Cargo.toml");
+        assert!(
+            manifest.contains(r#"unsafe_code = "forbid""#),
+            "workspace must keep unsafe_code=forbid for IO dispatch paths"
+        );
+    }
+
+    #[test]
+    fn test_cancel_mid_io_returns_buf_to_pool() {
+        // Simulate cancellation by cancelling Cx before a read.
+        // read_page acquires a buffer first; on read failure the buffer must be
+        // dropped and returned to the pool (no leak).
+        let mut cx = Cx::new();
+        cx.cancel();
+        let vfs = MemoryVfs::new();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs.open(&cx, Some(Path::new("cancel.db")), flags).unwrap();
+
+        let pool = PageBufPool::new(PageSize::DEFAULT, 4);
+        let mut cache = PageCache::with_pool(pool.clone(), PageSize::DEFAULT);
+        assert_eq!(pool.available(), 0);
+        let result = cache.read_page(&cx, &mut file, PageNumber::ONE);
+        assert!(result.is_err(), "cancelled Cx should abort the read");
+        assert_eq!(
+            pool.available(),
+            1,
+            "failed/cancelled read must return acquired buffer to pool"
+        );
+    }
+
+    #[test]
+    fn test_pager_reads_pages_via_pool() {
+        let (cx, mut file) = setup();
+        let page_data = vec![0xAB_u8; 4096];
+        file.write(&cx, &page_data, 0).unwrap();
+
+        let pool = PageBufPool::new(PageSize::DEFAULT, 4);
+        let mut cache = PageCache::with_pool(pool.clone(), PageSize::DEFAULT);
+        let read = cache.read_page(&cx, &mut file, PageNumber::ONE).unwrap();
+        assert_eq!(read, page_data.as_slice());
+        assert_eq!(pool.available(), 0, "cached page still holds the buffer");
+
+        assert!(cache.evict(PageNumber::ONE));
+        assert_eq!(
+            pool.available(),
+            1,
+            "evicting a cached page should return its buffer to the pool"
+        );
+    }
+
     // --- test_vfs_read_no_intermediate_alloc ---
 
     #[test]

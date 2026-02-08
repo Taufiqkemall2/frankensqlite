@@ -366,6 +366,19 @@ mod tests {
     // --- Pool tests ---
 
     #[test]
+    fn test_page_buf_owned_send_static() {
+        fn assert_send_static<T: Send + 'static>() {}
+        assert_send_static::<PageBuf>();
+    }
+
+    #[test]
+    fn test_page_buf_page_aligned() {
+        let buf = PageBuf::new(PageSize::DEFAULT);
+        let ptr = buf.as_ptr() as usize;
+        assert_eq!(ptr % PageSize::DEFAULT.as_usize(), 0);
+    }
+
+    #[test]
     fn test_page_buf_pool_reuse() {
         let pool = PageBufPool::new(PageSize::DEFAULT, 4);
         assert_eq!(pool.available(), 0);
@@ -384,6 +397,17 @@ mod tests {
             "bead_id={BEAD_ID} case=pool_reuse should reuse same allocation"
         );
         assert_eq!(pool.available(), 0);
+    }
+
+    #[test]
+    fn test_page_buf_drop_returns_to_pool() {
+        let pool = PageBufPool::new(PageSize::DEFAULT, 4);
+        assert_eq!(pool.available(), 0);
+        {
+            let _buf = pool.acquire();
+            assert_eq!(pool.available(), 0);
+        }
+        assert_eq!(pool.available(), 1, "dropped buffers must be recycled");
     }
 
     #[test]
@@ -406,6 +430,20 @@ mod tests {
     }
 
     #[test]
+    fn test_page_buf_pool_bounded() {
+        let pool = PageBufPool::new(PageSize::DEFAULT, 2);
+
+        let b1 = pool.acquire();
+        let b2 = pool.acquire();
+        let b3 = pool.acquire();
+        drop(b1);
+        drop(b2);
+        drop(b3);
+
+        assert_eq!(pool.available(), 2, "pool must enforce idle capacity bound");
+    }
+
+    #[test]
     fn test_page_buf_pool_acquired_is_aligned() {
         for &size in &[512u32, 1024, 4096, 16384, 65536] {
             let ps = PageSize::new(size).expect("valid page size");
@@ -419,6 +457,22 @@ mod tests {
             );
             assert_eq!(buf.page_size(), size as usize);
         }
+    }
+
+    #[test]
+    fn test_page_buf_pool_keyed_by_page_size() {
+        let pool_4k = PageBufPool::new(PageSize::DEFAULT, 4);
+        let pool_8k = PageBufPool::new(PageSize::new(8192).unwrap(), 4);
+
+        {
+            let _buf_4k = pool_4k.acquire();
+            let _buf_8k = pool_8k.acquire();
+            assert_eq!(pool_4k.page_size(), 4096);
+            assert_eq!(pool_8k.page_size(), 8192);
+        }
+
+        assert_eq!(pool_4k.available(), 1);
+        assert_eq!(pool_8k.available(), 1);
     }
 
     #[test]
