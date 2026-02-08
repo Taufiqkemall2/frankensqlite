@@ -9,6 +9,7 @@
 //! - [`CommitResponse`]: Result type for the commit sequencer.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use fsqlite_types::{
@@ -25,6 +26,8 @@ use crate::shm::SharedMemoryLayout;
 
 const DEFAULT_BUSY_TIMEOUT_MS: u64 = 100;
 const DEFAULT_SERIALIZED_WRITER_LEASE_SECS: u64 = 30;
+
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
 // ---------------------------------------------------------------------------
 // BeginKind
@@ -297,6 +300,7 @@ pub struct TransactionManager {
     write_mutex: SerializedWriteMutex,
     shm: SharedMemoryLayout,
     commit_index: CommitIndex,
+    conn_id: u64,
     /// Current schema epoch (simplified; in full impl this lives in SHM).
     schema_epoch: SchemaEpoch,
     write_merge_policy: WriteMergePolicy,
@@ -320,6 +324,7 @@ impl TransactionManager {
             write_mutex: SerializedWriteMutex::new(),
             shm: SharedMemoryLayout::new(page_size, 128),
             commit_index: CommitIndex::new(),
+            conn_id: NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed),
             schema_epoch: SchemaEpoch::ZERO,
             write_merge_policy: WriteMergePolicy::default(),
             ssi_enabled: true,
@@ -327,6 +332,12 @@ impl TransactionManager {
             serialized_writer_lease_secs: DEFAULT_SERIALIZED_WRITER_LEASE_SECS,
             txn_max_duration_ms: 5_000,
         }
+    }
+
+    /// Opaque per-connection identifier used in logs (helps prove PRAGMA scope).
+    #[must_use]
+    pub const fn conn_id(&self) -> u64 {
+        self.conn_id
     }
 
     /// Busy-timeout for draining concurrent writers during Serialized acquisition (§5.8.1).
@@ -375,6 +386,7 @@ impl TransactionManager {
         let old = self.ssi_enabled;
         self.ssi_enabled = enabled;
         tracing::debug!(
+            conn_id = self.conn_id,
             old_value = old,
             new_value = enabled,
             "PRAGMA fsqlite.serializable changed"
@@ -420,6 +432,8 @@ impl TransactionManager {
 
         let mut txn = Transaction::new(txn_id, TxnEpoch::new(0), snapshot, mode);
         txn.snapshot_established = snapshot_established;
+        // PRAGMA is per-connection and takes effect at BEGIN (not retroactive).
+        txn.ssi_enabled_at_begin = self.ssi_enabled;
 
         // For Immediate/Exclusive: acquire serialized writer exclusion at BEGIN.
         if kind == BeginKind::Immediate || kind == BeginKind::Exclusive {
@@ -428,6 +442,7 @@ impl TransactionManager {
         }
 
         tracing::info!(
+            conn_id = self.conn_id,
             txn_id = %txn_id,
             ?kind,
             ?mode,
@@ -790,8 +805,15 @@ impl TransactionManager {
     /// attempt on conflict, (3) SSI re-validation after rebase, (4) publish.
     fn commit_concurrent(&self, txn: &mut Transaction) -> Result<CommitSeq, MvccError> {
         // Step 1: SSI validation — if dangerous structure, abort immediately.
-        // Skipped when PRAGMA fsqlite.serializable = OFF (plain SI mode).
-        if self.ssi_enabled && txn.has_dangerous_structure() {
+        // Skipped when txn began with PRAGMA fsqlite.serializable = OFF (plain SI mode).
+        if txn.ssi_enabled_at_begin && txn.has_dangerous_structure() {
+            tracing::info!(
+                conn_id = self.conn_id,
+                txn_id = %txn.txn_id,
+                has_in_rw = txn.has_in_rw,
+                has_out_rw = txn.has_out_rw,
+                "SSI abort: dangerous structure detected"
+            );
             self.abort(txn);
             return Err(MvccError::BusySnapshot);
         }
@@ -855,7 +877,14 @@ impl TransactionManager {
 
         // Step 3: SSI re-validation after rebase (§5.7.3 — mandatory even on
         // successful rebase, per spec line ~9005).
-        if self.ssi_enabled && rebased && txn.has_dangerous_structure() {
+        if txn.ssi_enabled_at_begin && rebased && txn.has_dangerous_structure() {
+            tracing::info!(
+                conn_id = self.conn_id,
+                txn_id = %txn.txn_id,
+                has_in_rw = txn.has_in_rw,
+                has_out_rw = txn.has_out_rw,
+                "SSI abort after rebase: dangerous structure detected"
+            );
             self.abort(txn);
             return Err(MvccError::BusySnapshot);
         }
@@ -1107,6 +1136,7 @@ impl TransactionManager {
 impl std::fmt::Debug for TransactionManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TransactionManager")
+            .field("conn_id", &self.conn_id)
             .field("schema_epoch", &self.schema_epoch)
             .field("write_merge_policy", &self.write_merge_policy)
             .field("ssi_enabled", &self.ssi_enabled)
@@ -3986,6 +4016,48 @@ mod tests {
             m.commit(&mut txn3).unwrap_err(),
             MvccError::BusySnapshot,
             "txn3: ON must take effect for next transaction"
+        );
+    }
+
+    #[test]
+    fn test_pragma_not_retroactive_to_active_txn_on_to_off() {
+        let mut m = mgr();
+        assert!(m.ssi_enabled());
+
+        // Begin under default ON, then flip OFF mid-flight: must NOT affect this txn.
+        let mut txn = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut txn, PageNumber::new(1).unwrap(), test_data(0x01))
+            .unwrap();
+        txn.has_in_rw = true;
+        txn.has_out_rw = true;
+        assert!(txn.has_dangerous_structure());
+
+        m.set_ssi_enabled(false);
+        assert_eq!(
+            m.commit(&mut txn).unwrap_err(),
+            MvccError::BusySnapshot,
+            "PRAGMA change must not be retroactive to an active txn"
+        );
+    }
+
+    #[test]
+    fn test_pragma_not_retroactive_to_active_txn_off_to_on() {
+        let mut m = mgr();
+        m.set_ssi_enabled(false);
+
+        // Begin under OFF, then flip ON mid-flight: must NOT affect this txn.
+        let mut txn = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut txn, PageNumber::new(1).unwrap(), test_data(0x01))
+            .unwrap();
+        txn.has_in_rw = true;
+        txn.has_out_rw = true;
+        assert!(txn.has_dangerous_structure());
+
+        m.set_ssi_enabled(true);
+        let seq = m.commit(&mut txn).unwrap();
+        assert!(
+            seq > CommitSeq::ZERO,
+            "OFF-at-BEGIN must tolerate write skew"
         );
     }
 }
