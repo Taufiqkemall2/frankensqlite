@@ -20,6 +20,16 @@ fsqlite-parser = { workspace = true }
 fsqlite-planner = { workspace = true }
 fsqlite-vdbe = { workspace = true }
 fsqlite-func = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+asupersync = { path = "/dp/asupersync" }
+criterion = { workspace = true }
+tracing = { workspace = true }
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "symbol_ops"
+harness = false
