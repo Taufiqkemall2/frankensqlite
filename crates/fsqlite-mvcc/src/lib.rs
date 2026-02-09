@@ -14,6 +14,7 @@ pub mod coordinator_ipc;
 pub mod core_types;
 pub mod deterministic_rebase;
 pub mod gc;
+pub mod history_compression;
 pub mod hot_witness_index;
 pub mod index_regen;
 pub mod invariants;
@@ -65,6 +66,15 @@ pub use deterministic_rebase::{
 pub use gc::{
     GC_F_MAX_HZ, GC_F_MIN_HZ, GC_PAGES_BUDGET, GC_TARGET_CHAIN_LENGTH, GC_VERSIONS_BUDGET,
     GcScheduler, GcTickResult, GcTodo, PruneResult, gc_tick, prune_page_chain,
+};
+pub use history_compression::{
+    CertificateVerificationError, CircuitBreakerEvent, CompressedPageHistory,
+    CompressedPageVersion, CompressedVersionData, HistoryCompressionError, MergeCertificate,
+    MergeCertificatePostState, MergeKind, VERIFIER_VERSION, are_intent_ops_independent,
+    circuit_breaker_check, collapse_join_max_updates, compress_page_history,
+    compute_footprint_digest, compute_op_digest, extract_join_max_constant, foata_normal_form,
+    generate_merge_certificate, is_join_max_int_update, is_mergeable_intent,
+    verify_merge_certificate,
 };
 pub use hot_witness_index::{
     ColdPlaneMode, ColdWitnessStore, HotWitnessBucketEntry, HotWitnessIndex, bitset_to_slot_ids,
