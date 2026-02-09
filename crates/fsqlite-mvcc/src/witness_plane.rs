@@ -156,6 +156,43 @@ pub fn witness_keys_overlap(a: &WitnessKey, b: &WitnessKey) -> bool {
                 tag: tb,
             },
         ) => ra == rb && ta == tb,
+        (
+            WitnessKey::KeyRange { btree_root: ra, .. },
+            WitnessKey::KeyRange { btree_root: rb, .. },
+        ) => ra == rb,
+        (WitnessKey::KeyRange { btree_root, .. }, WitnessKey::Page(p))
+        | (WitnessKey::Page(p), WitnessKey::KeyRange { btree_root, .. }) => p == btree_root,
+        (
+            WitnessKey::KeyRange { btree_root: range_root, .. },
+            WitnessKey::Cell {
+                btree_root: cell_root,
+                ..
+            },
+        )
+        | (
+            WitnessKey::Cell {
+                btree_root: cell_root,
+                ..
+            },
+            WitnessKey::KeyRange {
+                btree_root: range_root,
+                ..
+            },
+        ) => range_root == cell_root,
+        (
+            WitnessKey::KeyRange {
+                btree_root: range_root,
+                ..
+            },
+            WitnessKey::ByteRange { page, .. },
+        )
+        | (
+            WitnessKey::ByteRange { page, .. },
+            WitnessKey::KeyRange {
+                btree_root: range_root,
+                ..
+            },
+        ) => range_root == page,
         // Page overlaps with Cell if the page could contain that cell's btree.
         // Conservative: always overlap when page matches btree_root.
         (WitnessKey::Page(p), WitnessKey::Cell { btree_root, .. })
@@ -414,6 +451,36 @@ mod tests {
         assert!(
             !writer_ws.overlaps_write(&other_key),
             "must not detect overlap for different key"
+        );
+    }
+
+    #[test]
+    fn test_keyrange_phantom_protection() {
+        let key_range = WitnessKey::KeyRange {
+            btree_root: page(100),
+            lo: b"aa".to_vec(),
+            hi: b"zz".to_vec(),
+        };
+        let same_leaf_write = WitnessKey::Page(page(100));
+        let other_leaf_write = WitnessKey::Page(page(101));
+
+        assert!(
+            witness_keys_overlap(&key_range, &same_leaf_write),
+            "range witness must overlap writes on the same btree root page"
+        );
+        assert!(
+            !witness_keys_overlap(&key_range, &other_leaf_write),
+            "range witness should not overlap writes from other roots"
+        );
+
+        let same_tree_other_bounds = WitnessKey::KeyRange {
+            btree_root: page(100),
+            lo: b"m".to_vec(),
+            hi: b"n".to_vec(),
+        };
+        assert!(
+            witness_keys_overlap(&key_range, &same_tree_other_bounds),
+            "same-tree key ranges conservatively overlap to preserve phantom safety"
         );
     }
 

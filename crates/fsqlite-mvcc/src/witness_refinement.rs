@@ -442,7 +442,10 @@ mod tests {
         let non_overlap = refine_edges(
             in_edges,
             Vec::new(),
-            &[(10_u32, KeySummary::ByteRangeList(vec![(11_u32, 0_u16, 64_u16)]))],
+            &[(
+                10_u32,
+                KeySummary::ByteRangeList(vec![(11_u32, 0_u16, 64_u16)]),
+            )],
             &budget,
         );
         assert_eq!(non_overlap.eliminated_edges.len(), 1);
@@ -452,7 +455,10 @@ mod tests {
         let overlap = refine_edges(
             vec![make_edge(1, 2, 10)],
             Vec::new(),
-            &[(10_u32, KeySummary::ByteRangeList(vec![(10_u32, 32_u16, 64_u16)]))],
+            &[(
+                10_u32,
+                KeySummary::ByteRangeList(vec![(10_u32, 32_u16, 64_u16)]),
+            )],
             &budget,
         );
         assert_eq!(overlap.confirmed_edges.len(), 1);

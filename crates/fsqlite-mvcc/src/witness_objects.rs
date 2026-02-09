@@ -78,13 +78,15 @@ impl KeySummary {
                 }
             }
             Self::ByteRangeList(ranges) => match key {
-                WitnessKey::ByteRange { page, start, len } => ranges.iter().any(
-                    |(range_page, range_start, range_len)| {
+                WitnessKey::ByteRange { page, start, len } => {
+                    ranges.iter().any(|(range_page, range_start, range_len)| {
                         *range_page == page.get()
                             && byte_ranges_overlap(*range_start, *range_len, *start, *len)
-                    },
-                ),
-                WitnessKey::Page(pgno) => ranges.iter().any(|(range_page, _, _)| *range_page == pgno.get()),
+                    })
+                }
+                WitnessKey::Page(pgno) => ranges
+                    .iter()
+                    .any(|(range_page, _, _)| *range_page == pgno.get()),
                 WitnessKey::Cell { btree_root, .. } | WitnessKey::KeyRange { btree_root, .. } => {
                     ranges
                         .iter()

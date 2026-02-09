@@ -130,8 +130,8 @@ impl fmt::Display for VictimDecision {
 ///
 /// 1. **Confirmed cycle (T1, T3 both committed):** MUST abort T2 (pivot).
 ///    Safety is mandatory.
-/// 2. **Potential cycle:** Compare costs. If `L(T2) << L(T3)`, prefer
-///    aborting T2 to protect the heavier transaction. Default: abort pivot.
+/// 2. **Potential cycle:** Compare costs and abort the cheaper participant.
+///    On ties, default to aborting pivot for deterministic behavior.
 #[must_use]
 pub fn select_victim(
     status: CycleStatus,
@@ -153,9 +153,8 @@ pub fn select_victim(
             }
         }
         CycleStatus::Potential => {
-            // Optimistic: compare costs. Default to pivot unless other is much cheaper.
-            // "Alien Rule": if pivot is significantly cheaper, abort it to protect heavy txn.
-            if pivot_l <= other_l {
+            // Optimize for retry cost: abort the cheaper participant.
+            if pivot_l < other_l {
                 VictimDecision {
                     victim: Victim::Pivot,
                     cycle_status: status,
@@ -163,15 +162,22 @@ pub fn select_victim(
                     other_cost: other_l,
                     reason: "potential_cycle_abort_cheaper_pivot",
                 }
+            } else if other_l < pivot_l {
+                VictimDecision {
+                    victim: Victim::Other,
+                    cycle_status: status,
+                    pivot_cost: pivot_l,
+                    other_cost: other_l,
+                    reason: "potential_cycle_abort_cheaper_other",
+                }
             } else {
-                // Pivot is heavier. Default still aborts pivot (conservative),
-                // but logs the cost difference for auditing.
+                // Tie-breaker for deterministic behavior.
                 VictimDecision {
                     victim: Victim::Pivot,
                     cycle_status: status,
                     pivot_cost: pivot_l,
                     other_cost: other_l,
-                    reason: "potential_cycle_default_abort_pivot",
+                    reason: "potential_cycle_tie_abort_pivot",
                 }
             }
         }
@@ -528,6 +534,25 @@ mod tests {
             decision.pivot_cost < decision.other_cost,
             "bead_id={BEAD_ID} pivot_cost_lower"
         );
+    }
+
+    #[test]
+    fn test_victim_selection_potential_cycle_cheaper_other() {
+        let pivot = TxnCost {
+            write_set_size: 1000,
+            duration_us: 0,
+        };
+        let other = TxnCost {
+            write_set_size: 1,
+            duration_us: 0,
+        };
+        let decision = select_victim(CycleStatus::Potential, pivot, other);
+        assert_eq!(
+            decision.victim,
+            Victim::Other,
+            "bead_id={BEAD_ID} cheaper_other_aborted"
+        );
+        assert!(decision.reason.contains("cheaper_other"));
     }
 
     #[test]

@@ -46,8 +46,349 @@ pub const MTU_SAFE_SYMBOL_SIZE: u16 = 1448;
 /// Default maximum ISI multiplier for streaming stop.
 pub const DEFAULT_MAX_ISI_MULTIPLIER: u32 = 2;
 
+/// Default hard cap for a single remote message (4 MiB, §4.19.6).
+pub const DEFAULT_RPC_MESSAGE_CAP_BYTES: usize = 4 * 1024 * 1024;
+
+/// HTTP/2 default: max concurrent streams.
+pub const DEFAULT_HTTP2_MAX_CONCURRENT_STREAMS: u32 = 256;
+
+/// HTTP/2 default: maximum compressed header list size (64 KiB).
+pub const DEFAULT_HTTP2_MAX_HEADER_LIST_SIZE: usize = 65_536;
+
+/// HTTP/2 default: CONTINUATION timeout in milliseconds (5s).
+pub const DEFAULT_HTTP2_CONTINUATION_TIMEOUT_MS: u64 = 5_000;
+
+/// HTTP/2 default: absolute header fragment cap (256 KiB).
+pub const DEFAULT_HTTP2_HEADER_FRAGMENT_CAP: usize = 262_144;
+
+/// Default handshake timeout in milliseconds.
+pub const DEFAULT_HANDSHAKE_TIMEOUT_MS: u64 = 500;
+
 /// Changeset header size in bytes.
 pub const CHANGESET_HEADER_SIZE: usize = 4 + 2 + 4 + 4 + 8; // magic + version + page_size + n_pages + total_len = 22
+
+// ---------------------------------------------------------------------------
+// §4.19.6 Network Policy + Deterministic VirtualTcp
+// ---------------------------------------------------------------------------
+
+/// Transport security mode for remote networking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportSecurityMode {
+    /// TLS transport via rustls.
+    RustlsTls,
+    /// Plaintext transport (only for explicit local development opt-in).
+    Plaintext,
+}
+
+/// Enforced HTTP/2 hard limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Http2HardLimits {
+    pub max_concurrent_streams: u32,
+    pub max_header_list_size: usize,
+    pub continuation_timeout_ms: u64,
+    pub header_fragment_cap: usize,
+}
+
+impl Default for Http2HardLimits {
+    fn default() -> Self {
+        Self {
+            max_concurrent_streams: DEFAULT_HTTP2_MAX_CONCURRENT_STREAMS,
+            max_header_list_size: DEFAULT_HTTP2_MAX_HEADER_LIST_SIZE,
+            continuation_timeout_ms: DEFAULT_HTTP2_CONTINUATION_TIMEOUT_MS,
+            header_fragment_cap: DEFAULT_HTTP2_HEADER_FRAGMENT_CAP,
+        }
+    }
+}
+
+/// Networking stack policy for remote effects and replication transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkStackConfig {
+    pub security: TransportSecurityMode,
+    pub explicit_plaintext_opt_in: bool,
+    pub handshake_timeout_ms: u64,
+    pub message_size_cap_bytes: usize,
+    pub http2: Http2HardLimits,
+}
+
+impl Default for NetworkStackConfig {
+    fn default() -> Self {
+        Self {
+            security: TransportSecurityMode::RustlsTls,
+            explicit_plaintext_opt_in: false,
+            handshake_timeout_ms: DEFAULT_HANDSHAKE_TIMEOUT_MS,
+            message_size_cap_bytes: DEFAULT_RPC_MESSAGE_CAP_BYTES,
+            http2: Http2HardLimits::default(),
+        }
+    }
+}
+
+impl NetworkStackConfig {
+    /// Build plaintext config for explicit local development.
+    ///
+    /// # Errors
+    ///
+    /// Returns `FrankenError::Unsupported` when plaintext is requested
+    /// without explicit opt-in.
+    pub fn plaintext_local_dev(explicit_opt_in: bool) -> Result<Self> {
+        if !explicit_opt_in {
+            return Err(FrankenError::Unsupported);
+        }
+        Ok(Self {
+            security: TransportSecurityMode::Plaintext,
+            explicit_plaintext_opt_in: true,
+            ..Self::default()
+        })
+    }
+
+    /// Validate the transport security policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns `FrankenError::Unsupported` if plaintext is not explicitly opted in.
+    pub fn validate_security(&self) -> Result<()> {
+        if self.security == TransportSecurityMode::Plaintext && !self.explicit_plaintext_opt_in {
+            return Err(FrankenError::Unsupported);
+        }
+        Ok(())
+    }
+
+    /// Validate stream concurrency against HTTP/2 hard limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns `FrankenError::Busy` when `streams` exceeds the configured maximum.
+    pub fn validate_concurrent_streams(&self, streams: u32) -> Result<()> {
+        if streams > self.http2.max_concurrent_streams {
+            return Err(FrankenError::Busy);
+        }
+        Ok(())
+    }
+
+    /// Validate HTTP header-list size.
+    ///
+    /// # Errors
+    ///
+    /// Returns `FrankenError::TooBig` if header bytes exceed configured limit.
+    pub fn validate_header_list_size(&self, header_bytes: usize) -> Result<()> {
+        if header_bytes > self.http2.max_header_list_size {
+            return Err(FrankenError::TooBig);
+        }
+        Ok(())
+    }
+
+    /// Validate elapsed time for HTTP/2 continuation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `FrankenError::BusyRecovery` when continuation elapsed time
+    /// exceeds the configured timeout.
+    pub fn validate_continuation_elapsed(&self, elapsed_ms: u64) -> Result<()> {
+        if elapsed_ms > self.http2.continuation_timeout_ms {
+            return Err(FrankenError::BusyRecovery);
+        }
+        Ok(())
+    }
+
+    /// Validate elapsed handshake time against timeout budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns `FrankenError::BusyRecovery` when elapsed time exceeds budget.
+    pub fn validate_handshake_elapsed(&self, elapsed_ms: u64) -> Result<()> {
+        if elapsed_ms > self.handshake_timeout_ms {
+            return Err(FrankenError::BusyRecovery);
+        }
+        Ok(())
+    }
+
+    /// Validate message size against the hard cap.
+    ///
+    /// # Errors
+    ///
+    /// Returns `FrankenError::TooBig` when `message_bytes` exceeds the cap.
+    pub fn validate_message_size(&self, message_bytes: usize) -> Result<()> {
+        if message_bytes > self.message_size_cap_bytes {
+            return Err(FrankenError::TooBig);
+        }
+        Ok(())
+    }
+}
+
+/// Fault profile for deterministic in-memory VirtualTcp transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtualTcpFaultProfile {
+    pub drop_per_million: u32,
+    pub reorder_per_million: u32,
+    pub corrupt_per_million: u32,
+}
+
+impl VirtualTcpFaultProfile {
+    /// Validate rates in parts-per-million (`0..=1_000_000`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `FrankenError::OutOfRange` when any rate is above 1_000_000.
+    pub fn validate(&self) -> Result<()> {
+        const PPM_MAX: u32 = 1_000_000;
+        if self.drop_per_million > PPM_MAX {
+            return Err(FrankenError::OutOfRange {
+                what: "drop_per_million".to_owned(),
+                value: self.drop_per_million.to_string(),
+            });
+        }
+        if self.reorder_per_million > PPM_MAX {
+            return Err(FrankenError::OutOfRange {
+                what: "reorder_per_million".to_owned(),
+                value: self.reorder_per_million.to_string(),
+            });
+        }
+        if self.corrupt_per_million > PPM_MAX {
+            return Err(FrankenError::OutOfRange {
+                what: "corrupt_per_million".to_owned(),
+                value: self.corrupt_per_million.to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Trace event kind for deterministic VirtualTcp replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtualTcpTraceKind {
+    Dropped,
+    BufferedForReorder,
+    Delivered,
+    DeliveredCorrupt,
+    FlushedReordered,
+}
+
+/// Deterministic trace event emitted by VirtualTcp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtualTcpTraceEvent {
+    pub seq: u64,
+    pub kind: VirtualTcpTraceKind,
+    pub payload_hash: u64,
+}
+
+/// Deterministic in-memory network shim for lab/DPOR.
+#[derive(Debug, Clone)]
+pub struct VirtualTcp {
+    state: u64,
+    seq: u64,
+    faults: VirtualTcpFaultProfile,
+    pending_reorder: Option<Vec<u8>>,
+    trace: Vec<VirtualTcpTraceEvent>,
+}
+
+impl VirtualTcp {
+    /// Construct a new deterministic VirtualTcp instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns `FrankenError::OutOfRange` when fault probabilities are invalid.
+    pub fn new(seed: u64, faults: VirtualTcpFaultProfile) -> Result<Self> {
+        faults.validate()?;
+        Ok(Self {
+            state: seed,
+            seq: 0,
+            faults,
+            pending_reorder: None,
+            trace: Vec::new(),
+        })
+    }
+
+    /// Return deterministic trace events for replay/debugging.
+    #[must_use]
+    pub fn trace(&self) -> &[VirtualTcpTraceEvent] {
+        &self.trace
+    }
+
+    /// Transmit one payload through deterministic drop/reorder/corrupt rules.
+    ///
+    /// Returns zero, one, or two delivered payloads (reorder flush path).
+    #[must_use]
+    pub fn transmit(&mut self, payload: &[u8]) -> Vec<Vec<u8>> {
+        self.seq = self.seq.saturating_add(1);
+
+        if self.coin_flip(self.faults.drop_per_million) {
+            self.push_trace(VirtualTcpTraceKind::Dropped, payload);
+            return Vec::new();
+        }
+
+        let mut wire = payload.to_vec();
+        let mut corrupted = false;
+        if !wire.is_empty() && self.coin_flip(self.faults.corrupt_per_million) {
+            let idx = (self.next_u32() as usize) % wire.len();
+            wire[idx] ^= 0x01;
+            corrupted = true;
+        }
+
+        if self.coin_flip(self.faults.reorder_per_million) && self.pending_reorder.is_none() {
+            self.push_trace(VirtualTcpTraceKind::BufferedForReorder, &wire);
+            self.pending_reorder = Some(wire);
+            return Vec::new();
+        }
+
+        let mut out = Vec::with_capacity(2);
+        if let Some(previous) = self.pending_reorder.take() {
+            let kind = if corrupted {
+                VirtualTcpTraceKind::DeliveredCorrupt
+            } else {
+                VirtualTcpTraceKind::Delivered
+            };
+            self.push_trace(kind, &wire);
+            out.push(wire);
+            self.push_trace(VirtualTcpTraceKind::FlushedReordered, &previous);
+            out.push(previous);
+            return out;
+        }
+
+        let kind = if corrupted {
+            VirtualTcpTraceKind::DeliveredCorrupt
+        } else {
+            VirtualTcpTraceKind::Delivered
+        };
+        self.push_trace(kind, &wire);
+        out.push(wire);
+        out
+    }
+
+    /// Flush any pending reordered payload.
+    pub fn flush(&mut self) -> Option<Vec<u8>> {
+        let pending = self.pending_reorder.take()?;
+        self.seq = self.seq.saturating_add(1);
+        self.push_trace(VirtualTcpTraceKind::FlushedReordered, &pending);
+        Some(pending)
+    }
+
+    fn push_trace(&mut self, kind: VirtualTcpTraceKind, payload: &[u8]) {
+        self.trace.push(VirtualTcpTraceEvent {
+            seq: self.seq,
+            kind,
+            payload_hash: xxhash_rust::xxh3::xxh3_64(payload),
+        });
+    }
+
+    fn coin_flip(&mut self, per_million: u32) -> bool {
+        if per_million == 0 {
+            return false;
+        }
+        const PPM_MAX: u32 = 1_000_000;
+        if per_million >= PPM_MAX {
+            return true;
+        }
+        self.next_u32() % PPM_MAX < per_million
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        // Deterministic LCG for lab replay.
+        self.state = self
+            .state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        (self.state >> 32) as u32
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Changeset Encoding
@@ -1189,5 +1530,174 @@ mod tests {
 
         sender.reset();
         assert_eq!(sender.state(), SenderState::Idle);
+    }
+
+    // -----------------------------------------------------------------------
+    // §4.19.6 networking policy tests (bd-i0m5)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tls_by_default() {
+        let cfg = NetworkStackConfig::default();
+        assert_eq!(cfg.security, TransportSecurityMode::RustlsTls);
+        assert!(cfg.validate_security().is_ok());
+    }
+
+    #[test]
+    fn test_plaintext_requires_explicit_opt_in() {
+        let cfg = NetworkStackConfig {
+            security: TransportSecurityMode::Plaintext,
+            explicit_plaintext_opt_in: false,
+            ..NetworkStackConfig::default()
+        };
+        let err = cfg.validate_security().unwrap_err();
+        assert!(matches!(err, FrankenError::Unsupported));
+
+        let opted_in = NetworkStackConfig::plaintext_local_dev(true).unwrap();
+        assert_eq!(opted_in.security, TransportSecurityMode::Plaintext);
+        assert!(opted_in.validate_security().is_ok());
+    }
+
+    #[test]
+    fn test_http2_max_concurrent_streams() {
+        let cfg = NetworkStackConfig::default();
+        assert!(cfg
+            .validate_concurrent_streams(DEFAULT_HTTP2_MAX_CONCURRENT_STREAMS)
+            .is_ok());
+        let err = cfg
+            .validate_concurrent_streams(DEFAULT_HTTP2_MAX_CONCURRENT_STREAMS + 1)
+            .unwrap_err();
+        assert!(matches!(err, FrankenError::Busy));
+    }
+
+    #[test]
+    fn test_http2_max_header_list_size() {
+        let cfg = NetworkStackConfig::default();
+        assert!(cfg
+            .validate_header_list_size(DEFAULT_HTTP2_MAX_HEADER_LIST_SIZE)
+            .is_ok());
+        let err = cfg
+            .validate_header_list_size(DEFAULT_HTTP2_MAX_HEADER_LIST_SIZE + 1)
+            .unwrap_err();
+        assert!(matches!(err, FrankenError::TooBig));
+    }
+
+    #[test]
+    fn test_http2_continuation_timeout() {
+        let cfg = NetworkStackConfig::default();
+        assert!(cfg
+            .validate_continuation_elapsed(DEFAULT_HTTP2_CONTINUATION_TIMEOUT_MS)
+            .is_ok());
+        let err = cfg
+            .validate_continuation_elapsed(DEFAULT_HTTP2_CONTINUATION_TIMEOUT_MS + 1)
+            .unwrap_err();
+        assert!(matches!(err, FrankenError::BusyRecovery));
+    }
+
+    #[test]
+    fn test_message_size_cap_enforced() {
+        let cfg = NetworkStackConfig::default();
+        assert!(cfg
+            .validate_message_size(DEFAULT_RPC_MESSAGE_CAP_BYTES)
+            .is_ok());
+        let err = cfg
+            .validate_message_size(DEFAULT_RPC_MESSAGE_CAP_BYTES + 1)
+            .unwrap_err();
+        assert!(matches!(err, FrankenError::TooBig));
+    }
+
+    #[test]
+    fn test_handshake_timeout_bounded() {
+        let cfg = NetworkStackConfig {
+            handshake_timeout_ms: DEFAULT_HANDSHAKE_TIMEOUT_MS,
+            ..NetworkStackConfig::default()
+        };
+        assert!(cfg
+            .validate_handshake_elapsed(DEFAULT_HANDSHAKE_TIMEOUT_MS)
+            .is_ok());
+        let err = cfg
+            .validate_handshake_elapsed(DEFAULT_HANDSHAKE_TIMEOUT_MS + 500)
+            .unwrap_err();
+        assert!(matches!(err, FrankenError::BusyRecovery));
+    }
+
+    #[test]
+    fn test_virtual_tcp_deterministic() {
+        let faults = VirtualTcpFaultProfile {
+            drop_per_million: 150_000,
+            reorder_per_million: 200_000,
+            corrupt_per_million: 125_000,
+        };
+        let payloads = vec![
+            b"alpha".to_vec(),
+            b"beta".to_vec(),
+            b"gamma".to_vec(),
+            b"delta".to_vec(),
+            b"epsilon".to_vec(),
+        ];
+
+        let mut left = VirtualTcp::new(42, faults).unwrap();
+        let mut left_out = Vec::new();
+        for payload in &payloads {
+            left_out.extend(left.transmit(payload));
+        }
+        if let Some(flush) = left.flush() {
+            left_out.push(flush);
+        }
+        let left_trace = left.trace().to_vec();
+
+        let mut right = VirtualTcp::new(42, faults).unwrap();
+        let mut right_out = Vec::new();
+        for payload in &payloads {
+            right_out.extend(right.transmit(payload));
+        }
+        if let Some(flush) = right.flush() {
+            right_out.push(flush);
+        }
+        let right_trace = right.trace().to_vec();
+
+        assert_eq!(left_out, right_out);
+        assert_eq!(left_trace, right_trace);
+    }
+
+    #[test]
+    fn test_virtual_tcp_fault_injection() {
+        let mut vtcp = VirtualTcp::new(
+            7,
+            VirtualTcpFaultProfile {
+                drop_per_million: 0,
+                reorder_per_million: 1_000_000,
+                corrupt_per_million: 1_000_000,
+            },
+        )
+        .unwrap();
+
+        let out_first = vtcp.transmit(b"packet-a");
+        assert!(out_first.is_empty(), "first packet must be buffered");
+
+        let out_second = vtcp.transmit(b"packet-b");
+        assert_eq!(out_second.len(), 2, "second transmit flushes reorder queue");
+        assert_ne!(
+            out_second[0],
+            b"packet-b".to_vec(),
+            "corruption must alter delivered payload"
+        );
+
+        let has_buffer = vtcp
+            .trace()
+            .iter()
+            .any(|event| event.kind == VirtualTcpTraceKind::BufferedForReorder);
+        let has_corrupt_delivery = vtcp
+            .trace()
+            .iter()
+            .any(|event| event.kind == VirtualTcpTraceKind::DeliveredCorrupt);
+        let has_flush = vtcp
+            .trace()
+            .iter()
+            .any(|event| event.kind == VirtualTcpTraceKind::FlushedReordered);
+
+        assert!(has_buffer);
+        assert!(has_corrupt_delivery);
+        assert!(has_flush);
     }
 }

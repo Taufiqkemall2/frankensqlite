@@ -8,10 +8,10 @@
 use std::collections::HashMap;
 
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_func::vtab::{ColumnContext, IndexInfo, VirtualTable, VirtualTableCursor};
 use fsqlite_func::ScalarFunction;
-use fsqlite_types::cx::Cx;
+use fsqlite_func::vtab::{ColumnContext, IndexInfo, VirtualTable, VirtualTableCursor};
 use fsqlite_types::SqliteValue;
+use fsqlite_types::cx::Cx;
 use tracing::debug;
 
 // ---------------------------------------------------------------------------
@@ -555,9 +555,7 @@ pub fn parse_fts5_query(query: &str) -> std::result::Result<Vec<Fts5QueryToken>,
     insert_implicit_and(tokens)
 }
 
-fn tokenize_fts5_query(
-    query: &str,
-) -> std::result::Result<Vec<Fts5QueryToken>, Fts5QueryError> {
+fn tokenize_fts5_query(query: &str) -> std::result::Result<Vec<Fts5QueryToken>, Fts5QueryError> {
     let mut chars = query.chars().peekable();
     let mut tokens = Vec::new();
 
@@ -674,9 +672,7 @@ fn tokenize_fts5_query(
     Ok(tokens)
 }
 
-fn validate_fts5_parentheses(
-    tokens: &[Fts5QueryToken],
-) -> std::result::Result<(), Fts5QueryError> {
+fn validate_fts5_parentheses(tokens: &[Fts5QueryToken]) -> std::result::Result<(), Fts5QueryError> {
     let mut depth = 0u32;
     for token in tokens {
         match token.kind {
@@ -696,9 +692,7 @@ fn validate_fts5_parentheses(
     Ok(())
 }
 
-fn validate_fts5_not_binary(
-    tokens: &[Fts5QueryToken],
-) -> std::result::Result<(), Fts5QueryError> {
+fn validate_fts5_not_binary(tokens: &[Fts5QueryToken]) -> std::result::Result<(), Fts5QueryError> {
     for (i, token) in tokens.iter().enumerate() {
         if token.kind == Fts5QueryTokenKind::Not {
             // In FTS5, NOT is binary-only. It must have a left operand.
@@ -880,7 +874,10 @@ fn parse_primary(
             // NEAR(term1 term2, N)
             // Simplified: just parse as AND for now; collect nearby terms
             let rest = &tokens[1..];
-            if rest.first().map_or(true, |t| t.kind != Fts5QueryTokenKind::LParen) {
+            if rest
+                .first()
+                .map_or(true, |t| t.kind != Fts5QueryTokenKind::LParen)
+            {
                 return Err(Fts5QueryError::InvalidNearSyntax);
             }
             let rest = &rest[1..]; // skip (
@@ -946,12 +943,7 @@ impl InvertedIndex {
     }
 
     /// Index a document's tokens for a given column.
-    pub fn add_document(
-        &mut self,
-        docid: i64,
-        column: u32,
-        tokens: &[Fts5Token],
-    ) {
+    pub fn add_document(&mut self, docid: i64, column: u32, tokens: &[Fts5Token]) {
         // Build term -> positions map for this document+column.
         let mut term_positions: HashMap<&str, Vec<u32>> = HashMap::new();
         #[allow(clippy::cast_possible_truncation)]
@@ -1118,11 +1110,7 @@ pub fn evaluate_expr(index: &InvertedIndex, expr: &Fts5Expr) -> Vec<i64> {
     match expr {
         Fts5Expr::Term(term) => {
             let lower = term.to_lowercase();
-            let mut docs: Vec<i64> = index
-                .get_postings(&lower)
-                .iter()
-                .map(|p| p.docid)
-                .collect();
+            let mut docs: Vec<i64> = index.get_postings(&lower).iter().map(|p| p.docid).collect();
             docs.sort_unstable();
             docs.dedup();
             docs
@@ -1537,11 +1525,7 @@ impl VirtualTable for Fts5Table {
                 r
             };
 
-            let col_values: Vec<String> = args
-                .iter()
-                .skip(2)
-                .map(SqliteValue::to_text)
-                .collect();
+            let col_values: Vec<String> = args.iter().skip(2).map(SqliteValue::to_text).collect();
 
             self.insert_document(rowid, &col_values);
             return Ok(Some(rowid));
@@ -1557,11 +1541,7 @@ impl VirtualTable for Fts5Table {
             old_rowid
         };
 
-        let col_values: Vec<String> = args
-            .iter()
-            .skip(2)
-            .map(SqliteValue::to_text)
-            .collect();
+        let col_values: Vec<String> = args.iter().skip(2).map(SqliteValue::to_text).collect();
 
         self.insert_document(new_rowid, &col_values);
         Ok(Some(new_rowid))
@@ -1677,7 +1657,14 @@ pub fn highlight(text: &str, terms: &[String], open_tag: &str, close_tag: &str) 
 /// Generate a snippet of text around matching terms.
 #[must_use]
 #[allow(clippy::similar_names)]
-pub fn snippet(text: &str, terms: &[String], open_tag: &str, close_tag: &str, ellipsis: &str, max_tokens: usize) -> String {
+pub fn snippet(
+    text: &str,
+    terms: &[String],
+    open_tag: &str,
+    close_tag: &str,
+    ellipsis: &str,
+    max_tokens: usize,
+) -> String {
     let tokenizer = Unicode61Tokenizer::new();
     let tokens = tokenizer.tokenize(text);
     let lower_terms: Vec<String> = terms.iter().map(|t| t.to_lowercase()).collect();
@@ -2061,7 +2048,10 @@ mod tests {
 
         // Lower score = better match (negative BM25).
         assert!(score1 < score2, "doc1 should rank higher (more rust)");
-        assert!(score2 < score3, "doc2 should rank higher than doc3 (has rust)");
+        assert!(
+            score2 < score3,
+            "doc2 should rank higher than doc3 (has rust)"
+        );
         assert!(score3.abs() < f64::EPSILON, "doc3 should have score ~0");
     }
 
@@ -2177,7 +2167,10 @@ mod tests {
     fn test_fts5_table_insert_and_search() {
         let mut table = Fts5Table::with_columns(vec!["content".to_owned()]);
 
-        table.insert_document(1, &["the quick brown fox jumps over the lazy dog".to_owned()]);
+        table.insert_document(
+            1,
+            &["the quick brown fox jumps over the lazy dog".to_owned()],
+        );
         table.insert_document(2, &["the quick red car drives over the bridge".to_owned()]);
         table.insert_document(3, &["a lazy cat sleeps on the mat".to_owned()]);
 
@@ -2227,16 +2220,21 @@ mod tests {
 
     #[test]
     fn test_fts5_table_multicolumn() {
-        let mut table =
-            Fts5Table::with_columns(vec!["title".to_owned(), "body".to_owned()]);
+        let mut table = Fts5Table::with_columns(vec!["title".to_owned(), "body".to_owned()]);
 
         table.insert_document(
             1,
-            &["Rust Programming".to_owned(), "Rust is a systems language".to_owned()],
+            &[
+                "Rust Programming".to_owned(),
+                "Rust is a systems language".to_owned(),
+            ],
         );
         table.insert_document(
             2,
-            &["Python Guide".to_owned(), "Python is interpreted".to_owned()],
+            &[
+                "Python Guide".to_owned(),
+                "Python is interpreted".to_owned(),
+            ],
         );
 
         let results = table.search("rust").unwrap();
@@ -2328,14 +2326,7 @@ mod tests {
     #[test]
     fn test_snippet_with_ellipsis() {
         let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
-        let result = snippet(
-            text,
-            &["delta".to_owned()],
-            "<b>",
-            "</b>",
-            "...",
-            5,
-        );
+        let result = snippet(text, &["delta".to_owned()], "<b>", "</b>", "...", 5);
         assert!(result.contains("<b>delta</b>"));
         assert!(result.contains("..."));
     }
@@ -2471,7 +2462,10 @@ mod tests {
 
     #[test]
     fn test_query_error_display() {
-        assert_eq!(format!("{}", Fts5QueryError::EmptyQuery), "empty FTS5 query");
+        assert_eq!(
+            format!("{}", Fts5QueryError::EmptyQuery),
+            "empty FTS5 query"
+        );
         assert_eq!(
             format!("{}", Fts5QueryError::UnaryNotForbidden),
             "FTS5 NOT is binary-only; unary NOT is not allowed"
