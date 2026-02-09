@@ -13,6 +13,7 @@ pub mod decode_proofs;
 pub mod ecs_replication;
 pub mod epoch;
 pub mod explain;
+pub mod inter_object_coding;
 pub mod native_index;
 pub mod permeation_map;
 pub mod raptorq_integration;
