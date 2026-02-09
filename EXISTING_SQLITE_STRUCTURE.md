@@ -1,5 +1,9 @@
 # Existing SQLite Structure and Behavior
 
+> Historical reference notice: This document is retained for historical reference
+> only and is superseded by `COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md`.
+> If this file conflicts with the comprehensive spec, the comprehensive spec wins.
+
 This document is a complete behavior extraction from the C SQLite source code. It
 describes **what SQLite does** -- its file formats, data structures, instruction
 set, built-in functions, limits, locking protocol, and extension surface area.

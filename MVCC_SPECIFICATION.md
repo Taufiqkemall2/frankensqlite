@@ -1,5 +1,9 @@
 # MVCC Specification for FrankenSQLite
 
+> Historical reference notice: This document is retained for historical reference
+> only and is superseded by `COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md`.
+> If this file conflicts with the comprehensive spec, the comprehensive spec wins.
+
 ## 1. Introduction
 
 This document formally specifies the Multi-Version Concurrency Control (MVCC)

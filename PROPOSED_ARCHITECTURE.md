@@ -1,5 +1,9 @@
 # Proposed Architecture for FrankenSQLite
 
+> Historical reference notice: This document is retained for historical reference
+> only and is superseded by `COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md`.
+> If this file conflicts with the comprehensive spec, the comprehensive spec wins.
+
 ## Overview
 
 Clean-room Rust reimplementation of SQLite with MVCC page-level versioning.
