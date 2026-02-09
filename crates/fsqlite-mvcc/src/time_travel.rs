@@ -197,26 +197,19 @@ pub fn resolve_timestamp_via_markers(
         "resolving timestamp to commit_seq via marker store"
     );
 
-    // The BTreeMap is ordered by commit_seq ascending. Since
-    // commit_time_unix_ns is monotonically non-decreasing, we need the
-    // *last* marker whose timestamp <= target.
-    //
-    // We iterate forward and keep track of the best candidate.
-    let mut best: Option<CommitSeq> = None;
-
-    // CommitMarkerStore exposes `get(CommitSeq)` but not iteration.
-    // We use the commit-log based fallback below for the general case.
-    // This function is the marker-aware path for native mode.
-    //
-    // Since CommitMarkerStore wraps a BTreeMap<u64, CommitMarker> but doesn't
-    // expose iteration, we provide an alternative approach via CommitLog.
-    // The marker_store.get() method is used for validation only.
-    //
-    // For now, we document that callers should prefer `resolve_timestamp_via_commit_log`
-    // unless they have direct iterator access to markers.
-    let _ = (marker_store, &mut best);
-
-    Err(TimeTravelError::TimestampNotResolvable { target_unix_ns })
+    if let Some(seq) = marker_store.resolve_seq_at_or_before_timestamp(target_unix_ns) {
+        info!(
+            commit_seq = seq.get(),
+            target_unix_ns, "timestamp resolved to commit_seq via marker store"
+        );
+        Ok(seq)
+    } else {
+        warn!(
+            target_unix_ns,
+            "no commit marker found at or before target timestamp"
+        );
+        Err(TimeTravelError::TimestampNotResolvable { target_unix_ns })
+    }
 }
 
 /// Binary-search the commit log to find the greatest commit sequence whose
@@ -380,8 +373,8 @@ mod tests {
     use super::*;
 
     use fsqlite_types::{
-        CommitSeq, PageData, PageNumber, PageSize, PageVersion, SchemaEpoch, TxnEpoch, TxnId,
-        TxnToken, VersionPointer,
+        CommitMarker, CommitSeq, ObjectId, PageData, PageNumber, PageSize, PageVersion,
+        SchemaEpoch, TxnEpoch, TxnId, TxnToken, VersionPointer,
     };
 
     use crate::core_types::CommitRecord;
@@ -415,6 +408,17 @@ mod tests {
             commit_seq: CommitSeq::new(seq),
             pages: smallvec::smallvec![PageNumber::new(1).unwrap()],
             timestamp_unix_ns: timestamp_ns,
+        }
+    }
+
+    fn make_commit_marker(seq: u64, timestamp_ns: u64) -> CommitMarker {
+        CommitMarker {
+            commit_seq: CommitSeq::new(seq),
+            commit_time_unix_ns: timestamp_ns,
+            capsule_object_id: ObjectId::from_bytes([1_u8; 16]),
+            proof_object_id: ObjectId::from_bytes([2_u8; 16]),
+            prev_marker: None,
+            integrity_hash: [0_u8; 16],
         }
     }
 
@@ -512,6 +516,40 @@ mod tests {
         let seq = resolve_timestamp_via_commit_log(&commit_log, base_ts + 19_000_000_000)
             .expect("last commit timestamp should resolve");
         assert_eq!(seq, CommitSeq::new(20));
+    }
+
+    #[test]
+    fn test_time_travel_timestamp_to_commitseq_resolution_via_markers() {
+        let base_ts = 1_700_000_000_000_000_000_u64;
+        let mut marker_store = CommitMarkerStore::new();
+
+        for seq in 1..=5 {
+            marker_store.publish(make_commit_marker(
+                seq,
+                base_ts + (seq - 1) * 1_000_000_000,
+            ));
+        }
+
+        let seq = resolve_timestamp_via_markers(&marker_store, base_ts + 2_500_000_000)
+            .expect("between-commit marker timestamp should resolve");
+        assert_eq!(seq, CommitSeq::new(3));
+
+        let seq = resolve_timestamp_via_markers(&marker_store, base_ts + 4_000_000_000)
+            .expect("exact marker timestamp should resolve");
+        assert_eq!(seq, CommitSeq::new(5));
+    }
+
+    #[test]
+    fn test_time_travel_timestamp_to_commitseq_resolution_via_markers_not_found() {
+        let base_ts = 1_700_000_000_000_000_000_u64;
+        let mut marker_store = CommitMarkerStore::new();
+        marker_store.publish(make_commit_marker(10, base_ts + 1_000_000_000));
+
+        let result = resolve_timestamp_via_markers(&marker_store, base_ts);
+        assert!(matches!(
+            result.unwrap_err(),
+            TimeTravelError::TimestampNotResolvable { .. }
+        ));
     }
 
     #[test]

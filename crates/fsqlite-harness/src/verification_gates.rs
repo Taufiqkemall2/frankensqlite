@@ -13,6 +13,9 @@ pub enum GateScope {
     Universal,
     Phase2,
     Phase3,
+    Phase4,
+    Phase5,
+    Phase6,
 }
 
 /// Execution status for a single gate.
@@ -68,6 +71,23 @@ pub struct PhaseGateReport {
     pub phase3_pass: bool,
     pub blocked_by_universal_failure: bool,
     pub blocked_by_phase2_failure: bool,
+    pub gates: Vec<GateExecutionResult>,
+}
+
+/// Machine-readable report for Phase 4-6 verification gates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
+#[allow(clippy::struct_field_names)]
+pub struct CorePhaseGateReport {
+    pub schema_version: u32,
+    pub generated_unix_ms: u128,
+    pub workspace_root: String,
+    pub overall_pass: bool,
+    pub phase4_pass: bool,
+    pub phase5_pass: bool,
+    pub phase6_pass: bool,
+    pub blocked_by_phase4_failure: bool,
+    pub blocked_by_phase5_failure: bool,
     pub gates: Vec<GateExecutionResult>,
 }
 
@@ -133,11 +153,24 @@ pub fn phase_1_to_3_gate_plan() -> Vec<GatePlanEntry> {
     gate_specs().iter().map(as_plan_entry).collect()
 }
 
+/// Return the canonical Phase 4-6 gate plan.
+#[must_use]
+pub fn phase_4_to_6_gate_plan() -> Vec<GatePlanEntry> {
+    core_gate_specs().iter().map(as_plan_entry).collect()
+}
+
 /// Run Phase 1-3 gates using the default process-backed executor.
 #[must_use]
 pub fn run_phase_1_to_3_gates(workspace_root: &Path) -> PhaseGateReport {
     let runner = ProcessGateCommandRunner;
     run_phase_1_to_3_gates_with_runner(workspace_root, &runner)
+}
+
+/// Run Phase 4-6 gates using the default process-backed executor.
+#[must_use]
+pub fn run_phase_4_to_6_gates(workspace_root: &Path) -> CorePhaseGateReport {
+    let runner = ProcessGateCommandRunner;
+    run_phase_4_to_6_gates_with_runner(workspace_root, &runner)
 }
 
 /// Run Phase 1-3 gates with a custom executor.
@@ -219,6 +252,85 @@ pub fn run_phase_1_to_3_gates_with_runner<R: GateCommandRunner>(
     }
 }
 
+/// Run Phase 4-6 gates with a custom executor.
+#[must_use]
+pub fn run_phase_4_to_6_gates_with_runner<R: GateCommandRunner>(
+    workspace_root: &Path,
+    runner: &R,
+) -> CorePhaseGateReport {
+    let gate_plan = phase_4_to_6_gate_plan();
+    let mut gates = Vec::with_capacity(gate_plan.len());
+
+    let phase4_pass = run_scope(
+        GateScope::Phase4,
+        &gate_plan,
+        workspace_root,
+        runner,
+        &mut gates,
+    );
+
+    let mut phase5_pass = false;
+    let mut phase6_pass = false;
+    let mut blocked_by_phase4_failure = false;
+    let mut blocked_by_phase5_failure = false;
+
+    if phase4_pass {
+        phase5_pass = run_scope(
+            GateScope::Phase5,
+            &gate_plan,
+            workspace_root,
+            runner,
+            &mut gates,
+        );
+        if phase5_pass {
+            phase6_pass = run_scope(
+                GateScope::Phase6,
+                &gate_plan,
+                workspace_root,
+                runner,
+                &mut gates,
+            );
+        } else {
+            blocked_by_phase5_failure = true;
+            push_skipped_scope(
+                GateScope::Phase6,
+                &gate_plan,
+                "blocked_by_phase5_failure",
+                &mut gates,
+            );
+        }
+    } else {
+        blocked_by_phase4_failure = true;
+        push_skipped_scope(
+            GateScope::Phase5,
+            &gate_plan,
+            "blocked_by_phase4_failure",
+            &mut gates,
+        );
+        push_skipped_scope(
+            GateScope::Phase6,
+            &gate_plan,
+            "blocked_by_phase4_failure",
+            &mut gates,
+        );
+    }
+
+    let overall_pass = phase4_pass && phase5_pass && phase6_pass;
+
+    CorePhaseGateReport {
+        schema_version: 1,
+        generated_unix_ms: unix_time_ms(),
+        workspace_root: workspace_root.display().to_string(),
+        overall_pass,
+        phase4_pass,
+        phase5_pass,
+        phase6_pass,
+        blocked_by_phase4_failure,
+        blocked_by_phase5_failure,
+        gates,
+    }
+}
+
 /// Persist a phase gate report as pretty JSON.
 ///
 /// # Errors
@@ -229,6 +341,21 @@ pub fn write_phase_gate_report(path: &Path, report: &PhaseGateReport) -> io::Res
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("phase_gate_report_serialize_failed: {error}"),
+        )
+    })?;
+    fs::write(path, json)
+}
+
+/// Persist a core phase gate report as pretty JSON.
+///
+/// # Errors
+///
+/// Returns an error if serialization or writing fails.
+pub fn write_core_phase_gate_report(path: &Path, report: &CorePhaseGateReport) -> io::Result<()> {
+    let json = serde_json::to_string_pretty(report).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("core_phase_gate_report_serialize_failed: {error}"),
         )
     })?;
     fs::write(path, json)
@@ -370,6 +497,278 @@ fn gate_specs() -> Vec<GateSpec> {
     ]
 }
 
+#[allow(clippy::too_many_lines)]
+fn core_gate_specs() -> Vec<GateSpec> {
+    vec![
+        GateSpec {
+            gate_id: "phase4.sql_conformance_20",
+            gate_name: "Phase 4 gate: SQL conformance (20 tests)",
+            scope: GateScope::Phase4,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "test_phase4_gate_sql_conformance_20",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
+            gate_id: "phase4.vdbe_explain",
+            gate_name: "Phase 4 gate: VDBE EXPLAIN output sequence",
+            scope: GateScope::Phase4,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "test_phase4_gate_vdbe_explain",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
+            gate_id: "phase4.sorter_100k",
+            gate_name: "Phase 4 gate: sorter correctness on 100k rows",
+            scope: GateScope::Phase4,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "test_phase4_gate_sorter_100k",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
+            gate_id: "phase5.format_write_read_c",
+            gate_name: "Phase 5 gate: FrankenSQLite DB readable by C sqlite3",
+            scope: GateScope::Phase5,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "test_phase5_gate_format_write_read_c",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
+            gate_id: "phase5.format_read_c_write",
+            gate_name: "Phase 5 gate: C sqlite3 DB readable by FrankenSQLite",
+            scope: GateScope::Phase5,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "test_phase5_gate_format_read_c_write",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
+            gate_id: "phase5.wal_crash_recovery",
+            gate_name: "Phase 5 gate: WAL crash recovery (100 scenarios)",
+            scope: GateScope::Phase5,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "test_phase5_gate_wal_crash_recovery",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
+            gate_id: "phase5.raptorq_wal",
+            gate_name: "Phase 5 gate: RaptorQ WAL recovery under corruption",
+            scope: GateScope::Phase5,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "test_phase5_gate_raptorq_wal",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
+            gate_id: "phase6.mvcc_stress",
+            gate_name: "Phase 6 gate: MVCC stress (100 writers x 100 ops)",
+            scope: GateScope::Phase6,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "test_phase6_gate_mvcc_stress",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
+            gate_id: "phase6.ssi_write_skew",
+            gate_name: "Phase 6 gate: SSI write skew detection",
+            scope: GateScope::Phase6,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "test_phase6_gate_ssi_write_skew",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
+            gate_id: "phase6.ssi_mazurkiewicz",
+            gate_name: "Phase 6 gate: SSI Mazurkiewicz no-false-negatives",
+            scope: GateScope::Phase6,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "test_phase6_gate_ssi_mazurkiewicz",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
+            gate_id: "phase6.ssi_witness_epoch",
+            gate_name: "Phase 6 gate: witness plane TxnEpoch validation",
+            scope: GateScope::Phase6,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "test_phase6_gate_ssi_witness_epoch",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
+            gate_id: "phase6.ssi_witness_decode",
+            gate_name: "Phase 6 gate: witness decode under symbol loss",
+            scope: GateScope::Phase6,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "test_phase6_gate_ssi_witness_decode",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
+            gate_id: "phase6.snapshot_mazurkiewicz",
+            gate_name: "Phase 6 gate: snapshot isolation Mazurkiewicz exploration",
+            scope: GateScope::Phase6,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "test_phase6_gate_snapshot_mazurkiewicz",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
+            gate_id: "phase6.eprocess_inv",
+            gate_name: "Phase 6 gate: e-process invariants INV-1..INV-7",
+            scope: GateScope::Phase6,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "test_phase6_gate_eprocess_inv",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
+            gate_id: "phase6.gc_memory",
+            gate_name: "Phase 6 gate: GC memory bound <= 2x theoretical minimum",
+            scope: GateScope::Phase6,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "test_phase6_gate_gc_memory",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
+            gate_id: "phase6.serialized_parity",
+            gate_name: "Phase 6 gate: serialized-mode parity with C SQLite",
+            scope: GateScope::Phase6,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "test_phase6_gate_serialized_parity",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
+            gate_id: "phase6.rebase_merge",
+            gate_name: "Phase 6 gate: rebase merge success (1k attempts)",
+            scope: GateScope::Phase6,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "test_phase6_gate_rebase_merge",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
+            gate_id: "phase6.structured_merge",
+            gate_name: "Phase 6 gate: structured merge safety",
+            scope: GateScope::Phase6,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "test_phase6_gate_structured_merge",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
+            gate_id: "phase6.crash_model",
+            gate_name: "Phase 6 gate: crash model durability scenarios",
+            scope: GateScope::Phase6,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "test_phase6_gate_crash_model",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+    ]
+}
+
 fn as_plan_entry(spec: &GateSpec) -> GatePlanEntry {
     GatePlanEntry {
         gate_id: spec.gate_id.to_owned(),
@@ -486,7 +885,8 @@ mod tests {
 
     use super::{
         GateCommandOutput, GateCommandRunner, GateScope, GateStatus, phase_1_to_3_gate_plan,
-        run_phase_1_to_3_gates_with_runner,
+        phase_4_to_6_gate_plan, run_phase_1_to_3_gates_with_runner,
+        run_phase_4_to_6_gates_with_runner,
     };
 
     #[derive(Debug, Default)]
@@ -709,6 +1109,117 @@ mod tests {
         assert!(report.phase3_pass);
         assert!(!report.blocked_by_universal_failure);
         assert!(!report.blocked_by_phase2_failure);
+        assert!(
+            report
+                .gates
+                .iter()
+                .all(|gate| gate.status == GateStatus::Passed)
+        );
+    }
+
+    #[test]
+    fn test_phase4_gate_sql_conformance_20() {
+        let plan = phase_4_to_6_gate_plan();
+        let gate = find_gate(&plan, "phase4.sql_conformance_20");
+        let command = gate.command.join(" ");
+
+        assert_eq!(gate.scope, GateScope::Phase4);
+        assert!(command.contains("test_phase4_gate_sql_conformance_20"));
+    }
+
+    #[test]
+    fn test_phase5_gate_wal_crash_recovery() {
+        let plan = phase_4_to_6_gate_plan();
+        let gate = find_gate(&plan, "phase5.wal_crash_recovery");
+        let command = gate.command.join(" ");
+
+        assert_eq!(gate.scope, GateScope::Phase5);
+        assert!(command.contains("test_phase5_gate_wal_crash_recovery"));
+    }
+
+    #[test]
+    fn test_phase6_gate_crash_model() {
+        let plan = phase_4_to_6_gate_plan();
+        let gate = find_gate(&plan, "phase6.crash_model");
+        let command = gate.command.join(" ");
+
+        assert_eq!(gate.scope, GateScope::Phase6);
+        assert!(command.contains("test_phase6_gate_crash_model"));
+    }
+
+    #[test]
+    fn test_core_gate_runner_blocks_phase5_and_phase6_when_phase4_fails() {
+        let workspace = std::path::Path::new(".");
+        let runner = MockRunner::with_failures(["phase4.vdbe_explain"]);
+        let report = run_phase_4_to_6_gates_with_runner(workspace, &runner);
+
+        assert!(!report.overall_pass);
+        assert!(!report.phase4_pass);
+        assert!(report.blocked_by_phase4_failure);
+        assert!(!report.phase5_pass);
+        assert!(!report.phase6_pass);
+
+        let phase5_statuses = report
+            .gates
+            .iter()
+            .filter(|gate| gate.scope == GateScope::Phase5)
+            .map(|gate| gate.status)
+            .collect::<Vec<_>>();
+        let phase6_statuses = report
+            .gates
+            .iter()
+            .filter(|gate| gate.scope == GateScope::Phase6)
+            .map(|gate| gate.status)
+            .collect::<Vec<_>>();
+
+        assert!(
+            phase5_statuses
+                .iter()
+                .all(|status| *status == GateStatus::Skipped)
+        );
+        assert!(
+            phase6_statuses
+                .iter()
+                .all(|status| *status == GateStatus::Skipped)
+        );
+    }
+
+    #[test]
+    fn test_core_gate_runner_skips_phase6_when_phase5_fails() {
+        let workspace = std::path::Path::new(".");
+        let runner = MockRunner::with_failures(["phase5.wal_crash_recovery"]);
+        let report = run_phase_4_to_6_gates_with_runner(workspace, &runner);
+
+        assert!(report.phase4_pass);
+        assert!(!report.phase5_pass);
+        assert!(!report.phase6_pass);
+        assert!(report.blocked_by_phase5_failure);
+
+        let phase6_statuses = report
+            .gates
+            .iter()
+            .filter(|gate| gate.scope == GateScope::Phase6)
+            .map(|gate| gate.status)
+            .collect::<Vec<_>>();
+        assert!(
+            phase6_statuses
+                .iter()
+                .all(|status| *status == GateStatus::Skipped)
+        );
+    }
+
+    #[test]
+    fn test_core_gate_runner_all_pass() {
+        let workspace = std::path::Path::new(".");
+        let runner = MockRunner::default();
+        let report = run_phase_4_to_6_gates_with_runner(workspace, &runner);
+
+        assert!(report.overall_pass);
+        assert!(report.phase4_pass);
+        assert!(report.phase5_pass);
+        assert!(report.phase6_pass);
+        assert!(!report.blocked_by_phase4_failure);
+        assert!(!report.blocked_by_phase5_failure);
         assert!(
             report
                 .gates

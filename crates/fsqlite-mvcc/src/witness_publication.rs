@@ -477,6 +477,19 @@ impl CommitMarkerStore {
         self.markers.get(&commit_seq.get())
     }
 
+    /// Resolve the greatest commit sequence whose marker timestamp is
+    /// less than or equal to `target_unix_ns`.
+    ///
+    /// Markers are keyed by monotonic `commit_seq`, and marker timestamps are
+    /// expected to be monotonic non-decreasing, so reverse iteration yields
+    /// the newest marker at-or-before the target.
+    #[must_use]
+    pub fn resolve_seq_at_or_before_timestamp(&self, target_unix_ns: u64) -> Option<CommitSeq> {
+        self.markers.iter().rev().find_map(|(seq, marker)| {
+            (marker.commit_time_unix_ns <= target_unix_ns).then_some(CommitSeq::new(*seq))
+        })
+    }
+
     /// Number of published markers.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -987,6 +1000,36 @@ mod tests {
         assert_eq!(cold.reads_for_txn(txn(2)).len(), 1);
         // But marker_store says txn 2 is not committed:
         assert!(!marker_store.is_committed(CommitSeq::new(200)));
+    }
+
+    #[test]
+    fn test_commit_marker_timestamp_resolution() {
+        let mut marker_store = CommitMarkerStore::new();
+
+        let mut marker_10 = make_marker(10);
+        marker_10.commit_time_unix_ns = 1_000;
+        marker_store.publish(marker_10);
+
+        let mut marker_20 = make_marker(20);
+        marker_20.commit_time_unix_ns = 2_000;
+        marker_store.publish(marker_20);
+
+        let mut marker_30 = make_marker(30);
+        marker_30.commit_time_unix_ns = 3_000;
+        marker_store.publish(marker_30);
+
+        assert_eq!(
+            marker_store.resolve_seq_at_or_before_timestamp(2_500),
+            Some(CommitSeq::new(20))
+        );
+        assert_eq!(
+            marker_store.resolve_seq_at_or_before_timestamp(3_000),
+            Some(CommitSeq::new(30))
+        );
+        assert_eq!(
+            marker_store.resolve_seq_at_or_before_timestamp(999),
+            None
+        );
     }
 
     // -- §5.6.4.8 test 5: Witnesses with commit_seq < safe_gc_seq are prunable --
