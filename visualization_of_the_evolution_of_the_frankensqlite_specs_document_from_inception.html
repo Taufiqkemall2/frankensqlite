@@ -937,7 +937,7 @@
 <script type="module">
     import { animate, stagger, spring } from "https://cdn.jsdelivr.net/npm/motion@10.18.0/+esm";
 
-    const DB_URL = "spec_evolution_v1.sqlite3?v=2";
+    const DB_URL = "spec_evolution_v1.sqlite3";
     const BUCKETS = [
         { id: 1, name: "Logic/Math", color: "#39ff14", desc: "Fixing outright mistakes in logic, math, or reasoning." },
         { id: 2, name: "Legacy SQLite", color: "#adff2f", desc: "Fixing inaccurate statements about the existing sqlite legacy codebase." },
@@ -981,6 +981,7 @@
             const xhr = new XMLHttpRequest();
             xhr.open("GET", url, true);
             xhr.responseType = "arraybuffer";
+            xhr.setRequestHeader("Cache-Control", "no-cache");
             xhr.onload = () => {
                 if (xhr.status >= 200 && xhr.status < 300) resolve(xhr.response);
                 else reject(new Error(`HTTP ${xhr.status} fetching ${url}`));

@@ -1,12 +1,9 @@
 /index.html
-  Content-Type: text/html; charset=utf-8
+  Cache-Control: no-cache
 
 /spec_evolution.html
-  Content-Type: text/html; charset=utf-8
+  Cache-Control: no-cache
 
 /*.sqlite3
   Content-Type: application/octet-stream
-  Content-Disposition: inline
-  Cache-Control: public, max-age=86400
-  Accept-Ranges: none
   X-Content-Type-Options: nosniff

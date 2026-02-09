@@ -6,6 +6,7 @@
 //! This crate is intentionally small in early phases: it defines the core MVCC
 //! primitives and the cross-process witness/lock-table coordination types.
 
+pub mod bocpd;
 pub mod cache_aligned;
 pub mod compat;
 pub mod conflict_model;
@@ -29,6 +30,9 @@ pub mod witness_refinement;
 pub mod write_coordinator;
 pub mod xor_delta;
 
+pub use bocpd::{
+    BocpdConfig, BocpdMonitor, ConjugateModel, HazardFunction, RegimeStats,
+};
 pub use cache_aligned::{
     CACHE_LINE_BYTES, CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS, CacheAligned, RcriEntry,
     RcriOverflowError, RecentlyCommittedReadersIndex, SLOT_PAYLOAD_MASK, SLOT_TAG_MASK,
