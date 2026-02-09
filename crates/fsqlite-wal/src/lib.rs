@@ -1,9 +1,11 @@
 //! WAL checksum primitives, integrity helpers, and native commit protocol.
 
 pub mod checkpoint;
+pub mod checkpoint_executor;
 pub mod checksum;
 pub mod native_commit;
 pub mod recovery_compaction;
+pub mod wal;
 pub mod wal_fec;
 pub mod wal_index;
 
@@ -11,6 +13,7 @@ pub use checkpoint::{
     CheckpointMode, CheckpointPlan, CheckpointPostAction, CheckpointProgress, CheckpointState,
     plan_checkpoint,
 };
+pub use checkpoint_executor::{CheckpointExecutionResult, CheckpointTarget, execute_checkpoint};
 pub use checksum::{
     BTREE_PAGE_TYPE_FLAGS, CRASH_MODEL_SECTOR_SIZES, ChecksumFailureKind, CrashModelContract,
     HashTier, IntegrityCheckIssue, IntegrityCheckLevel, IntegrityCheckReport,
@@ -32,6 +35,7 @@ pub use checksum::{
     wal_header_checksum, write_page_checksum, write_wal_frame_checksum, write_wal_frame_salts,
     write_wal_header_checksum, write_wal_header_salts, zero_page_checksum_trailer,
 };
+pub use wal::WalFile;
 pub use wal_fec::{
     DEFAULT_RAPTORQ_REPAIR_SYMBOLS, MAX_RAPTORQ_REPAIR_SYMBOLS, WAL_FEC_GROUP_META_MAGIC,
     WAL_FEC_GROUP_META_VERSION, WalFecDecodeProof, WalFecGroupId, WalFecGroupMeta,
