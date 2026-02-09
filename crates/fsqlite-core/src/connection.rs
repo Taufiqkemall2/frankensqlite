@@ -121,10 +121,26 @@ impl PreparedStatement {
     }
 }
 
+/// Snapshot of the database + schema state at a point in time.
+/// Used for transaction rollback and savepoint restore.
+#[derive(Debug, Clone)]
+struct DbSnapshot {
+    db: MemDatabase,
+    schema: Vec<TableSchema>,
+}
+
+/// A named savepoint with its pre-state snapshot.
+#[derive(Debug, Clone)]
+struct SavepointEntry {
+    name: String,
+    snapshot: DbSnapshot,
+}
+
 /// A database connection holding in-memory tables and schema metadata.
 ///
-/// In Phase 4, all table storage uses `MemDatabase`. The B-tree + pager +
-/// VFS stack will replace this in Phase 5.
+/// Supports transactions (BEGIN/COMMIT/ROLLBACK) and savepoints
+/// (SAVEPOINT/RELEASE/ROLLBACK TO). All table storage uses `MemDatabase`
+/// until the B-tree + pager + VFS stack replaces this in Phase 5+.
 pub struct Connection {
     path: String,
     /// In-memory table storage (shared with the VDBE engine during execution).
@@ -133,6 +149,13 @@ pub struct Connection {
     schema: RefCell<Vec<TableSchema>>,
     /// Scalar/aggregate/window function registry shared with the VDBE engine.
     func_registry: Arc<FunctionRegistry>,
+    /// Whether an explicit transaction is active (BEGIN without matching COMMIT/ROLLBACK).
+    in_transaction: RefCell<bool>,
+    /// Snapshot taken at BEGIN time, restored on ROLLBACK.
+    txn_snapshot: RefCell<Option<DbSnapshot>>,
+    /// Savepoint stack: each SAVEPOINT pushes a snapshot, RELEASE pops,
+    /// ROLLBACK TO restores to the named savepoint (without popping).
+    savepoints: RefCell<Vec<SavepointEntry>>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -161,6 +184,9 @@ impl Connection {
             db: RefCell::new(MemDatabase::new()),
             schema: RefCell::new(Vec::new()),
             func_registry: default_function_registry(),
+            in_transaction: RefCell::new(false),
+            txn_snapshot: RefCell::new(None),
+            savepoints: RefCell::new(Vec::new()),
         })
     }
 
@@ -243,8 +269,28 @@ impl Connection {
                 let program = self.compile_table_delete(delete)?;
                 self.execute_table_program(&program, params)
             }
+            Statement::Begin(begin) => {
+                self.execute_begin(begin)?;
+                Ok(Vec::new())
+            }
+            Statement::Commit => {
+                self.execute_commit()?;
+                Ok(Vec::new())
+            }
+            Statement::Rollback(ref rb) => {
+                self.execute_rollback(rb)?;
+                Ok(Vec::new())
+            }
+            Statement::Savepoint(ref name) => {
+                self.execute_savepoint(name)?;
+                Ok(Vec::new())
+            }
+            Statement::Release(ref name) => {
+                self.execute_release(name)?;
+                Ok(Vec::new())
+            }
             _ => Err(FrankenError::NotImplemented(
-                "only SELECT, INSERT, UPDATE, DELETE, and CREATE TABLE are supported".to_owned(),
+                "only SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, and transaction control are supported".to_owned(),
             )),
         }
     }
@@ -328,6 +374,124 @@ impl Connection {
 
         Ok(())
     }
+
+    // ── Transaction control ──────────────────────────────────────────────
+
+    /// Returns `true` if an explicit transaction is active.
+    pub fn in_transaction(&self) -> bool {
+        *self.in_transaction.borrow()
+    }
+
+    /// Take a snapshot of the current database + schema state.
+    fn snapshot(&self) -> DbSnapshot {
+        DbSnapshot {
+            db: self.db.borrow().clone(),
+            schema: self.schema.borrow().clone(),
+        }
+    }
+
+    /// Restore a snapshot, replacing the current database + schema state.
+    fn restore_snapshot(&self, snap: &DbSnapshot) {
+        (*self.db.borrow_mut()).clone_from(&snap.db);
+        (*self.schema.borrow_mut()).clone_from(&snap.schema);
+    }
+
+    /// Handle BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE].
+    fn execute_begin(&self, _begin: fsqlite_ast::BeginStatement) -> Result<()> {
+        if *self.in_transaction.borrow() {
+            return Err(FrankenError::Internal(
+                "cannot start a transaction within a transaction".to_owned(),
+            ));
+        }
+        *self.txn_snapshot.borrow_mut() = Some(self.snapshot());
+        *self.in_transaction.borrow_mut() = true;
+        Ok(())
+    }
+
+    /// Handle COMMIT.
+    fn execute_commit(&self) -> Result<()> {
+        if !*self.in_transaction.borrow() {
+            return Err(FrankenError::Internal(
+                "cannot commit - no transaction is active".to_owned(),
+            ));
+        }
+        // Discard rollback snapshot and savepoints — changes are committed.
+        *self.txn_snapshot.borrow_mut() = None;
+        self.savepoints.borrow_mut().clear();
+        *self.in_transaction.borrow_mut() = false;
+        Ok(())
+    }
+
+    /// Handle ROLLBACK [TO SAVEPOINT name].
+    fn execute_rollback(&self, rb: &fsqlite_ast::RollbackStatement) -> Result<()> {
+        if let Some(ref sp_name) = rb.to_savepoint {
+            // ROLLBACK TO SAVEPOINT: restore to the named savepoint's snapshot
+            // but keep the savepoint (don't pop it).
+            let savepoints = self.savepoints.borrow();
+            let entry = savepoints
+                .iter()
+                .rev()
+                .find(|e| e.name.eq_ignore_ascii_case(sp_name))
+                .ok_or_else(|| {
+                    FrankenError::Internal(format!("no such savepoint: {sp_name}"))
+                })?;
+            let snap = entry.snapshot.clone();
+            drop(savepoints);
+            self.restore_snapshot(&snap);
+        } else {
+            // Full ROLLBACK: restore to transaction start.
+            if !*self.in_transaction.borrow() {
+                return Err(FrankenError::Internal(
+                    "cannot rollback - no transaction is active".to_owned(),
+                ));
+            }
+            let snap = self.txn_snapshot.borrow().clone();
+            if let Some(snap) = &snap {
+                self.restore_snapshot(snap);
+            }
+            *self.txn_snapshot.borrow_mut() = None;
+            self.savepoints.borrow_mut().clear();
+            *self.in_transaction.borrow_mut() = false;
+        }
+        Ok(())
+    }
+
+    /// Handle SAVEPOINT name.
+    #[allow(clippy::unnecessary_wraps)] // will return errors once pager is wired
+    fn execute_savepoint(&self, name: &str) -> Result<()> {
+        // If no explicit transaction, implicitly begin one.
+        if !*self.in_transaction.borrow() {
+            *self.txn_snapshot.borrow_mut() = Some(self.snapshot());
+            *self.in_transaction.borrow_mut() = true;
+        }
+        self.savepoints.borrow_mut().push(SavepointEntry {
+            name: name.to_owned(),
+            snapshot: self.snapshot(),
+        });
+        Ok(())
+    }
+
+    /// Handle RELEASE [SAVEPOINT] name.
+    fn execute_release(&self, name: &str) -> Result<()> {
+        let mut savepoints = self.savepoints.borrow_mut();
+        let idx = savepoints
+            .iter()
+            .rposition(|e| e.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| {
+                FrankenError::Internal(format!("no such savepoint: {name}"))
+            })?;
+        // RELEASE removes the named savepoint and all savepoints created after it.
+        savepoints.truncate(idx);
+        // If no savepoints remain and we started implicitly, end the transaction.
+        if savepoints.is_empty() && self.txn_snapshot.borrow().is_some() {
+            drop(savepoints);
+            // Implicit transaction via savepoint: commit on final release.
+            // (If the user did explicit BEGIN, they still need COMMIT.)
+        }
+        Ok(())
+    }
+
+    // ── Compilation helpers ─────────────────────────────────────────────
 
     /// Compile a table-backed SELECT through the VDBE codegen.
     fn compile_table_select(&self, select: &SelectStatement) -> Result<VdbeProgram> {
@@ -1952,5 +2116,228 @@ mod tests {
         let rows = conn.query("SELECT 'abc' LIKE 'a_c';").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(1)]);
+    }
+
+    // ── Transaction tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_begin_commit() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER);").unwrap();
+        assert!(!conn.in_transaction());
+
+        conn.execute("BEGIN;").unwrap();
+        assert!(conn.in_transaction());
+
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t VALUES (2);").unwrap();
+        conn.execute("COMMIT;").unwrap();
+        assert!(!conn.in_transaction());
+
+        let rows = conn.query("SELECT x FROM t;").unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_begin_rollback_restores_state() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO t VALUES (2);").unwrap();
+        conn.execute("INSERT INTO t VALUES (3);").unwrap();
+
+        // Verify 3 rows during transaction.
+        let rows = conn.query("SELECT x FROM t;").unwrap();
+        assert_eq!(rows.len(), 3);
+
+        conn.execute("ROLLBACK;").unwrap();
+        assert!(!conn.in_transaction());
+
+        // After rollback, only the original row remains.
+        let rows = conn.query("SELECT x FROM t;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
+    fn test_rollback_restores_schema() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER);").unwrap();
+        conn.execute("ROLLBACK;").unwrap();
+
+        // Table should not exist after rollback.
+        let result = conn.query("SELECT x FROM t;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_nested_begin_errors() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("BEGIN;").unwrap();
+        let result = conn.execute("BEGIN;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_commit_without_begin_errors() {
+        let conn = Connection::open(":memory:").unwrap();
+        let result = conn.execute("COMMIT;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_rollback_without_begin_errors() {
+        let conn = Connection::open(":memory:").unwrap();
+        let result = conn.execute("ROLLBACK;");
+        assert!(result.is_err());
+    }
+
+    // ── Savepoint tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_savepoint_rollback_to() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+
+        conn.execute("SAVEPOINT sp1;").unwrap();
+        conn.execute("INSERT INTO t VALUES (2);").unwrap();
+
+        conn.execute("SAVEPOINT sp2;").unwrap();
+        conn.execute("INSERT INTO t VALUES (3);").unwrap();
+
+        // Verify 3 rows.
+        let rows = conn.query("SELECT x FROM t;").unwrap();
+        assert_eq!(rows.len(), 3);
+
+        // Rollback to sp2: undo value 3 only.
+        conn.execute("ROLLBACK TO sp2;").unwrap();
+        let rows = conn.query("SELECT x FROM t;").unwrap();
+        assert_eq!(rows.len(), 2);
+
+        // Rollback to sp1: undo value 2 as well.
+        conn.execute("ROLLBACK TO sp1;").unwrap();
+        let rows = conn.query("SELECT x FROM t;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
+    fn test_savepoint_release() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER);").unwrap();
+
+        conn.execute("SAVEPOINT sp1;").unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+
+        conn.execute("SAVEPOINT sp2;").unwrap();
+        conn.execute("INSERT INTO t VALUES (2);").unwrap();
+
+        // Release sp2: changes committed to sp1 scope.
+        conn.execute("RELEASE sp2;").unwrap();
+
+        let rows = conn.query("SELECT x FROM t;").unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_savepoint_starts_implicit_transaction() {
+        let conn = Connection::open(":memory:").unwrap();
+        assert!(!conn.in_transaction());
+        conn.execute("SAVEPOINT sp1;").unwrap();
+        assert!(conn.in_transaction());
+    }
+
+    #[test]
+    fn test_rollback_to_nonexistent_savepoint_errors() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("BEGIN;").unwrap();
+        let result = conn.execute("ROLLBACK TO nosuch;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_release_nonexistent_savepoint_errors() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("BEGIN;").unwrap();
+        let result = conn.execute("RELEASE nosuch;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_transaction_with_update_rollback() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'alice');").unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("UPDATE t SET name = 'bob' WHERE id = 1;")
+            .unwrap();
+
+        let rows = conn.query("SELECT name FROM t;").unwrap();
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Text("bob".to_owned())]
+        );
+
+        conn.execute("ROLLBACK;").unwrap();
+
+        let rows = conn.query("SELECT name FROM t;").unwrap();
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Text("alice".to_owned())]
+        );
+    }
+
+    #[test]
+    fn test_transaction_with_delete_rollback() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t VALUES (2);").unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("DELETE FROM t WHERE x = 1;").unwrap();
+
+        let rows = conn.query("SELECT x FROM t;").unwrap();
+        assert_eq!(rows.len(), 1);
+
+        conn.execute("ROLLBACK;").unwrap();
+
+        let rows = conn.query("SELECT x FROM t;").unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_nested_savepoints_deep() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER);").unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+
+        conn.execute("SAVEPOINT a;").unwrap();
+        conn.execute("INSERT INTO t VALUES (2);").unwrap();
+
+        conn.execute("SAVEPOINT b;").unwrap();
+        conn.execute("INSERT INTO t VALUES (3);").unwrap();
+
+        conn.execute("SAVEPOINT c;").unwrap();
+        conn.execute("INSERT INTO t VALUES (4);").unwrap();
+
+        // Rollback to b: undo values 3 and 4.
+        conn.execute("ROLLBACK TO b;").unwrap();
+        let rows = conn.query("SELECT x FROM t;").unwrap();
+        assert_eq!(rows.len(), 2);
+
+        // Commit the whole transaction.
+        conn.execute("COMMIT;").unwrap();
+
+        let rows = conn.query("SELECT x FROM t;").unwrap();
+        assert_eq!(rows.len(), 2);
     }
 }

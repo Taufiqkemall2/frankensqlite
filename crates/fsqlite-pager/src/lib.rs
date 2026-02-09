@@ -3,6 +3,7 @@ pub mod encrypt;
 pub mod journal;
 pub mod page_buf;
 pub mod page_cache;
+pub mod pager;
 pub mod traits;
 
 pub use arc_cache::{ArcCache, ArcCacheInner, CacheKey, CacheLookup, CachedPage};
@@ -17,6 +18,7 @@ pub use journal::{
 };
 pub use page_buf::{PageBuf, PageBufPool};
 pub use page_cache::PageCache;
+pub use pager::{SimplePager, SimpleTransaction};
 pub use traits::{
     CheckpointPageWriter, MockCheckpointPageWriter, MockMvccPager, MockTransaction, MvccPager,
     TransactionHandle, TransactionMode,

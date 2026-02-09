@@ -6,8 +6,8 @@
 
 use crate::ProgramBuilder;
 use fsqlite_ast::{
-    ColumnRef, DeleteStatement, Expr, InsertSource, InsertStatement, Literal, QualifiedTableRef,
-    ResultColumn, SelectCore, SelectStatement, UpdateStatement,
+    ColumnRef, DeleteStatement, Expr, InsertSource, InsertStatement, LimitClause, Literal,
+    QualifiedTableRef, ResultColumn, SelectCore, SelectStatement, UpdateStatement,
 };
 use fsqlite_types::opcode::{Opcode, P4};
 
@@ -254,6 +254,7 @@ pub fn codegen_select(
                 table,
                 columns,
                 where_clause.as_deref(),
+                stmt.limit.as_ref(),
                 out_regs,
                 out_col_count,
                 done_label,
@@ -268,6 +269,7 @@ pub fn codegen_select(
             table,
             columns,
             where_clause.as_deref(),
+            stmt.limit.as_ref(),
             out_regs,
             out_col_count,
             done_label,
@@ -286,7 +288,7 @@ pub fn codegen_select(
     Ok(())
 }
 
-/// Codegen for a full table scan SELECT with optional WHERE filtering.
+/// Codegen for a full table scan SELECT with optional WHERE filtering and LIMIT/OFFSET.
 #[allow(clippy::too_many_arguments)]
 fn codegen_select_full_scan(
     b: &mut ProgramBuilder,
@@ -294,11 +296,26 @@ fn codegen_select_full_scan(
     table: &TableSchema,
     columns: &[ResultColumn],
     where_clause: Option<&Expr>,
+    limit_clause: Option<&LimitClause>,
     out_regs: i32,
     out_col_count: i32,
     done_label: crate::Label,
     end_label: crate::Label,
 ) -> Result<(), CodegenError> {
+    // Allocate LIMIT/OFFSET counter registers (if present).
+    let limit_reg = limit_clause.map(|lc| {
+        let r = b.alloc_reg();
+        emit_limit_expr(b, &lc.limit, r);
+        r
+    });
+    let offset_reg = limit_clause.and_then(|lc| {
+        lc.offset.as_ref().map(|off_expr| {
+            let r = b.alloc_reg();
+            emit_limit_expr(b, off_expr, r);
+            r
+        })
+    });
+
     b.emit_op(
         Opcode::OpenRead,
         cursor,
@@ -318,11 +335,21 @@ fn codegen_select_full_scan(
         emit_where_filter(b, where_expr, cursor, table, skip_label);
     }
 
+    // OFFSET: if offset counter > 0, decrement by 1 and skip this row.
+    if let Some(off_r) = offset_reg {
+        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, skip_label, P4::None, 0);
+    }
+
     // Read columns.
     emit_column_reads(b, cursor, columns, table, out_regs)?;
 
     // ResultRow.
     b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+
+    // LIMIT: decrement limit counter; jump to done when zero.
+    if let Some(lim_r) = limit_reg {
+        b.emit_jump_to_label(Opcode::DecrJumpZero, lim_r, 0, done_label, P4::None, 0);
+    }
 
     // Skip label for WHERE-filtered rows.
     b.resolve_label(skip_label);
@@ -341,6 +368,30 @@ fn codegen_select_full_scan(
     b.resolve_label(end_label);
 
     Ok(())
+}
+
+/// Emit a LIMIT or OFFSET expression into a register.
+///
+/// Handles integer literals and bind parameters; falls back to -1
+/// (unlimited) for complex expressions.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_limit_expr(b: &mut ProgramBuilder, expr: &Expr, target_reg: i32) {
+    match expr {
+        Expr::Literal(Literal::Integer(n), _) => {
+            b.emit_op(Opcode::Integer, *n as i32, target_reg, 0, P4::None, 0);
+        }
+        Expr::Placeholder(pt, _) => {
+            let param_idx = match pt {
+                fsqlite_ast::PlaceholderType::Numbered(n) => *n as i32,
+                _ => 1,
+            };
+            b.emit_op(Opcode::Variable, param_idx, target_reg, 0, P4::None, 0);
+        }
+        _ => {
+            // Unsupported expression — use -1 (unlimited).
+            b.emit_op(Opcode::Integer, -1, target_reg, 0, P4::None, 0);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1246,9 +1297,9 @@ mod tests {
     use crate::ProgramBuilder;
     use fsqlite_ast::{
         Assignment, AssignmentTarget, BinaryOp as AstBinaryOp, ColumnRef, DeleteStatement,
-        Distinctness, Expr, FromClause, InsertSource, InsertStatement, PlaceholderType,
-        QualifiedName, QualifiedTableRef, ResultColumn, SelectBody, SelectCore, SelectStatement,
-        Span, TableOrSubquery, UpdateStatement,
+        Distinctness, Expr, FromClause, InsertSource, InsertStatement, LimitClause, Literal,
+        PlaceholderType, QualifiedName, QualifiedTableRef, ResultColumn, SelectBody, SelectCore,
+        SelectStatement, Span, TableOrSubquery, UpdateStatement,
     };
     use fsqlite_types::opcode::Opcode;
 
@@ -1372,6 +1423,52 @@ mod tests {
             },
             order_by: vec![],
             limit: None,
+        }
+    }
+
+    fn star_select_with_limit(table: &str, limit: i64) -> SelectStatement {
+        SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Star],
+                    from: Some(from_table(table)),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: Some(LimitClause {
+                limit: Expr::Literal(Literal::Integer(limit), Span::ZERO),
+                offset: None,
+            }),
+        }
+    }
+
+    fn star_select_with_limit_offset(table: &str, limit: i64, offset: i64) -> SelectStatement {
+        SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Star],
+                    from: Some(from_table(table)),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: Some(LimitClause {
+                limit: Expr::Literal(Literal::Integer(limit), Span::ZERO),
+                offset: Some(Expr::Literal(Literal::Integer(offset), Span::ZERO)),
+            }),
         }
     }
 
@@ -1845,5 +1942,134 @@ mod tests {
             &prog,
             &[Opcode::Insert, Opcode::ResultRow, Opcode::Close,]
         ));
+    }
+
+    // === Test 11: SELECT with LIMIT ===
+    #[test]
+    fn test_codegen_select_with_limit() {
+        let stmt = star_select_with_limit("t", 10);
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // Should contain Integer (for limit), DecrJumpZero (for countdown).
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::Integer,
+                Opcode::OpenRead,
+                Opcode::Rewind,
+                Opcode::Column,
+                Opcode::ResultRow,
+                Opcode::DecrJumpZero,
+                Opcode::Next,
+                Opcode::Close,
+                Opcode::Halt,
+            ]
+        ));
+
+        // DecrJumpZero p1 should be the limit register.
+        let djz = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::DecrJumpZero)
+            .expect("must have DecrJumpZero");
+        assert!(djz.p1 >= 1, "limit register must be allocated");
+    }
+
+    // === Test 12: SELECT with LIMIT and OFFSET ===
+    #[test]
+    fn test_codegen_select_with_limit_offset() {
+        let stmt = star_select_with_limit_offset("t", 5, 3);
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // Should have both IfPos (offset skip) and DecrJumpZero (limit).
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::Integer, // limit value
+                Opcode::Integer, // offset value
+                Opcode::OpenRead,
+                Opcode::Rewind,
+                Opcode::IfPos, // offset countdown
+                Opcode::Column,
+                Opcode::ResultRow,
+                Opcode::DecrJumpZero, // limit countdown
+                Opcode::Next,
+                Opcode::Close,
+                Opcode::Halt,
+            ]
+        ));
+
+        // Verify IfPos p3 == 1 (decrement by 1).
+        let ifpos = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::IfPos)
+            .expect("must have IfPos");
+        assert_eq!(ifpos.p3, 1, "IfPos should decrement offset by 1");
+    }
+
+    // === Test 13: SELECT without LIMIT has no DecrJumpZero ===
+    #[test]
+    fn test_codegen_select_no_limit_no_decr() {
+        let stmt = star_select("t");
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // Without LIMIT, there should be no DecrJumpZero.
+        let djz_count = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::DecrJumpZero)
+            .count();
+        assert_eq!(djz_count, 0, "no DecrJumpZero without LIMIT");
+
+        // And no IfPos either.
+        let ifpos_count = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::IfPos)
+            .count();
+        assert_eq!(ifpos_count, 0, "no IfPos without OFFSET");
+    }
+
+    // === Test 14: LIMIT labels properly resolved ===
+    #[test]
+    fn test_codegen_select_limit_labels_resolved() {
+        let stmt = star_select_with_limit_offset("t", 10, 5);
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // All jump targets should be valid addresses.
+        for op in prog.ops() {
+            if op.opcode.is_jump() {
+                assert!(
+                    op.p2 >= 0,
+                    "unresolved jump at {:?}: p2 = {}",
+                    op.opcode,
+                    op.p2
+                );
+                assert!(
+                    usize::try_from(op.p2).unwrap() <= prog.len(),
+                    "jump target out of range at {:?}: p2 = {} (prog len = {})",
+                    op.opcode,
+                    op.p2,
+                    prog.len()
+                );
+            }
+        }
     }
 }

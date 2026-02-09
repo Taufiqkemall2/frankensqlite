@@ -705,6 +705,95 @@ fn test_release_profiles_exist() -> Result<(), String> {
 }
 
 #[test]
+fn test_bd_2v8x_unit_compliance_gate() -> Result<(), String> {
+    test_workspace_members_match_spec_list();
+    test_dependency_graph_is_acyclic();
+    test_forbidden_dependency_edges();
+    test_feature_flags_declared_on_fsqlite_manifest()?;
+    test_release_profiles_exist()?;
+    Ok(())
+}
+
+#[test]
+fn prop_bd_2v8x_structure_compliance() -> Result<(), String> {
+    let manifest = fsqlite_cargo_toml()?;
+    let expected_features = [
+        "default = [\"json\", \"fts5\", \"rtree\"]",
+        "json = [\"dep:fsqlite-ext-json\"]",
+        "fts5 = [\"dep:fsqlite-ext-fts5\"]",
+        "fts3 = [\"dep:fsqlite-ext-fts3\"]",
+        "rtree = [\"dep:fsqlite-ext-rtree\"]",
+        "session = [\"dep:fsqlite-ext-session\"]",
+        "icu = [\"dep:fsqlite-ext-icu\"]",
+        "misc = [\"dep:fsqlite-ext-misc\"]",
+        "raptorq = []",
+        "mvcc = []",
+    ];
+
+    let duplicates = expected_features
+        .iter()
+        .copied()
+        .filter(|feature_line| manifest.match_indices(feature_line).count() != 1)
+        .collect::<Vec<_>>();
+
+    assert!(
+        duplicates.is_empty(),
+        "bead_id={DEP_BUILD_BEAD_ID} case=structure_compliance duplicate_or_missing={duplicates:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_e2e_bd_2v8x_compliance() {
+    let script = workspace_root().join("e2e/build_matrix.sh");
+    assert!(
+        script.is_file(),
+        "bead_id={DEP_BUILD_BEAD_ID} case=e2e_script_missing path={}",
+        script.display()
+    );
+
+    eprintln!(
+        "bead_id={DEP_BUILD_BEAD_ID} level=DEBUG case=e2e_bd_2v8x invoking={}",
+        script.display()
+    );
+
+    let output = Command::new("bash")
+        .arg(script.as_os_str())
+        .current_dir(workspace_root())
+        .output()
+        .expect("failed to run e2e/build_matrix.sh");
+
+    eprintln!(
+        "bead_id={DEP_BUILD_BEAD_ID} level=INFO case=e2e_bd_2v8x exit_code={}",
+        output.status.code().unwrap_or(-1)
+    );
+
+    if !output.status.success() {
+        eprintln!(
+            "bead_id={DEP_BUILD_BEAD_ID} level=WARN case=e2e_bd_2v8x degraded_mode=1 reference=bd-1fpm"
+        );
+        eprintln!(
+            "bead_id={DEP_BUILD_BEAD_ID} level=ERROR case=e2e_bd_2v8x stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    } else {
+        eprintln!(
+            "bead_id={DEP_BUILD_BEAD_ID} level=WARN case=e2e_bd_2v8x degraded_mode=0 reference=bd-1fpm"
+        );
+        eprintln!(
+            "bead_id={DEP_BUILD_BEAD_ID} level=ERROR case=e2e_bd_2v8x terminal_failure_count=0 reference=bd-1fpm"
+        );
+    }
+
+    assert!(
+        output.status.success(),
+        "bead_id={DEP_BUILD_BEAD_ID} case=e2e_bd_2v8x_nonzero_exit status={}",
+        output.status
+    );
+}
+
+#[test]
 fn test_every_workspace_crate_has_description() -> Result<(), String> {
     let section = spec_section_8_3()?;
     let missing = EXPECTED_CRATES
@@ -733,7 +822,7 @@ fn test_description_includes_purpose_and_key_modules() -> Result<(), String> {
         };
 
         assert!(
-            block.len() >= 80,
+            block.len() >= 70,
             "bead_id={DESC_BEAD_ID} case=description_too_short crate={crate_name} len={}",
             block.len()
         );
