@@ -11,6 +11,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
@@ -21,7 +22,9 @@ use fsqlite_types::{ObjectId, Oti, PageSize, SymbolRecord, SymbolRecordFlags};
 use tracing::{debug, error, info, warn};
 use xxhash_rust::xxh3::xxh3_64;
 
-use crate::checksum::{WalSalts, Xxh3Checksum128, wal_fec_source_hash_xxh3_128};
+use crate::checksum::{
+    WalSalts, Xxh3Checksum128, verify_wal_fec_source_hash, wal_fec_source_hash_xxh3_128,
+};
 
 /// Magic bytes for [`WalFecGroupMeta`].
 pub const WAL_FEC_GROUP_META_MAGIC: [u8; 8] = *b"FSQLWFEC";
@@ -495,6 +498,58 @@ impl WalFecGroupRecord {
 pub struct WalFecScanResult {
     pub groups: Vec<WalFecGroupRecord>,
     pub truncated_tail: bool,
+}
+
+/// Why WAL-FEC recovery fell back to SQLite-compatible truncation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalFecRecoveryFallbackReason {
+    MissingSidecarGroup,
+    SidecarUnreadable,
+    SaltMismatch,
+    InsufficientSymbols,
+    DecodeFailed,
+    DecodedPayloadMismatch,
+}
+
+/// Recovery audit artifact for a single WAL-FEC group attempt (§3.4.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalFecDecodeProof {
+    pub group_id: WalFecGroupId,
+    pub required_symbols: u32,
+    pub available_symbols: u32,
+    pub validated_source_symbols: u32,
+    pub validated_repair_symbols: u32,
+    pub decode_attempted: bool,
+    pub decode_succeeded: bool,
+    pub recovered_frame_nos: Vec<u32>,
+    pub fallback_reason: Option<WalFecRecoveryFallbackReason>,
+}
+
+/// Successful recovery payload for one commit group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalFecRecoveredGroup {
+    pub meta: WalFecGroupMeta,
+    pub recovered_pages: Vec<Vec<u8>>,
+    pub recovered_frame_nos: Vec<u32>,
+    pub db_size_pages: u32,
+    pub decode_proof: WalFecDecodeProof,
+}
+
+/// Final action for a WAL-FEC recovery attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalFecRecoveryOutcome {
+    Recovered(WalFecRecoveredGroup),
+    TruncateBeforeGroup {
+        truncate_before_frame_no: u32,
+        decode_proof: WalFecDecodeProof,
+    },
+}
+
+/// Candidate WAL source frame payload read from `.wal`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalFrameCandidate {
+    pub frame_no: u32,
+    pub page_data: Vec<u8>,
 }
 
 const DEFAULT_REPAIR_PIPELINE_QUEUE_CAPACITY: usize = 64;
