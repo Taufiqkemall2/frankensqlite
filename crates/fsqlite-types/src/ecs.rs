@@ -47,7 +47,9 @@ impl PayloadHash {
 ///
 /// Spec:
 /// `ObjectId = Trunc128(BLAKE3("fsqlite:ecs:v1" || canonical_object_header || payload_hash))`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[repr(transparent)]
 pub struct ObjectId([u8; 16]);
 
