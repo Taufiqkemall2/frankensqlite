@@ -746,7 +746,7 @@ fn prop_bd_2v8x_structure_compliance() -> Result<(), String> {
 
 #[test]
 fn test_e2e_bd_2v8x_compliance() {
-    let script = workspace_root().join("e2e/build_matrix.sh");
+    let script = workspace_root().join("e2e/bd_2v8x_compliance.sh");
     assert!(
         script.is_file(),
         "bead_id={DEP_BUILD_BEAD_ID} case=e2e_script_missing path={}",
@@ -762,27 +762,27 @@ fn test_e2e_bd_2v8x_compliance() {
         .arg(script.as_os_str())
         .current_dir(workspace_root())
         .output()
-        .expect("failed to run e2e/build_matrix.sh");
+        .expect("failed to run e2e/bd_2v8x_compliance.sh");
 
     eprintln!(
         "bead_id={DEP_BUILD_BEAD_ID} level=INFO case=e2e_bd_2v8x exit_code={}",
         output.status.code().unwrap_or(-1)
     );
 
-    if !output.status.success() {
+    if output.status.success() {
+        eprintln!(
+            "bead_id={DEP_BUILD_BEAD_ID} level=WARN case=e2e_bd_2v8x degraded_mode=0 reference=bd-1fpm"
+        );
+        eprintln!(
+            "bead_id={DEP_BUILD_BEAD_ID} level=ERROR case=e2e_bd_2v8x terminal_failure_count=0 reference=bd-1fpm"
+        );
+    } else {
         eprintln!(
             "bead_id={DEP_BUILD_BEAD_ID} level=WARN case=e2e_bd_2v8x degraded_mode=1 reference=bd-1fpm"
         );
         eprintln!(
             "bead_id={DEP_BUILD_BEAD_ID} level=ERROR case=e2e_bd_2v8x stderr={}",
             String::from_utf8_lossy(&output.stderr)
-        );
-    } else {
-        eprintln!(
-            "bead_id={DEP_BUILD_BEAD_ID} level=WARN case=e2e_bd_2v8x degraded_mode=0 reference=bd-1fpm"
-        );
-        eprintln!(
-            "bead_id={DEP_BUILD_BEAD_ID} level=ERROR case=e2e_bd_2v8x terminal_failure_count=0 reference=bd-1fpm"
         );
     }
 

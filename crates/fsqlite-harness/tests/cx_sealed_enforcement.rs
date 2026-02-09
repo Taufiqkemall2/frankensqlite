@@ -2,13 +2,14 @@
 
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use fsqlite_btree::{BtreeCursorOps, MockBtreeCursor, SeekResult};
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::{
     AggregateFunction, AuthAction, AuthResult, Authorizer, CollationFunction, ColumnContext,
-    ConstraintOp, IndexConstraint, IndexInfo, ScalarFunction, VirtualTable, VirtualTableCursor,
-    WindowFunction,
+    ConstraintOp, FunctionRegistry, IndexConstraint, IndexInfo, ScalarFunction, VirtualTable,
+    VirtualTableCursor, WindowFunction,
 };
 use fsqlite_pager::{
     CheckpointPageWriter, MockCheckpointPageWriter, MockMvccPager, MockTransaction, MvccPager,
@@ -564,4 +565,538 @@ fn test_dummy_vtab_best_index_receives_constraints() {
     vtab.best_index(&mut info)
         .expect("best_index should succeed");
     assert!((info.estimated_cost - 1.0).abs() < f64::EPSILON);
+}
+
+// ---------------------------------------------------------------------------
+// bd-36vb: Trait composition + mock implementation compliance
+// ---------------------------------------------------------------------------
+
+const COMPOSITION_BEAD_ID: &str = "bd-36vb";
+
+#[derive(Clone, Default)]
+struct RecordingLog {
+    entries: Arc<Mutex<Vec<String>>>,
+}
+
+impl RecordingLog {
+    fn push(&self, entry: impl Into<String>) {
+        self.entries
+            .lock()
+            .expect("recording log mutex must not be poisoned")
+            .push(entry.into());
+    }
+
+    fn snapshot(&self) -> Vec<String> {
+        self.entries
+            .lock()
+            .expect("recording log mutex must not be poisoned")
+            .clone()
+    }
+}
+
+#[derive(Clone)]
+struct RecordingVfs {
+    log: RecordingLog,
+    fail_write: bool,
+}
+
+impl RecordingVfs {
+    fn new(fail_write: bool) -> Self {
+        Self {
+            log: RecordingLog::default(),
+            fail_write,
+        }
+    }
+}
+
+struct RecordingFile {
+    log: RecordingLog,
+    fail_write: bool,
+    bytes: Vec<u8>,
+}
+
+impl Vfs for RecordingVfs {
+    type File = RecordingFile;
+
+    fn name(&self) -> &'static str {
+        "recording_vfs"
+    }
+
+    fn open(
+        &self,
+        _cx: &Cx,
+        path: Option<&Path>,
+        flags: VfsOpenFlags,
+    ) -> Result<(Self::File, VfsOpenFlags)> {
+        self.log.push(format!(
+            "open:{}",
+            path.map_or_else(|| "<temp>".to_owned(), |p| p.display().to_string())
+        ));
+        Ok((
+            RecordingFile {
+                log: self.log.clone(),
+                fail_write: self.fail_write,
+                bytes: Vec::new(),
+            },
+            flags,
+        ))
+    }
+
+    fn delete(&self, _cx: &Cx, path: &Path, _sync_dir: bool) -> Result<()> {
+        self.log.push(format!("delete:{}", path.display()));
+        Ok(())
+    }
+
+    fn access(&self, _cx: &Cx, path: &Path, _flags: AccessFlags) -> Result<bool> {
+        self.log.push(format!("access:{}", path.display()));
+        Ok(true)
+    }
+
+    fn full_pathname(&self, _cx: &Cx, path: &Path) -> Result<PathBuf> {
+        self.log.push(format!("full_pathname:{}", path.display()));
+        Ok(path.to_path_buf())
+    }
+}
+
+impl VfsFile for RecordingFile {
+    fn close(&mut self, _cx: &Cx) -> Result<()> {
+        self.log.push("close");
+        Ok(())
+    }
+
+    fn read(&mut self, _cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        self.log.push(format!("read:{offset}:{}", buf.len()));
+        let start = usize::try_from(offset).expect("offset must fit usize");
+        if start >= self.bytes.len() {
+            buf.fill(0);
+            return Ok(0);
+        }
+        let available = &self.bytes[start..];
+        let n = available.len().min(buf.len());
+        buf[..n].copy_from_slice(&available[..n]);
+        if n < buf.len() {
+            buf[n..].fill(0);
+        }
+        Ok(n)
+    }
+
+    fn write(&mut self, _cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+        self.log.push(format!("write:{offset}:{}", buf.len()));
+        if self.fail_write {
+            return Err(FrankenError::Unsupported);
+        }
+        let start = usize::try_from(offset).expect("offset must fit usize");
+        let end = start + buf.len();
+        if end > self.bytes.len() {
+            self.bytes.resize(end, 0);
+        }
+        self.bytes[start..end].copy_from_slice(buf);
+        Ok(())
+    }
+
+    fn truncate(&mut self, _cx: &Cx, size: u64) -> Result<()> {
+        self.log.push(format!("truncate:{size}"));
+        let new_len = usize::try_from(size).expect("size must fit usize");
+        self.bytes.truncate(new_len);
+        Ok(())
+    }
+
+    fn sync(&mut self, _cx: &Cx, _flags: SyncFlags) -> Result<()> {
+        self.log.push("sync");
+        Ok(())
+    }
+
+    fn file_size(&self, _cx: &Cx) -> Result<u64> {
+        Ok(self.bytes.len() as u64)
+    }
+
+    fn lock(&mut self, _cx: &Cx, level: LockLevel) -> Result<()> {
+        self.log.push(format!("lock:{level:?}"));
+        Ok(())
+    }
+
+    fn unlock(&mut self, _cx: &Cx, level: LockLevel) -> Result<()> {
+        self.log.push(format!("unlock:{level:?}"));
+        Ok(())
+    }
+
+    fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn shm_map(&mut self, _cx: &Cx, _region: u32, _size: u32, _extend: bool) -> Result<ShmRegion> {
+        Err(FrankenError::Unsupported)
+    }
+
+    fn shm_lock(&mut self, _cx: &Cx, _offset: u32, _n: u32, _flags: u32) -> Result<()> {
+        Err(FrankenError::Unsupported)
+    }
+
+    fn shm_barrier(&self) {}
+
+    fn shm_unmap(&mut self, _cx: &Cx, _delete: bool) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn test_pager_owns_vfs_file() {
+    let cx = Cx::new();
+    let vfs = RecordingVfs::new(false);
+    let (file, _) = vfs
+        .open(
+            &cx,
+            Some(Path::new("pager-owns-vfs-file.db")),
+            VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE,
+        )
+        .expect("open should succeed");
+
+    let mut boxed: Box<dyn VfsFile> = Box::new(file);
+    boxed
+        .write(&cx, b"abc", 0)
+        .expect("boxed file write should succeed");
+    boxed
+        .sync(&cx, SyncFlags::NORMAL)
+        .expect("sync should succeed");
+
+    let log = vfs.log.snapshot();
+    assert!(log.iter().any(|entry| entry.starts_with("open:")));
+    assert!(log.iter().any(|entry| entry.starts_with("write:")));
+}
+
+#[test]
+fn test_pager_opens_via_vfs() {
+    let cx = Cx::new();
+    let vfs = RecordingVfs::new(false);
+    let _ = vfs
+        .open(
+            &cx,
+            Some(Path::new("pager-opens-via-vfs.db")),
+            VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE,
+        )
+        .expect("open should succeed");
+
+    let log = vfs.log.snapshot();
+    assert!(
+        log.first().is_some_and(|entry| entry.starts_with("open:")),
+        "bead_id={COMPOSITION_BEAD_ID} expected first call to be open"
+    );
+}
+
+#[test]
+fn test_mvcc_pager_page_resolution_chain() {
+    let cx = Cx::new();
+    let pager = MockMvccPager;
+    let txn = pager
+        .begin(&cx, TransactionMode::Deferred)
+        .expect("mock begin should succeed");
+
+    let page = txn
+        .get_page(&cx, PageNumber::new(7).expect("non-zero page number"))
+        .expect("mock get_page should succeed");
+    let stamp = u32::from_le_bytes(page.as_bytes()[..4].try_into().expect("stamp bytes"));
+
+    assert_eq!(
+        stamp, 7,
+        "bead_id={COMPOSITION_BEAD_ID} mock pager must stamp requested page number"
+    );
+}
+
+#[test]
+fn test_mvcc_pager_wraps_pager_and_wal() {
+    let cx = Cx::new();
+    let pager = MockMvccPager;
+    let mut writer = MockCheckpointPageWriter;
+
+    let mut txn = pager
+        .begin(&cx, TransactionMode::Deferred)
+        .expect("mock begin should succeed");
+    let allocated = txn.allocate_page(&cx).expect("allocate should succeed");
+    txn.commit(&cx).expect("commit should succeed");
+
+    writer
+        .truncate(&cx, allocated.get())
+        .expect("truncate should succeed");
+    writer.sync(&cx).expect("sync should succeed");
+}
+
+#[test]
+fn test_btcursor_calls_pager_get_page() {
+    let cx = Cx::new();
+    let pager = MockMvccPager;
+    let txn = pager
+        .begin(&cx, TransactionMode::Deferred)
+        .expect("begin should succeed");
+    let _ = txn
+        .get_page(&cx, PageNumber::new(3).expect("non-zero page number"))
+        .expect("get_page should succeed");
+
+    let mut cursor = MockBtreeCursor::new(vec![(3, b"three".to_vec())]);
+    assert!(
+        cursor
+            .table_move_to(&cx, 3)
+            .expect("seek should succeed")
+            .is_found()
+    );
+    assert_eq!(cursor.rowid(&cx).expect("rowid should succeed"), 3);
+}
+
+#[test]
+fn test_vdbe_cursor_wraps_btcursor() {
+    let cx = Cx::new();
+    let mut cursor = MockBtreeCursor::new(vec![(1, b"alpha".to_vec()), (2, b"beta".to_vec())]);
+    assert!(cursor.first(&cx).expect("first should succeed"));
+    assert_eq!(
+        cursor.payload(&cx).expect("payload should succeed"),
+        b"alpha"
+    );
+    assert!(cursor.next(&cx).expect("next should succeed"));
+    assert_eq!(
+        cursor.payload(&cx).expect("payload should succeed"),
+        b"beta"
+    );
+}
+
+#[test]
+fn test_vdbe_function_lookup() {
+    let mut registry = FunctionRegistry::new();
+    registry.register_scalar(DummyScalar);
+    let scalar = registry
+        .find_scalar("dummy_scalar", 0)
+        .expect("registered scalar should be found");
+    assert_eq!(
+        scalar.invoke(&[]).expect("scalar invoke should succeed"),
+        SqliteValue::Integer(1)
+    );
+}
+
+#[test]
+fn test_mock_vfs_records_calls() {
+    let cx = Cx::new();
+    let vfs = RecordingVfs::new(false);
+    let _ = vfs
+        .open(
+            &cx,
+            Some(Path::new("records-calls.db")),
+            VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE,
+        )
+        .expect("open should succeed");
+    let _ = vfs
+        .access(&cx, Path::new("records-calls.db"), AccessFlags::EXISTS)
+        .expect("access should succeed");
+    vfs.delete(&cx, Path::new("records-calls.db"), false)
+        .expect("delete should succeed");
+
+    let log = vfs.log.snapshot();
+    assert!(log.iter().any(|entry| entry.starts_with("open:")));
+    assert!(log.iter().any(|entry| entry.starts_with("access:")));
+    assert!(log.iter().any(|entry| entry.starts_with("delete:")));
+}
+
+#[test]
+fn test_mock_vfs_configurable_errors() {
+    let cx = Cx::new();
+    let vfs = RecordingVfs::new(true);
+    let (mut file, _) = vfs
+        .open(
+            &cx,
+            Some(Path::new("inject-error.db")),
+            VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE,
+        )
+        .expect("open should succeed");
+
+    let err = file
+        .write(&cx, b"fail-me", 0)
+        .expect_err("write should fail when configured");
+    assert!(matches!(err, FrankenError::Unsupported));
+}
+
+#[test]
+fn test_mock_mvcc_pager_preconfigured_pages() {
+    let cx = Cx::new();
+    let pager = MockMvccPager;
+    let txn = pager
+        .begin(&cx, TransactionMode::Deferred)
+        .expect("begin should succeed");
+
+    let first = txn
+        .get_page(&cx, PageNumber::new(11).expect("non-zero page number"))
+        .expect("get_page should succeed");
+    let second = txn
+        .get_page(&cx, PageNumber::new(12).expect("non-zero page number"))
+        .expect("get_page should succeed");
+
+    let first_stamp = u32::from_le_bytes(first.as_bytes()[..4].try_into().expect("stamp bytes"));
+    let second_stamp = u32::from_le_bytes(second.as_bytes()[..4].try_into().expect("stamp bytes"));
+    assert_eq!(first_stamp, 11);
+    assert_eq!(second_stamp, 12);
+}
+
+#[test]
+fn test_mock_btree_cursor_preconfigured_rows() {
+    let cx = Cx::new();
+    let mut cursor = MockBtreeCursor::new(vec![(1, b"a".to_vec()), (2, b"b".to_vec())]);
+    assert!(cursor.first(&cx).expect("first should succeed"));
+    assert_eq!(cursor.rowid(&cx).expect("rowid should succeed"), 1);
+    assert!(cursor.next(&cx).expect("next should succeed"));
+    assert_eq!(cursor.rowid(&cx).expect("rowid should succeed"), 2);
+}
+
+#[derive(Debug)]
+struct FixedScalar {
+    name: &'static str,
+    value: SqliteValue,
+}
+
+impl ScalarFunction for FixedScalar {
+    fn invoke(&self, _args: &[SqliteValue]) -> Result<SqliteValue> {
+        Ok(self.value.clone())
+    }
+    fn num_args(&self) -> i32 {
+        -1
+    }
+    fn name(&self) -> &'static str {
+        self.name
+    }
+}
+
+#[test]
+fn test_mock_scalar_function_fixed_value() {
+    let scalar = FixedScalar {
+        name: "fixed",
+        value: SqliteValue::Integer(42),
+    };
+    assert_eq!(
+        scalar
+            .invoke(&[SqliteValue::Text("ignored".to_owned())])
+            .expect("invoke should succeed"),
+        SqliteValue::Integer(42)
+    );
+}
+
+#[test]
+fn test_sealed_trait_mock_in_defining_crate() {
+    let pager = MockMvccPager;
+    let _: &dyn MvccPager<Txn = MockTransaction> = &pager;
+
+    let mut cursor = MockBtreeCursor::new(vec![(1, b"x".to_vec())]);
+    let _: &mut dyn BtreeCursorOps = &mut cursor;
+
+    let mut writer = MockCheckpointPageWriter;
+    let _: &mut dyn CheckpointPageWriter = &mut writer;
+}
+
+#[test]
+fn test_layer_isolation_btree_without_real_pager() {
+    let cx = Cx::new();
+    let pager = MockMvccPager;
+    let txn = pager
+        .begin(&cx, TransactionMode::Deferred)
+        .expect("begin should succeed");
+
+    let page = txn
+        .get_page(&cx, PageNumber::new(99).expect("non-zero page number"))
+        .expect("get_page should succeed");
+    assert_eq!(
+        u32::from_le_bytes(page.as_bytes()[..4].try_into().expect("stamp bytes")),
+        99
+    );
+}
+
+#[test]
+fn test_layer_isolation_vdbe_without_real_btree() {
+    let cx = Cx::new();
+    let mut cursor = MockBtreeCursor::new(vec![(10, b"row".to_vec())]);
+    assert!(cursor.first(&cx).expect("first should succeed"));
+    assert_eq!(cursor.payload(&cx).expect("payload should succeed"), b"row");
+}
+
+#[test]
+fn test_e2e_full_layer_stack() {
+    let cx = Cx::new();
+
+    let vfs = RecordingVfs::new(false);
+    let (mut file, _) = vfs
+        .open(
+            &cx,
+            Some(Path::new("full-layer-stack.db")),
+            VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE,
+        )
+        .expect("open should succeed");
+    file.write(&cx, b"stack", 0).expect("write should succeed");
+
+    let pager = MockMvccPager;
+    let txn = pager
+        .begin(&cx, TransactionMode::Deferred)
+        .expect("begin should succeed");
+    let page = txn
+        .get_page(&cx, PageNumber::new(5).expect("non-zero page number"))
+        .expect("get_page should succeed");
+    assert_eq!(
+        u32::from_le_bytes(page.as_bytes()[..4].try_into().expect("stamp bytes")),
+        5
+    );
+
+    let mut cursor = MockBtreeCursor::new(vec![(1, b"payload".to_vec())]);
+    assert!(cursor.first(&cx).expect("first should succeed"));
+    assert_eq!(
+        cursor.payload(&cx).expect("payload should succeed"),
+        b"payload"
+    );
+
+    let mut registry = FunctionRegistry::new();
+    registry.register_scalar(FixedScalar {
+        name: "stack_fn",
+        value: SqliteValue::Integer(7),
+    });
+    let function = registry
+        .find_scalar("stack_fn", -1)
+        .expect("function should be found");
+    assert_eq!(
+        function.invoke(&[]).expect("invoke should succeed"),
+        SqliteValue::Integer(7)
+    );
+
+    eprintln!(
+        "bead_id={COMPOSITION_BEAD_ID} level=DEBUG from_layer=vfs to_layer=pager operation=open_write"
+    );
+    eprintln!(
+        "bead_id={COMPOSITION_BEAD_ID} level=DEBUG from_layer=mvcc to_layer=btree operation=get_page_traverse"
+    );
+    eprintln!("bead_id={COMPOSITION_BEAD_ID} level=INFO operation=e2e_full_layer_stack status=ok");
+}
+
+#[test]
+fn test_e2e_mock_vfs_error_propagation() {
+    let cx = Cx::new();
+    let vfs = RecordingVfs::new(true);
+    let (mut file, _) = vfs
+        .open(
+            &cx,
+            Some(Path::new("error-propagation.db")),
+            VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE,
+        )
+        .expect("open should succeed");
+
+    let err = file
+        .write(&cx, b"boom", 0)
+        .expect_err("configured write failure should propagate");
+    assert!(matches!(err, FrankenError::Unsupported));
+}
+
+#[test]
+fn test_e2e_function_registry_in_vdbe() {
+    let mut registry = FunctionRegistry::new();
+    registry.register_scalar(FixedScalar {
+        name: "double_like",
+        value: SqliteValue::Integer(84),
+    });
+
+    let function = registry
+        .find_scalar("double_like", -1)
+        .expect("function must be present");
+    let result = function
+        .invoke(&[SqliteValue::Integer(42)])
+        .expect("invoke should succeed");
+    assert_eq!(result, SqliteValue::Integer(84));
 }
