@@ -293,6 +293,7 @@ fn write_issues_jsonl(path: &Path, issues: &[Value]) {
     fs::write(path, out).expect("issues jsonl should be written");
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn issue(
     id: &str,
     title: &str,

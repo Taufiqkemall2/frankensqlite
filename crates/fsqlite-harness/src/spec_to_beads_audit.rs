@@ -104,7 +104,7 @@ struct Issue {
     description: String,
     acceptance_criteria: String,
     status: String,
-    issue_type: String,
+    kind: String,
     close_reason: Option<String>,
     comments: Vec<String>,
     dependencies: Vec<IssueDependency>,
@@ -128,8 +128,8 @@ struct RawIssue {
     acceptance_criteria: String,
     #[serde(default)]
     status: String,
-    #[serde(default)]
-    issue_type: String,
+    #[serde(default, rename = "issue_type")]
+    kind: String,
     #[serde(default)]
     close_reason: Option<String>,
     #[serde(default)]
@@ -320,7 +320,7 @@ fn load_issues(path: &Path) -> Result<Vec<Issue>> {
             description: parsed.description,
             acceptance_criteria: parsed.acceptance_criteria,
             status: parsed.status,
-            issue_type: parsed.issue_type,
+            kind: parsed.kind,
             close_reason: parsed.close_reason,
             comments: parsed.comments.into_iter().map(|c| c.text).collect(),
             dependencies: parsed
@@ -409,7 +409,7 @@ fn lint_open_task_structure(issues: &[Issue]) -> Vec<OpenTaskStructureFailure> {
         if !issue.status.eq_ignore_ascii_case("open") {
             continue;
         }
-        if !issue.issue_type.eq_ignore_ascii_case("task") {
+        if !issue.kind.eq_ignore_ascii_case("task") {
             continue;
         }
 
@@ -518,7 +518,7 @@ fn lint_dependency_integrity(issues: &[Issue]) -> Vec<DependencyFailure> {
     }
 
     for issue in issues {
-        if !issue.issue_type.eq_ignore_ascii_case("task") || !issue.title.contains('§') {
+        if !issue.kind.eq_ignore_ascii_case("task") || !issue.title.contains('§') {
             continue;
         }
 
@@ -531,7 +531,7 @@ fn lint_dependency_integrity(issues: &[Issue]) -> Vec<DependencyFailure> {
                 return false;
             };
             let parent = &issues[*parent_idx];
-            parent.issue_type.eq_ignore_ascii_case("epic") && parent.title.contains('§')
+            parent.kind.eq_ignore_ascii_case("epic") && parent.title.contains('§')
         });
 
         if !has_parent {
@@ -556,6 +556,7 @@ fn lint_dependency_integrity(issues: &[Issue]) -> Vec<DependencyFailure> {
     failures
 }
 
+#[allow(clippy::items_after_statements)]
 fn find_cycles(issues: &[Issue], index_by_id: &HashMap<String, usize>) -> Vec<Vec<String>> {
     let mut state = vec![0_u8; issues.len()];
     let mut stack: Vec<usize> = Vec::new();
@@ -635,7 +636,7 @@ fn lint_closed_rollup_hygiene(issues: &[Issue]) -> Vec<ClosedRollupHygieneWarnin
         if !issue.status.eq_ignore_ascii_case("closed") {
             continue;
         }
-        if !issue.issue_type.eq_ignore_ascii_case("task") {
+        if !issue.kind.eq_ignore_ascii_case("task") {
             continue;
         }
         if !issue.title.contains('§') {
@@ -680,7 +681,7 @@ fn lint_closed_rollup_hygiene(issues: &[Issue]) -> Vec<ClosedRollupHygieneWarnin
 
         let mut has_open_replacement = false;
         for replacement_id in replacement_ids {
-            let Some(replacement_idx) = index_by_id.get(replacement_id.as_str()) else {
+            let Some(repl_pos) = index_by_id.get(replacement_id.as_str()) else {
                 warnings.push(ClosedRollupHygieneWarning {
                     issue_id: issue.id.clone(),
                     warning: format!(
@@ -691,7 +692,7 @@ fn lint_closed_rollup_hygiene(issues: &[Issue]) -> Vec<ClosedRollupHygieneWarnin
                 continue;
             };
 
-            if issues[*replacement_idx].status.eq_ignore_ascii_case("open") {
+            if issues[*repl_pos].status.eq_ignore_ascii_case("open") {
                 has_open_replacement = true;
             }
         }
@@ -816,7 +817,7 @@ fn contains_bullet(lines: &[&str]) -> bool {
             return true;
         }
 
-        let digit_count = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
+        let digit_count = trimmed.chars().take_while(char::is_ascii_digit).count();
         if digit_count == 0 {
             return false;
         }

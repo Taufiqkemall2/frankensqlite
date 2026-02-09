@@ -170,6 +170,7 @@ pub enum PerfLoopError {
 }
 
 impl fmt::Display for PerfLoopError {
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoOptimizationLeverDetected => {
@@ -354,7 +355,9 @@ pub fn classify_optimization_lever(path: &Path) -> Option<OptimizationLever> {
 
     if normalized.starts_with(".beads/")
         || normalized.starts_with("docs/")
-        || normalized.ends_with(".md")
+        || std::path::Path::new(normalized.as_str())
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
         || normalized.starts_with("tests/")
         || normalized.contains("/tests/")
     {
@@ -463,15 +466,16 @@ pub fn capture_golden_checksums(
     golden_output_dir: &Path,
     checksum_file: &Path,
 ) -> Result<(), PerfLoopError> {
-    let mut files = read_top_level_files_sorted(golden_output_dir)?;
+    use std::fmt::Write as _;
+
+    let files = read_top_level_files_sorted(golden_output_dir)?;
     if files.is_empty() {
         return Err(PerfLoopError::MissingGoldenOutput {
             path: golden_output_dir.to_path_buf(),
         });
     }
-
     let mut output = String::new();
-    for file in files.drain(..) {
+    for file in files {
         let digest = compute_sha256(&file)?;
         let file_name = file
             .file_name()
@@ -480,7 +484,7 @@ pub fn capture_golden_checksums(
                 path: file.clone(),
                 message: "invalid UTF-8 file name".to_string(),
             })?;
-        output.push_str(&format!("{digest} *{file_name}\n"));
+        writeln!(output, "{digest} *{file_name}").expect("String write infallible");
     }
 
     fs::write(checksum_file, output).map_err(|error| PerfLoopError::Io {

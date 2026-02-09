@@ -504,8 +504,8 @@ fn test_must_keywords_have_test_mapping() {
         "bead_id={BEAD_ID} case=missing_section2_must_sample"
     );
 
-    let samples: Vec<MustStatement> = sampled.into_values().collect();
-    let gaps = collect_must_mapping_gaps(&samples, &issue_index);
+    let must_stmts: Vec<MustStatement> = sampled.into_values().collect();
+    let gaps = collect_must_mapping_gaps(&must_stmts, &issue_index);
     assert!(
         gaps.is_empty(),
         "bead_id={BEAD_ID} case=missing_must_mapping sampled_gaps={gaps:?}"

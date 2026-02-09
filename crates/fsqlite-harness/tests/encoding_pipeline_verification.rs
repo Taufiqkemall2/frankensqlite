@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_truncation)]
 //! RaptorQ Encoding Pipeline verification suite (§3.2.3).
 //!
 //! Bead: bd-1hi.3
@@ -28,7 +29,7 @@ fn make_source(k: usize, symbol_size: usize) -> Vec<Vec<u8>> {
     (0..k)
         .map(|i| {
             (0..symbol_size)
-                .map(|j| ((i * 37 + j * 13 + 7) % 256) as u8)
+                .map(|j| u8::try_from((i * 37 + j * 13 + 7) % 256).unwrap_or(0))
                 .collect()
         })
         .collect()
@@ -40,7 +41,7 @@ fn try_encoder(k: usize, symbol_size: usize, seed: u64) -> Option<SystematicEnco
 }
 
 fn encoder_or_skip(k: usize, symbol_size: usize) -> Option<SystematicEncoder> {
-    for seed in [42, 123, 7, 999, 314159] {
+    for seed in [42, 123, 7, 999, 314_159] {
         if let Some(enc) = try_encoder(k, symbol_size, seed) {
             return Some(enc);
         }
@@ -77,6 +78,7 @@ fn build_full_decode_input(
             }
         }
         received.push(ReceivedSymbol {
+            #[allow(clippy::cast_possible_truncation)]
             esi: i as u32,
             is_source: true,
             columns,
@@ -126,6 +128,7 @@ fn build_decode_with_erasures(
             }
         }
         received.push(ReceivedSymbol {
+            #[allow(clippy::cast_possible_truncation)]
             esi: i as u32,
             is_source: true,
             columns,

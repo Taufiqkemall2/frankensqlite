@@ -638,6 +638,7 @@ mod tests {
 
         // Seek to commit_seq=500 via offset formula.
         let target_seq = 500u64;
+        #[allow(clippy::cast_possible_truncation)]
         let offset = record_offset(target_seq, start_seq) as usize;
         let record_bytes = &segment[offset..offset + COMMIT_MARKER_RECORD_BYTES];
         let record = CommitMarkerRecord::decode(record_bytes).expect("decode at offset");
@@ -732,18 +733,21 @@ mod tests {
 
         // Search for time at commit_seq=50.
         let target_ns = base_ns + 50 * 1_000_000;
+        #[allow(clippy::cast_possible_truncation)]
         let result = binary_search_by_time(start_seq, 100, target_ns, |seq| {
             records.get(seq as usize).cloned()
         });
         assert_eq!(result, Some(50));
 
         // Search before all records.
+        #[allow(clippy::cast_possible_truncation)]
         let result = binary_search_by_time(start_seq, 100, base_ns - 1, |seq| {
             records.get(seq as usize).cloned()
         });
         assert_eq!(result, None);
 
         // Search after all records.
+        #[allow(clippy::cast_possible_truncation)]
         let result = binary_search_by_time(start_seq, 100, u64::MAX, |seq| {
             records.get(seq as usize).cloned()
         });

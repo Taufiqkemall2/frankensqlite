@@ -191,7 +191,7 @@ fn test_deg_distribution_statistical() {
 
     // Low degrees (1-5) should account for majority of symbols.
     let low_degree_count: u64 = degree_counts[1..=5].iter().sum();
-    let low_fraction = low_degree_count as f64 / n_samples as f64;
+    let low_fraction = low_degree_count as f64 / f64::from(n_samples);
     assert!(
         low_fraction > 0.5,
         "bead_id={BEAD_ID} case=deg_distribution_low_degrees fraction={low_fraction:.4} \
@@ -281,6 +281,7 @@ fn test_systematic_params_h_grows_with_sqrt_k() {
     let test_k_values = [10, 100, 1000, 5000];
     for &k in &test_k_values {
         let params = SystematicParams::for_source_block(k, 64);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let sqrt_k = (k as f64).sqrt().ceil() as usize;
         assert!(
             params.h >= sqrt_k,
@@ -372,10 +373,10 @@ fn test_tuple_generator_different_esi_differ() {
 
     let encoder = SystematicEncoder::new(&source, symbol_size, seed).expect("encoder");
     let k_u32 = u32::try_from(k).expect("k fits u32");
-    let mut seen = HashSet::new();
+    let mut visited = HashSet::new();
     for esi in k_u32..k_u32 + 20 {
         let sym = encoder.repair_symbol(esi);
-        let was_new = seen.insert(sym);
+        let was_new = visited.insert(sym);
         assert!(
             was_new,
             "bead_id={BEAD_ID} case=tuple_different_esi_differ esi={esi} (duplicate!)"
@@ -796,10 +797,10 @@ fn test_encoding_pipeline_stages() {
 
     {
         let _stage = stage_span("generate_encoding_symbols", &params, seed, 0);
-        let mut emitter = SystematicEncoder::new(&source, symbol_size, seed).expect("encoder emit");
-        let emitted = emitter.emit_systematic();
-        assert_eq!(emitted.len(), k);
-        for (index, symbol) in emitted.iter().enumerate() {
+        let mut enc = SystematicEncoder::new(&source, symbol_size, seed).expect("encoder emit");
+        let source_syms = enc.emit_systematic();
+        assert_eq!(source_syms.len(), k);
+        for (index, symbol) in source_syms.iter().enumerate() {
             assert_eq!(symbol.data, source[index]);
             assert!(symbol.is_source);
         }

@@ -69,7 +69,7 @@ fn make_conformance_golden_fixture() -> (TempDir, PathBuf, PathBuf) {
 
 #[test]
 fn test_loop_one_lever_only_uses_git_diff_heuristics() {
-    let same_lever_diff = r#"
+    let same_lever_diff = r"
 diff --git a/crates/fsqlite-mvcc/src/lifecycle.rs b/crates/fsqlite-mvcc/src/lifecycle.rs
 index 1111111..2222222 100644
 --- a/crates/fsqlite-mvcc/src/lifecycle.rs
@@ -82,7 +82,7 @@ diff --git a/crates/fsqlite-mvcc/tests/lifecycle_tests.rs b/crates/fsqlite-mvcc/
 index 5555555..6666666 100644
 --- a/crates/fsqlite-mvcc/tests/lifecycle_tests.rs
 +++ b/crates/fsqlite-mvcc/tests/lifecycle_tests.rs
-"#;
+";
     let same_paths = parse_git_diff_changed_paths(same_lever_diff);
     let lever = enforce_one_lever_rule(&same_paths).expect("same lever should pass");
     assert_eq!(
@@ -91,7 +91,7 @@ index 5555555..6666666 100644
         "bead_id={BEAD_ID} expected concurrency-only change set"
     );
 
-    let multi_lever_diff = r#"
+    let multi_lever_diff = r"
 diff --git a/crates/fsqlite-mvcc/src/lifecycle.rs b/crates/fsqlite-mvcc/src/lifecycle.rs
 index 1111111..2222222 100644
 --- a/crates/fsqlite-mvcc/src/lifecycle.rs
@@ -100,7 +100,7 @@ diff --git a/crates/fsqlite-vfs/src/unix.rs b/crates/fsqlite-vfs/src/unix.rs
 index 7777777..8888888 100644
 --- a/crates/fsqlite-vfs/src/unix.rs
 +++ b/crates/fsqlite-vfs/src/unix.rs
-"#;
+";
     let mixed_paths = parse_git_diff_changed_paths(multi_lever_diff);
     let error = enforce_one_lever_rule(&mixed_paths).expect_err("multi-lever should fail");
     assert!(
@@ -593,9 +593,9 @@ fn test_score_formula() {
         effort: 5,
     };
     let score = compute_opportunity_score(&entry).expect("score");
-    assert_eq!(
-        score, 3.0,
-        "bead_id={OPPORTUNITY_MATRIX_BEAD_ID} expected (5*3)/5 = 3.0"
+    assert!(
+        (score - 3.0).abs() < f64::EPSILON,
+        "bead_id={OPPORTUNITY_MATRIX_BEAD_ID} expected (5*3)/5 = 3.0, got {score}"
     );
 }
 
@@ -624,9 +624,9 @@ fn test_zero_confidence() {
         effort: 2,
     };
     let score = compute_opportunity_score(&entry).expect("score");
-    assert_eq!(
-        score, 0.0,
-        "bead_id={OPPORTUNITY_MATRIX_BEAD_ID} unnamed hotspot must force score to 0"
+    assert!(
+        score.abs() < f64::EPSILON,
+        "bead_id={OPPORTUNITY_MATRIX_BEAD_ID} unnamed hotspot must force score to 0, got {score}"
     );
 }
 
