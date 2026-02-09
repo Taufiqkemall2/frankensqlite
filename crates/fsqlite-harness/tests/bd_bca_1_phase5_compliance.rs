@@ -322,7 +322,7 @@ fn test_persistence_create_close_reopen() -> Result<(), String> {
         page_no
     };
 
-    let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT)
+    let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT)
         .map_err(|error| format!("open_pager_for_read_failed error={error}"))?;
     let txn = pager
         .begin(&cx, TransactionMode::ReadOnly)
