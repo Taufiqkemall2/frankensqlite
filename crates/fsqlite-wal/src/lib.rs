@@ -1,11 +1,16 @@
 //! WAL checksum primitives, integrity helpers, and native commit protocol.
 
+pub mod checkpoint;
 pub mod checksum;
 pub mod native_commit;
 pub mod recovery_compaction;
 pub mod wal_fec;
 pub mod wal_index;
 
+pub use checkpoint::{
+    CheckpointMode, CheckpointPlan, CheckpointPostAction, CheckpointProgress, CheckpointState,
+    plan_checkpoint,
+};
 pub use checksum::{
     BTREE_PAGE_TYPE_FLAGS, CRASH_MODEL_SECTOR_SIZES, ChecksumFailureKind, CrashModelContract,
     HashTier, IntegrityCheckIssue, IntegrityCheckLevel, IntegrityCheckReport,
