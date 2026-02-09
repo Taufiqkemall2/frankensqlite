@@ -19,8 +19,6 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700;800&family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet" />
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github-dark.min.css" />
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/diff2html/bundles/css/diff2html.min.css" />
     <style>
         :root {
             /* --- Mouse Defaults --- */
@@ -671,6 +669,34 @@
             display: block;
         }
 
+        .spec-fallback-banner {
+            background: rgba(255, 42, 109, 0.1);
+            border: 1px solid rgba(255, 42, 109, 0.4);
+            border-radius: var(--radius-sm);
+            color: #ff6b94;
+            font-family: var(--font-mono);
+            font-size: 11px;
+            line-height: 1.5;
+            margin-bottom: 12px;
+            padding: 10px 12px;
+            white-space: normal;
+        }
+
+        .spec-fallback-pre {
+            background: var(--bg-surface-2);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            color: var(--text-2);
+            font-family: var(--font-mono);
+            font-size: 12px;
+            line-height: 1.6;
+            margin: 0;
+            overflow-x: auto;
+            padding: 12px;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
         /* --- Loading Overlay --- */
         #loadingOverlay {
             position: fixed;
@@ -928,10 +954,6 @@
 <!-- Deps -->
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.10/dayjs.min.js"></script>
-<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/markdown-it@14.1.0/dist/markdown-it.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.0/dist/purify.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/diff2html/bundles/js/diff2html.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/sql-wasm.js"></script>
 
 <script type="module">
@@ -971,6 +993,264 @@
         diffMode: 'line-by-line',
         renderNonce: 0 
     };
+
+    const DEPENDENCY_URLS = {
+        markdownIt: "https://cdn.jsdelivr.net/npm/markdown-it@14.1.0/dist/markdown-it.min.js",
+        domPurify: "https://cdn.jsdelivr.net/npm/dompurify@3.1.0/dist/purify.min.js",
+        diff2Html: "https://cdn.jsdelivr.net/npm/diff2html/bundles/js/diff2html.min.js",
+        diff2HtmlCss: "https://cdn.jsdelivr.net/npm/diff2html/bundles/css/diff2html.min.css",
+        hljs: "https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js",
+        hljsCss: "https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github-dark.min.css",
+    };
+
+    const DEPENDENCY_PROMISES = new Map();
+    const DEPENDENCY_ATTEMPTS = new Map();
+
+    function monotonicNowMs() {
+        if (typeof performance !== "undefined" && typeof performance.now === "function") {
+            return performance.now();
+        }
+        return Date.now();
+    }
+
+    function emitStructuredLog(level, event, payload = {}) {
+        const body = { event, ...payload };
+        const line = JSON.stringify(body);
+        if (level === "error") console.error(line);
+        else if (level === "warn") console.warn(line);
+        else console.info(line);
+    }
+
+    function nextDependencyAttempt(dep) {
+        const attempt = (DEPENDENCY_ATTEMPTS.get(dep) || 0) + 1;
+        DEPENDENCY_ATTEMPTS.set(dep, attempt);
+        return attempt;
+    }
+
+    function startRenderPass(panel) {
+        const start = monotonicNowMs();
+        emitStructuredLog("info", "spec_viz_render_start", { panel });
+        if (typeof performance !== "undefined" && typeof performance.mark === "function") {
+            try { performance.mark(`spec_viz_render_start:${panel}`); } catch (_e) {}
+        }
+        return start;
+    }
+
+    function finishRenderPass(panel, startedAt, nodeCount) {
+        const durationMs = Math.round(monotonicNowMs() - startedAt);
+        emitStructuredLog("info", "spec_viz_render_finish", {
+            panel,
+            duration_ms: durationMs,
+            node_count: nodeCount,
+        });
+        if (typeof performance !== "undefined" &&
+            typeof performance.mark === "function" &&
+            typeof performance.measure === "function") {
+            try {
+                performance.mark(`spec_viz_render_finish:${panel}`);
+                performance.measure(
+                    `spec_viz_render:${panel}`,
+                    `spec_viz_render_start:${panel}`,
+                    `spec_viz_render_finish:${panel}`
+                );
+            } catch (_e) {}
+        }
+    }
+
+    function logFallback(panel, reason, error) {
+        emitStructuredLog("warn", "spec_viz_fallback_activated", {
+            panel,
+            reason,
+            error: error ? String(error && (error.message || error)) : undefined,
+        });
+    }
+
+    function clearFallbackBanner(root) {
+        const existing = root.querySelector("[data-spec-viz-fallback-banner='1']");
+        if (existing) existing.remove();
+    }
+
+    function showFallbackBanner(root, message) {
+        clearFallbackBanner(root);
+        const banner = document.createElement("div");
+        banner.setAttribute("data-spec-viz-fallback-banner", "1");
+        banner.className = "spec-fallback-banner";
+        banner.textContent = message;
+        root.prepend(banner);
+    }
+
+    function renderEscapedFallback(root, text, message) {
+        root.innerHTML = "";
+        showFallbackBanner(root, message);
+        const pre = document.createElement("pre");
+        pre.className = "spec-fallback-pre";
+        pre.textContent = text || "";
+        root.appendChild(pre);
+    }
+
+    function loadScriptDependency(dep, url) {
+        if (DEPENDENCY_PROMISES.has(dep)) return DEPENDENCY_PROMISES.get(dep);
+
+        const attempt = nextDependencyAttempt(dep);
+        const startedAt = monotonicNowMs();
+        emitStructuredLog("info", "spec_viz_dependency_load_start", { dep, url, attempt });
+
+        const promise = new Promise((resolve, reject) => {
+            const selector = `script[data-spec-viz-dep="${dep}"]`;
+            let script = document.querySelector(selector);
+            if (script && script.dataset.loaded === "true") {
+                emitStructuredLog("info", "spec_viz_dependency_load_finish", {
+                    dep,
+                    url,
+                    attempt,
+                    duration_ms: 0,
+                });
+                resolve();
+                return;
+            }
+
+            if (!script) {
+                script = document.createElement("script");
+                script.src = url;
+                script.async = true;
+                script.defer = true;
+                script.setAttribute("data-spec-viz-dep", dep);
+            }
+
+            const cleanup = () => {
+                script.removeEventListener("load", onLoad);
+                script.removeEventListener("error", onError);
+            };
+
+            const onLoad = () => {
+                cleanup();
+                script.dataset.loaded = "true";
+                emitStructuredLog("info", "spec_viz_dependency_load_finish", {
+                    dep,
+                    url,
+                    attempt,
+                    duration_ms: Math.round(monotonicNowMs() - startedAt),
+                });
+                resolve();
+            };
+
+            const onError = () => {
+                cleanup();
+                DEPENDENCY_PROMISES.delete(dep);
+                emitStructuredLog("error", "spec_viz_dependency_load_failure", {
+                    dep,
+                    url,
+                    attempt,
+                    duration_ms: Math.round(monotonicNowMs() - startedAt),
+                });
+                reject(new Error(`Dependency load failed: ${dep}`));
+            };
+
+            script.addEventListener("load", onLoad, { once: true });
+            script.addEventListener("error", onError, { once: true });
+            if (!script.parentNode) document.head.appendChild(script);
+        });
+
+        DEPENDENCY_PROMISES.set(dep, promise);
+        return promise;
+    }
+
+    function loadStyleDependency(dep, url) {
+        if (DEPENDENCY_PROMISES.has(dep)) return DEPENDENCY_PROMISES.get(dep);
+
+        const attempt = nextDependencyAttempt(dep);
+        const startedAt = monotonicNowMs();
+        emitStructuredLog("info", "spec_viz_dependency_load_start", { dep, url, attempt });
+
+        const promise = new Promise((resolve, reject) => {
+            const selector = `link[data-spec-viz-dep="${dep}"]`;
+            let link = document.querySelector(selector);
+            if (link && link.dataset.loaded === "true") {
+                emitStructuredLog("info", "spec_viz_dependency_load_finish", {
+                    dep,
+                    url,
+                    attempt,
+                    duration_ms: 0,
+                });
+                resolve();
+                return;
+            }
+
+            if (!link) {
+                link = document.createElement("link");
+                link.rel = "stylesheet";
+                link.href = url;
+                link.setAttribute("data-spec-viz-dep", dep);
+            }
+
+            const cleanup = () => {
+                link.removeEventListener("load", onLoad);
+                link.removeEventListener("error", onError);
+            };
+
+            const onLoad = () => {
+                cleanup();
+                link.dataset.loaded = "true";
+                emitStructuredLog("info", "spec_viz_dependency_load_finish", {
+                    dep,
+                    url,
+                    attempt,
+                    duration_ms: Math.round(monotonicNowMs() - startedAt),
+                });
+                resolve();
+            };
+
+            const onError = () => {
+                cleanup();
+                DEPENDENCY_PROMISES.delete(dep);
+                emitStructuredLog("error", "spec_viz_dependency_load_failure", {
+                    dep,
+                    url,
+                    attempt,
+                    duration_ms: Math.round(monotonicNowMs() - startedAt),
+                });
+                reject(new Error(`Dependency load failed: ${dep}`));
+            };
+
+            link.addEventListener("load", onLoad, { once: true });
+            link.addEventListener("error", onError, { once: true });
+            if (!link.parentNode) document.head.appendChild(link);
+        });
+
+        DEPENDENCY_PROMISES.set(dep, promise);
+        return promise;
+    }
+
+    async function ensureMarkdown() {
+        await Promise.all([
+            loadScriptDependency("markdown-it", DEPENDENCY_URLS.markdownIt),
+            loadScriptDependency("dompurify", DEPENDENCY_URLS.domPurify),
+        ]);
+        if (typeof window.markdownit !== "function" || !window.DOMPurify) {
+            throw new Error("markdown-it / DOMPurify unavailable after load");
+        }
+    }
+
+    async function ensureDiff() {
+        await Promise.all([
+            loadScriptDependency("diff2html", DEPENDENCY_URLS.diff2Html),
+            loadStyleDependency("diff2html-css", DEPENDENCY_URLS.diff2HtmlCss),
+            loadScriptDependency("dompurify", DEPENDENCY_URLS.domPurify),
+        ]);
+        if (!window.Diff2Html || !window.DOMPurify) {
+            throw new Error("Diff2Html / DOMPurify unavailable after load");
+        }
+    }
+
+    async function ensureHighlight() {
+        await Promise.all([
+            loadScriptDependency("hljs", DEPENDENCY_URLS.hljs),
+            loadStyleDependency("hljs-css", DEPENDENCY_URLS.hljsCss),
+        ]);
+        if (!window.hljs) {
+            throw new Error("highlight.js unavailable after load");
+        }
+    }
 
     // --- Initialization ---
 
@@ -1127,8 +1407,16 @@
             // Validate SQLite magic header: "SQLite format 3\0"
             const magic = new TextDecoder().decode(bytes.slice(0, 15));
             if (magic !== "SQLite format 3") {
+                // Stale cached HTML served instead of the DB file — force reload to get fresh page
+                if (!sessionStorage.getItem("_db_reload")) {
+                    sessionStorage.setItem("_db_reload", "1");
+                    window.location.reload();
+                    return;
+                }
+                sessionStorage.removeItem("_db_reload");
                 throw new Error(`Not a SQLite file (${bytes.byteLength} bytes, starts with "${magic.slice(0,12)}...")`);
             }
+            sessionStorage.removeItem("_db_reload");
             DB = new SQL.Database(bytes);
             
             const baseRes = DB.exec("SELECT text FROM base_doc LIMIT 1");
@@ -1307,24 +1595,50 @@
     }
 
     async function renderSpec(nonce) {
+        const renderStartedAt = startRenderPass("spec");
         const el = document.getElementById("specContent");
         const targetIdx = STATE.idx;
         const text = await reconstructSnapshot(targetIdx);
-        
+
         if (nonce !== STATE.renderNonce) return;
 
-        const md = window.markdownit({ 
-            html: true, 
-            highlight: (str, lang) => (lang && hljs.getLanguage(lang)) ? hljs.highlight(str, { language: lang }).value : '' 
-        });
-        el.innerHTML = DOMPurify.sanitize(md.render(text));
-        
-        // --- Feature: Responsive Tables & Diff Highlight ---
-        enhanceTables(el);
-        await highlightDiffContext(el, targetIdx);
-        
-        const kpiLines = document.getElementById("kpiLines");
-        if(kpiLines) kpiLines.textContent = text.split("\n").length.toLocaleString();
+        try {
+            await ensureMarkdown();
+            if (nonce !== STATE.renderNonce) return;
+
+            const md = window.markdownit({ html: true });
+            el.innerHTML = window.DOMPurify.sanitize(md.render(text));
+            clearFallbackBanner(el);
+
+            // --- Feature: Responsive Tables & Diff Highlight ---
+            enhanceTables(el);
+            await highlightDiffContext(el, targetIdx);
+
+            const codeBlocks = el.querySelectorAll("pre code");
+            if (codeBlocks.length > 0) {
+                try {
+                    await ensureHighlight();
+                    if (nonce !== STATE.renderNonce) return;
+                    if (window.hljs && typeof window.hljs.highlightElement === "function") {
+                        codeBlocks.forEach((block) => window.hljs.highlightElement(block));
+                    }
+                } catch (e) {
+                    logFallback("spec", "highlight_dependency_failed", e);
+                    showFallbackBanner(el, "Code highlighting unavailable (dependency load failed).");
+                }
+            }
+        } catch (e) {
+            logFallback("spec", "markdown_dependency_failed", e);
+            renderEscapedFallback(
+                el,
+                text,
+                "Spec renderer dependencies unavailable. Displaying raw markdown."
+            );
+        } finally {
+            const kpiLines = document.getElementById("kpiLines");
+            if (kpiLines) kpiLines.textContent = text.split("\n").length.toLocaleString();
+            finishRenderPass("spec", renderStartedAt, el.querySelectorAll("*").length);
+        }
     }
 
     function enhanceTables(root) {
@@ -1495,19 +1809,40 @@
     }
 
     async function renderDiff(nonce) {
+        const renderStartedAt = startRenderPass("diff");
         const el = document.getElementById("diffContent");
         const p = await getPatch(STATE.idx);
-        
+
         if (nonce !== STATE.renderNonce) return;
 
-        if (!p) { el.innerHTML = "<div style='padding:20px; color:var(--text-3)'>NO DELTA</div>"; return; }
-        const diffHtml = Diff2Html.html(p, { 
-            drawFileList: false, 
-            matching: 'lines', 
-            outputFormat: STATE.diffMode, 
-            colorScheme: 'dark' 
-        });
-        el.innerHTML = DOMPurify.sanitize(diffHtml);
+        if (!p) {
+            el.innerHTML = "<div style='padding:20px; color:var(--text-3)'>NO DELTA</div>";
+            finishRenderPass("diff", renderStartedAt, 1);
+            return;
+        }
+
+        try {
+            await ensureDiff();
+            if (nonce !== STATE.renderNonce) return;
+
+            const diffHtml = window.Diff2Html.html(p, {
+                drawFileList: false,
+                matching: "lines",
+                outputFormat: STATE.diffMode,
+                colorScheme: "dark",
+            });
+            el.innerHTML = window.DOMPurify.sanitize(diffHtml);
+            clearFallbackBanner(el);
+        } catch (e) {
+            logFallback("diff", "diff_dependency_failed", e);
+            renderEscapedFallback(
+                el,
+                p,
+                "Diff renderer dependencies unavailable. Displaying unified patch text."
+            );
+        } finally {
+            finishRenderPass("diff", renderStartedAt, el.querySelectorAll("*").length);
+        }
     }
 
     // --- Visuals & Animation ---
