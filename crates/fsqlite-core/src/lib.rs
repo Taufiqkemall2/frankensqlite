@@ -27,6 +27,7 @@ pub mod symbol_log;
 pub mod symbol_size_policy;
 pub mod tiered_storage;
 pub mod transaction;
+pub mod wal_adapter;
 
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
