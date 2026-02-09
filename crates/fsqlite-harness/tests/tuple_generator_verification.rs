@@ -14,12 +14,15 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use asupersync::raptorq::decoder::{InactivationDecoder, ReceivedSymbol};
+use asupersync::raptorq::gf256::Gf256;
 use asupersync::raptorq::rfc6330::{V0, V1, V2, V3, deg, rand};
 use asupersync::raptorq::systematic::{
     ConstraintMatrix, RobustSoliton, SystematicEncoder, SystematicParams,
 };
+use tracing::{error, info_span};
 
 const BEAD_ID: &str = "bd-1hi.8";
+const ENCODING_PIPELINE_BEAD_ID: &str = "bd-1hi.3";
 
 // ============================================================================
 // §5.3.5.1 Rand function — RFC 6330 V0-V3 table verification
@@ -647,6 +650,214 @@ fn verify_roundtrip(k: usize, symbol_size: usize, seed: u64) {
         result.source, source,
         "bead_id={BEAD_ID} case=e2e_roundtrip_k{k} source mismatch"
     );
+}
+
+// ============================================================================
+// §3.2.3 Encoding pipeline normalization tests (bd-1hi.3)
+// ============================================================================
+
+fn stage_span(
+    stage: &'static str,
+    params: &SystematicParams,
+    seed: u64,
+    isi: u32,
+) -> tracing::span::EnteredSpan {
+    info_span!(
+        "encoding_pipeline_stage",
+        stage,
+        k = params.k,
+        k_prime = params.k,
+        s = params.s,
+        h = params.h,
+        w = params.w,
+        l = params.l,
+        isi,
+        seed
+    )
+    .entered()
+}
+
+fn deterministic_source_block(k: usize, symbol_size: usize) -> Vec<Vec<u8>> {
+    (0..k)
+        .map(|i| {
+            (0..symbol_size)
+                .map(|j| u8::try_from((i * 37 + j * 13 + 7) % 256).unwrap_or(0))
+                .collect()
+        })
+        .collect()
+}
+
+fn tiny_digest(bytes: &[u8]) -> u64 {
+    let mut acc = 0_u64;
+    for (idx, byte) in bytes.iter().take(16).enumerate() {
+        let shift = u32::try_from((idx % 8) * 8).expect("shift fits u32");
+        acc ^= u64::from(*byte) << shift;
+    }
+    let len_u64 = match u64::try_from(bytes.len()) {
+        Ok(value) => value,
+        Err(_) => u64::MAX,
+    };
+    acc ^ len_u64
+}
+
+fn assert_constraint_system_holds(
+    matrix: &ConstraintMatrix,
+    params: &SystematicParams,
+    intermediate: &[Vec<u8>],
+    source: &[Vec<u8>],
+    symbol_size: usize,
+    seed: u64,
+) -> Result<(), String> {
+    let zero = vec![0_u8; symbol_size];
+    let lt_start = params.s + params.h;
+
+    for row in 0..matrix.rows {
+        let mut computed = vec![0_u8; symbol_size];
+        for (col, intermediate_symbol) in intermediate.iter().enumerate().take(matrix.cols) {
+            let coeff = matrix.get(row, col);
+            if coeff.is_zero() {
+                continue;
+            }
+            for (dst, src) in computed.iter_mut().zip(intermediate_symbol.iter()) {
+                *dst ^= (coeff * Gf256(*src)).raw();
+            }
+        }
+
+        let expected = if row < lt_start {
+            &zero
+        } else if row - lt_start < source.len() {
+            &source[row - lt_start]
+        } else {
+            &zero
+        };
+
+        if computed != *expected {
+            let isi = u32::try_from(row.saturating_sub(lt_start)).unwrap_or(u32::MAX);
+            error!(
+                bead_id = ENCODING_PIPELINE_BEAD_ID,
+                stage = "solve_check",
+                k = params.k,
+                k_prime = params.k,
+                s = params.s,
+                h = params.h,
+                w = params.w,
+                l = params.l,
+                isi,
+                seed,
+                expected_digest = tiny_digest(expected),
+                actual_digest = tiny_digest(&computed),
+                "constraint-system mismatch while checking A*C=D"
+            );
+            return Err(format!("A*C=D mismatch at row {row}"));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_encoding_pipeline_stages() {
+    let k = 64_usize;
+    let symbol_size = 128_usize;
+    let seed = 42_u64;
+    let source = deterministic_source_block(k, symbol_size);
+
+    let params = SystematicParams::for_source_block(k, symbol_size);
+    {
+        let _stage = stage_span("determine_parameters", &params, seed, 0);
+        assert_eq!(params.k, k);
+        assert_eq!(params.l, params.k + params.s + params.h);
+    }
+
+    let matrix = {
+        let _stage = stage_span("construct_constraint_matrix", &params, seed, 0);
+        let matrix = ConstraintMatrix::build(&params, seed);
+        assert_eq!(matrix.rows, params.s + params.h + params.k);
+        assert_eq!(matrix.cols, params.l);
+        matrix
+    };
+
+    let lt_start = params.s + params.h;
+    {
+        let _stage = stage_span("build_source_vector", &params, seed, 0);
+        assert_eq!(matrix.rows - lt_start, params.k);
+    }
+
+    {
+        let _stage = stage_span("solve_intermediate_symbols", &params, seed, 0);
+        let encoder = SystematicEncoder::new(&source, symbol_size, seed).expect("encoder creation");
+        let intermediate: Vec<Vec<u8>> = (0..params.l)
+            .map(|idx| encoder.intermediate_symbol(idx).to_vec())
+            .collect();
+        assert_eq!(intermediate.len(), params.l);
+
+        assert_constraint_system_holds(&matrix, &params, &intermediate, &source, symbol_size, seed)
+            .expect("A*C=D must hold for systematic encoder output");
+    }
+
+    {
+        let _stage = stage_span("generate_encoding_symbols", &params, seed, 0);
+        let mut emitter = SystematicEncoder::new(&source, symbol_size, seed).expect("encoder emit");
+        let emitted = emitter.emit_systematic();
+        assert_eq!(emitted.len(), k);
+        for (index, symbol) in emitted.iter().enumerate() {
+            assert_eq!(symbol.data, source[index]);
+            assert!(symbol.is_source);
+        }
+    }
+}
+
+#[test]
+fn test_encoding_pipeline_correctness() {
+    verify_roundtrip(128, 256, 42);
+}
+
+#[test]
+fn test_encoding_pipeline_systematic() {
+    verify_systematic_property(100, 64, 42);
+}
+
+#[test]
+fn test_encoding_pipeline_deterministic() {
+    let k = 96_usize;
+    let symbol_size = 128_usize;
+    let seed = 7_u64;
+    let source = deterministic_source_block(k, symbol_size);
+    let params = SystematicParams::for_source_block(k, symbol_size);
+
+    let mut encoder_a = {
+        let _stage = stage_span("determinism_check", &params, seed, 0);
+        SystematicEncoder::new(&source, symbol_size, seed).expect("encoder A")
+    };
+    let mut encoder_b = SystematicEncoder::new(&source, symbol_size, seed).expect("encoder B");
+
+    {
+        let _stage = stage_span("deterministic_systematic_symbols", &params, seed, 0);
+        let source_a = encoder_a.emit_systematic();
+        let source_b = encoder_b.emit_systematic();
+        assert_eq!(source_a.len(), source_b.len());
+        for (idx, (lhs, rhs)) in source_a.iter().zip(source_b.iter()).enumerate() {
+            assert_eq!(
+                lhs.data, rhs.data,
+                "bead_id={ENCODING_PIPELINE_BEAD_ID} case=deterministic_source idx={idx}"
+            );
+        }
+    }
+
+    let k_u32 = u32::try_from(k).expect("k fits u32");
+    for esi in k_u32..k_u32 + 16 {
+        let _stage = stage_span("deterministic_repair_symbol", &params, seed, esi);
+        let repair_a = encoder_a.repair_symbol(esi);
+        let repair_b = encoder_b.repair_symbol(esi);
+        assert_eq!(
+            repair_a, repair_b,
+            "bead_id={ENCODING_PIPELINE_BEAD_ID} case=deterministic_repair esi={esi}"
+        );
+    }
+}
+
+#[test]
+fn test_e2e_encode_decode_pipeline() {
+    verify_roundtrip(1000, 4096, 42);
 }
 
 // ============================================================================
