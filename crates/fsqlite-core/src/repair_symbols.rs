@@ -9,7 +9,8 @@
 //!
 //! ```text
 //! slack_decode = 2  // V1 default: target K_source+2 decode slack (RFC 6330 Annex B)
-//! R = max(slack_decode, ceil(K_source * overhead_percent / 100))
+//! R_formula = max(slack_decode, ceil(K_source * overhead_percent / 100))
+//! R = min(max_repair_symbols, max(R_formula, small_k_min_repair when K_source <= small_k_clamp_max_k))
 //! ```
 //!
 //! ## Seed Derivation
@@ -20,6 +21,15 @@
 //!
 //! This makes "the object" a platonic mathematical entity: any replica can
 //! regenerate missing repair symbols (within policy) without coordination.
+//!
+//! ## Guardrails
+//!
+//! - Union-only hardening: increasing redundancy is always append-safe.
+//! - Decreases are never automatic here; any decrease must be justified by
+//!   evidence-ledger policy outside this selector.
+//! - Runtime budget policy changes are epoch-boundary only (`policy_epoch` monotone).
+//! - Budget selection is arithmetic-only and intentionally avoids symbol encoding,
+//!   so it is safe to run on critical paths.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -40,6 +50,27 @@ pub const DEFAULT_SLACK_DECODE: u32 = 2;
 
 /// Default overhead percentage.
 pub const DEFAULT_OVERHEAD_PERCENT: u32 = 20;
+
+/// Hard floor for user-provided overhead percentages.
+pub const MIN_OVERHEAD_PERCENT: u32 = 1;
+
+/// Hard ceiling for user-provided overhead percentages.
+pub const MAX_OVERHEAD_PERCENT: u32 = 500;
+
+/// For tiny objects, enforce a stronger minimum repair budget.
+pub const DEFAULT_SMALL_K_CLAMP_MAX_K: u32 = 8;
+
+/// For tiny objects (`K <= DEFAULT_SMALL_K_CLAMP_MAX_K`), enforce at least this many repair symbols.
+pub const DEFAULT_SMALL_K_MIN_REPAIR: u32 = 3;
+
+/// Absolute cap on generated repair symbols (explicit anti-footgun guardrail).
+pub const DEFAULT_MAX_REPAIR_SYMBOLS: u32 = 250_000;
+
+/// Versioned policy identifier for repair-budget selection.
+pub const REPAIR_BUDGET_POLICY_ID: &str = "rq_budget_v1";
+
+/// Initial policy epoch. Runtime retunes MUST apply only at epoch boundaries.
+pub const INITIAL_REPAIR_POLICY_EPOCH: u64 = 0;
 
 /// E-value threshold at which failure drift alerts fire.
 pub const DEFAULT_FAILURE_ALERT_THRESHOLD: f64 = 20.0;
@@ -80,6 +111,106 @@ impl fmt::Display for RedundancyTrigger {
     }
 }
 
+/// Object-class specific repair budget defaults.
+///
+/// Commit markers/proofs are durability-critical and therefore stricter than
+/// page-history objects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RepairObjectClass {
+    /// Commit marker object.
+    CommitMarker,
+    /// Commit proof object.
+    CommitProof,
+    /// Historical page/object payload.
+    PageHistory,
+    /// Snapshot data block.
+    SnapshotBlock,
+    /// WAL FEC group symbols.
+    WalFecGroup,
+    /// Generic ECS object.
+    GenericEcs,
+}
+
+/// Policy knobs for one repair object class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectRepairPolicy {
+    /// Versioned policy id used for explainability and replay.
+    pub policy_id: &'static str,
+    /// Object class.
+    pub object_class: RepairObjectClass,
+    /// Default overhead percentage for this class.
+    pub default_overhead_percent: u32,
+    /// Small-K threshold for clamp activation.
+    pub small_k_clamp_max_k: u32,
+    /// Minimum repair symbols when small-K clamp is active.
+    pub small_k_min_repair: u32,
+    /// Absolute maximum repair symbols for this class.
+    pub max_repair_symbols: u32,
+}
+
+impl ObjectRepairPolicy {
+    /// Return the default policy row for an object class.
+    #[must_use]
+    pub const fn for_class(object_class: RepairObjectClass) -> Self {
+        match object_class {
+            RepairObjectClass::CommitMarker => Self {
+                policy_id: REPAIR_BUDGET_POLICY_ID,
+                object_class,
+                default_overhead_percent: 60,
+                small_k_clamp_max_k: DEFAULT_SMALL_K_CLAMP_MAX_K,
+                small_k_min_repair: 4,
+                max_repair_symbols: DEFAULT_MAX_REPAIR_SYMBOLS,
+            },
+            RepairObjectClass::CommitProof => Self {
+                policy_id: REPAIR_BUDGET_POLICY_ID,
+                object_class,
+                default_overhead_percent: 50,
+                small_k_clamp_max_k: DEFAULT_SMALL_K_CLAMP_MAX_K,
+                small_k_min_repair: 4,
+                max_repair_symbols: DEFAULT_MAX_REPAIR_SYMBOLS,
+            },
+            RepairObjectClass::PageHistory => Self {
+                policy_id: REPAIR_BUDGET_POLICY_ID,
+                object_class,
+                default_overhead_percent: 20,
+                small_k_clamp_max_k: DEFAULT_SMALL_K_CLAMP_MAX_K,
+                small_k_min_repair: DEFAULT_SMALL_K_MIN_REPAIR,
+                max_repair_symbols: DEFAULT_MAX_REPAIR_SYMBOLS,
+            },
+            RepairObjectClass::SnapshotBlock => Self {
+                policy_id: REPAIR_BUDGET_POLICY_ID,
+                object_class,
+                default_overhead_percent: 25,
+                small_k_clamp_max_k: DEFAULT_SMALL_K_CLAMP_MAX_K,
+                small_k_min_repair: DEFAULT_SMALL_K_MIN_REPAIR,
+                max_repair_symbols: DEFAULT_MAX_REPAIR_SYMBOLS,
+            },
+            RepairObjectClass::WalFecGroup => Self {
+                policy_id: REPAIR_BUDGET_POLICY_ID,
+                object_class,
+                default_overhead_percent: 30,
+                small_k_clamp_max_k: DEFAULT_SMALL_K_CLAMP_MAX_K,
+                small_k_min_repair: DEFAULT_SMALL_K_MIN_REPAIR,
+                max_repair_symbols: DEFAULT_MAX_REPAIR_SYMBOLS,
+            },
+            RepairObjectClass::GenericEcs => Self {
+                policy_id: REPAIR_BUDGET_POLICY_ID,
+                object_class,
+                default_overhead_percent: DEFAULT_OVERHEAD_PERCENT,
+                small_k_clamp_max_k: DEFAULT_SMALL_K_CLAMP_MAX_K,
+                small_k_min_repair: DEFAULT_SMALL_K_MIN_REPAIR,
+                max_repair_symbols: DEFAULT_MAX_REPAIR_SYMBOLS,
+            },
+        }
+    }
+}
+
+/// Budget policy updates are only allowed at epoch boundaries.
+#[must_use]
+pub const fn can_apply_policy_change(current_epoch: u64, requested_epoch: u64) -> bool {
+    requested_epoch > current_epoch
+}
+
 // ---------------------------------------------------------------------------
 // Repair Config
 // ---------------------------------------------------------------------------
@@ -92,6 +223,16 @@ pub struct RepairConfig {
     pub slack_decode: u32,
     /// Multiplicative overhead percentage: `PRAGMA raptorq_overhead = <percent>`.
     pub overhead_percent: u32,
+    /// Small-K clamp activation threshold.
+    pub small_k_clamp_max_k: u32,
+    /// Small-K clamp minimum R.
+    pub small_k_min_repair: u32,
+    /// Explicit upper bound for R.
+    pub max_repair_symbols: u32,
+    /// Versioned policy id for explainability/proofs.
+    pub policy_id: &'static str,
+    /// Monotone policy epoch. Runtime changes are epoch-boundary only.
+    pub policy_epoch: u64,
 }
 
 impl RepairConfig {
@@ -101,6 +242,11 @@ impl RepairConfig {
         Self {
             slack_decode: DEFAULT_SLACK_DECODE,
             overhead_percent: DEFAULT_OVERHEAD_PERCENT,
+            small_k_clamp_max_k: DEFAULT_SMALL_K_CLAMP_MAX_K,
+            small_k_min_repair: DEFAULT_SMALL_K_MIN_REPAIR,
+            max_repair_symbols: DEFAULT_MAX_REPAIR_SYMBOLS,
+            policy_id: REPAIR_BUDGET_POLICY_ID,
+            policy_epoch: INITIAL_REPAIR_POLICY_EPOCH,
         }
     }
 
@@ -110,6 +256,26 @@ impl RepairConfig {
         Self {
             slack_decode: DEFAULT_SLACK_DECODE,
             overhead_percent,
+            small_k_clamp_max_k: DEFAULT_SMALL_K_CLAMP_MAX_K,
+            small_k_min_repair: DEFAULT_SMALL_K_MIN_REPAIR,
+            max_repair_symbols: DEFAULT_MAX_REPAIR_SYMBOLS,
+            policy_id: REPAIR_BUDGET_POLICY_ID,
+            policy_epoch: INITIAL_REPAIR_POLICY_EPOCH,
+        }
+    }
+
+    /// Build a class-specific config row from the default policy table.
+    #[must_use]
+    pub const fn for_object_class(object_class: RepairObjectClass, policy_epoch: u64) -> Self {
+        let policy = ObjectRepairPolicy::for_class(object_class);
+        Self {
+            slack_decode: DEFAULT_SLACK_DECODE,
+            overhead_percent: policy.default_overhead_percent,
+            small_k_clamp_max_k: policy.small_k_clamp_max_k,
+            small_k_min_repair: policy.small_k_min_repair,
+            max_repair_symbols: policy.max_repair_symbols,
+            policy_id: policy.policy_id,
+            policy_epoch,
         }
     }
 }
@@ -131,24 +297,97 @@ pub struct RepairBudget {
     pub k_source: u32,
     /// Computed number of repair symbols.
     pub repair_count: u32,
+    /// Versioned policy id used for this decision.
+    pub policy_id: &'static str,
+    /// Policy epoch used for this decision.
+    pub policy_epoch: u64,
+    /// Overhead as requested by caller/PRAGMA.
+    pub overhead_percent_requested: u32,
+    /// Overhead after policy clamping.
+    pub overhead_percent_applied: u32,
+    /// Whether small-K clamp increased `repair_count`.
+    pub small_k_clamped: bool,
+    /// Whether max-R guardrail capped `repair_count`.
+    pub max_repair_capped: bool,
     /// Maximum tolerated erasure fraction (without coordination).
     pub loss_fraction_max_permille: u32,
     /// Whether this budget has zero erasure tolerance (small-K warning).
     pub underprovisioned: bool,
 }
 
+/// Explicit policy surface for deterministic repair-count selection.
+///
+/// This function performs only arithmetic and guardrails; it does not encode
+/// any symbols and is safe on critical paths.
+#[must_use]
+pub fn select_repair_count(k_source: u32, overhead_percent: u32) -> u32 {
+    select_repair_count_with_config(k_source, &RepairConfig::with_overhead(overhead_percent))
+}
+
+/// Compute a budget using per-object policy defaults plus an optional overhead override.
+///
+/// Runtime policy updates MUST use epoch-boundary increments.
+#[must_use]
+pub fn compute_repair_budget_for_object(
+    k_source: u32,
+    object_class: RepairObjectClass,
+    overhead_percent_override: Option<u32>,
+    policy_epoch: u64,
+) -> RepairBudget {
+    let mut config = RepairConfig::for_object_class(object_class, policy_epoch);
+    if let Some(overhead_percent) = overhead_percent_override {
+        config.overhead_percent = overhead_percent;
+    }
+    compute_repair_budget(k_source, &config)
+}
+
+#[must_use]
+fn select_repair_count_with_config(k_source: u32, config: &RepairConfig) -> u32 {
+    let bounded_overhead_percent = config
+        .overhead_percent
+        .clamp(MIN_OVERHEAD_PERCENT, MAX_OVERHEAD_PERCENT);
+    let overhead_r = (u64::from(k_source) * u64::from(bounded_overhead_percent)).div_ceil(100);
+    #[allow(clippy::cast_possible_truncation)]
+    let overhead_r = overhead_r as u32;
+    let formula_r = config.slack_decode.max(overhead_r);
+    let small_k_floor = if k_source > 0 && k_source <= config.small_k_clamp_max_k {
+        config.small_k_min_repair.max(config.slack_decode)
+    } else {
+        config.slack_decode
+    };
+    let max_r = config.max_repair_symbols.max(config.slack_decode);
+
+    formula_r.max(small_k_floor).min(max_r)
+}
+
 /// Compute the repair symbol count R for a given K_source and config (§3.5.3).
 ///
-/// Formula: `R = max(slack_decode, ceil(K_source * overhead_percent / 100))`
+/// Base formula: `R_formula = max(slack_decode, ceil(K_source * overhead_percent / 100))`
+///
+/// Final selection applies policy guardrails:
+/// - small-K clamp
+/// - explicit max-R cap
+/// - bounded overhead percentage
 ///
 /// Returns a `RepairBudget` with the computed R and derived metrics.
 #[must_use]
 pub fn compute_repair_budget(k_source: u32, config: &RepairConfig) -> RepairBudget {
-    // R = max(slack_decode, ceil(K_source * overhead_percent / 100))
-    let overhead_r = (u64::from(k_source) * u64::from(config.overhead_percent)).div_ceil(100);
+    let overhead_percent_applied = config
+        .overhead_percent
+        .clamp(MIN_OVERHEAD_PERCENT, MAX_OVERHEAD_PERCENT);
+    let overhead_r = (u64::from(k_source) * u64::from(overhead_percent_applied)).div_ceil(100);
     #[allow(clippy::cast_possible_truncation)]
     let overhead_r = overhead_r as u32;
-    let repair_count = config.slack_decode.max(overhead_r);
+    let formula_r = config.slack_decode.max(overhead_r);
+    let repair_count = select_repair_count_with_config(k_source, config);
+    let small_k_floor = if k_source > 0 && k_source <= config.small_k_clamp_max_k {
+        config.small_k_min_repair.max(config.slack_decode)
+    } else {
+        config.slack_decode
+    };
+    let small_k_clamped = repair_count > formula_r && repair_count == small_k_floor;
+    let max_repair_capped = repair_count < formula_r.max(small_k_floor);
+    let overhead_was_clamped = overhead_percent_applied != config.overhead_percent;
 
     // loss_fraction_max = max(0, (R - slack_decode) / (K_source + R))
     // Expressed as permille (parts per thousand) for integer precision.
@@ -164,11 +403,35 @@ pub fn compute_repair_budget(k_source: u32, config: &RepairConfig) -> RepairBudg
 
     let underprovisioned = loss_fraction_max_permille == 0 && k_source > 0;
 
+    if overhead_was_clamped {
+        warn!(
+            requested_overhead_percent = config.overhead_percent,
+            applied_overhead_percent = overhead_percent_applied,
+            min_overhead_percent = MIN_OVERHEAD_PERCENT,
+            max_overhead_percent = MAX_OVERHEAD_PERCENT,
+            "repair budget overhead clamped to policy bounds"
+        );
+    }
+
+    if max_repair_capped {
+        warn!(
+            k_source,
+            repair_count,
+            requested_formula_r = formula_r.max(small_k_floor),
+            max_repair_symbols = config.max_repair_symbols,
+            policy_id = config.policy_id,
+            policy_epoch = config.policy_epoch,
+            "repair budget capped by explicit max-R guardrail"
+        );
+    }
+
     if underprovisioned {
         warn!(
             k_source,
             repair_count,
-            overhead_percent = config.overhead_percent,
+            overhead_percent = overhead_percent_applied,
+            policy_id = config.policy_id,
+            policy_epoch = config.policy_epoch,
             "small-K underprovisioning: loss_fraction_max = 0, no erasure tolerance beyond decode slack"
         );
     }
@@ -176,6 +439,12 @@ pub fn compute_repair_budget(k_source: u32, config: &RepairConfig) -> RepairBudg
     RepairBudget {
         k_source,
         repair_count,
+        policy_id: config.policy_id,
+        policy_epoch: config.policy_epoch,
+        overhead_percent_requested: config.overhead_percent,
+        overhead_percent_applied,
+        small_k_clamped,
+        max_repair_capped,
         loss_fraction_max_permille,
         underprovisioned,
     }
@@ -978,17 +1247,21 @@ mod tests {
         let b = compute_repair_budget(100, &config);
         assert_eq!(b.repair_count, 20);
 
-        // K=3, 20% → R = max(2, ceil(0.6)) = max(2, 1) = 2.
+        // K=3, 20% → formula gives 2, small-K clamp raises to 3.
         let b = compute_repair_budget(3, &config);
-        assert_eq!(b.repair_count, 2);
+        assert_eq!(b.repair_count, 3);
+        assert!(b.small_k_clamped);
 
-        // K=1, 20% → R = max(2, ceil(0.2)) = max(2, 1) = 2.
+        // K=1, 20% → formula gives 2, small-K clamp raises to 3.
         let b = compute_repair_budget(1, &config);
-        assert_eq!(b.repair_count, 2);
+        assert_eq!(b.repair_count, 3);
+        assert!(b.small_k_clamped);
 
         // K=56403, 20% → R = max(2, ceil(11280.6)) = max(2, 11281) = 11281.
         let b = compute_repair_budget(56403, &config);
         assert_eq!(b.repair_count, 11281);
+        assert_eq!(b.policy_id, REPAIR_BUDGET_POLICY_ID);
+        assert_eq!(b.policy_epoch, INITIAL_REPAIR_POLICY_EPOCH);
     }
 
     // -- bd-1hi.22 test 2: Same object → same seed (deterministic) --
@@ -1038,9 +1311,9 @@ mod tests {
         let b = compute_repair_budget(100, &config);
         assert_eq!(b.loss_fraction_max_permille, 150);
 
-        // K=3, R=2: loss_fraction_max = max(0, (2-2)/(3+2)) = 0.
+        // K=3, R=3 after small-K clamp: loss_fraction_max = (3-2)/(3+3) = 1/6 = 166‰.
         let b = compute_repair_budget(3, &config);
-        assert_eq!(b.loss_fraction_max_permille, 0);
+        assert_eq!(b.loss_fraction_max_permille, 166);
     }
 
     // -- bd-1hi.22 test 6: Small-K underprovisioning warning --
@@ -1049,13 +1322,13 @@ mod tests {
     fn test_small_k_underprovisioning_warning() {
         let config = RepairConfig::new();
 
-        // K=3 with 20% overhead → R=2, loss_fraction_max=0, underprovisioned.
+        // K=3 with 20% overhead uses small-K clamp (R=3), so we are no longer underprovisioned.
         let b = compute_repair_budget(3, &config);
         assert!(
-            b.underprovisioned,
-            "K=3 must be flagged as underprovisioned"
+            !b.underprovisioned,
+            "K=3 should be hardened by small-K clamp"
         );
-        assert_eq!(b.loss_fraction_max_permille, 0);
+        assert_eq!(b.loss_fraction_max_permille, 166);
 
         // K=100 → R=20, loss_fraction_max=150‰, NOT underprovisioned.
         let b = compute_repair_budget(100, &config);
@@ -1120,6 +1393,67 @@ mod tests {
         let config = RepairConfig::with_overhead(1);
         let b = compute_repair_budget(1000, &config);
         assert_eq!(b.repair_count, 10, "K=1000 with 1% → R=max(2,10)=10");
+    }
+
+    #[test]
+    fn test_select_repair_count_policy_surface() {
+        assert_eq!(select_repair_count(1, 20), 3);
+        assert_eq!(select_repair_count(3, 20), 3);
+        assert_eq!(select_repair_count(100, 20), 20);
+    }
+
+    #[test]
+    fn test_repair_budget_bounds_and_clamps() {
+        let config = RepairConfig {
+            slack_decode: DEFAULT_SLACK_DECODE,
+            overhead_percent: 900,
+            small_k_clamp_max_k: 8,
+            small_k_min_repair: 3,
+            max_repair_symbols: 25,
+            policy_id: REPAIR_BUDGET_POLICY_ID,
+            policy_epoch: 7,
+        };
+        let b = compute_repair_budget(100, &config);
+        assert_eq!(b.overhead_percent_applied, MAX_OVERHEAD_PERCENT);
+        assert_eq!(b.repair_count, 25);
+        assert!(b.max_repair_capped);
+        assert_eq!(b.policy_epoch, 7);
+    }
+
+    #[test]
+    fn test_object_policy_defaults_stricter_for_commit_artifacts() {
+        let marker = ObjectRepairPolicy::for_class(RepairObjectClass::CommitMarker);
+        let proof = ObjectRepairPolicy::for_class(RepairObjectClass::CommitProof);
+        let history = ObjectRepairPolicy::for_class(RepairObjectClass::PageHistory);
+        assert!(marker.default_overhead_percent > history.default_overhead_percent);
+        assert!(proof.default_overhead_percent > history.default_overhead_percent);
+        assert!(marker.small_k_min_repair >= history.small_k_min_repair);
+    }
+
+    #[test]
+    fn test_compute_repair_budget_for_object_policy() {
+        let marker_budget = compute_repair_budget_for_object(
+            50,
+            RepairObjectClass::CommitMarker,
+            None,
+            INITIAL_REPAIR_POLICY_EPOCH + 1,
+        );
+        let history_budget = compute_repair_budget_for_object(
+            50,
+            RepairObjectClass::PageHistory,
+            None,
+            INITIAL_REPAIR_POLICY_EPOCH + 1,
+        );
+        assert!(marker_budget.repair_count > history_budget.repair_count);
+        assert_eq!(marker_budget.policy_id, REPAIR_BUDGET_POLICY_ID);
+        assert_eq!(marker_budget.policy_epoch, INITIAL_REPAIR_POLICY_EPOCH + 1);
+    }
+
+    #[test]
+    fn test_policy_change_epoch_boundary_only() {
+        assert!(!can_apply_policy_change(5, 5));
+        assert!(!can_apply_policy_change(5, 4));
+        assert!(can_apply_policy_change(5, 6));
     }
 
     // -- bd-1hi.22 test 10: Adaptive overhead evidence ledger --
