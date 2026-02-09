@@ -100,7 +100,7 @@ fn load_issue_description(issue_id: &str) -> Result<String, String> {
 
 fn contains_identifier(text: &str, expected_marker: &str) -> bool {
     text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
-        .any(|token| token == expected_marker)
+        .any(|candidate| candidate == expected_marker)
 }
 
 fn evaluate_description(description: &str) -> ComplianceEvaluation {
@@ -641,6 +641,153 @@ fn test_checkpoint_all_4_modes() -> Result<(), String> {
                 "bead_id={BEAD_ID} case=checkpoint_mode_sync_missing mode={mode_label}"
             ));
         }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_savepoints_nested() -> Result<(), String> {
+    let cx = test_cx();
+    let vfs = MemoryVfs::new();
+    let path = PathBuf::from("/bd_bca_1_savepoints.db");
+    let page_size = PageSize::DEFAULT.as_usize();
+
+    let page_no = {
+        let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT)
+            .map_err(|error| format!("open_pager_for_savepoint_test_failed error={error}"))?;
+        let mut txn = pager
+            .begin(&cx, TransactionMode::Immediate)
+            .map_err(|error| format!("begin_savepoint_writer_failed error={error}"))?;
+
+        let page_no = txn
+            .allocate_page(&cx)
+            .map_err(|error| format!("allocate_savepoint_page_failed error={error}"))?;
+        txn.write_page(&cx, page_no, &sample_page(0x11, page_size))
+            .map_err(|error| format!("write_initial_savepoint_page_failed error={error}"))?;
+
+        txn.savepoint(&cx, "outer")
+            .map_err(|error| format!("savepoint_outer_failed error={error}"))?;
+        txn.write_page(&cx, page_no, &sample_page(0x22, page_size))
+            .map_err(|error| format!("write_after_outer_savepoint_failed error={error}"))?;
+
+        txn.savepoint(&cx, "inner")
+            .map_err(|error| format!("savepoint_inner_failed error={error}"))?;
+        txn.write_page(&cx, page_no, &sample_page(0x33, page_size))
+            .map_err(|error| format!("write_after_inner_savepoint_failed error={error}"))?;
+
+        txn.rollback_to_savepoint(&cx, "inner")
+            .map_err(|error| format!("rollback_to_inner_failed error={error}"))?;
+        let after_inner_rollback = txn
+            .get_page(&cx, page_no)
+            .map_err(|error| format!("read_after_inner_rollback_failed error={error}"))?;
+        if after_inner_rollback.as_ref()[0] != 0x22 {
+            return Err(format!(
+                "bead_id={BEAD_ID} case=savepoints_nested_inner_rollback_mismatch expected=34 actual={}",
+                after_inner_rollback.as_ref()[0]
+            ));
+        }
+
+        txn.release_savepoint(&cx, "inner")
+            .map_err(|error| format!("release_inner_savepoint_failed error={error}"))?;
+        txn.rollback_to_savepoint(&cx, "outer")
+            .map_err(|error| format!("rollback_to_outer_failed error={error}"))?;
+        txn.release_savepoint(&cx, "outer")
+            .map_err(|error| format!("release_outer_savepoint_failed error={error}"))?;
+        txn.commit(&cx)
+            .map_err(|error| format!("commit_savepoint_test_failed error={error}"))?;
+        page_no
+    };
+
+    let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT)
+        .map_err(|error| format!("open_pager_for_savepoint_readback_failed error={error}"))?;
+    let read_txn = pager
+        .begin(&cx, TransactionMode::ReadOnly)
+        .map_err(|error| format!("begin_savepoint_reader_failed error={error}"))?;
+    let persisted = read_txn
+        .get_page(&cx, page_no)
+        .map_err(|error| format!("read_savepoint_page_after_commit_failed error={error}"))?;
+    if persisted.as_ref()[0] != 0x11 {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=savepoints_nested_outer_rollback_mismatch expected=17 actual={}",
+            persisted.as_ref()[0]
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_wal_concurrent_readers_writer() -> Result<(), String> {
+    let cx = test_cx();
+    let vfs = MemoryVfs::new();
+    let wal_path = PathBuf::from("/bd_bca_1_concurrent_readers_writer.db-wal");
+    let page_size = PageSize::DEFAULT.as_usize();
+    let page_size_u32 =
+        u32::try_from(page_size).map_err(|error| format!("page_size_u32_failed error={error}"))?;
+
+    {
+        let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
+        let mut wal = WalFile::create(&cx, wal_file, page_size_u32, 0, wal_salts())
+            .map_err(|error| format!("create_wal_for_reader_writer_test_failed error={error}"))?;
+        wal.append_frame(&cx, 1, &sample_page(0x51, page_size), 1)
+            .map_err(|error| format!("append_initial_writer_frame_failed error={error}"))?;
+        wal.close(&cx)
+            .map_err(|error| format!("close_initial_writer_wal_failed error={error}"))?;
+    }
+
+    let mut reader_snapshot = WalFile::open(&cx, open_wal_file(&vfs, &cx, &wal_path)?)
+        .map_err(|error| format!("open_reader_snapshot_failed error={error}"))?;
+    if reader_snapshot.frame_count() != 1 {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=wal_reader_snapshot_initial_count expected=1 actual={}",
+            reader_snapshot.frame_count()
+        ));
+    }
+
+    {
+        let mut writer = WalFile::open(&cx, open_wal_file(&vfs, &cx, &wal_path)?)
+            .map_err(|error| format!("open_writer_failed error={error}"))?;
+        writer
+            .append_frame(&cx, 2, &sample_page(0x52, page_size), 2)
+            .map_err(|error| format!("append_second_writer_frame_failed error={error}"))?;
+        writer
+            .close(&cx)
+            .map_err(|error| format!("close_writer_failed error={error}"))?;
+    }
+
+    if reader_snapshot.frame_count() != 1 {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=wal_reader_snapshot_stability expected=1 actual={}",
+            reader_snapshot.frame_count()
+        ));
+    }
+    let (_, snapshot_page) = reader_snapshot
+        .read_frame(&cx, 0)
+        .map_err(|error| format!("read_snapshot_reader_frame_failed error={error}"))?;
+    if snapshot_page[0] != 0x51 {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=wal_reader_snapshot_content_mismatch expected=81 actual={}",
+            snapshot_page[0]
+        ));
+    }
+
+    let mut reader_latest = WalFile::open(&cx, open_wal_file(&vfs, &cx, &wal_path)?)
+        .map_err(|error| format!("open_latest_reader_failed error={error}"))?;
+    if reader_latest.frame_count() != 2 {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=wal_reader_latest_count expected=2 actual={}",
+            reader_latest.frame_count()
+        ));
+    }
+    let (_, latest_page) = reader_latest
+        .read_frame(&cx, 1)
+        .map_err(|error| format!("read_latest_reader_frame_failed error={error}"))?;
+    if latest_page[0] != 0x52 {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=wal_reader_latest_content_mismatch expected=82 actual={}",
+            latest_page[0]
+        ));
     }
 
     Ok(())

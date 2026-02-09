@@ -204,8 +204,12 @@ impl Connection {
 
     /// Prepare and execute SQL as a query.
     pub fn query(&self, sql: &str) -> Result<Vec<Row>> {
-        let statement = parse_single_statement(sql)?;
-        self.execute_statement(statement, None)
+        let statements = parse_statements(sql)?;
+        let mut rows = Vec::new();
+        for statement in statements {
+            rows = self.execute_statement(statement, None)?;
+        }
+        Ok(rows)
     }
 
     /// Prepare and execute SQL as a query with bound SQL parameters.
@@ -662,6 +666,23 @@ fn validate_bound_parameters(program: &VdbeProgram, params: &[SqliteValue]) -> R
 }
 
 fn parse_single_statement(sql: &str) -> Result<Statement> {
+    let statements = parse_statements(sql)?;
+    let mut iter = statements.into_iter();
+    let statement = iter.next().ok_or_else(|| FrankenError::ParseError {
+        offset: 0,
+        detail: "no SQL statement provided".to_owned(),
+    })?;
+
+    if iter.next().is_some() {
+        return Err(FrankenError::NotImplemented(
+            "multiple statements are not supported in this API path".to_owned(),
+        ));
+    }
+
+    Ok(statement)
+}
+
+fn parse_statements(sql: &str) -> Result<Vec<Statement>> {
     let mut parser = Parser::from_sql(sql);
     let (statements, errors) = parser.parse_all();
 
@@ -673,19 +694,14 @@ fn parse_single_statement(sql: &str) -> Result<Statement> {
         });
     }
 
-    let mut iter = statements.into_iter();
-    let statement = iter.next().ok_or_else(|| FrankenError::ParseError {
-        offset: 0,
-        detail: "no SQL statement provided".to_owned(),
-    })?;
-
-    if iter.next().is_some() {
-        return Err(FrankenError::NotImplemented(
-            "multiple statements are not supported yet".to_owned(),
-        ));
+    if statements.is_empty() {
+        return Err(FrankenError::ParseError {
+            offset: 0,
+            detail: "no SQL statement provided".to_owned(),
+        });
     }
 
-    Ok(statement)
+    Ok(statements)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1654,6 +1670,15 @@ mod tests {
     }
 
     #[test]
+    fn test_query_with_params_multiple_statements_rejected() {
+        let conn = Connection::open(":memory:").unwrap();
+        let error = conn
+            .query_with_params("SELECT ?1; SELECT ?1 + 1;", &[SqliteValue::Integer(1)])
+            .expect_err("multi-statement parameterized query should fail");
+        assert!(matches!(error, FrankenError::NotImplemented(_)));
+    }
+
+    #[test]
     fn test_prepared_statement_query_with_params() {
         let conn = Connection::open(":memory:").unwrap();
         let stmt = conn.prepare("SELECT ?1 + 1;").unwrap();
@@ -1841,6 +1866,37 @@ mod tests {
                 SqliteValue::Text("world".to_owned())
             ]
         );
+    }
+
+    #[test]
+    fn test_query_executes_multiple_statements_in_order() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query(
+                "CREATE TABLE t (x INTEGER); \
+                 INSERT INTO t VALUES (10); \
+                 INSERT INTO t VALUES (20); \
+                 SELECT x FROM t;",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(10)]);
+        assert_eq!(row_values(&rows[1]), vec![SqliteValue::Integer(20)]);
+    }
+
+    #[test]
+    fn test_query_multiple_statements_returns_last_result_set() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query(
+                "VALUES (1), (2); \
+                 VALUES (3), (4), (5);",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(3)]);
+        assert_eq!(row_values(&rows[1]), vec![SqliteValue::Integer(4)]);
+        assert_eq!(row_values(&rows[2]), vec![SqliteValue::Integer(5)]);
     }
 
     #[test]
