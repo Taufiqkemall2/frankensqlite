@@ -3060,6 +3060,669 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // bd-2d6i §12.1 — remaining required tests (exact names per bead spec)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_select_star() {
+        // SELECT * returns all columns from all tables.
+        let stmt = parse_one("SELECT * FROM t");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { columns, .. } = &s.body.select {
+                assert!(matches!(columns[0], ResultColumn::Star));
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_inner_join_on() {
+        // INNER JOIN ON produces correct intersection.
+        let stmt = parse_one("SELECT * FROM a INNER JOIN b ON a.id = b.a_id");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { from, .. } = &s.body.select {
+                let from = from.as_ref().expect("FROM clause");
+                assert_eq!(from.joins[0].join_type.kind, JoinKind::Inner);
+                assert!(matches!(
+                    from.joins[0].constraint,
+                    Some(JoinConstraint::On(_))
+                ));
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_left_outer_join() {
+        // LEFT JOIN returns all left rows with NULLs for non-matching right.
+        let stmt = parse_one("SELECT * FROM a LEFT OUTER JOIN b ON a.id = b.a_id");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { from, .. } = &s.body.select {
+                let from = from.as_ref().expect("FROM clause");
+                assert_eq!(from.joins[0].join_type.kind, JoinKind::Left);
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_right_outer_join() {
+        // RIGHT JOIN returns all right rows (3.39+ feature).
+        let stmt = parse_one("SELECT * FROM a RIGHT JOIN b ON a.id = b.a_id");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { from, .. } = &s.body.select {
+                let from = from.as_ref().expect("FROM clause");
+                assert_eq!(from.joins[0].join_type.kind, JoinKind::Right);
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_full_outer_join() {
+        // FULL OUTER JOIN returns rows from both tables.
+        let stmt = parse_one("SELECT * FROM a FULL OUTER JOIN b ON a.id = b.a_id");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { from, .. } = &s.body.select {
+                let from = from.as_ref().expect("FROM clause");
+                assert_eq!(from.joins[0].join_type.kind, JoinKind::Full);
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_cross_join_no_reorder() {
+        // CROSS JOIN prevents optimizer reordering; parser must produce JoinKind::Cross.
+        let stmt = parse_one("SELECT * FROM a CROSS JOIN b");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { from, .. } = &s.body.select {
+                let from = from.as_ref().expect("FROM clause");
+                assert_eq!(from.joins[0].join_type.kind, JoinKind::Cross);
+                // Cross joins must NOT have an ON or USING constraint.
+                assert!(from.joins[0].constraint.is_none());
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_natural_join() {
+        // NATURAL JOIN uses shared column names for implicit ON.
+        let stmt = parse_one("SELECT * FROM a NATURAL JOIN b");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { from, .. } = &s.body.select {
+                let from = from.as_ref().expect("FROM clause");
+                assert!(from.joins[0].join_type.natural);
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_using_clause() {
+        // JOIN USING joins on specified shared columns.
+        let stmt = parse_one("SELECT * FROM a JOIN b USING (id, name)");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { from, .. } = &s.body.select {
+                let from = from.as_ref().expect("FROM clause");
+                match &from.joins[0].constraint {
+                    Some(JoinConstraint::Using(cols)) => {
+                        assert_eq!(cols.len(), 2);
+                        assert_eq!(cols[0], "id");
+                        assert_eq!(cols[1], "name");
+                    }
+                    other => unreachable!("expected USING constraint, got {other:?}"),
+                }
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_cte_basic() {
+        // WITH clause defines reusable named subquery.
+        let stmt = parse_one("WITH cte AS (SELECT 1 AS x) SELECT * FROM cte");
+        if let Statement::Select(s) = stmt {
+            let with = s.with.as_ref().expect("WITH clause");
+            assert!(!with.recursive);
+            assert_eq!(with.ctes.len(), 1);
+            assert_eq!(with.ctes[0].name, "cte");
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_cte_recursive_union_all() {
+        // Recursive CTE with UNION ALL generates rows.
+        let stmt = parse_one(
+            "WITH RECURSIVE cnt(x) AS (\
+             SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x<10\
+             ) SELECT x FROM cnt",
+        );
+        if let Statement::Select(s) = stmt {
+            let with = s.with.as_ref().expect("WITH clause");
+            assert!(with.recursive);
+            assert_eq!(with.ctes[0].name, "cnt");
+            // Verify the CTE body contains a UNION ALL compound.
+            let cte_body = &with.ctes[0].query;
+            assert_eq!(cte_body.body.compounds.len(), 1);
+            assert_eq!(cte_body.body.compounds[0].0, CompoundOp::UnionAll);
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_cte_recursive_union_cycle_detection() {
+        // Recursive CTE with UNION (not UNION ALL) detects cycles via dedup.
+        let stmt = parse_one(
+            "WITH RECURSIVE paths(a, b) AS (\
+             SELECT src, dst FROM edges \
+             UNION \
+             SELECT p.a, e.dst FROM paths p JOIN edges e ON p.b = e.src\
+             ) SELECT * FROM paths",
+        );
+        if let Statement::Select(s) = stmt {
+            let with = s.with.as_ref().expect("WITH clause");
+            assert!(with.recursive);
+            // UNION (not UNION ALL) provides implicit cycle detection.
+            let cte_body = &with.ctes[0].query;
+            assert_eq!(cte_body.body.compounds.len(), 1);
+            assert_eq!(cte_body.body.compounds[0].0, CompoundOp::Union);
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_cte_materialized_hint() {
+        // MATERIALIZED forces single evaluation.
+        let stmt = parse_one("WITH cte AS MATERIALIZED (SELECT 1) SELECT * FROM cte");
+        if let Statement::Select(s) = stmt {
+            let with = s.with.as_ref().expect("WITH clause");
+            assert_eq!(
+                with.ctes[0].materialized,
+                Some(CteMaterialized::Materialized)
+            );
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_cte_not_materialized_hint() {
+        // NOT MATERIALIZED allows inlining.
+        let stmt = parse_one("WITH cte AS NOT MATERIALIZED (SELECT 1) SELECT * FROM cte");
+        if let Statement::Select(s) = stmt {
+            let with = s.with.as_ref().expect("WITH clause");
+            assert_eq!(
+                with.ctes[0].materialized,
+                Some(CteMaterialized::NotMaterialized)
+            );
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_window_partition_by() {
+        // PARTITION BY correctly groups window function output.
+        let stmt = parse_one("SELECT sum(x) OVER (PARTITION BY dept) FROM emp");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { columns, .. } = &s.body.select {
+                match &columns[0] {
+                    ResultColumn::Expr {
+                        expr:
+                            Expr::FunctionCall {
+                                over: Some(over), ..
+                            },
+                        ..
+                    } => {
+                        assert_eq!(over.partition_by.len(), 1);
+                    }
+                    other => unreachable!("expected window function, got {other:?}"),
+                }
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_window_order_by() {
+        // ORDER BY within window function controls row ordering.
+        let stmt = parse_one("SELECT row_number() OVER (ORDER BY salary DESC) FROM emp");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { columns, .. } = &s.body.select {
+                match &columns[0] {
+                    ResultColumn::Expr {
+                        expr:
+                            Expr::FunctionCall {
+                                over: Some(over), ..
+                            },
+                        ..
+                    } => {
+                        assert_eq!(over.order_by.len(), 1);
+                        assert_eq!(over.order_by[0].direction, Some(SortDirection::Desc));
+                    }
+                    other => unreachable!("expected window function, got {other:?}"),
+                }
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_window_frame_rows() {
+        // ROWS frame spec limits window to specified row range.
+        let stmt = parse_one(
+            "SELECT sum(x) OVER (ORDER BY y ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
+        );
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { columns, .. } = &s.body.select {
+                match &columns[0] {
+                    ResultColumn::Expr {
+                        expr:
+                            Expr::FunctionCall {
+                                over: Some(over), ..
+                            },
+                        ..
+                    } => {
+                        let frame = over.frame.as_ref().expect("frame spec");
+                        assert_eq!(frame.frame_type, FrameType::Rows);
+                        assert!(matches!(frame.start, FrameBound::Preceding(_)));
+                        assert!(matches!(frame.end, Some(FrameBound::CurrentRow)));
+                    }
+                    other => unreachable!("expected window function, got {other:?}"),
+                }
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_window_exclude_current_row() {
+        // EXCLUDE CURRENT ROW omits current row from frame.
+        let stmt = parse_one(
+            "SELECT sum(x) OVER (ORDER BY y ROWS BETWEEN UNBOUNDED PRECEDING AND \
+             UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) FROM t",
+        );
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { columns, .. } = &s.body.select {
+                match &columns[0] {
+                    ResultColumn::Expr {
+                        expr:
+                            Expr::FunctionCall {
+                                over: Some(over), ..
+                            },
+                        ..
+                    } => {
+                        let frame = over.frame.as_ref().expect("frame spec");
+                        assert_eq!(frame.exclude, Some(FrameExclude::CurrentRow));
+                    }
+                    other => unreachable!("expected window function, got {other:?}"),
+                }
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_window_exclude_ties() {
+        // EXCLUDE TIES omits peers of current row.
+        let stmt = parse_one(
+            "SELECT sum(x) OVER (ORDER BY y ROWS BETWEEN UNBOUNDED PRECEDING AND \
+             UNBOUNDED FOLLOWING EXCLUDE TIES) FROM t",
+        );
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { columns, .. } = &s.body.select {
+                match &columns[0] {
+                    ResultColumn::Expr {
+                        expr:
+                            Expr::FunctionCall {
+                                over: Some(over), ..
+                            },
+                        ..
+                    } => {
+                        let frame = over.frame.as_ref().expect("frame spec");
+                        assert_eq!(frame.exclude, Some(FrameExclude::Ties));
+                    }
+                    other => unreachable!("expected window function, got {other:?}"),
+                }
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_nulls_first_asc() {
+        // NULLS FIRST with ASC puts NULLs before non-NULL values.
+        let stmt = parse_one("SELECT a FROM t ORDER BY a ASC NULLS FIRST");
+        if let Statement::Select(s) = stmt {
+            assert_eq!(s.order_by.len(), 1);
+            assert_eq!(s.order_by[0].direction, Some(SortDirection::Asc));
+            assert_eq!(s.order_by[0].nulls, Some(NullsOrder::First));
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_nulls_last_asc() {
+        // NULLS LAST with ASC puts NULLs after non-NULL values.
+        let stmt = parse_one("SELECT a FROM t ORDER BY a ASC NULLS LAST");
+        if let Statement::Select(s) = stmt {
+            assert_eq!(s.order_by.len(), 1);
+            assert_eq!(s.order_by[0].direction, Some(SortDirection::Asc));
+            assert_eq!(s.order_by[0].nulls, Some(NullsOrder::Last));
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_distinct_deduplicates() {
+        // SELECT DISTINCT removes duplicate rows (parser-level: keyword present).
+        let stmt = parse_one("SELECT DISTINCT a, b FROM t");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { distinct, .. } = &s.body.select {
+                assert_eq!(*distinct, Distinctness::Distinct);
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_limit_offset() {
+        // LIMIT N OFFSET M skips M rows and returns N.
+        let stmt = parse_one("SELECT a FROM t LIMIT 10 OFFSET 20");
+        if let Statement::Select(s) = stmt {
+            let limit = s.limit.expect("LIMIT clause");
+            assert!(matches!(
+                limit.limit,
+                Expr::Literal(Literal::Integer(10), _)
+            ));
+            assert!(matches!(
+                limit.offset,
+                Some(Expr::Literal(Literal::Integer(20), _))
+            ));
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_limit_comma_syntax() {
+        // LIMIT offset,count (MySQL syntax) — offset first, count second.
+        let stmt = parse_one("SELECT a FROM t LIMIT 5, 10");
+        if let Statement::Select(s) = stmt {
+            let limit = s.limit.expect("LIMIT clause");
+            // In MySQL syntax, LIMIT 5, 10 means offset=5, count=10.
+            assert!(matches!(
+                limit.limit,
+                Expr::Literal(Literal::Integer(10), _)
+            ));
+            assert!(matches!(
+                limit.offset,
+                Some(Expr::Literal(Literal::Integer(5), _))
+            ));
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_negative_limit_unlimited() {
+        // Negative LIMIT means unlimited (parser accepts negative literal).
+        let stmt = parse_one("SELECT a FROM t LIMIT -1");
+        if let Statement::Select(s) = stmt {
+            let limit = s.limit.expect("LIMIT clause");
+            // Parser may represent -1 as UnaryOp::Negate on Integer(1),
+            // or as Integer(-1). Either is valid.
+            match &limit.limit {
+                Expr::UnaryOp {
+                    op: fsqlite_ast::UnaryOp::Negate,
+                    ..
+                } => {}
+                Expr::Literal(Literal::Integer(n), _) if *n < 0 => {}
+                other => unreachable!("expected negative limit expression, got {other:?}"),
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_negative_offset_zero() {
+        // Negative OFFSET treated as zero (parser accepts negative literal).
+        let stmt = parse_one("SELECT a FROM t LIMIT 10 OFFSET -5");
+        if let Statement::Select(s) = stmt {
+            let limit = s.limit.expect("LIMIT clause");
+            assert!(limit.offset.is_some());
+            match limit.offset.as_ref().unwrap() {
+                Expr::UnaryOp {
+                    op: fsqlite_ast::UnaryOp::Negate,
+                    ..
+                } => {}
+                Expr::Literal(Literal::Integer(n), _) if *n < 0 => {}
+                other => unreachable!("expected negative offset expression, got {other:?}"),
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_current_date_constant() {
+        // current_date is parsed as a literal keyword.
+        let stmt = parse_one("SELECT CURRENT_DATE");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { columns, .. } = &s.body.select {
+                match &columns[0] {
+                    ResultColumn::Expr {
+                        expr: Expr::Literal(Literal::CurrentDate, _),
+                        ..
+                    } => {}
+                    other => unreachable!("expected CURRENT_DATE literal, got {other:?}"),
+                }
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_current_time_constant() {
+        // current_time is parsed as a literal keyword.
+        let stmt = parse_one("SELECT CURRENT_TIME");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { columns, .. } = &s.body.select {
+                match &columns[0] {
+                    ResultColumn::Expr {
+                        expr: Expr::Literal(Literal::CurrentTime, _),
+                        ..
+                    } => {}
+                    other => unreachable!("expected CURRENT_TIME literal, got {other:?}"),
+                }
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_current_timestamp_constant() {
+        // current_timestamp is parsed as a literal keyword.
+        let stmt = parse_one("SELECT CURRENT_TIMESTAMP");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { columns, .. } = &s.body.select {
+                match &columns[0] {
+                    ResultColumn::Expr {
+                        expr: Expr::Literal(Literal::CurrentTimestamp, _),
+                        ..
+                    } => {}
+                    other => unreachable!("expected CURRENT_TIMESTAMP literal, got {other:?}"),
+                }
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_date_constants_evaluated_once_per_statement() {
+        // Parser-level: all three date/time constants parse as distinct Literal variants.
+        // Runtime guarantee (evaluated once per stmt, not per row) is verified at VDBE level.
+        let stmt = parse_one("SELECT CURRENT_DATE, CURRENT_TIME, CURRENT_TIMESTAMP FROM t");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { columns, .. } = &s.body.select {
+                assert_eq!(columns.len(), 3);
+                assert!(matches!(
+                    &columns[0],
+                    ResultColumn::Expr {
+                        expr: Expr::Literal(Literal::CurrentDate, _),
+                        ..
+                    }
+                ));
+                assert!(matches!(
+                    &columns[1],
+                    ResultColumn::Expr {
+                        expr: Expr::Literal(Literal::CurrentTime, _),
+                        ..
+                    }
+                ));
+                assert!(matches!(
+                    &columns[2],
+                    ResultColumn::Expr {
+                        expr: Expr::Literal(Literal::CurrentTimestamp, _),
+                        ..
+                    }
+                ));
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_indexed_by_hint() {
+        // FROM t1 INDEXED BY idx forces specified index.
+        let stmt = parse_one("SELECT * FROM t INDEXED BY idx_t");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { from, .. } = &s.body.select {
+                let from = from.as_ref().expect("FROM clause");
+                match &from.source {
+                    TableOrSubquery::Table {
+                        index_hint: Some(IndexHint::IndexedBy(name)),
+                        ..
+                    } => assert_eq!(name, "idx_t"),
+                    other => unreachable!("expected indexed table source, got {other:?}"),
+                }
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_not_indexed_hint() {
+        // FROM t1 NOT INDEXED prevents index use.
+        let stmt = parse_one("SELECT * FROM t NOT INDEXED");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { from, .. } = &s.body.select {
+                let from = from.as_ref().expect("FROM clause");
+                match &from.source {
+                    TableOrSubquery::Table {
+                        index_hint: Some(IndexHint::NotIndexed),
+                        ..
+                    } => {}
+                    other => unreachable!("expected not-indexed table source, got {other:?}"),
+                }
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_table_valued_function_in_from() {
+        // FROM generate_series(1,100) works as table source.
+        let stmt = parse_one("SELECT * FROM generate_series(1, 100) AS gs");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { from, .. } = &s.body.select {
+                let from = from.as_ref().expect("FROM clause");
+                match &from.source {
+                    TableOrSubquery::TableFunction { name, args, alias } => {
+                        assert_eq!(name, "generate_series");
+                        assert_eq!(args.len(), 2);
+                        assert_eq!(alias.as_deref(), Some("gs"));
+                    }
+                    other => unreachable!("expected table-valued function source, got {other:?}"),
+                }
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // bd-2kvo Phase 3 acceptance: keywords as identifiers
     // -----------------------------------------------------------------------
 

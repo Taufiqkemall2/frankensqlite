@@ -16,6 +16,7 @@ use fsqlite_types::{
     CommitSeq, MergePageKind, PageData, PageNumber, PageSize, PageVersion, SchemaEpoch, Snapshot,
     TxnEpoch, TxnId, TxnToken,
 };
+use fsqlite_wal::DEFAULT_RAPTORQ_REPAIR_SYMBOLS;
 
 use crate::cache_aligned::{logical_now_epoch_secs, logical_now_millis};
 use crate::core_types::{
@@ -276,6 +277,8 @@ pub struct TransactionManager {
     /// performed on concurrent commits.  When false, plain SI is used and
     /// write-skew is tolerated.
     ssi_enabled: bool,
+    /// `PRAGMA raptorq_repair_symbols` value for WAL-FEC commit groups.
+    raptorq_repair_symbols: u8,
     busy_timeout_ms: u64,
     serialized_writer_lease_secs: u64,
     txn_max_duration_ms: u64,
@@ -296,6 +299,7 @@ impl TransactionManager {
             schema_epoch: SchemaEpoch::ZERO,
             write_merge_policy: WriteMergePolicy::default(),
             ssi_enabled: true,
+            raptorq_repair_symbols: DEFAULT_RAPTORQ_REPAIR_SYMBOLS,
             busy_timeout_ms: DEFAULT_BUSY_TIMEOUT_MS,
             serialized_writer_lease_secs: DEFAULT_SERIALIZED_WRITER_LEASE_SECS,
             txn_max_duration_ms: 5_000,
@@ -358,6 +362,24 @@ impl TransactionManager {
             old_value = old,
             new_value = enabled,
             "PRAGMA fsqlite.serializable changed"
+        );
+    }
+
+    /// Current WAL-FEC repair-symbol budget (`PRAGMA raptorq_repair_symbols`).
+    #[must_use]
+    pub const fn raptorq_repair_symbols(&self) -> u8 {
+        self.raptorq_repair_symbols
+    }
+
+    /// Set WAL-FEC repair-symbol budget (`PRAGMA raptorq_repair_symbols = N`).
+    pub fn set_raptorq_repair_symbols(&mut self, value: u8) {
+        let old = self.raptorq_repair_symbols;
+        self.raptorq_repair_symbols = value;
+        tracing::debug!(
+            conn_id = self.conn_id,
+            old_value = old,
+            new_value = value,
+            "PRAGMA raptorq_repair_symbols changed"
         );
     }
 

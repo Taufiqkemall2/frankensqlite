@@ -16,7 +16,7 @@ use fsqlite_types::value::SqliteValue;
 use crate::VdbeProgram;
 
 /// Outcome of a single engine execution.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecOutcome {
     /// Program halted normally (Halt with p1=0).
     Done,
@@ -39,11 +39,12 @@ pub struct VdbeEngine {
 impl VdbeEngine {
     /// Create a new engine with enough registers for the given program.
     #[must_use]
+    #[allow(clippy::cast_sign_loss)]
     pub fn new(register_count: i32) -> Self {
         // +1 because registers are 1-indexed (register 0 unused).
-        let count = (register_count + 1).max(1) as usize;
+        let count = register_count.max(0) as u32 + 1;
         Self {
-            registers: vec![SqliteValue::Null; count],
+            registers: vec![SqliteValue::Null; count as usize],
             results: Vec::new(),
         }
     }
@@ -52,7 +53,13 @@ impl VdbeEngine {
     ///
     /// Returns `Ok(ExecOutcome::Done)` on normal halt, or an error if the
     /// program encounters a fatal condition.
-    #[allow(clippy::too_many_lines)]
+    #[allow(
+        clippy::too_many_lines,
+        clippy::match_same_arms,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap
+    )]
     pub fn execute(&mut self, program: &VdbeProgram) -> Result<ExecOutcome> {
         let ops = program.ops();
         if ops.is_empty() {
@@ -86,7 +93,6 @@ impl VdbeEngine {
 
                 Opcode::Goto => {
                     pc = op.p2 as usize;
-                    continue;
                 }
 
                 Opcode::Halt => {
@@ -389,43 +395,39 @@ impl VdbeEngine {
 
                     // NULL handling: if either is NULL, jump depends on p5
                     // flag (SQLITE_NULLEQ).
-                    if lhs.is_null() || rhs.is_null() {
+                    let should_jump = if lhs.is_null() || rhs.is_null() {
                         let null_eq = (op.p5 & 0x80) != 0;
                         if null_eq {
                             // IS / IS NOT semantics: NULL == NULL is true.
                             let both_null = lhs.is_null() && rhs.is_null();
-                            let should_jump = match op.opcode {
+                            match op.opcode {
                                 Opcode::Eq => both_null,
                                 Opcode::Ne => !both_null,
                                 _ => false,
-                            };
-                            if should_jump {
-                                pc = op.p2 as usize;
-                            } else {
-                                pc += 1;
                             }
                         } else {
                             // Standard SQL: comparison with NULL is NULL (no jump).
-                            pc += 1;
+                            false
                         }
-                        continue;
-                    }
-
-                    let cmp = lhs.partial_cmp(rhs);
-                    let should_jump = match (op.opcode, cmp) {
-                        (Opcode::Eq, Some(std::cmp::Ordering::Equal)) => true,
-                        (Opcode::Ne, Some(ord)) if ord != std::cmp::Ordering::Equal => true,
-                        (Opcode::Lt, Some(std::cmp::Ordering::Less)) => true,
-                        (
-                            Opcode::Le,
-                            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal),
-                        ) => true,
-                        (Opcode::Gt, Some(std::cmp::Ordering::Greater)) => true,
-                        (
-                            Opcode::Ge,
-                            Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal),
-                        ) => true,
-                        _ => false,
+                    } else {
+                        let cmp = lhs.partial_cmp(rhs);
+                        matches!(
+                            (op.opcode, cmp),
+                            (Opcode::Eq, Some(std::cmp::Ordering::Equal))
+                                | (Opcode::Lt, Some(std::cmp::Ordering::Less))
+                                | (
+                                    Opcode::Le,
+                                    Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+                                )
+                                | (Opcode::Gt, Some(std::cmp::Ordering::Greater))
+                                | (
+                                    Opcode::Ge,
+                                    Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+                                )
+                        ) || matches!(
+                            (op.opcode, cmp),
+                            (Opcode::Ne, Some(ord)) if ord != std::cmp::Ordering::Equal
+                        )
                     };
 
                     if should_jump {
@@ -498,41 +500,35 @@ impl VdbeEngine {
 
                 Opcode::NotNull => {
                     // Jump to p2 if p1 is NOT NULL.
-                    if !self.get_reg(op.p1).is_null() {
-                        pc = op.p2 as usize;
-                    } else {
+                    if self.get_reg(op.p1).is_null() {
                         pc += 1;
+                    } else {
+                        pc = op.p2 as usize;
                     }
                 }
 
                 Opcode::Once => {
                     // Jump to p2 on first execution only.
-                    if !once_flags[pc] {
+                    if once_flags[pc] {
+                        pc += 1;
+                    } else {
                         once_flags[pc] = true;
                         pc = op.p2 as usize;
-                    } else {
-                        pc += 1;
                     }
                 }
 
                 // ── Gosub / Return ──────────────────────────────────────
                 Opcode::Gosub => {
                     // Store return address in p1, jump to p2.
-                    #[allow(clippy::cast_possible_wrap)]
                     let return_addr = (pc + 1) as i32;
                     self.set_reg(op.p1, SqliteValue::Integer(i64::from(return_addr)));
                     pc = op.p2 as usize;
-                    continue;
                 }
 
                 Opcode::Return => {
                     // Jump to address stored in p1.
                     let addr = self.get_reg(op.p1).to_integer();
-                    #[allow(clippy::cast_sign_loss)]
-                    {
-                        pc = addr as usize;
-                    }
-                    continue;
+                    pc = addr as usize;
                 }
 
                 // ── Transaction (stub for expression eval) ──────────────
@@ -564,7 +560,6 @@ impl VdbeEngine {
                 Opcode::Rewind | Opcode::Sort | Opcode::SorterSort => {
                     // Stub: jump to p2 (table empty / no cursor).
                     pc = op.p2 as usize;
-                    continue;
                 }
 
                 Opcode::Next | Opcode::Prev | Opcode::SorterNext => {
@@ -593,13 +588,11 @@ impl VdbeEngine {
                 | Opcode::SeekHit => {
                     // Stub: seek not found, jump to p2.
                     pc = op.p2 as usize;
-                    continue;
                 }
 
                 Opcode::NotFound | Opcode::NotExists | Opcode::IfNoHope => {
                     // Stub: key not found, jump to p2.
                     pc = op.p2 as usize;
-                    continue;
                 }
 
                 Opcode::Found | Opcode::NoConflict => {
@@ -624,15 +617,8 @@ impl VdbeEngine {
                 // ── Record building ─────────────────────────────────────
                 Opcode::MakeRecord => {
                     // Build a record from p1..p1+p2-1 into p3.
-                    // For now, store as blob placeholder. Full record format
-                    // will use fsqlite-types::record.
-                    let start = op.p1 as usize;
-                    let count = op.p2 as usize;
-                    let mut parts = Vec::with_capacity(count);
-                    for r in start..start + count {
-                        parts.push(self.get_reg(r as i32).to_text());
-                    }
-                    // Placeholder: store as text join (will be binary record later).
+                    // Placeholder: store as empty blob. Full record format
+                    // will use fsqlite-types::record in Phase 5.
                     self.set_reg(op.p3, SqliteValue::Blob(Vec::new()));
                     pc += 1;
                 }
@@ -715,13 +701,11 @@ impl VdbeEngine {
                 Opcode::IfNullRow => {
                     // Stub: cursor p1 always has null row in stub mode.
                     pc = op.p2 as usize;
-                    continue;
                 }
 
                 Opcode::IfNotOpen => {
                     // Stub: cursor is never open in stub mode.
                     pc = op.p2 as usize;
-                    continue;
                 }
 
                 Opcode::TypeCheck
@@ -737,7 +721,6 @@ impl VdbeEngine {
                     // Jump to one of p1/p2/p3 based on last comparison.
                     // Stub: jump to p2 (neutral).
                     pc = op.p2 as usize;
-                    continue;
                 }
 
                 Opcode::IsType => {
@@ -748,13 +731,11 @@ impl VdbeEngine {
                 Opcode::Last => {
                     // Stub: table empty, jump to p2.
                     pc = op.p2 as usize;
-                    continue;
                 }
 
                 Opcode::IfSizeBetween | Opcode::IfEmpty => {
                     // Stub: jump to p2.
                     pc = op.p2 as usize;
-                    continue;
                 }
 
                 Opcode::DeferredSeek | Opcode::IdxRowid | Opcode::FinishSeek => {
@@ -799,28 +780,18 @@ impl VdbeEngine {
                     } else {
                         pc += 1;
                     }
-                    continue;
                 }
 
                 Opcode::Yield => {
                     let saved = self.get_reg(op.p1).to_integer();
-                    #[allow(clippy::cast_possible_wrap)]
                     let current = (pc + 1) as i32;
                     self.set_reg(op.p1, SqliteValue::Integer(i64::from(current)));
-                    #[allow(clippy::cast_sign_loss)]
-                    {
-                        pc = saved as usize;
-                    }
-                    continue;
+                    pc = saved as usize;
                 }
 
                 Opcode::EndCoroutine => {
                     let saved = self.get_reg(op.p1).to_integer();
-                    #[allow(clippy::cast_sign_loss)]
-                    {
-                        pc = saved as usize;
-                    }
-                    continue;
+                    pc = saved as usize;
                 }
 
                 // ── Aggregation (stub) ──────────────────────────────────
@@ -849,10 +820,12 @@ impl VdbeEngine {
 
     // ── Helpers ─────────────────────────────────────────────────────────
 
+    #[allow(clippy::cast_sign_loss)]
     fn get_reg(&self, r: i32) -> &SqliteValue {
         self.registers.get(r as usize).unwrap_or(&SqliteValue::Null)
     }
 
+    #[allow(clippy::cast_sign_loss)]
     fn set_reg(&mut self, r: i32, val: SqliteValue) {
         let idx = r as usize;
         if idx >= self.registers.len() {
@@ -870,21 +843,18 @@ fn sql_div(dividend: &SqliteValue, divisor: &SqliteValue) -> SqliteValue {
     if dividend.is_null() || divisor.is_null() {
         return SqliteValue::Null;
     }
-    match (dividend, divisor) {
-        (SqliteValue::Integer(a), SqliteValue::Integer(b)) => {
-            if *b == 0 {
-                SqliteValue::Null
-            } else {
-                SqliteValue::Integer(a / b)
-            }
+    if let (SqliteValue::Integer(a), SqliteValue::Integer(b)) = (dividend, divisor) {
+        if *b == 0 {
+            SqliteValue::Null
+        } else {
+            SqliteValue::Integer(a / b)
         }
-        _ => {
-            let b = divisor.to_float();
-            if b == 0.0 {
-                SqliteValue::Null
-            } else {
-                SqliteValue::Float(dividend.to_float() / b)
-            }
+    } else {
+        let b = divisor.to_float();
+        if b == 0.0 {
+            SqliteValue::Null
+        } else {
+            SqliteValue::Float(dividend.to_float() / b)
         }
     }
 }
@@ -911,8 +881,10 @@ fn sql_shift_left(val: i64, amount: i64) -> SqliteValue {
     if amount >= 64 {
         return SqliteValue::Integer(0);
     }
-    #[allow(clippy::cast_sign_loss)]
-    SqliteValue::Integer(val << (amount as u32))
+    // amount is in [0, 63] so the cast is safe.
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    let shift = amount as u32;
+    SqliteValue::Integer(val << shift)
 }
 
 /// SQL shift right (SQLite semantics: negative shift = shift left).
@@ -923,8 +895,10 @@ fn sql_shift_right(val: i64, amount: i64) -> SqliteValue {
     if amount >= 64 {
         return SqliteValue::Integer(if val < 0 { -1 } else { 0 });
     }
-    #[allow(clippy::cast_sign_loss)]
-    SqliteValue::Integer(val >> (amount as u32))
+    // amount is in [0, 63] so the cast is safe.
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    let shift = amount as u32;
+    SqliteValue::Integer(val >> shift)
 }
 
 /// Three-valued SQL AND.

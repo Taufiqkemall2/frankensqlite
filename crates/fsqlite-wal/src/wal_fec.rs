@@ -30,10 +30,109 @@ use crate::checksum::{
 pub const WAL_FEC_GROUP_META_MAGIC: [u8; 8] = *b"FSQLWFEC";
 /// Current [`WalFecGroupMeta`] wire version.
 pub const WAL_FEC_GROUP_META_VERSION: u32 = 1;
+/// Default `PRAGMA raptorq_repair_symbols` value for fresh databases.
+pub const DEFAULT_RAPTORQ_REPAIR_SYMBOLS: u8 = 2;
+/// Maximum accepted `PRAGMA raptorq_repair_symbols` value (`u8` range).
+pub const MAX_RAPTORQ_REPAIR_SYMBOLS: u8 = u8::MAX;
+/// Magic bytes for the optional `.wal-fec` configuration header.
+pub const WAL_FEC_PRAGMA_HEADER_MAGIC: [u8; 8] = *b"FSQLWFCP";
+/// Current `.wal-fec` configuration header version.
+pub const WAL_FEC_PRAGMA_HEADER_VERSION: u32 = 1;
 
 const LENGTH_PREFIX_BYTES: usize = 4;
 const META_FIXED_PREFIX_BYTES: usize = 8 + 4 + (8 * 4) + 22 + 16;
 const META_CHECKSUM_BYTES: usize = 8;
+const WAL_FEC_PRAGMA_HEADER_BYTES: usize = 8 + 4 + 1 + 3 + 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WalFecPragmaHeader {
+    magic: [u8; 8],
+    version: u32,
+    raptorq_repair_symbols: u8,
+    reserved: [u8; 3],
+    checksum: u64,
+}
+
+impl WalFecPragmaHeader {
+    #[must_use]
+    fn new(raptorq_repair_symbols: u8) -> Self {
+        let mut header = Self {
+            magic: WAL_FEC_PRAGMA_HEADER_MAGIC,
+            version: WAL_FEC_PRAGMA_HEADER_VERSION,
+            raptorq_repair_symbols,
+            reserved: [0; 3],
+            checksum: 0,
+        };
+        header.checksum = header.compute_checksum();
+        header
+    }
+
+    fn from_prefix(bytes: &[u8]) -> Result<Option<Self>> {
+        if bytes.len() < WAL_FEC_PRAGMA_HEADER_BYTES {
+            return Ok(None);
+        }
+
+        let mut magic = [0_u8; 8];
+        magic.copy_from_slice(&bytes[..8]);
+        if magic != WAL_FEC_PRAGMA_HEADER_MAGIC {
+            return Ok(None);
+        }
+
+        let version = u32::from_le_bytes(bytes[8..12].try_into().expect("fixed-length slice"));
+        if version != WAL_FEC_PRAGMA_HEADER_VERSION {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "unsupported wal-fec pragma header version {version}, expected {WAL_FEC_PRAGMA_HEADER_VERSION}"
+                ),
+            });
+        }
+
+        let raptorq_repair_symbols = bytes[12];
+        let mut reserved = [0_u8; 3];
+        reserved.copy_from_slice(&bytes[13..16]);
+        let checksum = u64::from_le_bytes(bytes[16..24].try_into().expect("fixed-length slice"));
+
+        let header = Self {
+            magic,
+            version,
+            raptorq_repair_symbols,
+            reserved,
+            checksum,
+        };
+
+        let computed = header.compute_checksum();
+        if computed != checksum {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "wal-fec pragma header checksum mismatch: stored {checksum:#018x}, computed {computed:#018x}"
+                ),
+            });
+        }
+
+        Ok(Some(header))
+    }
+
+    #[must_use]
+    fn to_bytes(self) -> [u8; WAL_FEC_PRAGMA_HEADER_BYTES] {
+        let mut out = [0_u8; WAL_FEC_PRAGMA_HEADER_BYTES];
+        out[..8].copy_from_slice(&self.magic);
+        out[8..12].copy_from_slice(&self.version.to_le_bytes());
+        out[12] = self.raptorq_repair_symbols;
+        out[13..16].copy_from_slice(&self.reserved);
+        out[16..24].copy_from_slice(&self.checksum.to_le_bytes());
+        out
+    }
+
+    #[must_use]
+    fn compute_checksum(&self) -> u64 {
+        let mut payload = [0_u8; 16];
+        payload[..8].copy_from_slice(&self.magic);
+        payload[8..12].copy_from_slice(&self.version.to_le_bytes());
+        payload[12] = self.raptorq_repair_symbols;
+        payload[13..16].copy_from_slice(&self.reserved);
+        xxh3_64(&payload)
+    }
+}
 
 /// Unique commit-group identifier:
 /// `group_id := (wal_salt1, wal_salt2, end_frame_no)`.
@@ -982,6 +1081,65 @@ pub fn wal_fec_path_for_wal(wal_path: &Path) -> PathBuf {
     }
 }
 
+/// Read persistent `PRAGMA raptorq_repair_symbols` from `.wal-fec` header.
+///
+/// Returns [`DEFAULT_RAPTORQ_REPAIR_SYMBOLS`] when the sidecar is missing or
+/// still in legacy format without a config header.
+pub fn read_wal_fec_raptorq_repair_symbols(sidecar_path: &Path) -> Result<u8> {
+    if !sidecar_path.exists() {
+        return Ok(DEFAULT_RAPTORQ_REPAIR_SYMBOLS);
+    }
+
+    let bytes = fs::read(sidecar_path)?;
+    let Some(header) = WalFecPragmaHeader::from_prefix(&bytes)? else {
+        return Ok(DEFAULT_RAPTORQ_REPAIR_SYMBOLS);
+    };
+
+    debug!(
+        sidecar = %sidecar_path.display(),
+        raptorq_repair_symbols = header.raptorq_repair_symbols,
+        "loaded wal-fec repair symbol setting from sidecar header"
+    );
+    Ok(header.raptorq_repair_symbols)
+}
+
+/// Persist `PRAGMA raptorq_repair_symbols` in a checksummed `.wal-fec` header.
+///
+/// Existing sidecar group data is preserved exactly after the header region.
+pub fn persist_wal_fec_raptorq_repair_symbols(sidecar_path: &Path, value: u8) -> Result<()> {
+    let existing = if sidecar_path.exists() {
+        fs::read(sidecar_path)?
+    } else {
+        Vec::new()
+    };
+
+    let payload_offset = match WalFecPragmaHeader::from_prefix(&existing)? {
+        Some(_) => WAL_FEC_PRAGMA_HEADER_BYTES,
+        None => 0,
+    };
+
+    let header = WalFecPragmaHeader::new(value);
+    let mut rewritten = Vec::with_capacity(
+        WAL_FEC_PRAGMA_HEADER_BYTES + existing.len().saturating_sub(payload_offset),
+    );
+    rewritten.extend_from_slice(&header.to_bytes());
+    rewritten.extend_from_slice(&existing[payload_offset..]);
+
+    if let Some(parent) = sidecar_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    fs::write(sidecar_path, rewritten)?;
+
+    info!(
+        sidecar = %sidecar_path.display(),
+        raptorq_repair_symbols = value,
+        "persisted wal-fec repair symbol setting"
+    );
+    Ok(())
+}
+
 /// Ensure WAL file and `.wal-fec` sidecar both exist.
 pub fn ensure_wal_with_fec_sidecar(wal_path: &Path) -> Result<PathBuf> {
     OpenOptions::new()
@@ -1035,7 +1193,7 @@ pub fn scan_wal_fec(sidecar_path: &Path) -> Result<WalFecScanResult> {
         return Ok(WalFecScanResult::default());
     }
     let bytes = fs::read(sidecar_path)?;
-    let mut cursor = 0usize;
+    let mut cursor = scan_offset_after_optional_pragma_header(&bytes)?;
     let mut groups = Vec::new();
     let mut truncated_tail = false;
 
@@ -1595,7 +1753,7 @@ fn scan_wal_fec_for_recovery(sidecar_path: &Path) -> Result<Vec<WalFecRecoveryGr
     }
 
     let bytes = fs::read(sidecar_path)?;
-    let mut cursor = 0usize;
+    let mut cursor = scan_offset_after_optional_pragma_header(&bytes)?;
     let mut groups = Vec::new();
 
     while cursor < bytes.len() {
@@ -1667,6 +1825,17 @@ fn build_decode_proof(
 
 fn usize_to_u32(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+fn scan_offset_after_optional_pragma_header(bytes: &[u8]) -> Result<usize> {
+    let Some(header) = WalFecPragmaHeader::from_prefix(bytes)? else {
+        return Ok(0);
+    };
+    debug!(
+        raptorq_repair_symbols = header.raptorq_repair_symbols,
+        "detected wal-fec pragma header during scan"
+    );
+    Ok(WAL_FEC_PRAGMA_HEADER_BYTES)
 }
 
 fn write_length_prefixed(file: &mut File, payload: &[u8], what: &str) -> Result<()> {
@@ -1745,4 +1914,65 @@ fn read_array<const N: usize>(bytes: &[u8], cursor: &mut usize, field: &str) -> 
     out.copy_from_slice(&bytes[*cursor..end]);
     *cursor = end;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_wal_fec_pragma_header_default_without_header() {
+        let dir = tempdir().expect("tempdir");
+        let sidecar = dir.path().join("db.wal-fec");
+
+        fs::write(&sidecar, b"legacy-groups-without-header").expect("write legacy bytes");
+
+        let value = read_wal_fec_raptorq_repair_symbols(&sidecar).expect("read default");
+        assert_eq!(value, DEFAULT_RAPTORQ_REPAIR_SYMBOLS);
+    }
+
+    #[test]
+    fn test_wal_fec_pragma_persist_and_reload_across_reopen() {
+        let dir = tempdir().expect("tempdir");
+        let sidecar = dir.path().join("db.wal-fec");
+
+        persist_wal_fec_raptorq_repair_symbols(&sidecar, 4).expect("persist setting");
+        let first_read = read_wal_fec_raptorq_repair_symbols(&sidecar).expect("read setting");
+        let second_read = read_wal_fec_raptorq_repair_symbols(&sidecar).expect("re-read setting");
+
+        assert_eq!(first_read, 4);
+        assert_eq!(second_read, 4);
+    }
+
+    #[test]
+    fn test_wal_fec_pragma_persist_preserves_payload_bytes() {
+        let dir = tempdir().expect("tempdir");
+        let sidecar = dir.path().join("db.wal-fec");
+        let legacy_payload = vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+        fs::write(&sidecar, &legacy_payload).expect("write legacy payload");
+
+        persist_wal_fec_raptorq_repair_symbols(&sidecar, 9).expect("persist setting");
+
+        let rewritten = fs::read(&sidecar).expect("read rewritten sidecar");
+        assert!(rewritten.len() >= WAL_FEC_PRAGMA_HEADER_BYTES);
+        assert_eq!(
+            &rewritten[WAL_FEC_PRAGMA_HEADER_BYTES..],
+            legacy_payload.as_slice()
+        );
+    }
+
+    #[test]
+    fn test_scan_wal_fec_accepts_header_only_file() {
+        let dir = tempdir().expect("tempdir");
+        let sidecar = dir.path().join("db.wal-fec");
+
+        persist_wal_fec_raptorq_repair_symbols(&sidecar, 3).expect("persist setting");
+        let scan = scan_wal_fec(&sidecar).expect("scan header-only sidecar");
+
+        assert!(scan.groups.is_empty());
+        assert!(!scan.truncated_tail);
+    }
 }

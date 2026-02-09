@@ -460,9 +460,16 @@ impl VdbeProgram {
 /// but we keep these handlers in VDBE (the execution boundary) so higher layers
 /// can remain declarative.
 pub mod pragma {
-    use fsqlite_ast::{Expr, Literal, PragmaStatement, PragmaValue, QualifiedName};
+    use std::path::Path;
+
+    use fsqlite_ast::{Expr, Literal, PragmaStatement, PragmaValue, QualifiedName, UnaryOp};
     use fsqlite_error::{FrankenError, Result};
     use fsqlite_mvcc::TransactionManager;
+    use fsqlite_wal::{
+        MAX_RAPTORQ_REPAIR_SYMBOLS, persist_wal_fec_raptorq_repair_symbols,
+        read_wal_fec_raptorq_repair_symbols,
+    };
+    use tracing::{debug, error, info, warn};
 
     /// Result of applying a PRAGMA statement.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -471,6 +478,8 @@ pub mod pragma {
         Unsupported,
         /// PRAGMA yields a boolean value (e.g. query or echo after set).
         Bool(bool),
+        /// PRAGMA yields an integer value.
+        Int(i64),
     }
 
     /// Apply a PRAGMA statement to the provided connection-scoped state.
@@ -478,13 +487,33 @@ pub mod pragma {
     /// Currently supports:
     /// - `PRAGMA fsqlite.serializable`
     /// - `PRAGMA fsqlite.serializable = ON|OFF|TRUE|FALSE|1|0`
+    /// - `PRAGMA raptorq_repair_symbols`
+    /// - `PRAGMA raptorq_repair_symbols = N` (N in [0, 255])
     ///
     /// Unknown pragmas return [`PragmaOutput::Unsupported`].
     pub fn apply(mgr: &mut TransactionManager, stmt: &PragmaStatement) -> Result<PragmaOutput> {
-        if !is_fsqlite_serializable(&stmt.name) {
-            return Ok(PragmaOutput::Unsupported);
-        }
+        apply_with_sidecar(mgr, stmt, None)
+    }
 
+    /// Apply a PRAGMA statement with optional `.wal-fec` sidecar persistence.
+    pub fn apply_with_sidecar(
+        mgr: &mut TransactionManager,
+        stmt: &PragmaStatement,
+        wal_fec_sidecar_path: Option<&Path>,
+    ) -> Result<PragmaOutput> {
+        if is_fsqlite_serializable(&stmt.name) {
+            return apply_serializable(mgr, stmt);
+        }
+        if is_raptorq_repair_symbols(&stmt.name) {
+            return apply_raptorq_repair_symbols(mgr, stmt, wal_fec_sidecar_path);
+        }
+        Ok(PragmaOutput::Unsupported)
+    }
+
+    fn apply_serializable(
+        mgr: &mut TransactionManager,
+        stmt: &PragmaStatement,
+    ) -> Result<PragmaOutput> {
         match &stmt.value {
             None => Ok(PragmaOutput::Bool(mgr.ssi_enabled())),
             Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
@@ -500,6 +529,116 @@ pub mod pragma {
             .as_deref()
             .is_some_and(|s| s.eq_ignore_ascii_case("fsqlite"))
             && name.name.eq_ignore_ascii_case("serializable")
+    }
+
+    fn is_raptorq_repair_symbols(name: &QualifiedName) -> bool {
+        let schema_ok = match name.schema.as_deref() {
+            None => true,
+            Some(schema) => schema.eq_ignore_ascii_case("fsqlite"),
+        };
+        schema_ok && name.name.eq_ignore_ascii_case("raptorq_repair_symbols")
+    }
+
+    fn apply_raptorq_repair_symbols(
+        mgr: &mut TransactionManager,
+        stmt: &PragmaStatement,
+        wal_fec_sidecar_path: Option<&Path>,
+    ) -> Result<PragmaOutput> {
+        match &stmt.value {
+            None => {
+                if let Some(sidecar) = wal_fec_sidecar_path {
+                    let persisted = read_wal_fec_raptorq_repair_symbols(sidecar)?;
+                    mgr.set_raptorq_repair_symbols(persisted);
+                    debug!(
+                        sidecar = %sidecar.display(),
+                        raptorq_repair_symbols = persisted,
+                        "loaded raptorq_repair_symbols from wal-fec sidecar"
+                    );
+                }
+                Ok(PragmaOutput::Int(i64::from(mgr.raptorq_repair_symbols())))
+            }
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let requested = parse_raptorq_repair_symbols(expr)?;
+                mgr.set_raptorq_repair_symbols(requested);
+
+                if let Some(sidecar) = wal_fec_sidecar_path {
+                    persist_wal_fec_raptorq_repair_symbols(sidecar, requested)?;
+                    info!(
+                        sidecar = %sidecar.display(),
+                        raptorq_repair_symbols = requested,
+                        "persisted raptorq_repair_symbols to wal-fec sidecar"
+                    );
+                }
+
+                Ok(PragmaOutput::Int(i64::from(mgr.raptorq_repair_symbols())))
+            }
+        }
+    }
+
+    fn parse_raptorq_repair_symbols(expr: &Expr) -> Result<u8> {
+        let raw = parse_integer_expr(expr)?;
+        if raw < 0 {
+            warn!(
+                value = raw,
+                "rejecting negative raptorq_repair_symbols value"
+            );
+            return Err(FrankenError::OutOfRange {
+                what: "raptorq_repair_symbols".to_owned(),
+                value: raw.to_string(),
+            });
+        }
+
+        let max = i64::from(MAX_RAPTORQ_REPAIR_SYMBOLS);
+        if raw > max {
+            warn!(
+                value = raw,
+                max = MAX_RAPTORQ_REPAIR_SYMBOLS,
+                "rejecting out-of-range raptorq_repair_symbols value"
+            );
+            return Err(FrankenError::OutOfRange {
+                what: "raptorq_repair_symbols".to_owned(),
+                value: raw.to_string(),
+            });
+        }
+
+        u8::try_from(raw).map_err(|_| {
+            error!(
+                value = raw,
+                "failed to convert validated raptorq_repair_symbols to u8"
+            );
+            FrankenError::OutOfRange {
+                what: "raptorq_repair_symbols".to_owned(),
+                value: raw.to_string(),
+            }
+        })
+    }
+
+    fn parse_integer_expr(expr: &Expr) -> Result<i64> {
+        match expr {
+            Expr::Literal(Literal::Integer(n), _) => Ok(*n),
+            Expr::UnaryOp {
+                op: UnaryOp::Negate,
+                expr,
+                ..
+            } => Ok(-parse_integer_expr(expr)?),
+            Expr::UnaryOp {
+                op: UnaryOp::Plus,
+                expr,
+                ..
+            } => parse_integer_expr(expr),
+            Expr::Column(col, _) => {
+                col.column
+                    .parse::<i64>()
+                    .map_err(|_| FrankenError::TypeMismatch {
+                        expected: "integer (0..255)".to_owned(),
+                        actual: col.column.clone(),
+                    })
+            }
+            other => Err(FrankenError::TypeMismatch {
+                expected: "integer (0..255)".to_owned(),
+                actual: format!("{other:?}"),
+            }),
+        }
     }
 
     fn parse_bool(expr: &Expr) -> Result<bool> {
@@ -936,10 +1075,21 @@ mod tests {
 
     // ── PRAGMA handling (bd-iwu.5) ───────────────────────────────────────
 
+    use std::fs;
+    use std::path::Path;
+
     use fsqlite_ast::Statement;
+    use fsqlite_error::FrankenError;
     use fsqlite_mvcc::{BeginKind, MvccError, TransactionManager};
     use fsqlite_parser::Parser;
-    use fsqlite_types::{CommitSeq, PageData, PageNumber, PageSize};
+    use fsqlite_types::{CommitSeq, ObjectId, Oti, PageData, PageNumber, PageSize};
+    use fsqlite_wal::{
+        DEFAULT_RAPTORQ_REPAIR_SYMBOLS, WalFecGroupMeta, WalFecGroupMetaInit, WalFecGroupRecord,
+        WalFecRecoveryOutcome, WalFrameCandidate, WalSalts, append_wal_fec_group,
+        build_source_page_hashes, generate_wal_fec_repair_symbols,
+        recover_wal_fec_group_with_decoder, scan_wal_fec,
+    };
+    use tempfile::tempdir;
 
     fn parse_pragma(sql: &str) -> std::result::Result<fsqlite_ast::PragmaStatement, String> {
         let mut p = Parser::from_sql(sql);
@@ -954,6 +1104,58 @@ mod tests {
         let mut page = PageData::zeroed(PageSize::DEFAULT);
         page.as_bytes_mut()[0] = first_byte;
         page
+    }
+
+    fn make_source_pages(seed: u8, k_source: u32) -> Vec<Vec<u8>> {
+        let page_len = usize::try_from(PageSize::DEFAULT.get()).expect("page size fits usize");
+        (0..k_source)
+            .map(|idx| {
+                let idx_u8 = u8::try_from(idx).expect("test k_source fits u8");
+                let mut page = vec![seed.wrapping_add(idx_u8); page_len];
+                page[0] = idx_u8;
+                page
+            })
+            .collect()
+    }
+
+    fn make_wal_fec_group(
+        start_frame_no: u32,
+        r_repair: u8,
+        seed: u8,
+    ) -> (WalFecGroupRecord, Vec<Vec<u8>>) {
+        let k_source = 5_u32;
+        let source_pages = make_source_pages(seed, k_source);
+        let page_size = PageSize::DEFAULT.get();
+        let source_hashes = build_source_page_hashes(&source_pages);
+        let page_numbers = (0..k_source).map(|i| 10 + i).collect::<Vec<_>>();
+        let oti = Oti {
+            f: u64::from(k_source) * u64::from(page_size),
+            al: 1,
+            t: page_size,
+            z: 1,
+            n: 1,
+        };
+        let meta = WalFecGroupMeta::from_init(WalFecGroupMetaInit {
+            wal_salt1: 0xA11C_E001,
+            wal_salt2: 0xA11C_E002,
+            start_frame_no,
+            end_frame_no: start_frame_no + (k_source - 1),
+            db_size_pages: 256,
+            page_size,
+            k_source,
+            r_repair: u32::from(r_repair),
+            oti,
+            object_id: ObjectId::from_bytes([seed; 16]),
+            page_numbers,
+            source_page_xxh3_128: source_hashes,
+        })
+        .expect("meta");
+        let repair_symbols =
+            generate_wal_fec_repair_symbols(&meta, &source_pages).expect("symbols");
+        (
+            WalFecGroupRecord::new(meta, repair_symbols).expect("group"),
+            source_pages,
+        )
     }
 
     #[test]
@@ -1057,5 +1259,214 @@ mod tests {
             seq > CommitSeq::ZERO,
             "serializable=OFF must allow write skew"
         );
+    }
+
+    #[test]
+    fn test_pragma_raptorq_repair_symbols_default_query() {
+        let mut mgr = TransactionManager::new(PageSize::DEFAULT);
+        let query = parse_pragma("PRAGMA raptorq_repair_symbols").expect("parse pragma");
+        assert_eq!(
+            pragma::apply(&mut mgr, &query).expect("query pragma"),
+            pragma::PragmaOutput::Int(i64::from(DEFAULT_RAPTORQ_REPAIR_SYMBOLS))
+        );
+    }
+
+    #[test]
+    fn test_bd_1hi_12_unit_compliance_gate() {
+        let dir = tempdir().expect("tempdir");
+        let sidecar = dir.path().join("unit.wal-fec");
+        let db_path = dir.path().join("unit.db");
+        fs::write(&db_path, vec![0_u8; 100]).expect("seed db header");
+
+        let mut conn_a = TransactionManager::new(PageSize::DEFAULT);
+        let mut conn_b = TransactionManager::new(PageSize::DEFAULT);
+
+        let query = parse_pragma("PRAGMA raptorq_repair_symbols").expect("parse query");
+        assert_eq!(
+            pragma::apply_with_sidecar(&mut conn_a, &query, Some(&sidecar)).expect("query default"),
+            pragma::PragmaOutput::Int(i64::from(DEFAULT_RAPTORQ_REPAIR_SYMBOLS))
+        );
+
+        let set_max = parse_pragma("PRAGMA raptorq_repair_symbols = 255").expect("parse set max");
+        assert_eq!(
+            pragma::apply_with_sidecar(&mut conn_a, &set_max, Some(&sidecar)).expect("set max"),
+            pragma::PragmaOutput::Int(255)
+        );
+
+        let set_too_high =
+            parse_pragma("PRAGMA raptorq_repair_symbols = 256").expect("parse set too high");
+        assert!(matches!(
+            pragma::apply_with_sidecar(&mut conn_a, &set_too_high, Some(&sidecar)),
+            Err(FrankenError::OutOfRange { .. })
+        ));
+
+        let set_negative =
+            parse_pragma("PRAGMA raptorq_repair_symbols = -1").expect("parse set negative");
+        assert!(matches!(
+            pragma::apply_with_sidecar(&mut conn_a, &set_negative, Some(&sidecar)),
+            Err(FrankenError::OutOfRange { .. })
+        ));
+
+        let set_non_integer =
+            parse_pragma("PRAGMA raptorq_repair_symbols = ON").expect("parse set non-integer");
+        assert!(matches!(
+            pragma::apply_with_sidecar(&mut conn_a, &set_non_integer, Some(&sidecar)),
+            Err(FrankenError::TypeMismatch { .. })
+        ));
+
+        let query_new_conn = parse_pragma("PRAGMA raptorq_repair_symbols").expect("parse query");
+        assert_eq!(
+            pragma::apply_with_sidecar(&mut conn_b, &query_new_conn, Some(&sidecar))
+                .expect("query persisted value"),
+            pragma::PragmaOutput::Int(255)
+        );
+
+        let set_shared = parse_pragma("PRAGMA raptorq_repair_symbols = 7").expect("parse shared");
+        let _ = pragma::apply_with_sidecar(&mut conn_a, &set_shared, Some(&sidecar))
+            .expect("persist shared setting");
+        assert_eq!(
+            pragma::apply_with_sidecar(&mut conn_b, &query_new_conn, Some(&sidecar))
+                .expect("cross-connection visibility"),
+            pragma::PragmaOutput::Int(7)
+        );
+
+        let db_bytes = fs::read(&db_path).expect("read db header");
+        assert!(
+            db_bytes[72..92].iter().all(|&byte| byte == 0),
+            "sqlite header reserved bytes must remain untouched"
+        );
+    }
+
+    #[test]
+    fn prop_bd_1hi_12_structure_compliance() {
+        let dir = tempdir().expect("tempdir");
+        let sidecar = dir.path().join("property.wal-fec");
+        let mut mgr = TransactionManager::new(PageSize::DEFAULT);
+        let query = parse_pragma("PRAGMA raptorq_repair_symbols").expect("parse query");
+
+        for value in 0_u16..=255_u16 {
+            let sql = format!("PRAGMA raptorq_repair_symbols = {value}");
+            let set_stmt = parse_pragma(&sql).expect("parse set statement");
+            assert_eq!(
+                pragma::apply_with_sidecar(&mut mgr, &set_stmt, Some(&sidecar)).expect("set value"),
+                pragma::PragmaOutput::Int(i64::from(value))
+            );
+            assert_eq!(
+                pragma::apply_with_sidecar(&mut mgr, &query, Some(&sidecar)).expect("query value"),
+                pragma::PragmaOutput::Int(i64::from(value))
+            );
+        }
+    }
+
+    #[test]
+    fn test_e2e_bd_1hi_12_compliance() {
+        let dir = tempdir().expect("tempdir");
+        let sidecar = dir.path().join("e2e.wal-fec");
+        let mut mgr = TransactionManager::new(PageSize::DEFAULT);
+
+        let set_zero = parse_pragma("PRAGMA raptorq_repair_symbols = 0").expect("parse set 0");
+        let _ = pragma::apply_with_sidecar(&mut mgr, &set_zero, Some(&sidecar)).expect("set 0");
+        if mgr.raptorq_repair_symbols() > 0 {
+            let (group, _) = make_wal_fec_group(1, mgr.raptorq_repair_symbols(), 0x10);
+            append_wal_fec_group(&sidecar, &group).expect("append group");
+        }
+        let after_zero = scan_wal_fec(&sidecar).expect("scan after zero");
+        assert!(
+            after_zero.groups.is_empty(),
+            "N=0 must produce no .wal-fec groups for new commits"
+        );
+
+        let set_one = parse_pragma("PRAGMA raptorq_repair_symbols = 1").expect("parse set 1");
+        let _ = pragma::apply_with_sidecar(&mut mgr, &set_one, Some(&sidecar)).expect("set 1");
+        let (group_r1, _) = make_wal_fec_group(1, mgr.raptorq_repair_symbols(), 0x11);
+        append_wal_fec_group(&sidecar, &group_r1).expect("append r=1 group");
+
+        let set_two = parse_pragma("PRAGMA raptorq_repair_symbols = 2").expect("parse set 2");
+        let _ = pragma::apply_with_sidecar(&mut mgr, &set_two, Some(&sidecar)).expect("set 2");
+        let (group_r2, _) = make_wal_fec_group(6, mgr.raptorq_repair_symbols(), 0x22);
+        append_wal_fec_group(&sidecar, &group_r2).expect("append r=2 group");
+
+        let set_four = parse_pragma("PRAGMA raptorq_repair_symbols = 4").expect("parse set 4");
+        let _ = pragma::apply_with_sidecar(&mut mgr, &set_four, Some(&sidecar)).expect("set 4");
+        let (group_r4, source_pages_r4) =
+            make_wal_fec_group(11, mgr.raptorq_repair_symbols(), 0x33);
+        append_wal_fec_group(&sidecar, &group_r4).expect("append r=4 group");
+
+        let scan = scan_wal_fec(&sidecar).expect("scan sidecar");
+        assert_eq!(scan.groups.len(), 3);
+        assert_eq!(scan.groups[0].repair_symbols.len(), 1);
+        assert_eq!(scan.groups[1].repair_symbols.len(), 2);
+        assert_eq!(scan.groups[2].repair_symbols.len(), 4);
+        assert_eq!(scan.groups[1].meta.r_repair, 2);
+        assert_eq!(scan.groups[2].meta.r_repair, 4);
+
+        let group_id = group_r4.meta.group_id();
+        let wal_salts = WalSalts {
+            salt1: group_r4.meta.wal_salt1,
+            salt2: group_r4.meta.wal_salt2,
+        };
+        let k_source = usize::try_from(group_r4.meta.k_source).expect("k fits usize");
+
+        let mut corrupt_three_frames = Vec::new();
+        for (idx, page) in source_pages_r4.iter().enumerate() {
+            let mut payload = page.clone();
+            if idx < 3 {
+                payload[0] ^= 0xFF;
+            }
+            corrupt_three_frames.push(WalFrameCandidate {
+                frame_no: group_r4.meta.start_frame_no + u32::try_from(idx).expect("idx fits u32"),
+                page_data: payload,
+            });
+        }
+        let expected_pages = source_pages_r4.clone();
+        let recovered = recover_wal_fec_group_with_decoder(
+            &sidecar,
+            group_id,
+            wal_salts,
+            group_r4.meta.start_frame_no,
+            &corrupt_three_frames,
+            move |meta: &WalFecGroupMeta, symbols| {
+                if symbols.len() < usize::try_from(meta.k_source).expect("k fits usize") {
+                    return Err(FrankenError::WalCorrupt {
+                        detail: "insufficient symbols".to_owned(),
+                    });
+                }
+                Ok(expected_pages.clone())
+            },
+        )
+        .expect("recover with <=R corruption");
+        match recovered {
+            WalFecRecoveryOutcome::Recovered(group) => {
+                assert_eq!(group.recovered_pages.len(), k_source);
+            }
+            other => panic!("expected recovered outcome, got {other:?}"),
+        }
+
+        let mut corrupt_five_frames = Vec::new();
+        for (idx, page) in source_pages_r4.iter().enumerate() {
+            let mut payload = page.clone();
+            payload[0] ^= 0x55;
+            corrupt_five_frames.push(WalFrameCandidate {
+                frame_no: group_r4.meta.start_frame_no + u32::try_from(idx).expect("idx fits u32"),
+                page_data: payload,
+            });
+        }
+        let truncated = recover_wal_fec_group_with_decoder(
+            &sidecar,
+            group_id,
+            wal_salts,
+            group_r4.meta.start_frame_no,
+            &corrupt_five_frames,
+            |_meta: &WalFecGroupMeta, _symbols| {
+                Err(FrankenError::WalCorrupt {
+                    detail: "decoder should not be able to recover".to_owned(),
+                })
+            },
+        )
+        .expect("recover with >R corruption");
+        assert!(matches!(
+            truncated,
+            WalFecRecoveryOutcome::TruncateBeforeGroup { .. }
+        ));
     }
 }

@@ -705,6 +705,9 @@ dependencies = [
  "fsqlite-pager",
  "fsqlite-parser",
  "fsqlite-types",
+ "fsqlite-wal",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]
