@@ -429,7 +429,7 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
     let hdr_size = page_type.header_size() as usize;
 
     // Compute cell distribution across pages.
-    let distribution = compute_distribution(&all_cells, usable_size, hdr_size)?;
+    let distribution = compute_distribution(&all_cells, usable_size, hdr_size, is_leaf)?;
 
     // Allocate/reuse pages.
     let new_page_count = distribution.len();
@@ -637,8 +637,20 @@ fn cell_on_page_size_from_ref(cell: &CellRef, cell_start: usize) -> usize {
 /// Compute how many cells go on each output page.
 ///
 /// Returns a vector of cell counts per page.
-#[allow(clippy::too_many_lines)]
 fn compute_distribution(
+    cells: &[GatheredCell],
+    usable_size: u32,
+    hdr_size: usize,
+    is_leaf: bool,
+) -> Result<Vec<usize>> {
+    if is_leaf {
+        return compute_leaf_distribution(cells, usable_size, hdr_size);
+    }
+    compute_interior_distribution(cells, usable_size, hdr_size)
+}
+
+#[allow(clippy::too_many_lines)]
+fn compute_leaf_distribution(
     cells: &[GatheredCell],
     usable_size: u32,
     hdr_size: usize,
@@ -653,7 +665,10 @@ fn compute_distribution(
     // Calculate total space needed.
     let total_size: usize = cells
         .iter()
-        .map(|c| c.size as usize + CELL_POINTER_SIZE as usize)
+        .map(cell_cost)
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| FrankenError::internal("balance: cell size overflow while sizing page"))?
+        .into_iter()
         .sum();
 
     // Estimate number of pages needed.
@@ -667,7 +682,8 @@ fn compute_distribution(
     // Greedy first-fit: assign cells to pages left-to-right.
     let mut current_page = 0;
     for (i, cell) in cells.iter().enumerate() {
-        let cell_cost = cell.size as usize + CELL_POINTER_SIZE as usize;
+        let cell_cost = cell_cost(cell)
+            .ok_or_else(|| FrankenError::internal(format!("balance: cell {} size overflow", i)))?;
         if hdr_size + cell_cost > usable_space {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -773,9 +789,120 @@ fn compute_distribution(
         }
     }
 
+    validate_distribution(cells, &distribution, hdr_size, usable_space, true)?;
+
+    Ok(distribution)
+}
+
+fn compute_interior_distribution(
+    cells: &[GatheredCell],
+    usable_size: u32,
+    hdr_size: usize,
+) -> Result<Vec<usize>> {
+    let usable_space = usable_size as usize;
+    let total_cells = cells.len();
+    if total_cells == 0 {
+        return Ok(vec![0]);
+    }
+
+    let mut distribution: Vec<usize> = Vec::new();
+    let mut cursor = 0usize;
+
+    while cursor < total_cells {
+        let mut used = hdr_size;
+        let mut count = 0usize;
+
+        while cursor + count < total_cells {
+            let idx = cursor + count;
+            let cell_cost = cell_cost(&cells[idx]).ok_or_else(|| {
+                FrankenError::internal(format!("balance: interior cell {} size overflow", idx))
+            })?;
+            let Some(next_used) = used.checked_add(cell_cost) else {
+                return Err(FrankenError::internal(format!(
+                    "balance: interior usage overflow on page {}",
+                    distribution.len()
+                )));
+            };
+            if next_used > usable_space {
+                break;
+            }
+            used = next_used;
+            count += 1;
+
+            let remaining = total_cells - (cursor + count);
+            if remaining == 0 {
+                break;
+            }
+
+            if remaining == 1 {
+                // A non-final page needs at least one divider plus one child cell.
+                // Keep packing this page rather than leaving an orphan divider.
+            }
+        }
+
+        if count == 0 {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "balance: interior cell {} cannot fit on page (usable {})",
+                    cursor, usable_space
+                ),
+            });
+        }
+
+        distribution.push(count);
+        cursor += count;
+
+        if cursor < total_cells {
+            // One gathered interior cell is promoted back to the parent divider
+            // between each pair of output pages.
+            cursor += 1;
+            if cursor >= total_cells {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "balance: interior distribution consumed trailing divider".to_owned(),
+                });
+            }
+        }
+    }
+
+    let logical_cells: usize = distribution.iter().sum();
+    let divider_count = distribution.len().saturating_sub(1);
+    if logical_cells + divider_count != total_cells {
+        return Err(FrankenError::internal(format!(
+            "balance: interior distribution accounting mismatch (cells={} dividers={} total={})",
+            logical_cells, divider_count, total_cells
+        )));
+    }
+
+    validate_distribution(cells, &distribution, hdr_size, usable_space, false)?;
+
+    Ok(distribution)
+}
+
+fn validate_distribution(
+    cells: &[GatheredCell],
+    distribution: &[usize],
+    hdr_size: usize,
+    usable_space: usize,
+    is_leaf: bool,
+) -> Result<()> {
+    let total_cells = cells.len();
     let mut cursor = 0usize;
     for (i, &count) in distribution.iter().enumerate() {
-        let slice_end = cursor + count;
+        let Some(slice_end) = cursor.checked_add(count) else {
+            return Err(FrankenError::internal(format!(
+                "balance: distribution overflow at page {}",
+                i
+            )));
+        };
+        if slice_end > total_cells {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "balance: distribution page {} exceeded gathered cells (end={} total={})",
+                    i, slice_end, total_cells
+                ),
+            });
+        }
+
         let payload_bytes = cells[cursor..slice_end]
             .iter()
             .map(|c| c.data.len())
@@ -789,20 +916,38 @@ fn compute_distribution(
                 ),
             });
         }
-        cursor = slice_end;
-    }
-
-    // Verify no page is empty (except in degenerate cases).
-    for (i, &count) in distribution.iter().enumerate() {
         if count == 0 && total_cells > 0 {
             return Err(FrankenError::internal(format!(
                 "balance: page {} in distribution has zero cells",
                 i
             )));
         }
+
+        cursor = slice_end;
+        if !is_leaf && i < distribution.len().saturating_sub(1) {
+            if cursor >= total_cells {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "balance: missing divider cell between interior pages".to_owned(),
+                });
+            }
+            cursor += 1;
+        }
     }
 
-    Ok(distribution)
+    if cursor != total_cells {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "balance: distribution consumed {} cells but gathered {}",
+                cursor, total_cells
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+fn cell_cost(cell: &GatheredCell) -> Option<usize> {
+    cell.data.len().checked_add(CELL_POINTER_SIZE as usize)
 }
 
 // ---------------------------------------------------------------------------
@@ -840,6 +985,18 @@ fn build_page(
         page[content_offset..content_offset + cell_len].copy_from_slice(&cell.data);
         #[allow(clippy::cast_possible_truncation)]
         cell_pointers.push(content_offset as u16);
+    }
+
+    let pointer_array_start = header_offset + page_type.header_size() as usize;
+    let pointer_array_end = pointer_array_start + cells.len() * CELL_POINTER_SIZE as usize;
+    if pointer_array_end > content_offset {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "build_page layout overlap: page_type={page_type:?} header_offset={header_offset} \
+                 pointer_end={pointer_array_end} content_offset={content_offset} cells={} usable={page_size}",
+                cells.len()
+            ),
+        });
     }
 
     // Write header.
@@ -1772,7 +1929,7 @@ mod tests {
             })
             .collect();
 
-        let dist = compute_distribution(&cells, USABLE, 8).unwrap();
+        let dist = compute_distribution(&cells, USABLE, 8, true).unwrap();
         assert_eq!(dist, vec![5]);
     }
 
@@ -1788,7 +1945,7 @@ mod tests {
             })
             .collect();
 
-        let dist = compute_distribution(&cells, USABLE, 8).unwrap();
+        let dist = compute_distribution(&cells, USABLE, 8, true).unwrap();
         assert!(dist.len() >= 3, "should need at least 3 pages");
         assert_eq!(dist.iter().sum::<usize>(), 6);
         // All pages should have cells.
@@ -1797,8 +1954,30 @@ mod tests {
 
     #[test]
     fn test_distribution_empty() {
-        let dist = compute_distribution(&[], USABLE, 8).unwrap();
+        let dist = compute_distribution(&[], USABLE, 8, true).unwrap();
         assert_eq!(dist, vec![0]);
+    }
+
+    #[test]
+    fn test_distribution_interior_accounts_for_parent_dividers() {
+        let cells: Vec<GatheredCell> = (0..15)
+            .map(|_| GatheredCell {
+                data: vec![0; 300],
+                size: 300,
+            })
+            .collect();
+
+        let dist = compute_distribution(&cells, USABLE, 12, false).unwrap();
+        assert!(
+            dist.len() > 1,
+            "interior distribution should split across pages"
+        );
+        assert!(dist.iter().all(|&c| c > 0));
+        assert_eq!(
+            dist.iter().sum::<usize>() + dist.len() - 1,
+            cells.len(),
+            "interior distribution must account for promoted divider cells"
+        );
     }
 
     // -- compute_sibling_range tests --
@@ -1855,6 +2034,24 @@ mod tests {
             let expected = &cells[i].data;
             assert_eq!(&page[offset..offset + expected.len()], expected.as_slice());
         }
+    }
+
+    #[test]
+    fn test_build_page_rejects_header_overlap() {
+        let cells: Vec<GatheredCell> = vec![
+            GatheredCell {
+                data: vec![0xAA; 2_000],
+                size: 2_000,
+            },
+            GatheredCell {
+                data: vec![0xBB; 2_000],
+                size: 2_000,
+            },
+        ];
+
+        let err = build_page(&cells, BtreePageType::LeafTable, 100, USABLE, None)
+            .expect_err("page-1 style header offset should reject overlap");
+        assert!(err.to_string().contains("layout overlap"));
     }
 
     // -- balance_nonroot tests --
