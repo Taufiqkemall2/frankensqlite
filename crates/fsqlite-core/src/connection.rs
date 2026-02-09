@@ -243,6 +243,7 @@ fn compile_expression_select(select: &SelectStatement) -> Result<VdbeProgram> {
     }
 
     let mut builder = ProgramBuilder::new();
+    let mut bind_state = BindParamState::default();
     let init_target = builder.emit_label();
     builder.emit_jump_to_label(Opcode::Init, 0, 0, init_target, P4::None, 0);
 
@@ -296,7 +297,7 @@ fn compile_expression_select(select: &SelectStatement) -> Result<VdbeProgram> {
             let out_first_reg = builder.alloc_regs(out_count);
             let skip_row_label = if let Some(predicate) = where_clause.as_ref() {
                 let predicate_reg = builder.alloc_temp();
-                emit_expr(&mut builder, predicate, predicate_reg)?;
+                emit_expr(&mut builder, predicate, predicate_reg, &mut bind_state)?;
                 let skip_label = builder.emit_label();
                 builder.emit_jump_to_label(
                     Opcode::IfNot,
@@ -327,7 +328,7 @@ fn compile_expression_select(select: &SelectStatement) -> Result<VdbeProgram> {
                     value: idx.to_string(),
                 })?;
                 let output_reg = out_first_reg + idx_i32;
-                emit_expr(&mut builder, expr, output_reg)?;
+                emit_expr(&mut builder, expr, output_reg, &mut bind_state)?;
             }
 
             builder.emit_op(Opcode::ResultRow, out_first_reg, out_count, 0, P4::None, 0);
@@ -371,7 +372,7 @@ fn compile_expression_select(select: &SelectStatement) -> Result<VdbeProgram> {
                         what: "VALUES column index".to_owned(),
                         value: idx.to_string(),
                     })?;
-                    emit_expr(&mut builder, expr, out_first_reg + idx_i32)?;
+                    emit_expr(&mut builder, expr, out_first_reg + idx_i32, &mut bind_state)?;
                 }
                 builder.emit_op(Opcode::ResultRow, out_first_reg, out_count, 0, P4::None, 0);
             }
@@ -383,7 +384,12 @@ fn compile_expression_select(select: &SelectStatement) -> Result<VdbeProgram> {
     builder.finish()
 }
 
-fn emit_expr(builder: &mut ProgramBuilder, expr: &Expr, target_reg: i32) -> Result<()> {
+fn emit_expr(
+    builder: &mut ProgramBuilder,
+    expr: &Expr,
+    target_reg: i32,
+    bind_state: &mut BindParamState,
+) -> Result<()> {
     match expr {
         Expr::Literal(literal, _) => {
             emit_literal(builder, literal, target_reg);
@@ -391,8 +397,10 @@ fn emit_expr(builder: &mut ProgramBuilder, expr: &Expr, target_reg: i32) -> Resu
         }
         Expr::BinaryOp {
             left, op, right, ..
-        } => emit_binary_expr(builder, left, *op, right, target_reg),
-        Expr::UnaryOp { op, expr, .. } => emit_unary_expr(builder, *op, expr, target_reg),
+        } => emit_binary_expr(builder, left, *op, right, target_reg, bind_state),
+        Expr::UnaryOp { op, expr, .. } => {
+            emit_unary_expr(builder, *op, expr, target_reg, bind_state)
+        }
         Expr::FunctionCall {
             name,
             args,
@@ -410,7 +418,7 @@ fn emit_expr(builder: &mut ProgramBuilder, expr: &Expr, target_reg: i32) -> Resu
             target_reg,
         ),
         Expr::Placeholder(placeholder, _) => {
-            let param_index = placeholder_to_index(placeholder)?;
+            let param_index = placeholder_to_index(placeholder, bind_state)?;
             builder.emit_op(Opcode::Variable, param_index, target_reg, 0, P4::None, 0);
             Ok(())
         }
@@ -425,13 +433,14 @@ fn emit_expr(builder: &mut ProgramBuilder, expr: &Expr, target_reg: i32) -> Resu
             whens,
             else_expr.as_deref(),
             target_reg,
+            bind_state,
         ),
         Expr::Cast {
             expr: inner,
             type_name,
             ..
         } => {
-            emit_expr(builder, inner, target_reg)?;
+            emit_expr(builder, inner, target_reg, bind_state)?;
             let affinity = type_name_to_affinity(&type_name.name);
             builder.emit_op(
                 Opcode::Cast,
@@ -446,7 +455,7 @@ fn emit_expr(builder: &mut ProgramBuilder, expr: &Expr, target_reg: i32) -> Resu
         Expr::IsNull {
             expr: inner, not, ..
         } => {
-            emit_expr(builder, inner, target_reg)?;
+            emit_expr(builder, inner, target_reg, bind_state)?;
             let lbl_null = builder.emit_label();
             let lbl_done = builder.emit_label();
             builder.emit_jump_to_label(Opcode::IsNull, target_reg, 0, lbl_null, P4::None, 0);
@@ -471,11 +480,12 @@ fn emit_binary_expr(
     op: BinaryOp,
     right: &Expr,
     target_reg: i32,
+    bind_state: &mut BindParamState,
 ) -> Result<()> {
     let left_reg = builder.alloc_temp();
     let right_reg = builder.alloc_temp();
-    emit_expr(builder, left, left_reg)?;
-    emit_expr(builder, right, right_reg)?;
+    emit_expr(builder, left, left_reg, bind_state)?;
+    emit_expr(builder, right, right_reg, bind_state)?;
 
     let opcode = match op {
         BinaryOp::Add => Opcode::Add,
@@ -552,19 +562,20 @@ fn emit_unary_expr(
     op: UnaryOp,
     expr: &Expr,
     target_reg: i32,
+    bind_state: &mut BindParamState,
 ) -> Result<()> {
     match op {
-        UnaryOp::Plus => emit_expr(builder, expr, target_reg),
+        UnaryOp::Plus => emit_expr(builder, expr, target_reg, bind_state),
         UnaryOp::BitNot => {
             let source_reg = builder.alloc_temp();
-            emit_expr(builder, expr, source_reg)?;
+            emit_expr(builder, expr, source_reg, bind_state)?;
             builder.emit_op(Opcode::BitNot, source_reg, target_reg, 0, P4::None, 0);
             builder.free_temp(source_reg);
             Ok(())
         }
         UnaryOp::Not => {
             let source_reg = builder.alloc_temp();
-            emit_expr(builder, expr, source_reg)?;
+            emit_expr(builder, expr, source_reg, bind_state)?;
             builder.emit_op(Opcode::Not, source_reg, target_reg, 0, P4::None, 0);
             builder.free_temp(source_reg);
             Ok(())
@@ -572,7 +583,7 @@ fn emit_unary_expr(
         UnaryOp::Negate => {
             let source_reg = builder.alloc_temp();
             let zero_reg = builder.alloc_temp();
-            emit_expr(builder, expr, source_reg)?;
+            emit_expr(builder, expr, source_reg, bind_state)?;
             builder.emit_op(Opcode::Integer, 0, zero_reg, 0, P4::None, 0);
             // target = 0 - source
             builder.emit_op(
@@ -684,14 +695,54 @@ fn literal_typeof(literal: &Literal) -> &'static str {
     }
 }
 
-fn placeholder_to_index(placeholder: &PlaceholderType) -> Result<i32> {
-    match placeholder {
-        PlaceholderType::Anonymous => Ok(1),
-        PlaceholderType::Numbered(index) => {
-            i32::try_from(*index).map_err(|_| FrankenError::OutOfRange {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BindParamState {
+    next_index: i32,
+}
+
+impl Default for BindParamState {
+    fn default() -> Self {
+        Self { next_index: 1 }
+    }
+}
+
+impl BindParamState {
+    fn claim_anonymous(&mut self) -> Result<i32> {
+        let index = self.next_index;
+        self.next_index =
+            self.next_index
+                .checked_add(1)
+                .ok_or_else(|| FrankenError::OutOfRange {
+                    what: "placeholder index".to_owned(),
+                    value: index.to_string(),
+                })?;
+        Ok(index)
+    }
+
+    fn register_numbered(&mut self, index: i32) -> Result<i32> {
+        let next = index
+            .checked_add(1)
+            .ok_or_else(|| FrankenError::OutOfRange {
                 what: "placeholder index".to_owned(),
                 value: index.to_string(),
-            })
+            })?;
+        self.next_index = self.next_index.max(next);
+        Ok(index)
+    }
+}
+
+fn placeholder_to_index(
+    placeholder: &PlaceholderType,
+    bind_state: &mut BindParamState,
+) -> Result<i32> {
+    match placeholder {
+        PlaceholderType::Anonymous => bind_state.claim_anonymous(),
+        PlaceholderType::Numbered(index) => {
+            let index = i32::try_from(*index).map_err(|_| FrankenError::OutOfRange {
+                what: "placeholder index".to_owned(),
+                value: index.to_string(),
+            })?;
+            bind_state.register_numbered(index)
         }
         PlaceholderType::ColonNamed(name)
         | PlaceholderType::AtNamed(name)
@@ -707,11 +758,12 @@ fn emit_case_expr(
     whens: &[(Expr, Expr)],
     else_expr: Option<&Expr>,
     target_reg: i32,
+    bind_state: &mut BindParamState,
 ) -> Result<()> {
     let done_label = builder.emit_label();
     let r_operand = if let Some(op_expr) = operand {
         let r = builder.alloc_temp();
-        emit_expr(builder, op_expr, r)?;
+        emit_expr(builder, op_expr, r, bind_state)?;
         Some(r)
     } else {
         None
@@ -722,21 +774,21 @@ fn emit_case_expr(
 
         if let Some(r_op) = r_operand {
             let r_when = builder.alloc_temp();
-            emit_expr(builder, when_expr, r_when)?;
+            emit_expr(builder, when_expr, r_when, bind_state)?;
             builder.emit_jump_to_label(Opcode::Ne, r_when, r_op, next_when, P4::None, 0);
             builder.free_temp(r_when);
         } else {
-            emit_expr(builder, when_expr, target_reg)?;
+            emit_expr(builder, when_expr, target_reg, bind_state)?;
             builder.emit_jump_to_label(Opcode::IfNot, target_reg, 1, next_when, P4::None, 0);
         }
 
-        emit_expr(builder, then_expr, target_reg)?;
+        emit_expr(builder, then_expr, target_reg, bind_state)?;
         builder.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
         builder.resolve_label(next_when);
     }
 
     if let Some(el) = else_expr {
-        emit_expr(builder, el, target_reg)?;
+        emit_expr(builder, el, target_reg, bind_state)?;
     } else {
         builder.emit_op(Opcode::Null, 0, target_reg, 0, P4::None, 0);
     }
@@ -914,5 +966,51 @@ mod tests {
         let rows = stmt.query_with_params(&[SqliteValue::Integer(9)]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(10)]);
+    }
+
+    #[test]
+    fn test_query_with_params_anonymous_placeholders_are_distinct() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query_with_params(
+                "SELECT ? + ?, ?;",
+                &[
+                    SqliteValue::Integer(2),
+                    SqliteValue::Integer(5),
+                    SqliteValue::Text("ok".to_owned()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Integer(7), SqliteValue::Text("ok".to_owned())]
+        );
+    }
+
+    #[test]
+    fn test_query_with_params_mixed_numbered_and_anonymous() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query_with_params(
+                "SELECT ?2, ?, ?3, ?;",
+                &[
+                    SqliteValue::Integer(10),
+                    SqliteValue::Integer(20),
+                    SqliteValue::Integer(30),
+                    SqliteValue::Integer(40),
+                ],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Integer(20),
+                SqliteValue::Integer(30),
+                SqliteValue::Integer(30),
+                SqliteValue::Integer(40),
+            ]
+        );
     }
 }
