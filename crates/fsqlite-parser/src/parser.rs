@@ -2720,4 +2720,245 @@ mod tests {
             unreachable!("expected Select");
         }
     }
+
+    // -----------------------------------------------------------------------
+    // bd-2kvo Phase 3 acceptance: Error recovery with line:column spans
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parser_error_recovery_with_span() {
+        // Multi-line input with an error on line 2.
+        let sql = "SELECT 1;\nXYZZY 42;\nSELECT 3";
+        let mut p = Parser::from_sql(sql);
+        let (stmts, errs) = p.parse_all();
+        assert_eq!(stmts.len(), 2, "should recover two valid statements");
+        assert!(!errs.is_empty(), "should report at least one error");
+
+        let err = &errs[0];
+        // XYZZY starts at line 2, column 1.
+        assert_eq!(err.line, 2, "error should be on line 2");
+        assert_eq!(err.col, 1, "error should be at column 1");
+        // Span should be non-zero and point within the source.
+        assert!(
+            err.span.start < err.span.end,
+            "error span should be non-empty"
+        );
+        let source_len = u32::try_from(sql.len()).unwrap();
+        assert!(
+            err.span.end <= source_len,
+            "error span.end should be within source"
+        );
+    }
+
+    #[test]
+    fn test_parser_error_span_mid_line() {
+        // Incomplete CREATE should produce an error.
+        let bad = Parser::from_sql("CREATE").parse_statement();
+        assert!(bad.is_err());
+        let err = bad.unwrap_err();
+        assert_eq!(err.line, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-2kvo Phase 3 acceptance: Keyword lookup covers 150+ keywords
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parser_keyword_lookup_all_150() {
+        use crate::token::TokenKind;
+
+        // Exhaustive list of all SQL keywords in lookup_keyword.
+        let keywords = [
+            "ABORT",
+            "ACTION",
+            "ADD",
+            "AFTER",
+            "ALL",
+            "ALTER",
+            "ALWAYS",
+            "ANALYZE",
+            "AND",
+            "AS",
+            "ASC",
+            "ATTACH",
+            "AUTOINCREMENT",
+            "BEFORE",
+            "BEGIN",
+            "BETWEEN",
+            "BY",
+            "CASCADE",
+            "CASE",
+            "CAST",
+            "CHECK",
+            "COLLATE",
+            "COLUMN",
+            "COMMIT",
+            "CONCURRENT",
+            "CONFLICT",
+            "CONSTRAINT",
+            "CREATE",
+            "CROSS",
+            "CURRENT_DATE",
+            "CURRENT_TIME",
+            "CURRENT_TIMESTAMP",
+            "DATABASE",
+            "DEFAULT",
+            "DEFERRABLE",
+            "DEFERRED",
+            "DELETE",
+            "DESC",
+            "DETACH",
+            "DISTINCT",
+            "DO",
+            "DROP",
+            "EACH",
+            "ELSE",
+            "END",
+            "ESCAPE",
+            "EXCEPT",
+            "EXCLUDE",
+            "EXCLUSIVE",
+            "EXISTS",
+            "EXPLAIN",
+            "FAIL",
+            "FILTER",
+            "FIRST",
+            "FOLLOWING",
+            "FOR",
+            "FOREIGN",
+            "FROM",
+            "FULL",
+            "GENERATED",
+            "GLOB",
+            "GROUP",
+            "GROUPS",
+            "HAVING",
+            "IF",
+            "IGNORE",
+            "IMMEDIATE",
+            "IN",
+            "INDEX",
+            "INDEXED",
+            "INITIALLY",
+            "INNER",
+            "INSERT",
+            "INSTEAD",
+            "INTERSECT",
+            "INTO",
+            "IS",
+            "ISNULL",
+            "JOIN",
+            "KEY",
+            "LAST",
+            "LEFT",
+            "LIKE",
+            "LIMIT",
+            "MATCH",
+            "MATERIALIZED",
+            "NATURAL",
+            "NO",
+            "NOT",
+            "NOTHING",
+            "NOTNULL",
+            "NULL",
+            "NULLS",
+            "OF",
+            "OFFSET",
+            "ON",
+            "OR",
+            "ORDER",
+            "OTHERS",
+            "OUTER",
+            "OVER",
+            "PARTITION",
+            "PLAN",
+            "PRAGMA",
+            "PRECEDING",
+            "PRIMARY",
+            "QUERY",
+            "RAISE",
+            "RANGE",
+            "RECURSIVE",
+            "REFERENCES",
+            "REGEXP",
+            "REINDEX",
+            "RELEASE",
+            "RENAME",
+            "REPLACE",
+            "RESTRICT",
+            "RETURNING",
+            "RIGHT",
+            "ROLLBACK",
+            "ROW",
+            "ROWS",
+            "SAVEPOINT",
+            "SELECT",
+            "SET",
+            "STORED",
+            "STRICT",
+            "TABLE",
+            "TEMP",
+            "TEMPORARY",
+            "THEN",
+            "TIES",
+            "TO",
+            "TRANSACTION",
+            "TRIGGER",
+            "TRUE",
+            "FALSE",
+            "UNBOUNDED",
+            "UNION",
+            "UNIQUE",
+            "UPDATE",
+            "USING",
+            "VACUUM",
+            "VALUES",
+            "VIEW",
+            "VIRTUAL",
+            "WHEN",
+            "WHERE",
+            "WINDOW",
+            "WITH",
+            "WITHOUT",
+        ];
+
+        assert!(
+            keywords.len() >= 150,
+            "expected 150+ keywords, got {}",
+            keywords.len()
+        );
+
+        for kw in &keywords {
+            assert!(
+                TokenKind::lookup_keyword(kw).is_some(),
+                "keyword {kw} not recognized (uppercase)"
+            );
+            // Case-insensitive: lowercase must also work.
+            let lower = kw.to_ascii_lowercase();
+            assert!(
+                TokenKind::lookup_keyword(&lower).is_some(),
+                "keyword {kw} not recognized (lowercase)"
+            );
+            // Mixed case.
+            let mixed: String = kw
+                .chars()
+                .enumerate()
+                .map(|(i, c)| {
+                    if i % 2 == 0 {
+                        c.to_ascii_lowercase()
+                    } else {
+                        c.to_ascii_uppercase()
+                    }
+                })
+                .collect();
+            assert!(
+                TokenKind::lookup_keyword(&mixed).is_some(),
+                "keyword {kw} not recognized (mixed case: {mixed})"
+            );
+        }
+
+        // Non-keyword should return None.
+        assert!(TokenKind::lookup_keyword("FOOBAR").is_none());
+        assert!(TokenKind::lookup_keyword("").is_none());
+    }
 }
