@@ -8,6 +8,7 @@ use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
 
 pub mod codegen;
+pub mod frame;
 
 // ── Label System ────────────────────────────────────────────────────────────
 

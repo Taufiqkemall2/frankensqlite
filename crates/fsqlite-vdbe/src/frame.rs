@@ -370,7 +370,10 @@ mod tests {
             pushed <= 10,
             "expected ~10 frames allowed, but got {pushed}"
         );
-        assert!(pushed >= 10, "expected at least 10 frames, but got {pushed}");
+        assert!(
+            pushed >= 10,
+            "expected at least 10 frames, but got {pushed}"
+        );
     }
 
     // ── Test 4: test_trigger_recursive_off_prevents_self_fire ───────────
@@ -426,7 +429,8 @@ mod tests {
         assert_eq!(stack.depth(), 5);
 
         // The 5th trigger (top of stack) raises RAISE(ABORT, "constraint failed").
-        stack.top_mut().unwrap().raise_result = Some(RaiseResult::Abort("constraint failed".to_owned()));
+        stack.top_mut().unwrap().raise_result =
+            Some(RaiseResult::Abort("constraint failed".to_owned()));
 
         // Verify the raise result is accessible.
         let top = stack.top().unwrap();
@@ -485,7 +489,10 @@ mod tests {
 
         // Read OLD.a (register at old_base + 0).
         let old_base = mapping.old_base.unwrap() as usize;
-        assert!(matches!(parent.registers[old_base], SqliteValue::Integer(10)));
+        assert!(matches!(
+            parent.registers[old_base],
+            SqliteValue::Integer(10)
+        ));
 
         // Read NEW.b (register at new_base + 1).
         let new_base = mapping.new_base.unwrap() as usize;
@@ -499,11 +506,17 @@ mod tests {
         // Verify the modification persists.
         let parent = &stack.frames[0];
         let new_base = parent.pseudo_tables.as_ref().unwrap().new_base.unwrap() as usize;
-        assert!(matches!(parent.registers[new_base], SqliteValue::Integer(999)));
+        assert!(matches!(
+            parent.registers[new_base],
+            SqliteValue::Integer(999)
+        ));
 
         // Verify OLD is unchanged.
         let old_base = parent.pseudo_tables.as_ref().unwrap().old_base.unwrap() as usize;
-        assert!(matches!(parent.registers[old_base], SqliteValue::Integer(10)));
+        assert!(matches!(
+            parent.registers[old_base],
+            SqliteValue::Integer(10)
+        ));
 
         // Clean up.
         stack.unwind_all();

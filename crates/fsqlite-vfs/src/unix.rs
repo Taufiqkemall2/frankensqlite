@@ -70,6 +70,158 @@ const SHARED_FIRST: u64 = PENDING_BYTE + 2;
 const SHARED_SIZE: u64 = 510;
 
 // ---------------------------------------------------------------------------
+// WAL SHM header initialization (legacy SQLite interop)
+// ---------------------------------------------------------------------------
+
+/// SQLite WAL-index SHM segment size (`WALINDEX_PGSZ` in `wal.c`).
+///
+/// This is always 32 KiB and is required so that legacy SQLite can map
+/// the first wal-index page without needing to take `WAL_WRITE_LOCK` just to
+/// grow the `*-shm` file. If we hold `WAL_WRITE_LOCK` on a freshly created
+/// zero-byte `*-shm`, legacy SQLite will spin in `walTryBeginRead()` and
+/// eventually surface `SQLITE_PROTOCOL` ("locking protocol").
+const SQLITE_WALINDEX_PGSZ: u64 = 32 * 1024;
+
+/// Bytes in the `*-shm` header region: 2x `WalIndexHdr` (48 bytes each) + `WalCkptInfo` (40 bytes).
+const SQLITE_WAL_SHM_HEADER_BYTES: usize = 136;
+
+/// `WalIndexHdr.iVersion` constant (must be 3007000).
+const SQLITE_WAL_INDEX_VERSION: u32 = 3_007_000;
+
+/// `WalCkptInfo.aReadMark[i]` value indicating the slot is unused.
+const SQLITE_WAL_READMARK_NOT_USED: u32 = 0xffff_ffff;
+
+/// Slot index for the `*-shm` deadman-switch (DMS) byte.
+///
+/// In C SQLite's unix VFS, this is `UNIX_SHM_DMS = UNIX_SHM_BASE + SQLITE_SHM_NLOCK`
+/// and lives at byte offset 128. Holding a SHARED lock on this byte prevents
+/// new openers from truncating the `*-shm` file on startup.
+const SQLITE_SHM_DMS_SLOT: u32 = WAL_TOTAL_LOCKS;
+
+fn sqlite_wal_path(path: &Path) -> PathBuf {
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    PathBuf::from(wal)
+}
+
+fn sqlite_page_size_from_db_header(db_header: &[u8]) -> Result<u32> {
+    const DB_HEADER_BYTES: usize = 100;
+    if db_header.len() < DB_HEADER_BYTES {
+        return Err(FrankenError::WalCorrupt {
+            detail: format!(
+                "sqlite db header too small: expected >= {DB_HEADER_BYTES}, got {}",
+                db_header.len()
+            ),
+        });
+    }
+
+    let raw = u16::from_be_bytes([db_header[16], db_header[17]]);
+    let page_size = if raw == 1 { 65_536 } else { u32::from(raw) };
+    if !(page_size.is_power_of_two() && (512..=65_536).contains(&page_size)) {
+        return Err(FrankenError::WalCorrupt {
+            detail: format!("invalid sqlite page size in db header: {page_size}"),
+        });
+    }
+    Ok(page_size)
+}
+
+fn sqlite_wal_checksum_native_8byte_chunks(data: &[u8]) -> Result<(u32, u32)> {
+    if data.len() % 8 != 0 {
+        return Err(FrankenError::WalCorrupt {
+            detail: format!(
+                "sqlite wal checksum input must be 8-byte aligned, got {} bytes",
+                data.len()
+            ),
+        });
+    }
+
+    let mut s1 = 0_u32;
+    let mut s2 = 0_u32;
+    for chunk in data.chunks_exact(8) {
+        let w1 = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let w2 = u32::from_ne_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+        s1 = s1.wrapping_add(w1).wrapping_add(s2);
+        s2 = s2.wrapping_add(w2).wrapping_add(s1);
+    }
+    Ok((s1, s2))
+}
+
+fn write_ne_u32(buf: &mut [u8], offset: usize, value: u32) {
+    buf[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+}
+
+fn build_empty_sqlite_wal_shm_header(
+    page_size: u32,
+    n_page: u32,
+) -> Result<[u8; SQLITE_WAL_SHM_HEADER_BYTES]> {
+    let sz_page_u16 = if page_size == 65_536 {
+        1_u16
+    } else {
+        u16::try_from(page_size).map_err(|_| FrankenError::WalCorrupt {
+            detail: format!("page size too large for wal-index header: {page_size}"),
+        })?
+    };
+
+    // Build a single WalIndexHdr copy (48 bytes) in native order.
+    let mut hdr = [0_u8; 48];
+    write_ne_u32(&mut hdr, 0, SQLITE_WAL_INDEX_VERSION);
+    write_ne_u32(&mut hdr, 4, 0); // unused
+    write_ne_u32(&mut hdr, 8, 0); // iChange
+    hdr[12] = 1; // isInit
+    hdr[13] = 0; // bigEndCksum (normal little-endian WAL checksums)
+    hdr[14..16].copy_from_slice(&sz_page_u16.to_ne_bytes());
+    write_ne_u32(&mut hdr, 16, 0); // mxFrame (empty WAL)
+    write_ne_u32(&mut hdr, 20, n_page);
+    write_ne_u32(&mut hdr, 24, 0); // aFrameCksum[0]
+    write_ne_u32(&mut hdr, 28, 0); // aFrameCksum[1]
+    write_ne_u32(&mut hdr, 32, 0); // aSalt[0]
+    write_ne_u32(&mut hdr, 36, 0); // aSalt[1]
+
+    let (ck1, ck2) = sqlite_wal_checksum_native_8byte_chunks(&hdr[..40])?;
+    write_ne_u32(&mut hdr, 40, ck1);
+    write_ne_u32(&mut hdr, 44, ck2);
+
+    // Build WalCkptInfo (40 bytes) in native order.
+    let mut ckpt = [0_u8; 40];
+    write_ne_u32(&mut ckpt, 0, 0); // nBackfill
+    // aReadMark[0] is always 0; remaining marks unused for empty WAL.
+    write_ne_u32(&mut ckpt, 4, 0);
+    for i in 1..5 {
+        write_ne_u32(&mut ckpt, 4 + i * 4, SQLITE_WAL_READMARK_NOT_USED);
+    }
+    // aLock[8] left as zeros (reserved bytes for OS-level locks).
+    write_ne_u32(&mut ckpt, 32, 0); // nBackfillAttempted
+    write_ne_u32(&mut ckpt, 36, 0); // notUsed0
+
+    let mut out = [0_u8; SQLITE_WAL_SHM_HEADER_BYTES];
+    out[..48].copy_from_slice(&hdr);
+    out[48..96].copy_from_slice(&hdr);
+    out[96..136].copy_from_slice(&ckpt);
+    Ok(out)
+}
+
+fn sqlite_wal_shm_header_is_valid(buf: &[u8]) -> Result<bool> {
+    if buf.len() < SQLITE_WAL_SHM_HEADER_BYTES {
+        return Ok(false);
+    }
+
+    let h1 = &buf[..48];
+    let h2 = &buf[48..96];
+    if h1 != h2 {
+        return Ok(false);
+    }
+
+    if h1[12] == 0 {
+        return Ok(false);
+    }
+
+    let (expected1, expected2) = sqlite_wal_checksum_native_8byte_chunks(&h1[..40])?;
+    let actual1 = u32::from_ne_bytes([h1[40], h1[41], h1[42], h1[43]]);
+    let actual2 = u32::from_ne_bytes([h1[44], h1[45], h1[46], h1[47]]);
+    Ok(expected1 == actual1 && expected2 == actual2)
+}
+
+// ---------------------------------------------------------------------------
 // POSIX fcntl helpers
 // ---------------------------------------------------------------------------
 
@@ -250,7 +402,11 @@ struct ShmInfo {
 
 impl ShmInfo {
     fn new(file: Arc<File>) -> Self {
-        let slot_count = usize::try_from(WAL_TOTAL_LOCKS).expect("WAL lock count fits in usize");
+        // Slots 0..WAL_TOTAL_LOCKS are the 8 legacy WAL lock bytes (120-127).
+        // Slot WAL_TOTAL_LOCKS is the DMS ("deadman switch") byte (128) used by
+        // SQLite to coordinate first-opener truncation of `*-shm`.
+        let slot_count =
+            usize::try_from(WAL_TOTAL_LOCKS.saturating_add(1)).expect("WAL lock count fits usize");
         Self {
             file,
             regions: HashMap::new(),
@@ -944,7 +1100,9 @@ impl UnixFile {
             WAL_WRITE_LOCK,
             1,
             SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
-        )
+        )?;
+        self.compat_writer_init_wal_shm_header_if_needed(cx)?;
+        Ok(())
     }
 
     pub fn compat_writer_release_wal_write_lock(&mut self, cx: &Cx) -> Result<()> {
@@ -954,6 +1112,89 @@ impl UnixFile {
             1,
             SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
         )
+    }
+
+    fn compat_writer_init_wal_shm_header_if_needed(&mut self, cx: &Cx) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+
+        // This routine is called while holding WAL_WRITE_LOCK. Its job is to
+        // ensure legacy SQLite can start a read transaction without needing to
+        // grab WAL_WRITE_LOCK just to initialize `*-shm`.
+        let shm_info = self.ensure_shm_info()?;
+        let shm_file = {
+            let info = shm_info.lock().expect("shm info lock poisoned");
+            Arc::clone(&info.file)
+        };
+
+        let len = shm_file.metadata().map_err(FrankenError::Io)?.len();
+        if len < SQLITE_WALINDEX_PGSZ {
+            shm_file
+                .set_len(SQLITE_WALINDEX_PGSZ)
+                .map_err(FrankenError::Io)?;
+        }
+
+        let mut header_buf = [0_u8; SQLITE_WAL_SHM_HEADER_BYTES];
+        let read = shm_file
+            .read_at(&mut header_buf, 0)
+            .map_err(FrankenError::Io)?;
+        if read == SQLITE_WAL_SHM_HEADER_BYTES && sqlite_wal_shm_header_is_valid(&header_buf)? {
+            return Ok(());
+        }
+
+        let wal_path = sqlite_wal_path(&self.path);
+        let wal_has_frames = fs::metadata(&wal_path)
+            .is_ok_and(|m| m.len() > 0);
+        if wal_has_frames {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "cannot initialize shm header while wal file has content: {}",
+                    wal_path.display()
+                ),
+            });
+        }
+
+        let mut db_hdr = [0_u8; 100];
+        let hdr_read = self
+            .file
+            .read_at(&mut db_hdr, 0)
+            .map_err(FrankenError::Io)?;
+        if hdr_read != db_hdr.len() {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "cannot initialize shm header: db header short read (read {hdr_read} bytes)"
+                ),
+            });
+        }
+        let page_size = sqlite_page_size_from_db_header(&db_hdr)?;
+        let db_len = self.file.metadata().map_err(FrankenError::Io)?.len();
+        let n_page_u64 = db_len / u64::from(page_size);
+        let n_page = u32::try_from(n_page_u64).unwrap_or(u32::MAX);
+
+        let header = build_empty_sqlite_wal_shm_header(page_size, n_page)?;
+        let mut written = 0_usize;
+        while written < header.len() {
+            let offset = u64::try_from(written).expect("header write offset fits u64");
+            let n = shm_file
+                .write_at(&header[written..], offset)
+                .map_err(FrankenError::Io)?;
+            if n == 0 {
+                return Err(FrankenError::Io(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "unix vfs shm header write_at returned 0",
+                )));
+            }
+            written += n;
+        }
+
+        let mut verify = [0_u8; SQLITE_WAL_SHM_HEADER_BYTES];
+        let verify_read = shm_file.read_at(&mut verify, 0).map_err(FrankenError::Io)?;
+        if verify_read != SQLITE_WAL_SHM_HEADER_BYTES || !sqlite_wal_shm_header_is_valid(&verify)? {
+            return Err(FrankenError::WalCorrupt {
+                detail: "shm header initialization failed local validation".to_owned(),
+            });
+        }
+
+        Ok(())
     }
 
     #[must_use]
