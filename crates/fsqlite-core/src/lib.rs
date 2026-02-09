@@ -5,8 +5,10 @@
 //! (`FrankenError::Busy`) instead of queue-and-wait semantics.
 
 pub mod commit_repair;
+pub mod decode_proofs;
 pub mod region;
 pub mod repair_symbols;
+pub mod symbol_size_policy;
 
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
