@@ -20,10 +20,12 @@
 //! (no I/O), keeping it short.
 
 use std::collections::HashMap;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use fsqlite_types::{CommitSeq, PageNumber};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 use crate::page_buf::PageBuf;
 
@@ -369,6 +371,49 @@ pub enum CacheLookup {
     GhostHitB2,
     /// Complete miss — not in any list.
     Miss,
+}
+
+/// Outcome of [`ArcCache::request_async`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsyncLookup {
+    /// Key was already resident in T1/T2.
+    Hit,
+    /// This caller loaded and admitted the page.
+    Loaded,
+    /// This caller waited for another loader and observed a hit.
+    WaitedForPeerHit,
+    /// This caller waited for another loader, but no page was admitted
+    /// (peer cancelled/failed/panicked).
+    WaitedForPeerMiss,
+}
+
+#[derive(Debug)]
+struct InflightLoad {
+    state: Mutex<InflightState>,
+    cv: Condvar,
+}
+
+impl InflightLoad {
+    fn new_loading() -> Self {
+        Self {
+            state: Mutex::new(InflightState {
+                loading: true,
+                waiters: 0,
+            }),
+            cv: Condvar::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InflightState {
+    loading: bool,
+    waiters: usize,
+}
+
+enum InflightRole {
+    Leader(Arc<InflightLoad>),
+    Waiter(Arc<InflightLoad>),
 }
 
 /// Core ARC state.  Not thread-safe — wrap in [`ArcCache`] for concurrent use.
@@ -1140,6 +1185,7 @@ impl std::fmt::Debug for ArcCacheInner {
 /// Thread-safe ARC cache wrapping [`ArcCacheInner`] in a [`Mutex`].
 pub struct ArcCache {
     inner: Mutex<ArcCacheInner>,
+    inflight: Mutex<HashMap<CacheKey, Arc<InflightLoad>>>,
 }
 
 impl ArcCache {
@@ -1148,6 +1194,7 @@ impl ArcCache {
     pub fn new(capacity: usize, max_bytes: usize) -> Self {
         Self {
             inner: Mutex::new(ArcCacheInner::new(capacity, max_bytes)),
+            inflight: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1155,12 +1202,126 @@ impl ArcCache {
     pub fn lock(&self) -> parking_lot::MutexGuard<'_, ArcCacheInner> {
         self.inner.lock()
     }
+
+    /// Singleflight miss path: suppress duplicate concurrent loads for `key`.
+    ///
+    /// The selected leader executes `loader` with no ARC mutex held. Peers wait
+    /// on a per-key placeholder and then re-check the cache.
+    ///
+    /// If the leader fails/panics, waiters are unblocked and observe
+    /// [`AsyncLookup::WaitedForPeerMiss`], allowing the caller to retry.
+    pub fn request_async<F, E>(&self, key: CacheKey, loader: F) -> Result<AsyncLookup, E>
+    where
+        F: FnOnce() -> Result<CachedPage, E> + std::panic::UnwindSafe,
+    {
+        match self.claim_inflight_slot(key) {
+            InflightRole::Leader(slot) => self.lead_request_async(key, &slot, loader),
+            InflightRole::Waiter(slot) => Ok(self.wait_for_peer_load(key, &slot)),
+        }
+    }
+
+    fn claim_inflight_slot(&self, key: CacheKey) -> InflightRole {
+        let existing = self.inflight.lock().get(&key).cloned();
+        if let Some(existing) = existing {
+            return InflightRole::Waiter(existing);
+        }
+
+        let slot = Arc::new(InflightLoad::new_loading());
+        let mut inflight = self.inflight.lock();
+        if let Some(existing) = inflight.get(&key).cloned() {
+            return InflightRole::Waiter(existing);
+        }
+        inflight.insert(key, Arc::clone(&slot));
+        drop(inflight);
+        InflightRole::Leader(slot)
+    }
+
+    fn wait_for_peer_load(&self, key: CacheKey, slot: &Arc<InflightLoad>) -> AsyncLookup {
+        Self::wait_on_slot(slot.as_ref());
+        let lookup = {
+            let mut inner = self.inner.lock();
+            inner.request(&key)
+        };
+        if matches!(lookup, CacheLookup::Hit) {
+            AsyncLookup::WaitedForPeerHit
+        } else {
+            AsyncLookup::WaitedForPeerMiss
+        }
+    }
+
+    fn lead_request_async<F, E>(
+        &self,
+        key: CacheKey,
+        slot: &Arc<InflightLoad>,
+        loader: F,
+    ) -> Result<AsyncLookup, E>
+    where
+        F: FnOnce() -> Result<CachedPage, E> + std::panic::UnwindSafe,
+    {
+        let lookup = {
+            let mut inner = self.inner.lock();
+            inner.request(&key)
+        };
+        if matches!(lookup, CacheLookup::Hit) {
+            self.release_inflight_slot(key, slot);
+            return Ok(AsyncLookup::Hit);
+        }
+
+        let load_result = catch_unwind(AssertUnwindSafe(loader));
+        match load_result {
+            Ok(Ok(page)) => {
+                {
+                    let mut inner = self.inner.lock();
+                    let post_lookup = inner.request(&key);
+                    if !matches!(post_lookup, CacheLookup::Hit) {
+                        debug_assert_eq!(page.key, key, "request_async loader returned wrong key");
+                        inner.admit(key, page, lookup);
+                    }
+                }
+                self.release_inflight_slot(key, slot);
+                Ok(AsyncLookup::Loaded)
+            }
+            Ok(Err(err)) => {
+                self.release_inflight_slot(key, slot);
+                Err(err)
+            }
+            Err(payload) => {
+                self.release_inflight_slot(key, slot);
+                resume_unwind(payload)
+            }
+        }
+    }
+
+    fn wait_on_slot(slot: &InflightLoad) {
+        let mut state = slot.state.lock();
+        state.waiters = state.waiters.saturating_add(1);
+        while state.loading {
+            slot.cv.wait(&mut state);
+        }
+        state.waiters = state.waiters.saturating_sub(1);
+    }
+
+    fn release_inflight_slot(&self, key: CacheKey, slot: &Arc<InflightLoad>) {
+        {
+            let mut state = slot.state.lock();
+            state.loading = false;
+        }
+        slot.cv.notify_all();
+        let mut inflight = self.inflight.lock();
+        let _ = inflight.remove(&key);
+    }
+
+    #[cfg(test)]
+    fn inflight_count(&self) -> usize {
+        self.inflight.lock().len()
+    }
 }
 
 impl std::fmt::Debug for ArcCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ArcCache")
             .field("inner", &*self.inner.lock())
+            .field("inflight_len", &self.inflight.lock().len())
             .finish()
     }
 }
@@ -1172,11 +1333,17 @@ impl std::fmt::Debug for ArcCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
     use fsqlite_types::PageSize;
 
     const BEAD_ID: &str = "bd-125g";
     const BEAD_ID_BD_3JK9: &str = "bd-3jk9";
     const BEAD_ID_BD_1ZLA: &str = "bd-1zla";
+    const BEAD_ID_BD_7PU_1: &str = "bd-7pu.1";
 
     /// Helper: create a `CacheKey` from raw parts.
     fn key(pgno: u32, commit_seq: u64) -> CacheKey {
@@ -1825,6 +1992,177 @@ mod tests {
             );
         }
         drop(inner);
+    }
+
+    #[test]
+    fn test_request_async_singleflight_duplicate_load_suppression() {
+        let cache = Arc::new(ArcCache::new(8, 0));
+        let load_calls = Arc::new(AtomicUsize::new(0));
+        let k = key(900, 1);
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let cache_ref = Arc::clone(&cache);
+            let calls_ref = Arc::clone(&load_calls);
+            handles.push(thread::spawn(move || {
+                cache_ref
+                    .request_async(k, || -> Result<CachedPage, &'static str> {
+                        let _ = calls_ref.fetch_add(1, AtomicOrdering::SeqCst);
+                        thread::sleep(Duration::from_millis(20));
+                        Ok(page(k, 4096))
+                    })
+                    .expect("singleflight request should not fail")
+            }));
+        }
+
+        let mut waited_hits = 0usize;
+        for handle in handles {
+            let outcome = handle.join().expect("worker thread should not panic");
+            if matches!(outcome, AsyncLookup::WaitedForPeerHit) {
+                waited_hits += 1;
+            }
+        }
+
+        assert_eq!(
+            load_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "bead_id={BEAD_ID_BD_7PU_1} case=singleflight_duplicate_load_suppression"
+        );
+        assert!(
+            waited_hits >= 1,
+            "bead_id={BEAD_ID_BD_7PU_1} case=singleflight_waiters_observed"
+        );
+        assert_eq!(
+            cache.inflight_count(),
+            0,
+            "bead_id={BEAD_ID_BD_7PU_1} case=singleflight_placeholder_cleared"
+        );
+
+        let mut inner = cache.lock();
+        assert_eq!(
+            inner.request(&k),
+            CacheLookup::Hit,
+            "bead_id={BEAD_ID_BD_7PU_1} case=singleflight_page_admitted"
+        );
+        drop(inner);
+    }
+
+    #[test]
+    fn test_request_async_error_path_clears_placeholder() {
+        let cache = ArcCache::new(4, 0);
+        let k = key(901, 1);
+
+        let first = cache.request_async(k, || -> Result<CachedPage, &'static str> {
+            Err("loader failed")
+        });
+        assert_eq!(
+            first,
+            Err("loader failed"),
+            "bead_id={BEAD_ID_BD_7PU_1} case=error_propagated_to_leader"
+        );
+        assert_eq!(
+            cache.inflight_count(),
+            0,
+            "bead_id={BEAD_ID_BD_7PU_1} case=error_placeholder_cleared"
+        );
+
+        let second = cache
+            .request_async(k, || -> Result<CachedPage, &'static str> {
+                Ok(page(k, 4096))
+            })
+            .expect("retry load should succeed");
+        assert!(
+            matches!(second, AsyncLookup::Loaded | AsyncLookup::Hit),
+            "bead_id={BEAD_ID_BD_7PU_1} case=error_retry_admits"
+        );
+
+        let mut inner = cache.lock();
+        assert_eq!(
+            inner.request(&k),
+            CacheLookup::Hit,
+            "bead_id={BEAD_ID_BD_7PU_1} case=error_retry_hit"
+        );
+        drop(inner);
+    }
+
+    #[test]
+    fn test_request_async_hit_path_skips_loader() {
+        let cache = ArcCache::new(4, 0);
+        let k = key(903, 1);
+
+        {
+            let mut inner = cache.lock();
+            let lookup = inner.request(&k);
+            inner.admit(k, page(k, 4096), lookup);
+            drop(inner);
+        }
+
+        let outcome = cache
+            .request_async(k, || -> Result<CachedPage, &'static str> {
+                panic!("hit path must not call loader");
+            })
+            .expect("hit path should not fail");
+        assert_eq!(
+            outcome,
+            AsyncLookup::Hit,
+            "bead_id={BEAD_ID_BD_7PU_1} case=hit_path_skips_loader"
+        );
+    }
+
+    #[test]
+    fn test_request_async_panic_notifies_waiters_and_allows_retry() {
+        let cache = Arc::new(ArcCache::new(4, 0));
+        let k = key(902, 1);
+
+        let cache_leader = Arc::clone(&cache);
+        let leader = thread::spawn(move || {
+            let panic_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let _ = cache_leader.request_async(k, || -> Result<CachedPage, &'static str> {
+                    thread::sleep(Duration::from_millis(75));
+                    panic!("forced loader panic for cancellation path");
+                });
+            }));
+            panic_result.is_err()
+        });
+
+        while cache.inflight_count() == 0 {
+            thread::yield_now();
+        }
+
+        let cache_waiter = Arc::clone(&cache);
+        let waiter = thread::spawn(move || {
+            cache_waiter
+                .request_async(k, || -> Result<CachedPage, &'static str> {
+                    panic!("waiter loader must not execute while placeholder is active");
+                })
+                .expect("waiter should observe peer outcome")
+        });
+
+        assert!(
+            leader.join().expect("leader thread join failed"),
+            "bead_id={BEAD_ID_BD_7PU_1} case=panic_expected"
+        );
+        let waiter_outcome = waiter.join().expect("waiter thread join failed");
+        assert_eq!(
+            waiter_outcome,
+            AsyncLookup::WaitedForPeerMiss,
+            "bead_id={BEAD_ID_BD_7PU_1} case=panic_waiter_unblocked"
+        );
+        assert_eq!(
+            cache.inflight_count(),
+            0,
+            "bead_id={BEAD_ID_BD_7PU_1} case=panic_placeholder_cleared"
+        );
+
+        let retry_outcome = cache
+            .request_async(k, || -> Result<CachedPage, &'static str> {
+                Ok(page(k, 4096))
+            })
+            .expect("retry after panic should succeed");
+        assert!(
+            matches!(retry_outcome, AsyncLookup::Loaded | AsyncLookup::Hit),
+            "bead_id={BEAD_ID_BD_7PU_1} case=panic_retry_succeeds"
+        );
     }
 
     #[test]
