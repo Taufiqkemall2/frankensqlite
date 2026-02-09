@@ -176,7 +176,12 @@ impl Frame {
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let payload_len = self.payload.len();
-        let len_be = u32::try_from(12 + payload_len).unwrap_or(FRAME_MAX_LEN_BE);
+        let max_payload_len = (FRAME_MAX_LEN_BE - FRAME_MIN_LEN_BE) as usize;
+        assert!(
+            payload_len <= max_payload_len,
+            "frame payload length {payload_len} exceeds max {max_payload_len}"
+        );
+        let len_be = FRAME_MIN_LEN_BE + u32::try_from(payload_len).expect("payload_len fits u32");
         let mut buf = Vec::with_capacity(FRAME_HEADER_WIRE_BYTES + payload_len);
         append_u32_be(&mut buf, len_be);
         append_u16_be(&mut buf, PROTOCOL_VERSION);
@@ -276,15 +281,15 @@ pub struct ReservePayload {
 }
 
 impl ReservePayload {
-    /// Wire size: purpose(1) + pad(3) + txn(16) = 20.
-    const WIRE_BYTES: usize = 20;
+    /// Wire size: purpose(1) + pad(7) + txn(16) = 24 (§5.9.0.1).
+    const WIRE_BYTES: usize = 24;
 
     /// Encode to payload bytes.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(Self::WIRE_BYTES);
         buf.push(self.purpose);
-        buf.extend_from_slice(&[0u8; 3]); // pad
+        buf.extend_from_slice(&[0u8; 7]); // pad to 8-byte alignment (§5.9.0.1)
         buf.extend_from_slice(&self.txn.to_bytes());
         buf
     }
@@ -296,7 +301,7 @@ impl ReservePayload {
             return None;
         }
         let purpose = src[0];
-        let txn = WireTxnToken::from_bytes(&src[4..])?;
+        let txn = WireTxnToken::from_bytes(&src[8..])?;
         Some(Self { purpose, txn })
     }
 }
@@ -327,12 +332,13 @@ impl ReserveResponse {
             }
             Self::Busy { retry_after_ms } => {
                 buf.push(Self::TAG_BUSY);
-                buf.extend_from_slice(&[0u8; 3]); // pad
+                buf.extend_from_slice(&[0u8; 7]); // pad to 8-byte alignment (§5.9.0.1)
                 append_u32_le(&mut buf, *retry_after_ms);
+                append_u32_le(&mut buf, 0); // pad1
             }
             Self::Err { code } => {
                 buf.push(Self::TAG_ERR);
-                buf.extend_from_slice(&[0u8; 3]); // pad
+                buf.extend_from_slice(&[0u8; 7]); // pad to 8-byte alignment (§5.9.0.1)
                 append_u32_le(&mut buf, *code);
             }
         }
@@ -349,13 +355,13 @@ impl ReserveResponse {
                 Some(Self::Ok { permit_id })
             }
             Self::TAG_BUSY => {
-                let retry = read_u32_le(src.get(4..8)?)?;
+                let retry = read_u32_le(src.get(8..12)?)?;
                 Some(Self::Busy {
                     retry_after_ms: retry,
                 })
             }
             Self::TAG_ERR => {
-                let code = read_u32_le(src.get(4..8)?)?;
+                let code = read_u32_le(src.get(8..12)?)?;
                 Some(Self::Err { code })
             }
             _ => None,
@@ -371,19 +377,20 @@ impl ReserveResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowidReservePayload {
     pub txn: WireTxnToken,
-    pub schema_epoch: u32,
+    pub schema_epoch: u64,
     pub table_id: u32,
     pub count: u32,
 }
 
 impl RowidReservePayload {
-    const WIRE_BYTES: usize = WIRE_TXN_TOKEN_BYTES + 12; // txn(16) + 3×u32(12)
+    /// txn(16) + schema_epoch(8) + table_id(4) + count(4) = 32 (§5.9.0.1).
+    const WIRE_BYTES: usize = 32;
 
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(Self::WIRE_BYTES);
         buf.extend_from_slice(&self.txn.to_bytes());
-        append_u32_le(&mut buf, self.schema_epoch);
+        append_u64_le(&mut buf, self.schema_epoch);
         append_u32_le(&mut buf, self.table_id);
         append_u32_le(&mut buf, self.count);
         buf
@@ -395,9 +402,9 @@ impl RowidReservePayload {
             return None;
         }
         let txn = WireTxnToken::from_bytes(src)?;
-        let schema_epoch = read_u32_le(&src[16..20])?;
-        let table_id = read_u32_le(&src[20..24])?;
-        let count = read_u32_le(&src[24..28])?;
+        let schema_epoch = read_u64_le(&src[16..24])?;
+        let table_id = read_u32_le(&src[24..28])?;
+        let count = read_u32_le(&src[28..32])?;
         Some(Self {
             txn,
             schema_epoch,
@@ -469,15 +476,18 @@ pub struct SpillPageEntry {
 }
 
 impl SpillPageEntry {
-    const WIRE_BYTES: usize = 24; // u32(4) + u64(8) + u32(4) + u64(8)
+    /// pgno(4) + pad0(4) + offset(8) + len(4) + pad1(4) + xxh3_64(8) = 32 (§5.9.0.1).
+    const WIRE_BYTES: usize = 32;
 
     #[must_use]
     pub fn to_bytes(self) -> [u8; Self::WIRE_BYTES] {
         let mut buf = [0u8; Self::WIRE_BYTES];
         buf[..4].copy_from_slice(&self.pgno.to_le_bytes());
-        buf[4..12].copy_from_slice(&self.offset.to_le_bytes());
-        buf[12..16].copy_from_slice(&self.len.to_le_bytes());
-        buf[16..24].copy_from_slice(&self.xxh3_64.to_le_bytes());
+        // buf[4..8] = pad0 (zero)
+        buf[8..16].copy_from_slice(&self.offset.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.len.to_le_bytes());
+        // buf[20..24] = pad1 (zero)
+        buf[24..32].copy_from_slice(&self.xxh3_64.to_le_bytes());
         buf
     }
 
@@ -488,9 +498,11 @@ impl SpillPageEntry {
         }
         Some(Self {
             pgno: read_u32_le(&src[..4])?,
-            offset: read_u64_le(&src[4..12])?,
-            len: read_u32_le(&src[12..16])?,
-            xxh3_64: read_u64_le(&src[16..24])?,
+            // src[4..8] = pad0 (skipped)
+            offset: read_u64_le(&src[8..16])?,
+            len: read_u32_le(&src[16..20])?,
+            // src[20..24] = pad1 (skipped)
+            xxh3_64: read_u64_le(&src[24..32])?,
         })
     }
 }
@@ -521,6 +533,40 @@ impl SubmitNativePayload {
     #[must_use]
     #[allow(clippy::too_many_lines)]
     pub fn to_bytes(&self) -> Vec<u8> {
+        assert!(
+            validate_write_set_summary(&self.write_set_summary),
+            "write_set_summary exceeds wire cap"
+        );
+        assert!(
+            is_canonical_pages(&self.write_set_summary),
+            "write_set_summary must be sorted ascending with no duplicates"
+        );
+        assert!(
+            validate_witness_edge_counts(
+                self.read_witness_refs.len(),
+                self.write_witness_refs.len(),
+                self.edge_refs.len(),
+                self.merge_refs.len()
+            ),
+            "witness/edge counts exceed wire cap"
+        );
+        assert!(
+            is_canonical_object_ids(&self.read_witness_refs),
+            "read_witness_refs must be sorted with no duplicates"
+        );
+        assert!(
+            is_canonical_object_ids(&self.write_witness_refs),
+            "write_witness_refs must be sorted with no duplicates"
+        );
+        assert!(
+            is_canonical_object_ids(&self.edge_refs),
+            "edge_refs must be sorted with no duplicates"
+        );
+        assert!(
+            is_canonical_object_ids(&self.merge_refs),
+            "merge_refs must be sorted with no duplicates"
+        );
+
         let mut buf = Vec::with_capacity(256);
         // permit_id
         append_u64_le(&mut buf, self.permit_id);
@@ -533,7 +579,8 @@ impl SubmitNativePayload {
         // capsule_digest_32 (32 bytes)
         buf.extend_from_slice(&self.capsule_digest_32);
         // write_set_summary: len(u32) + pages
-        let ws_count = u32::try_from(self.write_set_summary.len()).unwrap_or(u32::MAX);
+        let ws_count = u32::try_from(self.write_set_summary.len())
+            .expect("write_set_summary length must fit u32");
         append_u32_le(&mut buf, ws_count);
         for &pgno in &self.write_set_summary {
             append_u32_le(&mut buf, pgno);
@@ -566,20 +613,61 @@ impl SubmitNativePayload {
         // write_set_summary
         let ws_count = read_u32_le(src.get(pos..pos + 4)?)? as usize;
         pos += 4;
+        if ws_count > (WIRE_WRITE_SET_MAX_BYTES / 4) {
+            return None;
+        }
+        let ws_bytes = ws_count.checked_mul(4)?;
+        if src.len() < pos.checked_add(ws_bytes)? {
+            return None;
+        }
         let mut write_set_summary = Vec::with_capacity(ws_count);
         for _ in 0..ws_count {
             write_set_summary.push(read_u32_le(src.get(pos..pos + 4)?)?);
             pos += 4;
         }
         // witness arrays
-        let (read_witness_refs, new_pos) = decode_object_id_array(src, pos)?;
+        let mut remaining = WIRE_WITNESS_EDGE_MAX;
+        let (read_witness_refs, new_pos) = decode_object_id_array(src, pos, remaining)?;
         pos = new_pos;
-        let (write_witness_refs, new_pos) = decode_object_id_array(src, pos)?;
+        if !is_canonical_object_ids(&read_witness_refs) {
+            return None;
+        }
+        remaining = remaining.saturating_sub(read_witness_refs.len());
+
+        let (write_witness_refs, new_pos) = decode_object_id_array(src, pos, remaining)?;
         pos = new_pos;
-        let (edge_refs, new_pos) = decode_object_id_array(src, pos)?;
+        if !is_canonical_object_ids(&write_witness_refs) {
+            return None;
+        }
+        remaining = remaining.saturating_sub(write_witness_refs.len());
+
+        let (edge_refs, new_pos) = decode_object_id_array(src, pos, remaining)?;
         pos = new_pos;
-        let (merge_refs, new_pos) = decode_object_id_array(src, pos)?;
+        if !is_canonical_object_ids(&edge_refs) {
+            return None;
+        }
+        remaining = remaining.saturating_sub(edge_refs.len());
+
+        let (merge_refs, new_pos) = decode_object_id_array(src, pos, remaining)?;
         pos = new_pos;
+        if !is_canonical_object_ids(&merge_refs) {
+            return None;
+        }
+
+        if !is_canonical_pages(&write_set_summary) {
+            return None;
+        }
+        if !validate_write_set_summary(&write_set_summary) {
+            return None;
+        }
+        if !validate_witness_edge_counts(
+            read_witness_refs.len(),
+            write_witness_refs.len(),
+            edge_refs.len(),
+            merge_refs.len(),
+        ) {
+            return None;
+        }
         let abort_policy = *src.get(pos)?;
 
         Some(Self {
@@ -609,7 +697,7 @@ pub struct SubmitWalPayload {
     pub txn: WireTxnToken,
     pub mode: u8,
     pub snapshot_high: u64,
-    pub schema_epoch: u32,
+    pub schema_epoch: u64,
     pub has_in_rw: bool,
     pub has_out_rw: bool,
     pub wal_fec_r: u8,
@@ -626,19 +714,50 @@ impl SubmitWalPayload {
     #[must_use]
     #[allow(clippy::too_many_lines)]
     pub fn to_bytes(&self) -> Vec<u8> {
+        assert!(
+            validate_witness_edge_counts(
+                self.read_witness_refs.len(),
+                self.write_witness_refs.len(),
+                self.edge_refs.len(),
+                self.merge_refs.len()
+            ),
+            "witness/edge counts exceed wire cap"
+        );
+        assert!(
+            is_canonical_spill_pages(&self.spill_pages),
+            "spill_pages must be sorted by pgno with no duplicates"
+        );
+        assert!(
+            is_canonical_object_ids(&self.read_witness_refs),
+            "read_witness_refs must be sorted with no duplicates"
+        );
+        assert!(
+            is_canonical_object_ids(&self.write_witness_refs),
+            "write_witness_refs must be sorted with no duplicates"
+        );
+        assert!(
+            is_canonical_object_ids(&self.edge_refs),
+            "edge_refs must be sorted with no duplicates"
+        );
+        assert!(
+            is_canonical_object_ids(&self.merge_refs),
+            "merge_refs must be sorted with no duplicates"
+        );
+
         let mut buf = Vec::with_capacity(256);
         append_u64_le(&mut buf, self.permit_id);
         buf.extend_from_slice(&self.txn.to_bytes());
         buf.push(self.mode);
-        buf.extend_from_slice(&[0u8; 3]); // pad to 4-byte alignment
+        buf.extend_from_slice(&[0u8; 7]); // pad0 to 8-byte alignment (§5.9.0.1)
         append_u64_le(&mut buf, self.snapshot_high);
-        append_u32_le(&mut buf, self.schema_epoch);
+        append_u64_le(&mut buf, self.schema_epoch);
         buf.push(u8::from(self.has_in_rw));
         buf.push(u8::from(self.has_out_rw));
         buf.push(self.wal_fec_r);
-        buf.push(0); // pad
+        buf.extend_from_slice(&[0u8; 5]); // pad1 to 8-byte alignment (§5.9.0.1)
         // spill_pages
-        let sp_count = u32::try_from(self.spill_pages.len()).unwrap_or(u32::MAX);
+        let sp_count =
+            u32::try_from(self.spill_pages.len()).expect("spill_pages length must fit u32");
         append_u32_le(&mut buf, sp_count);
         for sp in &self.spill_pages {
             buf.extend_from_slice(&sp.to_bytes());
@@ -660,32 +779,75 @@ impl SubmitWalPayload {
         let txn = WireTxnToken::from_bytes(src.get(pos..)?)?;
         pos += WIRE_TXN_TOKEN_BYTES;
         let mode = *src.get(pos)?;
-        pos += 4; // mode(1) + pad(3)
+        pos += 8; // mode(1) + pad0(7)
         let snapshot_high = read_u64_le(src.get(pos..pos + 8)?)?;
         pos += 8;
-        let schema_epoch = read_u32_le(src.get(pos..pos + 4)?)?;
-        pos += 4;
+        let schema_epoch = read_u64_le(src.get(pos..pos + 8)?)?;
+        pos += 8;
         let has_in_rw = *src.get(pos)? != 0;
         pos += 1;
         let has_out_rw = *src.get(pos)? != 0;
         pos += 1;
         let wal_fec_r = *src.get(pos)?;
-        pos += 2; // fec_r(1) + pad(1)
+        pos += 6; // fec_r(1) + pad1(5)
         // spill_pages
         let sp_count = read_u32_le(src.get(pos..pos + 4)?)? as usize;
         pos += 4;
+        // Lower bound: we must have enough bytes for `sp_count` entries plus the four
+        // trailing ObjectId arrays (each at least a u32 count = 4 bytes).
+        let min_tail = 4usize * 4;
+        let available = src.len().checked_sub(pos)?;
+        if available < min_tail {
+            return None;
+        }
+        let max_spill = available
+            .checked_sub(min_tail)?
+            .checked_div(SpillPageEntry::WIRE_BYTES)?;
+        if sp_count > max_spill {
+            return None;
+        }
         let mut spill_pages = Vec::with_capacity(sp_count);
         for _ in 0..sp_count {
             spill_pages.push(SpillPageEntry::from_bytes(src.get(pos..)?)?);
             pos += SpillPageEntry::WIRE_BYTES;
         }
-        let (read_witness_refs, new_pos) = decode_object_id_array(src, pos)?;
+        if !is_canonical_spill_pages(&spill_pages) {
+            return None;
+        }
+        let mut remaining = WIRE_WITNESS_EDGE_MAX;
+        let (read_witness_refs, new_pos) = decode_object_id_array(src, pos, remaining)?;
         pos = new_pos;
-        let (write_witness_refs, new_pos) = decode_object_id_array(src, pos)?;
+        if !is_canonical_object_ids(&read_witness_refs) {
+            return None;
+        }
+        remaining = remaining.saturating_sub(read_witness_refs.len());
+
+        let (write_witness_refs, new_pos) = decode_object_id_array(src, pos, remaining)?;
         pos = new_pos;
-        let (edge_refs, new_pos) = decode_object_id_array(src, pos)?;
+        if !is_canonical_object_ids(&write_witness_refs) {
+            return None;
+        }
+        remaining = remaining.saturating_sub(write_witness_refs.len());
+
+        let (edge_refs, new_pos) = decode_object_id_array(src, pos, remaining)?;
         pos = new_pos;
-        let (merge_refs, _) = decode_object_id_array(src, pos)?;
+        if !is_canonical_object_ids(&edge_refs) {
+            return None;
+        }
+        remaining = remaining.saturating_sub(edge_refs.len());
+
+        let (merge_refs, _) = decode_object_id_array(src, pos, remaining)?;
+        if !is_canonical_object_ids(&merge_refs) {
+            return None;
+        }
+        if !validate_witness_edge_counts(
+            read_witness_refs.len(),
+            write_witness_refs.len(),
+            edge_refs.len(),
+            merge_refs.len(),
+        ) {
+            return None;
+        }
 
         Some(Self {
             permit_id,
@@ -737,7 +899,7 @@ impl NativePublishResponse {
                 buf.push(Self::TAG_CONFLICT);
                 buf.push(*reason);
                 buf.extend_from_slice(&[0u8; 2]); // pad
-                let count = u32::try_from(pages.len()).unwrap_or(u32::MAX);
+                let count = u32::try_from(pages.len()).expect("conflict pages length must fit u32");
                 append_u32_le(&mut buf, count);
                 for &p in pages {
                     append_u32_le(&mut buf, p);
@@ -768,6 +930,10 @@ impl NativePublishResponse {
             Self::TAG_CONFLICT => {
                 let reason = *src.get(1)?;
                 let count = read_u32_le(src.get(4..8)?)? as usize;
+                let max_pages = src.len().saturating_sub(8) / 4;
+                if count > max_pages {
+                    return None;
+                }
                 let mut pages = Vec::with_capacity(count);
                 for i in 0..count {
                     let off = 8 + i * 4;
@@ -816,7 +982,7 @@ impl WalCommitResponse {
                 buf.push(Self::TAG_CONFLICT);
                 buf.push(*reason);
                 buf.extend_from_slice(&[0u8; 2]);
-                let count = u32::try_from(pages.len()).unwrap_or(u32::MAX);
+                let count = u32::try_from(pages.len()).expect("conflict pages length must fit u32");
                 append_u32_le(&mut buf, count);
                 for &p in pages {
                     append_u32_le(&mut buf, p);
@@ -847,6 +1013,10 @@ impl WalCommitResponse {
             Self::TAG_CONFLICT => {
                 let reason = *src.get(1)?;
                 let count = read_u32_le(src.get(4..8)?)? as usize;
+                let max_pages = src.len().saturating_sub(8) / 4;
+                if count > max_pages {
+                    return None;
+                }
                 let mut pages = Vec::with_capacity(count);
                 for i in 0..count {
                     let off = 8 + i * 4;
@@ -872,15 +1042,27 @@ impl WalCommitResponse {
 // ---------------------------------------------------------------------------
 
 fn encode_object_id_array(buf: &mut Vec<u8>, ids: &[ObjectId]) {
-    let count = u32::try_from(ids.len()).unwrap_or(u32::MAX);
+    let count = u32::try_from(ids.len()).expect("ObjectId array length must fit u32");
     append_u32_le(buf, count);
     for id in ids {
         buf.extend_from_slice(id.as_bytes());
     }
 }
 
-fn decode_object_id_array(src: &[u8], pos: usize) -> Option<(Vec<ObjectId>, usize)> {
+fn decode_object_id_array(
+    src: &[u8],
+    pos: usize,
+    count_cap: usize,
+) -> Option<(Vec<ObjectId>, usize)> {
     let count = read_u32_le(src.get(pos..pos + 4)?)? as usize;
+    if count > count_cap {
+        return None;
+    }
+    let bytes_needed = count.checked_mul(16)?.checked_add(4)?;
+    let end = pos.checked_add(bytes_needed)?;
+    if end > src.len() {
+        return None;
+    }
     let mut cur = pos + 4;
     let mut ids = Vec::with_capacity(count);
     for _ in 0..count {
@@ -901,6 +1083,12 @@ pub fn is_canonical_pages(pages: &[u32]) -> bool {
     pages.windows(2).all(|w| w[0] < w[1])
 }
 
+/// Validate that `spill_pages` is sorted ascending by pgno with no duplicates.
+#[must_use]
+pub fn is_canonical_spill_pages(spill_pages: &[SpillPageEntry]) -> bool {
+    spill_pages.windows(2).all(|w| w[0].pgno < w[1].pgno)
+}
+
 /// Validate that `ids` is sorted lexicographically with no duplicates.
 #[must_use]
 pub fn is_canonical_object_ids(ids: &[ObjectId]) -> bool {
@@ -910,8 +1098,16 @@ pub fn is_canonical_object_ids(ids: &[ObjectId]) -> bool {
 /// Validate that a `write_set_summary` meets wire size caps.
 #[must_use]
 pub fn validate_write_set_summary(pages: &[u32]) -> bool {
-    let byte_len = pages.len() * 4;
+    let byte_len = pages.len().saturating_mul(4);
     byte_len <= WIRE_WRITE_SET_MAX_BYTES && byte_len % 4 == 0
+}
+
+/// Validate a raw write_set_summary byte length (§5.9.0.1).
+///
+/// Returns `true` if `byte_len` is a multiple of 4 and does not exceed 1 MiB.
+#[must_use]
+pub fn validate_write_set_summary_raw_len(byte_len: usize) -> bool {
+    byte_len % 4 == 0 && byte_len <= WIRE_WRITE_SET_MAX_BYTES
 }
 
 /// Validate total witness + edge counts do not exceed wire cap.
@@ -1168,12 +1364,19 @@ impl Drop for ReceivedFd {
 /// Send raw bytes plus a file descriptor over a Unix stream.
 #[cfg(target_family = "unix")]
 pub fn send_with_fd(
-    stream: &std::os::unix::net::UnixStream,
+    mut stream: &std::os::unix::net::UnixStream,
     data: &[u8],
     fd: std::os::unix::io::RawFd,
 ) -> std::io::Result<usize> {
     use std::io::IoSlice;
+    use std::io::Write as _;
     use std::os::unix::net::SocketAncillary;
+
+    if data.is_empty() {
+        return Err(std::io::Error::other(
+            "cannot send an fd with an empty data payload",
+        ));
+    }
 
     let mut ancillary_buf = [0u8; 128];
     let mut ancillary = SocketAncillary::new(&mut ancillary_buf);
@@ -1181,7 +1384,22 @@ pub fn send_with_fd(
         return Err(std::io::Error::other("ancillary buffer too small for fd"));
     }
 
-    stream.send_vectored_with_ancillary(&[IoSlice::new(data)], &mut ancillary)
+    // The ancillary control message (SCM_RIGHTS) is delivered with the first
+    // byte(s) received for this send call; subsequent writes should not repeat
+    // it. We therefore send once with ancillary, then (if needed) write the
+    // remaining bytes without ancillary.
+    let mut sent = stream.send_vectored_with_ancillary(&[IoSlice::new(data)], &mut ancillary)?;
+    if sent == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            "send_vectored_with_ancillary wrote 0 bytes",
+        ));
+    }
+    if sent < data.len() {
+        (&*stream).write_all(&data[sent..])?;
+        sent = data.len();
+    }
+    Ok(sent)
 }
 
 /// Receive raw bytes plus a file descriptor from a Unix stream.
@@ -1244,6 +1462,82 @@ pub fn recv_with_fd(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_family = "unix")]
+    fn recv_frame_with_optional_fd(
+        stream: &std::os::unix::net::UnixStream,
+    ) -> std::io::Result<(Frame, Option<ReceivedFd>)> {
+        use std::io::ErrorKind;
+
+        let mut header = [0u8; FRAME_HEADER_WIRE_BYTES];
+        let mut filled = 0usize;
+        let mut fd: Option<ReceivedFd> = None;
+
+        while filled < FRAME_HEADER_WIRE_BYTES {
+            let (n, maybe_fd) = recv_with_fd(stream, &mut header[filled..])?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "eof while reading frame header",
+                ));
+            }
+            filled += n;
+            if let Some(new_fd) = maybe_fd {
+                if fd.is_some() {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        "received multiple fds for a single frame",
+                    ));
+                }
+                fd = Some(new_fd);
+            }
+        }
+
+        let len_be = read_u32_be(&header[..4])
+            .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidData, "missing frame length"))?;
+        if len_be < FRAME_MIN_LEN_BE {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("len_be {len_be} below minimum {FRAME_MIN_LEN_BE}"),
+            ));
+        }
+        if len_be > FRAME_MAX_LEN_BE {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("len_be {len_be} exceeds cap {FRAME_MAX_LEN_BE}"),
+            ));
+        }
+
+        // Total wire length includes the 4-byte len field.
+        let total_len = 4usize + len_be as usize;
+        let mut wire = vec![0u8; total_len];
+        wire[..FRAME_HEADER_WIRE_BYTES].copy_from_slice(&header);
+
+        let mut pos = FRAME_HEADER_WIRE_BYTES;
+        while pos < total_len {
+            let (n, maybe_fd) = recv_with_fd(stream, &mut wire[pos..])?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "eof while reading frame payload",
+                ));
+            }
+            pos += n;
+            if let Some(new_fd) = maybe_fd {
+                if fd.is_some() {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        "received multiple fds for a single frame",
+                    ));
+                }
+                fd = Some(new_fd);
+            }
+        }
+
+        let frame = Frame::decode(&wire)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        Ok((frame, fd))
+    }
 
     // -- bd-1m07 test 1: Frame round-trip encode/decode for all 7 kinds --
     #[test]
@@ -1553,7 +1847,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn test_e2e_bd_1m07() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::os::fd::AsRawFd;
         use std::os::unix::net::UnixStream;
         use std::sync::{Arc, Barrier};
@@ -1573,13 +1867,12 @@ mod tests {
 
         // Server thread: read frames, process reserve/submit.
         let server = std::thread::spawn(move || {
-            let mut buf = vec![0u8; 4096];
             barrier_server.wait();
 
             // --- Round 1: RESERVE ---
-            let (n, maybe_fd) = recv_with_fd(&server_sock, &mut buf).expect("server recv reserve");
+            let (frame, maybe_fd) =
+                recv_frame_with_optional_fd(&server_sock).expect("server recv reserve");
             assert!(maybe_fd.is_none(), "reserve must not carry an fd");
-            let frame = Frame::decode(&buf[..n]).expect("decode reserve frame");
             assert_eq!(frame.kind, MessageKind::Reserve);
 
             let _payload =
@@ -1598,9 +1891,9 @@ mod tests {
                 .expect("server write reserve response");
 
             // --- Round 2: SUBMIT_WAL_COMMIT ---
-            let (n, maybe_fd) = recv_with_fd(&server_sock, &mut buf).expect("server recv submit");
+            let (frame, maybe_fd) =
+                recv_frame_with_optional_fd(&server_sock).expect("server recv submit");
             let _spill_fd = maybe_fd.expect("submit must carry spill fd");
-            let frame = Frame::decode(&buf[..n]).expect("decode submit frame");
             assert_eq!(frame.kind, MessageKind::SubmitWalCommit);
 
             let wal_payload =
@@ -1635,9 +1928,9 @@ mod tests {
             }
 
             // --- Round 3: Duplicate SUBMIT (idempotency) ---
-            let (n, maybe_fd) = recv_with_fd(&server_sock, &mut buf).expect("server recv dup");
+            let (frame, maybe_fd) =
+                recv_frame_with_optional_fd(&server_sock).expect("server recv dup");
             let _spill_fd = maybe_fd.expect("dup submit must carry spill fd");
-            let frame = Frame::decode(&buf[..n]).expect("decode dup frame");
             let wal_payload =
                 SubmitWalPayload::from_bytes(&frame.payload).expect("parse dup payload");
             let key = wal_payload.txn.idempotency_key();
@@ -1654,9 +1947,9 @@ mod tests {
                 .expect("server write dup response");
 
             // --- Round 4: PING ---
-            let (n, maybe_fd) = recv_with_fd(&server_sock, &mut buf).expect("server recv ping");
+            let (frame, maybe_fd) =
+                recv_frame_with_optional_fd(&server_sock).expect("server recv ping");
             assert!(maybe_fd.is_none(), "ping must not carry an fd");
-            let frame = Frame::decode(&buf[..n]).expect("decode ping");
             assert_eq!(frame.kind, MessageKind::Ping);
             let pong = Frame {
                 kind: MessageKind::Pong,
@@ -1670,7 +1963,6 @@ mod tests {
 
         // Client side.
         barrier.wait();
-        let mut buf = vec![0u8; 4096];
 
         // Round 1: RESERVE.
         let txn = WireTxnToken {
@@ -1686,10 +1978,9 @@ mod tests {
             .write_all(&reserve.encode())
             .expect("client write reserve");
 
-        let n = (&client_sock)
-            .read(&mut buf)
-            .expect("client read reserve resp");
-        let resp = Frame::decode(&buf[..n]).expect("decode reserve resp");
+        let (resp, resp_fd) =
+            recv_frame_with_optional_fd(&client_sock).expect("client read reserve resp");
+        assert!(resp_fd.is_none(), "reserve response must not carry an fd");
         assert_eq!(resp.kind, MessageKind::Response);
         let reserve_resp =
             ReserveResponse::from_bytes(&resp.payload).expect("parse reserve response");
@@ -1731,10 +2022,9 @@ mod tests {
         send_with_fd(&client_sock, &submit.encode(), spill_w.as_raw_fd())
             .expect("client send submit");
 
-        let n = (&client_sock)
-            .read(&mut buf)
-            .expect("client read commit resp");
-        let resp = Frame::decode(&buf[..n]).expect("decode commit resp");
+        let (resp, resp_fd) =
+            recv_frame_with_optional_fd(&client_sock).expect("client read commit resp");
+        assert!(resp_fd.is_none(), "commit response must not carry an fd");
         let commit_resp =
             WalCommitResponse::from_bytes(&resp.payload).expect("parse commit response");
         assert_eq!(commit_resp, WalCommitResponse::Ok { commit_seq: 42 });
@@ -1748,8 +2038,9 @@ mod tests {
         send_with_fd(&client_sock, &dup_submit.encode(), spill_w.as_raw_fd())
             .expect("client send dup submit");
 
-        let n = (&client_sock).read(&mut buf).expect("client read dup resp");
-        let resp = Frame::decode(&buf[..n]).expect("decode dup resp");
+        let (resp, resp_fd) =
+            recv_frame_with_optional_fd(&client_sock).expect("client read dup resp");
+        assert!(resp_fd.is_none(), "dup response must not carry an fd");
         let dup_resp =
             WalCommitResponse::from_bytes(&resp.payload).expect("parse dup commit response");
         assert_eq!(
@@ -1768,11 +2059,314 @@ mod tests {
             .write_all(&ping.encode())
             .expect("client write ping");
 
-        let n = (&client_sock).read(&mut buf).expect("client read pong");
-        let resp = Frame::decode(&buf[..n]).expect("decode pong");
+        let (resp, resp_fd) = recv_frame_with_optional_fd(&client_sock).expect("client read pong");
+        assert!(resp_fd.is_none(), "pong must not carry an fd");
         assert_eq!(resp.kind, MessageKind::Pong);
         assert_eq!(resp.request_id, 4);
 
         server.join().expect("server thread");
+    }
+
+    // ===================================================================
+    // bd-3ipx — Wire Payload Schemas (§5.9.0.1)
+    // ===================================================================
+
+    #[test]
+    fn test_reserve_v1_roundtrip() {
+        let original = ReservePayload {
+            purpose: 0, // NativePublish
+            txn: WireTxnToken {
+                txn_id: 0xDEAD_BEEF_0000_0001,
+                txn_epoch: 7,
+            },
+        };
+        let bytes = original.to_bytes();
+        assert_eq!(bytes.len(), 24, "ReserveV1 must be exactly 24 bytes");
+
+        // Verify pad bytes are zero.
+        assert_eq!(&bytes[1..8], &[0u8; 7], "pad0 must be zero");
+
+        let decoded = ReservePayload::from_bytes(&bytes).expect("decode must succeed");
+        assert_eq!(decoded, original, "round-trip mismatch");
+
+        // Also test purpose=1 (WalCommit).
+        let wal_reserve = ReservePayload {
+            purpose: 1,
+            txn: WireTxnToken {
+                txn_id: 42,
+                txn_epoch: 0,
+            },
+        };
+        let bytes2 = wal_reserve.to_bytes();
+        assert_eq!(bytes2.len(), 24);
+        assert_eq!(bytes2[0], 1, "purpose must be 1");
+        let decoded2 = ReservePayload::from_bytes(&bytes2).expect("decode purpose=1");
+        assert_eq!(decoded2, wal_reserve);
+    }
+
+    #[test]
+    fn test_reserve_resp_tagged_union_variants() {
+        // Ok variant: tag(1) + pad(7) + permit_id(8) = 16.
+        let ok = ReserveResponse::Ok { permit_id: 0xCAFE };
+        let ok_bytes = ok.to_bytes();
+        assert_eq!(ok_bytes[0], 0, "Ok tag = 0");
+        assert_eq!(&ok_bytes[1..8], &[0u8; 7], "pad0 must be zero");
+        let ok_rt = ReserveResponse::from_bytes(&ok_bytes).expect("decode Ok");
+        assert_eq!(ok_rt, ok);
+
+        // Busy variant: tag(1) + pad(7) + retry_after_ms(4) + pad1(4) = 16.
+        let busy = ReserveResponse::Busy {
+            retry_after_ms: 500,
+        };
+        let busy_bytes = busy.to_bytes();
+        assert_eq!(busy_bytes[0], 1, "Busy tag = 1");
+        assert_eq!(&busy_bytes[1..8], &[0u8; 7], "pad0 must be zero");
+        let busy_rt = ReserveResponse::from_bytes(&busy_bytes).expect("decode Busy");
+        assert_eq!(busy_rt, busy);
+
+        // Err variant: tag(1) + pad(7) + code(4) = 12.
+        let err = ReserveResponse::Err { code: 0x07 };
+        let err_bytes = err.to_bytes();
+        assert_eq!(err_bytes[0], 2, "Err tag = 2");
+        assert_eq!(&err_bytes[1..8], &[0u8; 7], "pad0 must be zero");
+        let err_rt = ReserveResponse::from_bytes(&err_bytes).expect("decode Err");
+        assert_eq!(err_rt, err);
+
+        // Verify unknown tag is rejected.
+        let mut bad = ok_bytes;
+        bad[0] = 99;
+        assert!(
+            ReserveResponse::from_bytes(&bad).is_none(),
+            "unknown tag must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_write_set_summary_canonical_encoding() {
+        // Input in arbitrary order.
+        let mut pages = vec![5_u32, 1, 100, 3];
+        pages.sort_unstable();
+        assert!(is_canonical_pages(&pages), "sorted pages must be canonical");
+        assert_eq!(pages, [1, 3, 5, 100]);
+
+        // Encode as raw bytes.
+        let mut bytes = Vec::new();
+        for &p in &pages {
+            append_u32_le(&mut bytes, p);
+        }
+        assert_eq!(bytes.len(), 16, "4 pages × 4 bytes = 16");
+        assert!(
+            validate_write_set_summary_raw_len(bytes.len()),
+            "16 bytes must be valid"
+        );
+
+        // Decode back.
+        let mut decoded = Vec::new();
+        for i in 0..4 {
+            let off = i * 4;
+            decoded.push(read_u32_le(&bytes[off..off + 4]).unwrap());
+        }
+        assert_eq!(decoded, pages, "round-trip mismatch");
+    }
+
+    #[test]
+    fn test_write_set_summary_len_not_multiple_of_4_rejected() {
+        assert!(
+            !validate_write_set_summary_raw_len(7),
+            "7 bytes is not a multiple of 4 — must be rejected"
+        );
+        assert!(
+            !validate_write_set_summary_raw_len(1),
+            "1 byte is not a multiple of 4"
+        );
+        assert!(
+            !validate_write_set_summary_raw_len(5),
+            "5 bytes is not a multiple of 4"
+        );
+        // Valid multiples of 4.
+        assert!(validate_write_set_summary_raw_len(0), "0 is valid");
+        assert!(validate_write_set_summary_raw_len(4), "4 is valid");
+        assert!(validate_write_set_summary_raw_len(8), "8 is valid");
+    }
+
+    #[test]
+    fn test_native_publish_conflict_response_page_list() {
+        let conflict = NativePublishResponse::Conflict {
+            pages: vec![10, 42, 99],
+            reason: 1,
+        };
+        let bytes = conflict.to_bytes();
+        assert_eq!(bytes[0], 1, "Conflict tag = 1");
+
+        let decoded = NativePublishResponse::from_bytes(&bytes).expect("decode Conflict response");
+        assert_eq!(decoded, conflict, "round-trip mismatch");
+
+        // Verify page list is intact.
+        if let NativePublishResponse::Conflict { pages, reason } = &decoded {
+            assert_eq!(pages.len(), 3);
+            assert_eq!(pages[0], 10);
+            assert_eq!(pages[1], 42);
+            assert_eq!(pages[2], 99);
+            assert_eq!(*reason, 1);
+        } else {
+            unreachable!("must be Conflict variant");
+        }
+    }
+
+    #[test]
+    fn test_wire_size_cap_write_set_summary_exceeds_1mib() {
+        // 262,144 pages = exactly 1 MiB of u32_le → accepted.
+        let max_pages: Vec<u32> = (0..262_144).collect();
+        assert!(
+            validate_write_set_summary(&max_pages),
+            "262,144 pages (1 MiB) must be accepted"
+        );
+
+        // 262,145 pages = just over 1 MiB → rejected.
+        let over_pages: Vec<u32> = (0..262_145).collect();
+        assert!(
+            !validate_write_set_summary(&over_pages),
+            "262,145 pages (> 1 MiB) must be rejected"
+        );
+
+        // Raw byte-level check.
+        assert!(
+            validate_write_set_summary_raw_len(WIRE_WRITE_SET_MAX_BYTES),
+            "exactly 1 MiB must pass"
+        );
+        assert!(
+            !validate_write_set_summary_raw_len(WIRE_WRITE_SET_MAX_BYTES + 4),
+            "1 MiB + 4 must fail"
+        );
+    }
+
+    #[test]
+    fn test_wire_size_cap_total_witness_count_exceeds_65536() {
+        // Exactly at limit: 65,536 total → accepted.
+        assert!(
+            validate_witness_edge_counts(16_384, 16_384, 16_384, 16_384),
+            "65,536 total must be accepted"
+        );
+
+        // Over limit: 65,537 total → rejected.
+        assert!(
+            !validate_witness_edge_counts(16_384, 16_384, 16_384, 16_385),
+            "65,537 total must be rejected"
+        );
+
+        // Edge case: all in one array.
+        assert!(validate_witness_edge_counts(65_536, 0, 0, 0));
+        assert!(!validate_witness_edge_counts(65_537, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_wal_commit_spill_page_encoding() {
+        let sp1 = SpillPageEntry {
+            pgno: 1,
+            offset: 4096,
+            len: 4096,
+            xxh3_64: 0x1234_5678_ABCD_EF01,
+        };
+        let sp2 = SpillPageEntry {
+            pgno: 5,
+            offset: 8192,
+            len: 4096,
+            xxh3_64: 0xFEDC_BA98_7654_3210,
+        };
+        let sp3 = SpillPageEntry {
+            pgno: 10,
+            offset: 12288,
+            len: 4096,
+            xxh3_64: 0,
+        };
+
+        // Each SpillPageEntry is exactly 32 bytes.
+        assert_eq!(
+            sp1.to_bytes().len(),
+            32,
+            "SpillPageV1 must be exactly 32 bytes"
+        );
+
+        // Round-trip each.
+        let sp1_rt = SpillPageEntry::from_bytes(&sp1.to_bytes()).unwrap();
+        assert_eq!(sp1_rt, sp1);
+        let sp2_rt = SpillPageEntry::from_bytes(&sp2.to_bytes()).unwrap();
+        assert_eq!(sp2_rt, sp2);
+        let sp3_rt = SpillPageEntry::from_bytes(&sp3.to_bytes()).unwrap();
+        assert_eq!(sp3_rt, sp3);
+
+        // Round-trip via SubmitWalPayload with 3 spill pages.
+        let wal = SubmitWalPayload {
+            permit_id: 42,
+            txn: WireTxnToken {
+                txn_id: 100,
+                txn_epoch: 1,
+            },
+            mode: 1, // Concurrent
+            snapshot_high: 999,
+            schema_epoch: 5,
+            has_in_rw: true,
+            has_out_rw: false,
+            wal_fec_r: 3,
+            spill_pages: vec![sp1, sp2, sp3],
+            read_witness_refs: vec![],
+            write_witness_refs: vec![],
+            edge_refs: vec![],
+            merge_refs: vec![],
+        };
+        let bytes = wal.to_bytes();
+        let decoded = SubmitWalPayload::from_bytes(&bytes).expect("decode WAL payload");
+        assert_eq!(decoded.spill_pages.len(), 3);
+        assert_eq!(decoded.spill_pages[0], sp1);
+        assert_eq!(decoded.spill_pages[1], sp2);
+        assert_eq!(decoded.spill_pages[2], sp3);
+        assert_eq!(decoded.schema_epoch, 5);
+        assert!(decoded.has_in_rw);
+        assert!(!decoded.has_out_rw);
+    }
+
+    #[test]
+    fn test_rowid_reserve_roundtrip() {
+        let original = RowidReservePayload {
+            txn: WireTxnToken {
+                txn_id: 0xAAAA_BBBB_CCCC_DDDD,
+                txn_epoch: 42,
+            },
+            schema_epoch: 7,
+            table_id: 100,
+            count: 64,
+        };
+        let bytes = original.to_bytes();
+        assert_eq!(bytes.len(), 32, "RowIdReserveV1 must be exactly 32 bytes");
+
+        let decoded = RowidReservePayload::from_bytes(&bytes).expect("decode must succeed");
+        assert_eq!(decoded, original, "round-trip mismatch");
+
+        // Verify field positions.
+        assert_eq!(
+            read_u64_le(&bytes[0..8]).unwrap(),
+            original.txn.txn_id,
+            "txn_id at offset 0"
+        );
+        assert_eq!(
+            read_u32_le(&bytes[8..12]).unwrap(),
+            original.txn.txn_epoch,
+            "txn_epoch at offset 8"
+        );
+        assert_eq!(
+            read_u64_le(&bytes[16..24]).unwrap(),
+            original.schema_epoch,
+            "schema_epoch at offset 16"
+        );
+        assert_eq!(
+            read_u32_le(&bytes[24..28]).unwrap(),
+            original.table_id,
+            "table_id at offset 24"
+        );
+        assert_eq!(
+            read_u32_le(&bytes[28..32]).unwrap(),
+            original.count,
+            "count at offset 28"
+        );
     }
 }

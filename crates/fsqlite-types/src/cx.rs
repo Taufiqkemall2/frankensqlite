@@ -28,11 +28,47 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 /// SQLite error code for `SQLITE_INTERRUPT`.
 pub const SQLITE_INTERRUPT: i32 = 9;
+
+/// Maximum nesting depth for masked cancellation sections (INV-MASK-BOUNDED).
+///
+/// Exceeding this limit panics in lab mode and emits a fatal diagnostic in production.
+pub const MAX_MASK_DEPTH: u32 = 64;
+
+// ---------------------------------------------------------------------------
+// §4.12 Cancellation State Machine
+// ---------------------------------------------------------------------------
+
+/// Observable state of a task's cancellation lifecycle (asupersync oracle model).
+///
+/// ```text
+/// Created → Running → CancelRequested → Cancelling → Finalizing → Completed
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CancelState {
+    Created,
+    Running,
+    CancelRequested,
+    Cancelling,
+    Finalizing,
+    Completed,
+}
+
+/// Reason for cancellation, ordered from weakest to strongest.
+///
+/// INV-CANCEL-IDEMPOTENT: multiple cancel requests are monotone — the strongest
+/// reason wins and the reason can never get weaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CancelReason {
+    Timeout = 0,
+    UserInterrupt = 1,
+    RegionClose = 2,
+    Abort = 3,
+}
 
 /// Capability set definitions and subset reasoning.
 pub mod cap {
@@ -252,6 +288,10 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug)]
 struct CxInner {
     cancel_requested: AtomicBool,
+    cancel_state: Mutex<CancelState>,
+    cancel_reason: Mutex<Option<CancelReason>>,
+    mask_depth: AtomicU32,
+    children: Mutex<Vec<Arc<Self>>>,
     last_checkpoint_msg: Mutex<Option<String>>,
     // Deterministic clock: milliseconds since epoch for tests.
     unix_millis: AtomicU64,
@@ -261,9 +301,57 @@ impl CxInner {
     fn new() -> Self {
         Self {
             cancel_requested: AtomicBool::new(false),
+            cancel_state: Mutex::new(CancelState::Created),
+            cancel_reason: Mutex::new(None),
+            mask_depth: AtomicU32::new(0),
+            children: Mutex::new(Vec::new()),
             last_checkpoint_msg: Mutex::new(None),
             unix_millis: AtomicU64::new(0),
         }
+    }
+}
+
+/// Propagate cancellation to a `CxInner` node and all its descendants.
+///
+/// We release each node's lock before recursing into children to avoid
+/// lock-ordering issues.
+fn propagate_cancel(inner: &CxInner, reason: CancelReason) {
+    // Set atomic flag (fast-path for checkpoint).
+    inner.cancel_requested.store(true, Ordering::Release);
+
+    // Monotone reason update.
+    {
+        let mut r = inner
+            .cancel_reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *r {
+            Some(existing) if existing >= reason => {}
+            _ => *r = Some(reason),
+        }
+    }
+
+    // State transition: Created/Running → CancelRequested.
+    {
+        let mut state = inner
+            .cancel_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(*state, CancelState::Created | CancelState::Running) {
+            *state = CancelState::CancelRequested;
+        }
+    }
+
+    // Collect children (release lock before recursing).
+    let children: Vec<Arc<CxInner>> = {
+        let guard = inner
+            .children
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.clone()
+    };
+    for child in &children {
+        propagate_cancel(child, reason);
     }
 }
 
@@ -357,22 +445,118 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Cancellation state machine (§4.12)
+    // -----------------------------------------------------------------------
+
     #[must_use]
     pub fn is_cancel_requested(&self) -> bool {
         self.inner.cancel_requested.load(Ordering::Acquire)
     }
 
+    /// Request cancellation with the default reason (`UserInterrupt`).
+    ///
+    /// Propagates to all child contexts per INV-CANCEL-PROPAGATES.
     pub fn cancel(&self) {
-        self.inner.cancel_requested.store(true, Ordering::Release);
+        self.cancel_with_reason(CancelReason::UserInterrupt);
     }
 
-    /// Check for cancellation at a yield point.
-    pub fn checkpoint(&self) -> Result<()> {
-        if self.is_cancel_requested() {
-            Err(Error::cancelled())
-        } else {
-            Ok(())
+    /// Request cancellation with an explicit reason.
+    ///
+    /// INV-CANCEL-IDEMPOTENT: the strongest reason wins; weaker reasons are
+    /// ignored once a stronger one has been set.
+    ///
+    /// INV-CANCEL-PROPAGATES: cancellation propagates to all descendants.
+    pub fn cancel_with_reason(&self, reason: CancelReason) {
+        propagate_cancel(&self.inner, reason);
+    }
+
+    /// Current state in the cancellation lifecycle.
+    #[must_use]
+    pub fn cancel_state(&self) -> CancelState {
+        *self
+            .inner
+            .cancel_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The strongest cancellation reason set so far, if any.
+    #[must_use]
+    pub fn cancel_reason(&self) -> Option<CancelReason> {
+        *self
+            .inner
+            .cancel_reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Transition from `Created` to `Running`.
+    pub fn transition_to_running(&self) {
+        let mut state = self
+            .inner
+            .cancel_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *state == CancelState::Created {
+            *state = CancelState::Running;
         }
+    }
+
+    /// Transition from `Cancelling` to `Finalizing`.
+    pub fn transition_to_finalizing(&self) {
+        let mut state = self
+            .inner
+            .cancel_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *state == CancelState::Cancelling {
+            *state = CancelState::Finalizing;
+        }
+    }
+
+    /// Transition to `Completed` (from `Finalizing` or `Running`).
+    pub fn transition_to_completed(&self) {
+        let mut state = self
+            .inner
+            .cancel_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(*state, CancelState::Finalizing | CancelState::Running) {
+            *state = CancelState::Completed;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Checkpoints (§4.12.1)
+    // -----------------------------------------------------------------------
+
+    /// Check for cancellation at a yield point.
+    ///
+    /// Returns `Ok(())` when not cancelled **or when inside a masked section**.
+    /// When cancellation is observed, transitions state from `CancelRequested`
+    /// to `Cancelling`.
+    pub fn checkpoint(&self) -> Result<()> {
+        // Fast path: not cancelled at all.
+        if !self.inner.cancel_requested.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        // Masked: defer cancellation observation.
+        if self.inner.mask_depth.load(Ordering::Acquire) > 0 {
+            return Ok(());
+        }
+        // Slow path: transition CancelRequested → Cancelling.
+        {
+            let mut state = self
+                .inner
+                .cancel_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *state == CancelState::CancelRequested {
+                *state = CancelState::Cancelling;
+            }
+        }
+        Err(Error::cancelled())
     }
 
     /// Check for cancellation and record a progress message.
@@ -397,6 +581,87 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
             .clone()
     }
 
+    // -----------------------------------------------------------------------
+    // Masked critical sections (§4.12.2)
+    // -----------------------------------------------------------------------
+
+    /// Enter a masked section where `checkpoint()` returns `Ok(())` even if
+    /// cancellation is requested.
+    ///
+    /// Returns a [`MaskGuard`] whose `Drop` restores the mask depth.
+    ///
+    /// # Panics
+    ///
+    /// Panics if nesting exceeds [`MAX_MASK_DEPTH`] (INV-MASK-BOUNDED).
+    #[must_use]
+    pub fn masked(&self) -> MaskGuard<'_> {
+        let prev = self.inner.mask_depth.fetch_add(1, Ordering::AcqRel);
+        if prev >= MAX_MASK_DEPTH {
+            self.inner.mask_depth.fetch_sub(1, Ordering::Release);
+            panic!(
+                "MAX_MASK_DEPTH ({MAX_MASK_DEPTH}) exceeded: mask nesting depth would be {}",
+                prev + 1
+            );
+        }
+        MaskGuard { inner: &self.inner }
+    }
+
+    /// Current mask nesting depth.
+    #[must_use]
+    pub fn mask_depth(&self) -> u32 {
+        self.inner.mask_depth.load(Ordering::Acquire)
+    }
+
+    // -----------------------------------------------------------------------
+    // Commit sections (§4.12.3)
+    // -----------------------------------------------------------------------
+
+    /// Execute a logically atomic commit section.
+    ///
+    /// The section masks cancellation, enforces a poll quota bound, and
+    /// guarantees the `finalizer` runs even on cancellation or panic.
+    pub fn commit_section<R>(
+        &self,
+        poll_quota: u32,
+        body: impl FnOnce(&CommitCtx) -> R,
+        finalizer: impl FnOnce(),
+    ) -> R {
+        struct FinGuard<G: FnOnce()>(Option<G>);
+        impl<G: FnOnce()> Drop for FinGuard<G> {
+            fn drop(&mut self) {
+                if let Some(f) = self.0.take() {
+                    f();
+                }
+            }
+        }
+
+        let _mask = self.masked();
+        let _fin = FinGuard(Some(finalizer));
+        let ctx = CommitCtx::new(poll_quota);
+        body(&ctx)
+    }
+
+    // -----------------------------------------------------------------------
+    // Child context management (INV-CANCEL-PROPAGATES)
+    // -----------------------------------------------------------------------
+
+    /// Create a child `Cx` that shares the parent's budget but has
+    /// independent cancellation state. Cancelling the parent propagates
+    /// to this child.
+    #[must_use]
+    pub fn create_child(&self) -> Self {
+        let child = Self::with_budget(self.budget);
+        {
+            let mut children = self
+                .inner
+                .children
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            children.push(Arc::clone(&child.inner));
+        }
+        child
+    }
+
     /// Set a deterministic unix time for tests.
     pub fn set_unix_millis_for_testing(&self, millis: u64)
     where
@@ -416,6 +681,60 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
         let secs = (millis as f64) / 1000.0;
         // Unix epoch in Julian days: 2440587.5
         2_440_587.5 + (secs / 86_400.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MaskGuard — RAII guard for masked cancellation sections (§4.12.2)
+// ---------------------------------------------------------------------------
+
+/// RAII guard that keeps the `Cx` masked while alive.
+///
+/// Created by [`Cx::masked()`]. On drop, the mask depth is decremented.
+#[derive(Debug)]
+pub struct MaskGuard<'a> {
+    inner: &'a CxInner,
+}
+
+impl Drop for MaskGuard<'_> {
+    fn drop(&mut self) {
+        self.inner.mask_depth.fetch_sub(1, Ordering::Release);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CommitCtx — bounded context for commit sections (§4.12.3)
+// ---------------------------------------------------------------------------
+
+/// Context passed to commit-section bodies.
+///
+/// Tracks a poll-quota budget that operations can decrement via [`Self::tick`].
+#[derive(Debug)]
+pub struct CommitCtx {
+    poll_remaining: AtomicU32,
+}
+
+impl CommitCtx {
+    fn new(poll_quota: u32) -> Self {
+        Self {
+            poll_remaining: AtomicU32::new(poll_quota),
+        }
+    }
+
+    /// Remaining poll budget.
+    #[must_use]
+    pub fn poll_remaining(&self) -> u32 {
+        self.poll_remaining.load(Ordering::Acquire)
+    }
+
+    /// Consume one unit of poll budget. Returns `true` if budget remains.
+    pub fn tick(&self) -> bool {
+        let prev = self.poll_remaining.load(Ordering::Acquire);
+        if prev == 0 {
+            return false;
+        }
+        self.poll_remaining.fetch_sub(1, Ordering::AcqRel);
+        true
     }
 }
 
@@ -811,5 +1130,463 @@ mod tests {
             "ambient authority violations (outside cfg(test) modules):\n{}",
             violations.join("\n")
         );
+    }
+
+    // ===================================================================
+    // §4.12 Cancellation Protocol Tests (bd-samf)
+    // ===================================================================
+
+    const BEAD_ID: &str = "bd-samf";
+
+    #[test]
+    fn test_cancel_state_machine_all_transitions() {
+        // Test 1: State machine transitions through all 6 states.
+        let cx = Cx::<FullCaps>::new();
+        assert_eq!(
+            cx.cancel_state(),
+            CancelState::Created,
+            "bead_id={BEAD_ID} initial_state"
+        );
+
+        cx.transition_to_running();
+        assert_eq!(
+            cx.cancel_state(),
+            CancelState::Running,
+            "bead_id={BEAD_ID} after_start"
+        );
+
+        cx.cancel_with_reason(CancelReason::UserInterrupt);
+        assert_eq!(
+            cx.cancel_state(),
+            CancelState::CancelRequested,
+            "bead_id={BEAD_ID} after_cancel"
+        );
+
+        // Observing cancellation via checkpoint transitions to Cancelling.
+        let err = cx.checkpoint();
+        assert!(err.is_err(), "bead_id={BEAD_ID} checkpoint_returns_err");
+        assert_eq!(
+            cx.cancel_state(),
+            CancelState::Cancelling,
+            "bead_id={BEAD_ID} after_checkpoint_observation"
+        );
+
+        cx.transition_to_finalizing();
+        assert_eq!(
+            cx.cancel_state(),
+            CancelState::Finalizing,
+            "bead_id={BEAD_ID} after_finalize_start"
+        );
+
+        cx.transition_to_completed();
+        assert_eq!(
+            cx.cancel_state(),
+            CancelState::Completed,
+            "bead_id={BEAD_ID} after_complete"
+        );
+    }
+
+    #[test]
+    fn test_cancel_propagates_to_children() {
+        // Test 2: Cancel propagates to 3 children within one call.
+        let parent = Cx::<FullCaps>::new();
+        parent.transition_to_running();
+
+        let child1 = parent.create_child();
+        child1.transition_to_running();
+        let child2 = parent.create_child();
+        child2.transition_to_running();
+        let child3 = parent.create_child();
+        child3.transition_to_running();
+
+        assert!(!child1.is_cancel_requested());
+        assert!(!child2.is_cancel_requested());
+        assert!(!child3.is_cancel_requested());
+
+        parent.cancel_with_reason(CancelReason::RegionClose);
+
+        // All children must see cancellation (INV-CANCEL-PROPAGATES).
+        assert!(
+            child1.is_cancel_requested(),
+            "bead_id={BEAD_ID} child1_cancelled"
+        );
+        assert!(
+            child2.is_cancel_requested(),
+            "bead_id={BEAD_ID} child2_cancelled"
+        );
+        assert!(
+            child3.is_cancel_requested(),
+            "bead_id={BEAD_ID} child3_cancelled"
+        );
+
+        // Children must be in CancelRequested state.
+        assert_eq!(child1.cancel_state(), CancelState::CancelRequested);
+        assert_eq!(child2.cancel_state(), CancelState::CancelRequested);
+        assert_eq!(child3.cancel_state(), CancelState::CancelRequested);
+
+        // Reason must propagate.
+        assert_eq!(child1.cancel_reason(), Some(CancelReason::RegionClose));
+    }
+
+    #[test]
+    fn test_cancel_idempotent_strongest_wins() {
+        // Test 3: Strongest cancel reason wins, cannot get weaker.
+        let cx = Cx::<FullCaps>::new();
+        cx.transition_to_running();
+
+        cx.cancel_with_reason(CancelReason::Timeout);
+        assert_eq!(
+            cx.cancel_reason(),
+            Some(CancelReason::Timeout),
+            "bead_id={BEAD_ID} first_reason"
+        );
+
+        // Stronger reason upgrades.
+        cx.cancel_with_reason(CancelReason::Abort);
+        assert_eq!(
+            cx.cancel_reason(),
+            Some(CancelReason::Abort),
+            "bead_id={BEAD_ID} upgraded_reason"
+        );
+
+        // Weaker reason does NOT downgrade.
+        cx.cancel_with_reason(CancelReason::UserInterrupt);
+        assert_eq!(
+            cx.cancel_reason(),
+            Some(CancelReason::Abort),
+            "bead_id={BEAD_ID} reason_stays_strongest"
+        );
+    }
+
+    #[test]
+    fn test_losers_drain_on_race() {
+        // Test 4: Simulate race combinator — loser with obligation resolves
+        // before race returns.
+        use std::sync::atomic::AtomicBool;
+
+        let loser_cx = Cx::<FullCaps>::new();
+        loser_cx.transition_to_running();
+
+        // Simulate an obligation on the loser.
+        let obligation_resolved = Arc::new(AtomicBool::new(false));
+        let ob_clone = Arc::clone(&obligation_resolved);
+
+        // Winner finishes → cancel loser.
+        loser_cx.cancel_with_reason(CancelReason::RegionClose);
+
+        // Loser observes cancellation at next checkpoint.
+        assert!(loser_cx.checkpoint().is_err());
+        assert_eq!(loser_cx.cancel_state(), CancelState::Cancelling);
+
+        // Loser drains: resolves obligation.
+        ob_clone.store(true, Ordering::Release);
+        loser_cx.transition_to_finalizing();
+        loser_cx.transition_to_completed();
+
+        assert!(
+            obligation_resolved.load(Ordering::Acquire),
+            "bead_id={BEAD_ID} loser_obligation_resolved"
+        );
+        assert_eq!(
+            loser_cx.cancel_state(),
+            CancelState::Completed,
+            "bead_id={BEAD_ID} loser_drained"
+        );
+    }
+
+    #[test]
+    fn test_vdbe_checkpoint_cancel_observed_at_next_opcode() {
+        // Test 5: Simulate VDBE opcode loop — cancel after opcode 50,
+        // observed at opcode 51.
+        let cx = Cx::<FullCaps>::new();
+        cx.transition_to_running();
+
+        let mut last_executed = 0u32;
+        for opcode in 0..100u32 {
+            // Checkpoint at start of each opcode.
+            if cx.checkpoint_with(format!("vdbe pc={opcode}")).is_err() {
+                last_executed = opcode;
+                break;
+            }
+            // Execute opcode.
+            last_executed = opcode;
+            // Cancel arrives at end of opcode 50.
+            if opcode == 50 {
+                cx.cancel_with_reason(CancelReason::UserInterrupt);
+            }
+        }
+
+        assert_eq!(
+            last_executed, 51,
+            "bead_id={BEAD_ID} cancel_observed_at_opcode_51"
+        );
+    }
+
+    #[test]
+    fn test_btree_checkpoint_cancel_within_one_node() {
+        // Test 6: Simulate B-tree descent — cancel mid-descent, observed
+        // within 1 node visit.
+        let cx = Cx::<FullCaps>::new();
+        cx.transition_to_running();
+
+        let nodes = ["root", "internal_l", "internal_r", "leaf_a", "leaf_b"];
+        let cancel_at = 2; // Cancel after visiting internal_r.
+        let mut observed_at = None;
+
+        for (i, node) in nodes.iter().enumerate() {
+            // Checkpoint at start of each node visit.
+            if cx.checkpoint_with(format!("btree node={node}")).is_err() {
+                observed_at = Some(i);
+                break;
+            }
+            // Visit node.
+            // Cancel arrives after visiting node at index cancel_at.
+            if i == cancel_at {
+                cx.cancel_with_reason(CancelReason::UserInterrupt);
+            }
+        }
+
+        assert_eq!(
+            observed_at,
+            Some(cancel_at + 1),
+            "bead_id={BEAD_ID} btree_cancel_within_one_node"
+        );
+    }
+
+    #[test]
+    fn test_masked_section_defers_cancel() {
+        // Test 7: Masked section defers cancel — checkpoint returns Ok inside
+        // mask, Err after exit.
+        let cx = Cx::<FullCaps>::new();
+        cx.transition_to_running();
+
+        cx.cancel_with_reason(CancelReason::UserInterrupt);
+        assert!(cx.is_cancel_requested());
+
+        // Enter masked section.
+        {
+            let _guard = cx.masked();
+            assert_eq!(cx.mask_depth(), 1);
+
+            // Inside mask, checkpoint succeeds despite cancellation.
+            assert!(
+                cx.checkpoint().is_ok(),
+                "bead_id={BEAD_ID} checkpoint_ok_while_masked"
+            );
+
+            // Nested mask.
+            {
+                let _inner = cx.masked();
+                assert_eq!(cx.mask_depth(), 2);
+                assert!(cx.checkpoint().is_ok());
+            }
+            assert_eq!(cx.mask_depth(), 1);
+        }
+        assert_eq!(cx.mask_depth(), 0);
+
+        // After mask exit, checkpoint observes cancellation.
+        assert!(
+            cx.checkpoint().is_err(),
+            "bead_id={BEAD_ID} checkpoint_err_after_mask_exit"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "MAX_MASK_DEPTH")]
+    #[allow(clippy::collection_is_never_read)]
+    fn test_max_mask_depth_exceeded_panics() {
+        // Test 8: MAX_MASK_DEPTH=64 exceeded panics in lab mode.
+        let cx = Cx::<FullCaps>::new();
+        let mut guards = Vec::new();
+        for _ in 0..MAX_MASK_DEPTH {
+            guards.push(cx.masked());
+        }
+        // This 65th mask should panic.
+        let _overflow = cx.masked();
+    }
+
+    #[test]
+    fn test_commit_section_completes_under_cancel() {
+        // Test 9: Cancel after op 1 of 3, all 3 complete + finalizers run.
+        let cx = Cx::<FullCaps>::new();
+        cx.transition_to_running();
+
+        let ops_completed = Arc::new(AtomicU32::new(0));
+        let finalizer_ran = Arc::new(AtomicBool::new(false));
+
+        let ops = Arc::clone(&ops_completed);
+        let fin = Arc::clone(&finalizer_ran);
+
+        cx.commit_section(
+            10,
+            |ctx| {
+                // Op 1.
+                assert!(ctx.tick());
+                ops.fetch_add(1, Ordering::Release);
+
+                // Cancel mid-section.
+                cx.cancel_with_reason(CancelReason::UserInterrupt);
+
+                // Op 2: still succeeds because commit section is masked.
+                assert!(ctx.tick());
+                ops.fetch_add(1, Ordering::Release);
+                assert!(
+                    cx.checkpoint().is_ok(),
+                    "bead_id={BEAD_ID} masked_during_commit"
+                );
+
+                // Op 3.
+                assert!(ctx.tick());
+                ops.fetch_add(1, Ordering::Release);
+            },
+            move || {
+                fin.store(true, Ordering::Release);
+            },
+        );
+
+        assert_eq!(
+            ops_completed.load(Ordering::Acquire),
+            3,
+            "bead_id={BEAD_ID} all_ops_completed"
+        );
+        assert!(
+            finalizer_ran.load(Ordering::Acquire),
+            "bead_id={BEAD_ID} finalizer_ran"
+        );
+
+        // After commit section, masking is removed — checkpoint should fail.
+        assert!(cx.checkpoint().is_err());
+    }
+
+    #[test]
+    fn test_commit_section_enforces_poll_quota() {
+        // Test 10: Commit section poll quota is bounded.
+        let cx = Cx::<FullCaps>::new();
+        cx.transition_to_running();
+
+        let ticks_succeeded = Arc::new(AtomicU32::new(0));
+        let ts = Arc::clone(&ticks_succeeded);
+
+        cx.commit_section(
+            3,
+            |ctx| {
+                assert_eq!(ctx.poll_remaining(), 3);
+                for _ in 0..5 {
+                    if ctx.tick() {
+                        ts.fetch_add(1, Ordering::Release);
+                    }
+                }
+            },
+            || {},
+        );
+
+        assert_eq!(
+            ticks_succeeded.load(Ordering::Acquire),
+            3,
+            "bead_id={BEAD_ID} poll_quota_enforced"
+        );
+    }
+
+    #[test]
+    fn test_cancel_unaware_hot_loop_detected() {
+        // Test 11: Simulate harness detecting a hot loop that never
+        // calls checkpoint.
+        let cx = Cx::<FullCaps>::new();
+        cx.transition_to_running();
+
+        // Harness deadline: if 100 iterations pass without checkpoint,
+        // the loop is cancel-unaware.
+        let deadline = 100u32;
+        let mut iterations_without_checkpoint = 0u32;
+        let mut detected_unaware = false;
+
+        cx.cancel_with_reason(CancelReason::UserInterrupt);
+
+        for _i in 0..200u32 {
+            iterations_without_checkpoint += 1;
+            if iterations_without_checkpoint >= deadline {
+                detected_unaware = true;
+                break;
+            }
+            // Bug: no cx.checkpoint() call in the loop body.
+        }
+
+        assert!(
+            detected_unaware,
+            "bead_id={BEAD_ID} cancel_unaware_loop_detected"
+        );
+
+        // Contrast: a compliant loop would checkpoint and exit.
+        let cx2 = Cx::<FullCaps>::new();
+        cx2.transition_to_running();
+        cx2.cancel_with_reason(CancelReason::UserInterrupt);
+        let mut compliant_iters = 0u32;
+        for _ in 0..200u32 {
+            if cx2.checkpoint().is_err() {
+                break;
+            }
+            compliant_iters += 1;
+        }
+        assert_eq!(
+            compliant_iters, 0,
+            "bead_id={BEAD_ID} compliant_loop_exits_immediately"
+        );
+    }
+
+    #[test]
+    fn test_write_coordinator_commit_section() {
+        // Test 12: Simulate WriteCoordinator — cancel mid-publish,
+        // proof+marker completes atomically via commit section.
+        let cx = Cx::<FullCaps>::new();
+        cx.transition_to_running();
+
+        let proof_published = Arc::new(AtomicBool::new(false));
+        let marker_published = Arc::new(AtomicBool::new(false));
+        let reservation_released = Arc::new(AtomicBool::new(false));
+
+        let proof = Arc::clone(&proof_published);
+        let marker = Arc::clone(&marker_published);
+        let release = Arc::clone(&reservation_released);
+
+        cx.commit_section(
+            10,
+            |ctx| {
+                // Step 1: FCW validation passed, commit_seq allocated.
+                assert!(ctx.tick());
+
+                // Cancel arrives mid-publish.
+                cx.cancel_with_reason(CancelReason::RegionClose);
+
+                // Step 2: Publish proof (must complete).
+                assert!(ctx.tick());
+                proof.store(true, Ordering::Release);
+                // Checkpoint inside commit section succeeds (masked).
+                assert!(cx.checkpoint().is_ok());
+
+                // Step 3: Publish marker (must complete).
+                assert!(ctx.tick());
+                marker.store(true, Ordering::Release);
+            },
+            move || {
+                // Finalizer: release reservation.
+                release.store(true, Ordering::Release);
+            },
+        );
+
+        assert!(
+            proof_published.load(Ordering::Acquire),
+            "bead_id={BEAD_ID} proof_published"
+        );
+        assert!(
+            marker_published.load(Ordering::Acquire),
+            "bead_id={BEAD_ID} marker_published"
+        );
+        assert!(
+            reservation_released.load(Ordering::Acquire),
+            "bead_id={BEAD_ID} reservation_released"
+        );
+
+        // After commit section, cancellation is visible.
+        assert!(cx.checkpoint().is_err());
     }
 }

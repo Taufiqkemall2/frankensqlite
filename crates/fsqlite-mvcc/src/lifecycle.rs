@@ -4127,52 +4127,116 @@ mod tests {
         // T1 reads (A,B)=(50,50), writes A=-40 (withdraw 90).
         // T2 reads (A,B)=(50,50), writes B=-40 (withdraw 90).
         // Under SSI: one must abort.
-        let m = mgr();
-        let pa = PageNumber::new(1).unwrap();
-        let pb = PageNumber::new(2).unwrap();
+        let ((), logs) = with_tracing_capture(|| {
+            let m = mgr();
+            assert!(m.ssi_enabled(), "SSI must be enabled by default");
 
-        // Seed: A=50, B=50 (represented as first byte).
-        let mut setup = m.begin(BeginKind::Immediate).unwrap();
-        m.write_page(&mut setup, pa, test_data(50)).unwrap();
-        m.write_page(&mut setup, pb, test_data(50)).unwrap();
-        m.commit(&mut setup).unwrap();
+            let pa = PageNumber::new(1).unwrap();
+            let pb = PageNumber::new(2).unwrap();
 
-        // T1: reads both, writes A.
-        let mut t1 = m.begin(BeginKind::Concurrent).unwrap();
-        let _ = m.read_page(&mut t1, pa);
-        let _ = m.read_page(&mut t1, pb);
-        m.write_page(&mut t1, pa, test_data(0xD8)).unwrap(); // -40 as u8
+            // Seed: A=50, B=50.
+            let mut setup = m.begin(BeginKind::Immediate).unwrap();
+            m.write_page(&mut setup, pa, test_i64(50)).unwrap();
+            m.write_page(&mut setup, pb, test_i64(50)).unwrap();
+            m.commit(&mut setup).unwrap();
 
-        // T2: reads both, writes B.
-        let mut t2 = m.begin(BeginKind::Concurrent).unwrap();
-        let _ = m.read_page(&mut t2, pa);
-        let _ = m.read_page(&mut t2, pb);
-        m.write_page(&mut t2, pb, test_data(0xD8)).unwrap(); // -40 as u8
+            // T1: reads both, writes A.
+            let mut t1 = m.begin(BeginKind::Concurrent).unwrap();
+            let a1 = decode_i64(&m.read_page(&mut t1, pa).unwrap());
+            let b1 = decode_i64(&m.read_page(&mut t1, pb).unwrap());
+            assert_eq!((a1, b1), (50, 50));
+            m.write_page(&mut t1, pa, test_i64(a1 - 90)).unwrap(); // -40
 
-        // Simulate SSI witness flags (the witness plane would set these):
-        // T1 has out_rw (wrote A which T2 read) and in_rw (read B which T2 writes).
-        t1.has_in_rw = true;
-        t1.has_out_rw = true;
-        // T2 has symmetric flags.
-        t2.has_in_rw = true;
-        t2.has_out_rw = true;
+            // T2: reads both, writes B.
+            let mut t2 = m.begin(BeginKind::Concurrent).unwrap();
+            let a2 = decode_i64(&m.read_page(&mut t2, pa).unwrap());
+            let b2 = decode_i64(&m.read_page(&mut t2, pb).unwrap());
+            assert_eq!((a2, b2), (50, 50));
+            m.write_page(&mut t2, pb, test_i64(b2 - 90)).unwrap(); // -40
 
-        // Under SSI, both have dangerous structure — first to commit fails.
-        let r1 = m.commit(&mut t1);
-        assert_eq!(
-            r1.unwrap_err(),
-            MvccError::BusySnapshot,
-            "write skew: T1 must abort (sum constraint preserved)"
+            // Each transaction's local constraint check passes under its snapshot.
+            let sum1 = decode_i64(&m.read_page(&mut t1, pa).unwrap())
+                + decode_i64(&m.read_page(&mut t1, pb).unwrap());
+            let sum2 = decode_i64(&m.read_page(&mut t2, pa).unwrap())
+                + decode_i64(&m.read_page(&mut t2, pb).unwrap());
+            assert!(sum1 >= 0, "txn1 local constraint check must pass");
+            assert!(sum2 >= 0, "txn2 local constraint check must pass");
+
+            // Under SSI, one of the two must abort to preserve the invariant.
+            let _ = m.commit(&mut t1).unwrap();
+
+            // Simulate witness-plane discovery of the dangerous structure.
+            t2.has_in_rw = true;
+            t2.has_out_rw = true;
+            assert_eq!(
+                m.commit(&mut t2).unwrap_err(),
+                MvccError::BusySnapshot,
+                "SSI must abort one writer to prevent write skew"
+            );
+
+            // Verify global invariant preserved: final sum must be >= 0.
+            let mut reader = m.begin(BeginKind::Deferred).unwrap();
+            let a = decode_i64(&m.read_page(&mut reader, pa).unwrap());
+            let b = decode_i64(&m.read_page(&mut reader, pb).unwrap());
+            assert!(a + b >= 0, "global invariant must hold (a={a}, b={b})");
+        });
+
+        assert!(
+            logs.contains("SSI abort: dangerous structure detected"),
+            "expected abort log; logs={logs}"
         );
+        assert!(logs.contains("conn_id="), "expected conn_id in logs");
+    }
 
-        // T2 also has dangerous structure (abort here too, unless you want
-        // to only abort one — in practice the first-to-commit check catches one).
-        let r2 = m.commit(&mut t2);
-        assert_eq!(
-            r2.unwrap_err(),
-            MvccError::BusySnapshot,
-            "write skew: T2 must also abort (both have dangerous structure)"
+    #[test]
+    fn test_write_skew_sum_constraint_serializable_off_allows_anomaly() {
+        let ((), logs) = with_tracing_capture(|| {
+            let mut m = mgr();
+            m.set_ssi_enabled(false);
+            assert!(!m.ssi_enabled());
+
+            let pa = PageNumber::new(1).unwrap();
+            let pb = PageNumber::new(2).unwrap();
+
+            // Seed: A=50, B=50.
+            let mut setup = m.begin(BeginKind::Immediate).unwrap();
+            m.write_page(&mut setup, pa, test_i64(50)).unwrap();
+            m.write_page(&mut setup, pb, test_i64(50)).unwrap();
+            m.commit(&mut setup).unwrap();
+
+            let mut t1 = m.begin(BeginKind::Concurrent).unwrap();
+            let mut t2 = m.begin(BeginKind::Concurrent).unwrap();
+
+            let a1 = decode_i64(&m.read_page(&mut t1, pa).unwrap());
+            let b2 = decode_i64(&m.read_page(&mut t2, pb).unwrap());
+            m.write_page(&mut t1, pa, test_i64(a1 - 90)).unwrap();
+            m.write_page(&mut t2, pb, test_i64(b2 - 90)).unwrap();
+
+            // Even if the witness plane marks the structure as dangerous, the
+            // per-txn PRAGMA snapshot should skip SSI validation entirely.
+            t1.has_in_rw = true;
+            t1.has_out_rw = true;
+            t2.has_in_rw = true;
+            t2.has_out_rw = true;
+
+            let _ = m.commit(&mut t1).unwrap();
+            let _ = m.commit(&mut t2).unwrap();
+
+            let mut reader = m.begin(BeginKind::Deferred).unwrap();
+            let a = decode_i64(&m.read_page(&mut reader, pa).unwrap());
+            let b = decode_i64(&m.read_page(&mut reader, pb).unwrap());
+            assert!(
+                a + b < 0,
+                "expected anomaly under SI (a={a}, b={b}, sum={})",
+                a + b
+            );
+        });
+
+        assert!(
+            logs.contains("PRAGMA fsqlite.serializable changed"),
+            "expected PRAGMA log; logs={logs}"
         );
+        assert!(logs.contains("conn_id="), "expected conn_id in logs");
     }
 
     #[test]
