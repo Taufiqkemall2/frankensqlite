@@ -540,4 +540,336 @@ mod tests {
         file.read(&cx, &mut buf, 4096).unwrap();
         assert!(buf.iter().all(|&b| b == 0xBB));
     }
+
+    #[test]
+    fn clone_vfs_shares_state() {
+        let cx = Cx::new();
+        let vfs1 = make_vfs();
+        let vfs2 = vfs1.clone();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+
+        let (mut file, _) = vfs1.open(&cx, Some(Path::new("shared.db")), flags).unwrap();
+        file.write(&cx, b"from vfs1", 0).unwrap();
+
+        // vfs2 should see the same file since they share inner state.
+        let open_flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE;
+        let (mut file2, _) = vfs2
+            .open(&cx, Some(Path::new("shared.db")), open_flags)
+            .unwrap();
+        let mut buf = [0u8; 9];
+        let n = file2.read(&cx, &mut buf, 0).unwrap();
+        assert_eq!(n, 9);
+        assert_eq!(&buf, b"from vfs1");
+    }
+
+    #[test]
+    fn write_zero_bytes() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs.open(&cx, Some(Path::new("zero.db")), flags).unwrap();
+
+        file.write(&cx, b"abc", 0).unwrap();
+        file.write(&cx, b"", 0).unwrap(); // zero-length write
+        assert_eq!(file.file_size(&cx).unwrap(), 3);
+
+        let mut buf = [0u8; 3];
+        file.read(&cx, &mut buf, 0).unwrap();
+        assert_eq!(&buf, b"abc");
+    }
+
+    #[test]
+    fn read_zero_bytes() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs.open(&cx, Some(Path::new("rz.db")), flags).unwrap();
+
+        file.write(&cx, b"data", 0).unwrap();
+        let mut buf = [];
+        let n = file.read(&cx, &mut buf, 0).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn read_at_exact_end() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs.open(&cx, Some(Path::new("end.db")), flags).unwrap();
+
+        file.write(&cx, b"12345", 0).unwrap();
+        let mut buf = [0xFFu8; 4];
+        let n = file.read(&cx, &mut buf, 5).unwrap();
+        assert_eq!(n, 0);
+        assert!(buf.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn truncate_to_zero() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs.open(&cx, Some(Path::new("tz.db")), flags).unwrap();
+
+        file.write(&cx, b"content", 0).unwrap();
+        file.truncate(&cx, 0).unwrap();
+        assert_eq!(file.file_size(&cx).unwrap(), 0);
+    }
+
+    #[test]
+    fn truncate_beyond_size_is_noop() {
+        // Vec::truncate with a length larger than current is a no-op.
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs.open(&cx, Some(Path::new("tb.db")), flags).unwrap();
+
+        file.write(&cx, b"hi", 0).unwrap();
+        file.truncate(&cx, 100).unwrap();
+        assert_eq!(file.file_size(&cx).unwrap(), 2);
+    }
+
+    #[test]
+    fn close_without_delete_preserves_file() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let path = Path::new("keep.db");
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+
+        let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        file.write(&cx, b"persist", 0).unwrap();
+        file.close(&cx).unwrap();
+
+        assert!(vfs.access(&cx, path, AccessFlags::EXISTS).unwrap());
+    }
+
+    #[test]
+    fn shm_map_returns_unsupported() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs.open(&cx, Some(Path::new("shm.db")), flags).unwrap();
+
+        let err = file.shm_map(&cx, 0, 4096, true).unwrap_err();
+        assert!(matches!(err, FrankenError::Unsupported));
+    }
+
+    #[test]
+    fn shm_lock_returns_unsupported() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs.open(&cx, Some(Path::new("shml.db")), flags).unwrap();
+
+        let err = file.shm_lock(&cx, 0, 1, 0).unwrap_err();
+        assert!(matches!(err, FrankenError::Unsupported));
+    }
+
+    #[test]
+    fn shm_barrier_is_noop() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (file, _) = vfs.open(&cx, Some(Path::new("shmb.db")), flags).unwrap();
+
+        file.shm_barrier(); // should not panic
+    }
+
+    #[test]
+    fn shm_unmap_succeeds() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs.open(&cx, Some(Path::new("shmu.db")), flags).unwrap();
+
+        file.shm_unmap(&cx, false).unwrap();
+        file.shm_unmap(&cx, true).unwrap(); // idempotent
+    }
+
+    #[test]
+    fn delete_nonexistent_is_silent() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        // Deleting a path that doesn't exist should not error (HashMap::remove is a no-op).
+        vfs.delete(&cx, Path::new("ghost.db"), false).unwrap();
+    }
+
+    #[test]
+    fn new_file_size_is_zero() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (file, _) = vfs
+            .open(&cx, Some(Path::new("empty_sz.db")), flags)
+            .unwrap();
+        assert_eq!(file.file_size(&cx).unwrap(), 0);
+    }
+
+    #[test]
+    fn open_with_create_adds_readwrite_flag() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE;
+        let (_, out_flags) = vfs.open(&cx, Some(Path::new("flag.db")), flags).unwrap();
+        assert!(out_flags.contains(VfsOpenFlags::READWRITE));
+    }
+
+    #[test]
+    fn access_readwrite_on_existing_file() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+
+        let (mut file, _) = vfs.open(&cx, Some(Path::new("acc.db")), flags).unwrap();
+        file.write(&cx, b"test", 0).unwrap();
+
+        // MemoryVfs always returns true for access if file exists.
+        assert!(
+            vfs.access(&cx, Path::new("acc.db"), AccessFlags::READWRITE)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn access_nonexistent() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        assert!(
+            !vfs.access(&cx, Path::new("nope.db"), AccessFlags::EXISTS)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn unlock_below_current_level_is_noop() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs.open(&cx, Some(Path::new("unlock.db")), flags).unwrap();
+
+        file.lock(&cx, LockLevel::Shared).unwrap();
+        // Unlocking to a higher level should be a no-op.
+        file.unlock(&cx, LockLevel::Exclusive).unwrap();
+        // The lock level should remain at Shared (unlock doesn't escalate).
+    }
+
+    #[test]
+    fn multiple_temp_files_distinct() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::TEMP_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+
+        let (mut f1, _) = vfs.open(&cx, None, flags).unwrap();
+        let (mut f2, _) = vfs.open(&cx, None, flags).unwrap();
+        let (mut f3, _) = vfs.open(&cx, None, flags).unwrap();
+
+        f1.write(&cx, b"one", 0).unwrap();
+        f2.write(&cx, b"two", 0).unwrap();
+        f3.write(&cx, b"three", 0).unwrap();
+
+        let mut buf = [0u8; 5];
+        f1.read(&cx, &mut buf, 0).unwrap();
+        assert_eq!(&buf[..3], b"one");
+
+        f2.read(&cx, &mut buf, 0).unwrap();
+        assert_eq!(&buf[..3], b"two");
+
+        f3.read(&cx, &mut buf, 0).unwrap();
+        assert_eq!(&buf[..5], b"three");
+    }
+
+    #[test]
+    fn full_pathname_relative_gets_root_prefix() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let result = vfs.full_pathname(&cx, Path::new("foo/bar.db")).unwrap();
+        assert_eq!(result, Path::new("/foo/bar.db"));
+    }
+
+    #[test]
+    fn memory_vfs_default_trait() {
+        let vfs = MemoryVfs::default();
+        assert_eq!(vfs.name(), "memory");
+    }
+
+    #[test]
+    fn concurrent_write_via_shared_handle() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+
+        let (mut f1, _) = vfs.open(&cx, Some(Path::new("conc.db")), flags).unwrap();
+        f1.write(&cx, b"AAAA", 0).unwrap();
+
+        // Open a second handle to the same file.
+        let open_flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE;
+        let (mut f2, _) = vfs
+            .open(&cx, Some(Path::new("conc.db")), open_flags)
+            .unwrap();
+        f2.write(&cx, b"BB", 1).unwrap();
+
+        // Both handles should see the merged result.
+        let mut buf = [0u8; 4];
+        f1.read(&cx, &mut buf, 0).unwrap();
+        assert_eq!(&buf, b"ABBA");
+    }
+
+    #[test]
+    fn close_resets_lock_to_none() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs.open(&cx, Some(Path::new("clr.db")), flags).unwrap();
+
+        file.lock(&cx, LockLevel::Exclusive).unwrap();
+        file.close(&cx).unwrap();
+        // Internal lock_level should be reset to None after close.
+        assert_eq!(file.lock_level, LockLevel::None);
+    }
+
+    #[test]
+    fn lock_full_escalation_and_downgrade() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs.open(&cx, Some(Path::new("esc.db")), flags).unwrap();
+
+        // Full SQLite lock escalation: None → Shared → Reserved → Pending → Exclusive
+        file.lock(&cx, LockLevel::Shared).unwrap();
+        file.lock(&cx, LockLevel::Reserved).unwrap();
+        file.lock(&cx, LockLevel::Pending).unwrap();
+        file.lock(&cx, LockLevel::Exclusive).unwrap();
+
+        // Full downgrade: Exclusive → Shared → None
+        file.unlock(&cx, LockLevel::Shared).unwrap();
+        file.unlock(&cx, LockLevel::None).unwrap();
+
+        // check_reserved_lock still false (MemoryVfs has no cross-connection locking).
+        assert!(!file.check_reserved_lock(&cx).unwrap());
+    }
+
+    #[test]
+    fn sector_size_and_device_characteristics_defaults() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (file, _) = vfs.open(&cx, Some(Path::new("dev.db")), flags).unwrap();
+
+        assert_eq!(file.sector_size(), 4096);
+        assert_eq!(file.device_characteristics(), 0);
+    }
+
+    #[test]
+    fn sync_with_different_flags() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs.open(&cx, Some(Path::new("sync2.db")), flags).unwrap();
+
+        // All sync flag variants should be no-ops for MemoryVfs.
+        file.sync(&cx, SyncFlags::NORMAL).unwrap();
+        file.sync(&cx, SyncFlags::FULL).unwrap();
+        file.sync(&cx, SyncFlags::DATAONLY).unwrap();
+    }
 }

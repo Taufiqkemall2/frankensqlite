@@ -1,9 +1,9 @@
 //! Windows VFS implementation.
 //!
 //! This backend provides the same `Vfs` / `VfsFile` surface as `UnixVfs`,
-//! using Windows-friendly file APIs and in-process lock coordination that
-//! mirrors SQLite's lock-level semantics (`NONE` → `SHARED` → `RESERVED`
-//! → `PENDING` → `EXCLUSIVE`).
+//! using Windows-friendly file APIs and lock sidecars backed by OS advisory
+//! locks (`LockFileEx` via `advisory-lock`) that mirror SQLite lock-level
+//! transitions (`NONE` → `SHARED` → `RESERVED` → `PENDING` → `EXCLUSIVE`).
 
 use std::collections::HashMap;
 use std::env;
@@ -14,11 +14,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering, fence};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use advisory_lock::{AdvisoryFileLock, FileLockError, FileLockMode};
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::shm::{
     SQLITE_SHM_EXCLUSIVE, SQLITE_SHM_LOCK, SQLITE_SHM_SHARED, SQLITE_SHM_UNLOCK, ShmRegion,
@@ -28,6 +29,10 @@ use crate::traits::{Vfs, VfsFile};
 
 /// SQLite I/O capability bit indicating files cannot be deleted while open.
 const SQLITE_IOCAP_UNDELETABLE_WHEN_OPEN: u32 = 0x0000_0800;
+const PENDING_BYTE: u64 = 0x4000_0000;
+const RESERVED_BYTE: u64 = PENDING_BYTE + 1;
+const SHARED_FIRST: u64 = PENDING_BYTE + 2;
+const SHARED_SIZE: u64 = 510;
 
 fn checkpoint_or_abort(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FrankenError::Abort)
@@ -49,6 +54,49 @@ fn sqlite_shm_path(path: &Path) -> PathBuf {
     let mut shm: OsString = path.as_os_str().to_owned();
     shm.push("-shm");
     PathBuf::from(shm)
+}
+
+fn append_suffix_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut value: OsString = path.as_os_str().to_owned();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn sqlite_shared_lock_path(path: &Path) -> PathBuf {
+    append_suffix_path(path, &format!(".lock.{SHARED_FIRST}.{SHARED_SIZE}.shared"))
+}
+
+fn sqlite_reserved_lock_path(path: &Path) -> PathBuf {
+    append_suffix_path(path, &format!(".lock.{RESERVED_BYTE}.reserved"))
+}
+
+fn sqlite_pending_lock_path(path: &Path) -> PathBuf {
+    append_suffix_path(path, &format!(".lock.{PENDING_BYTE}.pending"))
+}
+
+fn sqlite_exclusive_lock_path(path: &Path) -> PathBuf {
+    append_suffix_path(
+        path,
+        &format!(".lock.{}.exclusive", PENDING_BYTE + SHARED_SIZE + 1),
+    )
+}
+
+fn sqlite_lock_sidecar_paths(path: &Path) -> [PathBuf; 4] {
+    [
+        sqlite_shared_lock_path(path),
+        sqlite_reserved_lock_path(path),
+        sqlite_pending_lock_path(path),
+        sqlite_exclusive_lock_path(path),
+    ]
+}
+
+fn cleanup_lock_sidecars(path: &Path) -> Result<()> {
+    for sidecar in sqlite_lock_sidecar_paths(path) {
+        if sidecar.exists() {
+            fs::remove_file(sidecar)?;
+        }
+    }
+    Ok(())
 }
 
 fn ensure_shm_file_len(path: &Path, min_len: u64) -> Result<()> {
@@ -253,6 +301,131 @@ fn next_lock_level(level: LockLevel) -> Option<LockLevel> {
     }
 }
 
+fn lock_level_slot(level: LockLevel) -> Option<usize> {
+    match level {
+        LockLevel::None => None,
+        LockLevel::Shared => Some(0),
+        LockLevel::Reserved => Some(1),
+        LockLevel::Pending => Some(2),
+        LockLevel::Exclusive => Some(3),
+    }
+}
+
+#[derive(Debug)]
+struct WindowsOsLockFiles {
+    shared_file: File,
+    reserved_file: File,
+    pending_file: File,
+    exclusive_file: File,
+    held_levels: [bool; 4],
+}
+
+impl WindowsOsLockFiles {
+    fn open(path: &Path) -> Result<Self> {
+        let open_sidecar = |sidecar: &Path| -> Result<File> {
+            Ok(OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(sidecar)?)
+        };
+
+        Ok(Self {
+            shared_file: open_sidecar(&sqlite_shared_lock_path(path))?,
+            reserved_file: open_sidecar(&sqlite_reserved_lock_path(path))?,
+            pending_file: open_sidecar(&sqlite_pending_lock_path(path))?,
+            exclusive_file: open_sidecar(&sqlite_exclusive_lock_path(path))?,
+            held_levels: [false; 4],
+        })
+    }
+
+    fn try_lock_shared(file: &File) -> Result<()> {
+        match AdvisoryFileLock::try_lock(file, FileLockMode::Shared) {
+            Ok(()) => Ok(()),
+            Err(FileLockError::AlreadyLocked) => Err(FrankenError::Busy),
+            Err(FileLockError::Io(err)) => Err(FrankenError::Io(err)),
+        }
+    }
+
+    fn try_lock_exclusive(file: &File) -> Result<()> {
+        match AdvisoryFileLock::try_lock(file, FileLockMode::Exclusive) {
+            Ok(()) => Ok(()),
+            Err(FileLockError::AlreadyLocked) => Err(FrankenError::Busy),
+            Err(FileLockError::Io(err)) => Err(FrankenError::Io(err)),
+        }
+    }
+
+    fn unlock_file(file: &File) -> Result<()> {
+        match AdvisoryFileLock::unlock(file) {
+            Ok(()) => Ok(()),
+            Err(FileLockError::AlreadyLocked) => Err(FrankenError::LockFailed {
+                detail: "unlock called for contended lock".to_string(),
+            }),
+            Err(FileLockError::Io(err)) => Err(FrankenError::Io(err)),
+        }
+    }
+
+    fn lock_file_for_level(&self, level: LockLevel) -> Option<&File> {
+        match level {
+            LockLevel::None => None,
+            LockLevel::Shared => Some(&self.shared_file),
+            LockLevel::Reserved => Some(&self.reserved_file),
+            LockLevel::Pending => Some(&self.pending_file),
+            LockLevel::Exclusive => Some(&self.exclusive_file),
+        }
+    }
+
+    fn lock_held(&self, level: LockLevel) -> bool {
+        lock_level_slot(level).is_some_and(|slot| self.held_levels[slot])
+    }
+
+    fn set_lock_held(&mut self, level: LockLevel, held: bool) {
+        if let Some(slot) = lock_level_slot(level) {
+            self.held_levels[slot] = held;
+        }
+    }
+
+    fn try_lock_level(&mut self, level: LockLevel) -> Result<()> {
+        if level == LockLevel::None {
+            return Ok(());
+        }
+
+        if self.lock_held(level) {
+            return Ok(());
+        }
+
+        let file = self
+            .lock_file_for_level(level)
+            .ok_or_else(|| FrankenError::internal("invalid lock level"))?;
+        if level == LockLevel::Shared {
+            Self::try_lock_shared(file)?;
+        } else {
+            Self::try_lock_exclusive(file)?;
+        }
+        self.set_lock_held(level, true);
+        Ok(())
+    }
+
+    fn unlock_to(&mut self, level: LockLevel) -> Result<()> {
+        for held_level in [
+            LockLevel::Exclusive,
+            LockLevel::Pending,
+            LockLevel::Reserved,
+            LockLevel::Shared,
+        ] {
+            if level < held_level && self.lock_held(held_level) {
+                let file = self
+                    .lock_file_for_level(held_level)
+                    .ok_or_else(|| FrankenError::internal("invalid lock level"))?;
+                Self::unlock_file(file)?;
+                self.set_lock_held(held_level, false);
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Vfs for WindowsVfs {
     type File = WindowsFile;
 
@@ -313,6 +486,7 @@ impl Vfs for WindowsVfs {
         })?;
 
         let lock_state = windows_lock_table().get_or_create(&resolved)?;
+        let os_locks = WindowsOsLockFiles::open(&resolved)?;
         let owner_id = next_owner_id();
         let shm_path = sqlite_shm_path(&resolved);
 
@@ -328,6 +502,7 @@ impl Vfs for WindowsVfs {
                 path: resolved,
                 file,
                 lock_state,
+                os_locks,
                 owner_id,
                 lock_level: LockLevel::None,
                 delete_on_close,
@@ -347,6 +522,7 @@ impl Vfs for WindowsVfs {
         if shm_path.exists() {
             fs::remove_file(shm_path)?;
         }
+        cleanup_lock_sidecars(&resolved)?;
         Ok(())
     }
 
@@ -377,6 +553,7 @@ pub struct WindowsFile {
     path: PathBuf,
     file: File,
     lock_state: Arc<Mutex<WindowsLockState>>,
+    os_locks: WindowsOsLockFiles,
     owner_id: u64,
     lock_level: LockLevel,
     delete_on_close: bool,
@@ -575,6 +752,7 @@ impl VfsFile for WindowsFile {
         self.release_shm_owner_state(self.delete_on_close)?;
         if self.delete_on_close {
             drop(fs::remove_file(&self.path));
+            cleanup_lock_sidecars(&self.path)?;
         }
         windows_lock_table().remove_if_empty(&self.path)?;
         Ok(())
@@ -674,6 +852,18 @@ impl VfsFile for WindowsFile {
                 return Err(FrankenError::Busy);
             }
 
+            if let Err(err) = self.os_locks.try_lock_level(next) {
+                if matches!(err, FrankenError::Busy) {
+                    warn!(
+                        target: "fsqlite_vfs::windows",
+                        requested = ?next,
+                        path = %self.path.display(),
+                        "windows os lock contention"
+                    );
+                }
+                return Err(err);
+            }
+
             state.holders.insert(self.owner_id, next);
             debug!(
                 target: "fsqlite_vfs::windows",
@@ -700,6 +890,8 @@ impl VfsFile for WindowsFile {
             .lock()
             .map_err(|_| lock_poisoned("windows lock state"))?;
 
+        self.os_locks.unlock_to(level)?;
+
         if level == LockLevel::None {
             state.holders.remove(&self.owner_id);
         } else {
@@ -719,14 +911,41 @@ impl VfsFile for WindowsFile {
     }
 
     fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
+        if self.lock_level >= LockLevel::Reserved {
+            return Ok(false);
+        }
+        let reserved_path = sqlite_reserved_lock_path(&self.path);
+
         let state = self
             .lock_state
             .lock()
             .map_err(|_| lock_poisoned("windows lock state"))?;
-        Ok(state
+        if state
             .holders
             .iter()
-            .any(|(owner, level)| *owner != self.owner_id && *level >= LockLevel::Reserved))
+            .any(|(owner, level)| *owner != self.owner_id && *level >= LockLevel::Reserved)
+        {
+            return Ok(true);
+        }
+        drop(state);
+
+        match AdvisoryFileLock::try_lock(&self.os_locks.reserved_file, FileLockMode::Exclusive) {
+            Ok(()) => {
+                WindowsOsLockFiles::unlock_file(&self.os_locks.reserved_file)?;
+                Ok(false)
+            }
+            Err(FileLockError::AlreadyLocked) => Ok(true),
+            Err(FileLockError::Io(err)) => {
+                error!(
+                    target: "fsqlite_vfs::windows",
+                    function_name = "check_reserved_lock",
+                    error_code = err.raw_os_error().unwrap_or_default(),
+                    file_path = %reserved_path.display(),
+                    "windows reserved lock probe failed"
+                );
+                Err(FrankenError::Io(err))
+            }
+        }
     }
 
     fn sector_size(&self) -> u32 {
@@ -877,6 +1096,7 @@ impl VfsFile for WindowsFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use tempfile::tempdir;
 
     fn open_flags_create() -> VfsOpenFlags {
@@ -952,6 +1172,16 @@ mod tests {
     }
 
     #[test]
+    fn test_windowsvfs_file_size() {
+        test_windowsvfs_file_size_and_truncate();
+    }
+
+    #[test]
+    fn test_windowsvfs_truncate() {
+        test_windowsvfs_file_size_and_truncate();
+    }
+
+    #[test]
     fn test_windowsvfs_lock_escalation_and_contention() {
         let cx = Cx::new();
         let dir = tempdir().expect("temp dir");
@@ -979,6 +1209,71 @@ mod tests {
     }
 
     #[test]
+    fn test_windowsvfs_lock_escalation() {
+        test_windowsvfs_lock_escalation_and_contention();
+    }
+
+    #[test]
+    fn test_windowsvfs_lock_contention() {
+        test_windowsvfs_lock_escalation_and_contention();
+    }
+
+    #[test]
+    fn test_windowsvfs_reserved_lock_probe_observes_os_lock() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("reserved_probe.db");
+        let vfs = WindowsVfs::new();
+        let (file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open file");
+
+        let reserved_sidecar = sqlite_reserved_lock_path(&path);
+        let reserved_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&reserved_sidecar)
+            .expect("open reserved sidecar");
+        AdvisoryFileLock::try_lock(&reserved_file, FileLockMode::Exclusive)
+            .expect("acquire reserved sidecar lock");
+
+        assert!(file.check_reserved_lock(&cx).expect("reserved probe"));
+
+        AdvisoryFileLock::unlock(&reserved_file).expect("release reserved sidecar lock");
+        assert!(!file.check_reserved_lock(&cx).expect("reserved probe clear"));
+    }
+
+    #[test]
+    fn test_windowsvfs_delete_removes_lock_sidecars() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("sidecars.db");
+        let vfs = WindowsVfs::new();
+
+        let (mut file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open file");
+        file.lock(&cx, LockLevel::Shared).expect("shared");
+        file.unlock(&cx, LockLevel::None).expect("unlock");
+        file.close(&cx).expect("close");
+
+        let sidecars = sqlite_lock_sidecar_paths(&path);
+        assert!(
+            sidecars.iter().all(|path| path.exists()),
+            "expected lock sidecars to exist before delete"
+        );
+
+        vfs.delete(&cx, &path, false).expect("delete");
+        assert!(!path.exists());
+        assert!(
+            sidecars.iter().all(|path| !path.exists()),
+            "expected lock sidecars removed by delete"
+        );
+    }
+
+    #[test]
     fn test_windowsvfs_shared_memory_create_and_cross_handle() {
         let cx = Cx::new();
         let dir = tempdir().expect("temp dir");
@@ -1003,6 +1298,16 @@ mod tests {
         assert_eq!(guard[0], 0xAA);
         assert_eq!(guard[1], 0x55);
         drop(guard);
+    }
+
+    #[test]
+    fn test_windowsvfs_shared_memory_create() {
+        test_windowsvfs_shared_memory_create_and_cross_handle();
+    }
+
+    #[test]
+    fn test_windowsvfs_shared_memory_cross_handle() {
+        test_windowsvfs_shared_memory_create_and_cross_handle();
     }
 
     #[test]
@@ -1049,6 +1354,52 @@ mod tests {
             file.device_characteristics() & SQLITE_IOCAP_UNDELETABLE_WHEN_OPEN,
             SQLITE_IOCAP_UNDELETABLE_WHEN_OPEN
         );
+    }
+
+    #[test]
+    fn test_e2e_windowsvfs_c_sqlite_interop() {
+        let sqlite_available = Command::new("sqlite3")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !sqlite_available {
+            return;
+        }
+
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("interop.db");
+        let path_str = path.to_str().expect("path utf8");
+
+        let create_status = Command::new("sqlite3")
+            .arg(path_str)
+            .arg("CREATE TABLE t(x INTEGER); INSERT INTO t(x) VALUES (1),(2),(3);")
+            .status()
+            .expect("run sqlite3 create");
+        assert!(create_status.success());
+
+        let vfs = WindowsVfs::new();
+        let (mut file, _) = vfs
+            .open(
+                &cx,
+                Some(&path),
+                VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE,
+            )
+            .expect("open via windows vfs");
+        let mut header = [0_u8; 16];
+        let read = file.read(&cx, &mut header, 0).expect("read sqlite header");
+        assert_eq!(read, 16);
+        assert_eq!(&header, b"SQLite format 3\0");
+        file.close(&cx).expect("close vfs file");
+
+        let query_output = Command::new("sqlite3")
+            .arg(path_str)
+            .arg("SELECT count(*) FROM t;")
+            .output()
+            .expect("run sqlite3 query");
+        assert!(query_output.status.success());
+        let stdout = String::from_utf8(query_output.stdout).expect("utf8");
+        assert_eq!(stdout.trim(), "3");
     }
 
     #[test]

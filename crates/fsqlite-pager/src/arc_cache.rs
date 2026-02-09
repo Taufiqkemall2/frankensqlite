@@ -2688,4 +2688,9 @@ mod tests {
             assert!(cache.total_bytes() <= cache.max_bytes());
         }
     }
+
+    #[test]
+    fn test_arc_cache_scan_resistance() {
+        test_scan_resistance();
+    }
 }

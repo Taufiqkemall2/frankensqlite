@@ -248,4 +248,148 @@ mod tests {
         assert_eq!(wal_lock_byte(7), Some(127));
         assert_eq!(wal_lock_byte(8), None);
     }
+
+    #[test]
+    fn test_shm_region_is_empty() {
+        let empty = ShmRegion::new(0);
+        assert!(empty.is_empty());
+        assert_eq!(empty.len(), 0);
+
+        let non_empty = ShmRegion::new(1);
+        assert!(!non_empty.is_empty());
+    }
+
+    #[test]
+    fn test_shm_region_from_vec_empty() {
+        let region = ShmRegion::from_vec(vec![]);
+        assert!(region.is_empty());
+        assert_eq!(region.len(), 0);
+        assert!(region.lock().is_empty());
+    }
+
+    #[test]
+    fn test_shm_region_clone_shares_data() {
+        let r1 = ShmRegion::new(16);
+        let r2 = r1.clone();
+
+        r1.write_u32_le(0, 0x1234_5678);
+        assert_eq!(r2.read_u32_le(0), 0x1234_5678);
+    }
+
+    #[test]
+    fn test_shm_region_guard_deref_mut() {
+        let region = ShmRegion::new(8);
+        {
+            let mut guard = region.lock();
+            guard[0] = 0xAA;
+            guard[7] = 0xBB;
+        }
+        let guard = region.lock();
+        assert_eq!(guard[0], 0xAA);
+        assert_eq!(guard[7], 0xBB);
+        drop(guard);
+    }
+
+    #[test]
+    fn test_shm_region_u32_at_nonzero_offset() {
+        let region = ShmRegion::new(32);
+        region.write_u32_le(12, 999);
+        region.write_u32_le(28, u32::MAX);
+        assert_eq!(region.read_u32_le(12), 999);
+        assert_eq!(region.read_u32_le(28), u32::MAX);
+        // Bytes in between should still be zero.
+        assert_eq!(region.read_u32_le(16), 0);
+    }
+
+    #[test]
+    fn test_shm_region_u64_at_nonzero_offset() {
+        let region = ShmRegion::new(32);
+        region.write_u64_le(8, u64::MAX);
+        assert_eq!(region.read_u64_le(8), u64::MAX);
+        assert_eq!(region.read_u64_le(0), 0);
+    }
+
+    #[test]
+    fn test_shm_region_u32_min_max() {
+        let region = ShmRegion::new(8);
+        region.write_u32_le(0, 0);
+        assert_eq!(region.read_u32_le(0), 0);
+        region.write_u32_le(0, u32::MAX);
+        assert_eq!(region.read_u32_le(0), u32::MAX);
+    }
+
+    #[test]
+    fn test_shm_region_u64_min_max() {
+        let region = ShmRegion::new(16);
+        region.write_u64_le(0, 0);
+        assert_eq!(region.read_u64_le(0), 0);
+        region.write_u64_le(0, u64::MAX);
+        assert_eq!(region.read_u64_le(0), u64::MAX);
+    }
+
+    #[test]
+    fn test_shm_flag_constants() {
+        assert_eq!(SQLITE_SHM_UNLOCK, 0x01);
+        assert_eq!(SQLITE_SHM_LOCK, 0x02);
+        assert_eq!(SQLITE_SHM_SHARED, 0x04);
+        assert_eq!(SQLITE_SHM_EXCLUSIVE, 0x08);
+
+        // Lock + shared and unlock + exclusive are distinct flag combos.
+        assert_ne!(
+            SQLITE_SHM_LOCK | SQLITE_SHM_SHARED,
+            SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE
+        );
+    }
+
+    #[test]
+    fn test_wal_read_lock_slot_all_valid() {
+        for i in 0..WAL_NREADER {
+            assert_eq!(wal_read_lock_slot(i), Some(WAL_READ_LOCK_BASE + i));
+        }
+    }
+
+    #[test]
+    fn test_wal_lock_byte_all_valid() {
+        for slot in 0..WAL_TOTAL_LOCKS {
+            let byte = wal_lock_byte(slot);
+            assert!(byte.is_some());
+            assert_eq!(byte.unwrap(), 120 + u64::from(slot));
+        }
+    }
+
+    #[test]
+    fn test_wal_total_locks_consistent() {
+        assert_eq!(WAL_TOTAL_LOCKS, WAL_READ_LOCK_BASE + WAL_NREADER);
+        assert_eq!(WAL_NREADER_USIZE, WAL_NREADER as usize);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn test_shm_region_read_u32_out_of_bounds() {
+        let region = ShmRegion::new(4);
+        let _ = region.read_u32_le(2); // offset 2 + 4 = 6 > 4
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn test_shm_region_read_u64_out_of_bounds() {
+        let region = ShmRegion::new(8);
+        let _ = region.read_u64_le(4); // offset 4 + 8 = 12 > 8
+    }
+
+    #[test]
+    fn test_shm_region_debug() {
+        let region = ShmRegion::new(4);
+        let debug_str = format!("{region:?}");
+        assert!(debug_str.contains("ShmRegion"));
+    }
+
+    #[test]
+    fn test_shm_region_interleaved_u32_u64() {
+        let region = ShmRegion::new(16);
+        region.write_u32_le(0, 42);
+        region.write_u64_le(8, 0xCAFE_BABE_DEAD_BEEF);
+        assert_eq!(region.read_u32_le(0), 42);
+        assert_eq!(region.read_u64_le(8), 0xCAFE_BABE_DEAD_BEEF);
+    }
 }

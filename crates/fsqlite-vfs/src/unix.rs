@@ -2407,4 +2407,336 @@ mod tests {
             String::from_utf8_lossy(&allowed_write.stderr)
         );
     }
+
+    // -- Internal helper tests --
+
+    #[test]
+    fn test_wal_checksum_empty_input() {
+        let (s1, s2) = sqlite_wal_checksum_native_8byte_chunks(&[]).unwrap();
+        assert_eq!(s1, 0);
+        assert_eq!(s2, 0);
+    }
+
+    #[test]
+    fn test_wal_checksum_8_bytes() {
+        let data = [1u8, 0, 0, 0, 2, 0, 0, 0];
+        let (s1, s2) = sqlite_wal_checksum_native_8byte_chunks(&data).unwrap();
+        // w1 = 1, w2 = 2 (native-endian on little-endian)
+        // s1 = 0 + 1 + 0 = 1
+        // s2 = 0 + 2 + 1 = 3
+        assert_eq!(s1, 1);
+        assert_eq!(s2, 3);
+    }
+
+    #[test]
+    fn test_wal_checksum_non_aligned_fails() {
+        let data = [0u8; 7];
+        let result = sqlite_wal_checksum_native_8byte_chunks(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn test_page_size_from_header_valid_sizes() {
+        for &expected_size in &[512u32, 1024, 2048, 4096, 8192, 16384, 32768] {
+            let mut header = [0u8; 100];
+            let raw = expected_size as u16;
+            header[16] = (raw >> 8) as u8;
+            header[17] = (raw & 0xFF) as u8;
+            let size = sqlite_page_size_from_db_header(&header).unwrap();
+            assert_eq!(size, expected_size);
+        }
+    }
+
+    #[test]
+    fn test_page_size_from_header_65536() {
+        let mut header = [0u8; 100];
+        // Page size 65536 is encoded as 1.
+        header[16] = 0;
+        header[17] = 1;
+        let size = sqlite_page_size_from_db_header(&header).unwrap();
+        assert_eq!(size, 65536);
+    }
+
+    #[test]
+    fn test_page_size_from_header_too_small() {
+        let header = [0u8; 50];
+        let result = sqlite_page_size_from_db_header(&header);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_page_size_from_header_invalid() {
+        let mut header = [0u8; 100];
+        // Page size 3 is not a power of two.
+        header[16] = 0;
+        header[17] = 3;
+        let result = sqlite_page_size_from_db_header(&header);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_page_size_from_header_too_small_value() {
+        let mut header = [0u8; 100];
+        // Page size 256 is below minimum 512.
+        header[16] = 1;
+        header[17] = 0;
+        let result = sqlite_page_size_from_db_header(&header);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_build_and_validate_wal_shm_header() {
+        let header = build_empty_sqlite_wal_shm_header(4096, 10).unwrap();
+        assert_eq!(header.len(), SQLITE_WAL_SHM_HEADER_BYTES);
+        assert!(sqlite_wal_shm_header_is_valid(&header).unwrap());
+    }
+
+    #[test]
+    fn test_build_wal_shm_header_65536() {
+        let header = build_empty_sqlite_wal_shm_header(65536, 1).unwrap();
+        assert!(sqlite_wal_shm_header_is_valid(&header).unwrap());
+    }
+
+    #[test]
+    fn test_wal_shm_header_invalid_too_short() {
+        let buf = [0u8; 10];
+        assert!(!sqlite_wal_shm_header_is_valid(&buf).unwrap());
+    }
+
+    #[test]
+    fn test_wal_shm_header_invalid_mismatched_copies() {
+        let mut header = build_empty_sqlite_wal_shm_header(4096, 5).unwrap();
+        // Corrupt the second copy.
+        header[48] ^= 0xFF;
+        assert!(!sqlite_wal_shm_header_is_valid(&header).unwrap());
+    }
+
+    #[test]
+    fn test_wal_shm_header_invalid_not_initialized() {
+        let mut header = build_empty_sqlite_wal_shm_header(4096, 5).unwrap();
+        // Clear isInit flag.
+        header[12] = 0;
+        header[48 + 12] = 0;
+        assert!(!sqlite_wal_shm_header_is_valid(&header).unwrap());
+    }
+
+    #[test]
+    fn test_wal_shm_header_invalid_bad_checksum() {
+        let mut header = build_empty_sqlite_wal_shm_header(4096, 5).unwrap();
+        // Corrupt a data byte in the checksum area.
+        header[8] ^= 0xFF;
+        header[48 + 8] ^= 0xFF;
+        assert!(!sqlite_wal_shm_header_is_valid(&header).unwrap());
+    }
+
+    #[test]
+    fn test_sqlite_wal_path() {
+        let path = Path::new("/tmp/test.db");
+        assert_eq!(sqlite_wal_path(path), PathBuf::from("/tmp/test.db-wal"));
+    }
+
+    #[test]
+    fn test_sqlite_shm_path() {
+        let path = Path::new("/tmp/test.db");
+        assert_eq!(sqlite_shm_path(path), PathBuf::from("/tmp/test.db-shm"));
+    }
+
+    #[test]
+    fn test_write_ne_u32() {
+        let mut buf = [0u8; 8];
+        write_ne_u32(&mut buf, 0, 42);
+        write_ne_u32(&mut buf, 4, u32::MAX);
+        assert_eq!(u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]), 42);
+        assert_eq!(
+            u32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]),
+            u32::MAX
+        );
+    }
+
+    #[test]
+    fn test_unix_vfs_default_trait() {
+        let vfs = UnixVfs;
+        assert_eq!(vfs.name(), "unix");
+    }
+
+    #[test]
+    fn test_unix_vfs_temp_file() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let flags = VfsOpenFlags::TEMP_DB
+            | VfsOpenFlags::CREATE
+            | VfsOpenFlags::READWRITE
+            | VfsOpenFlags::DELETEONCLOSE;
+
+        let (mut file, out_flags) = vfs.open(&cx, None, flags).unwrap();
+        assert!(out_flags.contains(VfsOpenFlags::READWRITE));
+
+        file.write(&cx, b"temp data", 0).unwrap();
+        let mut buf = [0u8; 9];
+        file.read(&cx, &mut buf, 0).unwrap();
+        assert_eq!(&buf, b"temp data");
+
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_unix_vfs_read_empty_file() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("empty_read.db");
+
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let mut buf = [0xFF_u8; 8];
+        let n = file.read(&cx, &mut buf, 0).unwrap();
+        assert_eq!(n, 0);
+        assert!(buf.iter().all(|&b| b == 0));
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_unix_vfs_file_size_zero_on_create() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("size_zero.db");
+
+        let (file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        assert_eq!(file.file_size(&cx).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_unix_vfs_access_readwrite() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("access_rw.db");
+
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        file.write(&cx, b"test", 0).unwrap();
+        file.close(&cx).unwrap();
+
+        assert!(vfs.access(&cx, &path, AccessFlags::READWRITE).unwrap());
+    }
+
+    #[test]
+    fn test_unix_vfs_access_nonexistent() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("nofile.db");
+        assert!(!vfs.access(&cx, &path, AccessFlags::EXISTS).unwrap());
+        assert!(!vfs.access(&cx, &path, AccessFlags::READWRITE).unwrap());
+    }
+
+    #[test]
+    fn test_unix_vfs_delete_with_sync_dir() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("sync_del.db");
+
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        file.write(&cx, b"data", 0).unwrap();
+        file.close(&cx).unwrap();
+
+        vfs.delete(&cx, &path, true).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn test_unix_vfs_write_extends_and_read_gap() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("gap_write.db");
+
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        file.write(&cx, b"end", 100).unwrap();
+        assert_eq!(file.file_size(&cx).unwrap(), 103);
+
+        let mut buf = [0xFF_u8; 10];
+        let n = file.read(&cx, &mut buf, 0).unwrap();
+        assert_eq!(n, 10);
+        assert!(buf.iter().all(|&b| b == 0), "gap should be zeroed");
+
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_unix_vfs_sector_size_and_device_characteristics() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("sector.db");
+
+        let (file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        assert_eq!(file.sector_size(), 4096);
+        assert_eq!(file.device_characteristics(), 0);
+    }
+
+    #[test]
+    fn test_unix_vfs_shm_barrier_noop() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("barrier.db");
+
+        let (file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        file.shm_barrier(); // should not panic
+    }
+
+    #[test]
+    fn test_shm_dms_lock_byte() {
+        let byte = sqlite_shm_dms_lock_byte();
+        // WAL_WRITE_LOCK is slot 0, lock byte 120, plus WAL_TOTAL_LOCKS (8) = 128.
+        assert_eq!(byte, 128);
+    }
+
+    #[test]
+    fn test_validate_shm_request_zero_n() {
+        let result = UnixFile::validate_shm_request(0, 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_shm_request_overflow() {
+        let result = UnixFile::validate_shm_request(u32::MAX, 2);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_shm_request_exceeds_total() {
+        let result = UnixFile::validate_shm_request(WAL_TOTAL_LOCKS, 1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_shm_request_valid() {
+        UnixFile::validate_shm_request(0, 1).unwrap();
+        UnixFile::validate_shm_request(0, WAL_TOTAL_LOCKS).unwrap();
+        UnixFile::validate_shm_request(WAL_TOTAL_LOCKS - 1, 1).unwrap();
+    }
+
+    #[test]
+    fn test_unix_vfs_lock_downgrade_idempotent() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("down_lock.db");
+
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        file.lock(&cx, LockLevel::Shared).unwrap();
+
+        // Unlock to None, then try again — should be idempotent.
+        file.unlock(&cx, LockLevel::None).unwrap();
+        file.unlock(&cx, LockLevel::None).unwrap();
+        assert_eq!(file.lock_level, LockLevel::None);
+
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_unix_vfs_shm_unmap_without_prior_shm() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("no_shm.db");
+
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        // shm_unmap with delete=false should succeed even when no SHM was mapped.
+        file.shm_unmap(&cx, false).unwrap();
+        file.close(&cx).unwrap();
+    }
 }

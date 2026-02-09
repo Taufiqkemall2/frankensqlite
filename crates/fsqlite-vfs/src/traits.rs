@@ -233,4 +233,112 @@ mod tests {
         assert_eq!(file.sector_size(), 4096);
         assert_eq!(file.device_characteristics(), 0);
     }
+
+    /// Verify that VfsFile trait defaults are what we expect.
+    #[test]
+    fn vfs_file_sector_size_default_is_4096() {
+        struct Stub;
+        impl VfsFile for Stub {
+            fn close(&mut self, _: &Cx) -> Result<()> {
+                Ok(())
+            }
+            fn read(&mut self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> {
+                Ok(0)
+            }
+            fn write(&mut self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
+                Ok(())
+            }
+            fn truncate(&mut self, _: &Cx, _: u64) -> Result<()> {
+                Ok(())
+            }
+            fn sync(&mut self, _: &Cx, _: SyncFlags) -> Result<()> {
+                Ok(())
+            }
+            fn file_size(&self, _: &Cx) -> Result<u64> {
+                Ok(0)
+            }
+            fn lock(&mut self, _: &Cx, _: LockLevel) -> Result<()> {
+                Ok(())
+            }
+            fn unlock(&mut self, _: &Cx, _: LockLevel) -> Result<()> {
+                Ok(())
+            }
+            fn check_reserved_lock(&self, _: &Cx) -> Result<bool> {
+                Ok(false)
+            }
+            fn shm_map(&mut self, _: &Cx, _: u32, _: u32, _: bool) -> Result<ShmRegion> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn shm_lock(&mut self, _: &Cx, _: u32, _: u32, _: u32) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn shm_barrier(&self) {}
+            fn shm_unmap(&mut self, _: &Cx, _: bool) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let file = Stub;
+        assert_eq!(file.sector_size(), 4096);
+        assert_eq!(file.device_characteristics(), 0);
+    }
+
+    /// Verify that default Vfs::randomness produces different sequences.
+    #[test]
+    fn vfs_default_randomness_varies() {
+        use crate::memory::MemoryVfs;
+        use crate::traits::Vfs;
+
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let mut buf1 = [0u8; 32];
+        let mut buf2 = [0u8; 32];
+        vfs.randomness(&cx, &mut buf1);
+        vfs.randomness(&cx, &mut buf2);
+        assert_ne!(buf1, buf2);
+    }
+
+    /// Verify that default Vfs::current_time reads from Cx.
+    #[test]
+    fn vfs_default_current_time_from_cx() {
+        use crate::memory::MemoryVfs;
+        use crate::traits::Vfs;
+
+        let cx = Cx::new();
+        cx.set_unix_millis_for_testing(0);
+        let vfs = MemoryVfs::new();
+        let t1 = vfs.current_time(&cx);
+        // Unix epoch in Julian days is 2440587.5
+        #[allow(clippy::approx_constant)]
+        let expected = 2_440_587.5;
+        assert!(
+            (t1 - expected).abs() < 1e-6,
+            "at unix epoch, julian day should be ~2440587.5, got {t1}"
+        );
+    }
+
+    /// Verify randomness with a zero-length buffer doesn't panic.
+    #[test]
+    fn vfs_randomness_zero_length_buffer() {
+        use crate::memory::MemoryVfs;
+        use crate::traits::Vfs;
+
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let mut buf = [];
+        vfs.randomness(&cx, &mut buf);
+    }
+
+    /// Verify randomness with a 1-byte buffer.
+    #[test]
+    fn vfs_randomness_single_byte() {
+        use crate::memory::MemoryVfs;
+        use crate::traits::Vfs;
+
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let mut buf = [0u8; 1];
+        vfs.randomness(&cx, &mut buf);
+        // Can't assert much about the value, just that it doesn't panic.
+    }
 }

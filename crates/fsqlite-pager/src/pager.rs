@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
-use fsqlite_types::{PageData, PageNumber, PageSize};
+use fsqlite_types::{CommitSeq, PageData, PageNumber, PageSize};
 use fsqlite_vfs::{Vfs, VfsFile};
 
 use crate::journal::{JournalHeader, JournalPageRecord};
@@ -38,6 +38,8 @@ struct PagerInner<F: VfsFile> {
     journal_mode: JournalMode,
     /// Optional WAL backend for WAL-mode operation.
     wal_backend: Option<Box<dyn WalBackend>>,
+    /// Monotonic commit sequence for MVCC version tracking.
+    commit_seq: CommitSeq,
 }
 
 impl<F: VfsFile> PagerInner<F> {
@@ -231,6 +233,7 @@ where
                 freelist: Vec::new(),
                 journal_mode: JournalMode::Delete,
                 wal_backend: None,
+                commit_seq: CommitSeq::ZERO,
             })),
         })
     }
@@ -589,6 +592,9 @@ where
             )
         };
 
+        if commit_result.is_ok() {
+            inner.commit_seq = inner.commit_seq.next();
+        }
         inner.writer_active = false;
         drop(inner);
         if commit_result.is_ok() {
