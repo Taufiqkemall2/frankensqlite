@@ -81,9 +81,9 @@ pub struct SimplePager<V: Vfs> {
 
 impl<V: Vfs> traits::sealed::Sealed for SimplePager<V> {}
 
-impl<V: Vfs> MvccPager for SimplePager<V>
+impl<V> MvccPager for SimplePager<V>
 where
-    V: Send + Sync,
+    V: Vfs + Send + Sync,
     V::File: Send + Sync,
 {
     type Txn = SimpleTransaction<V>;
@@ -127,11 +127,13 @@ where
 
         let file_size = db_file.file_size(&cx)?;
         let page_size_u64 = page_size.as_usize() as u64;
-        let db_size = if page_size_u64 > 0 {
-            (file_size / page_size_u64) as u32
-        } else {
-            0
-        };
+        let db_pages = file_size
+            .checked_div(page_size_u64)
+            .ok_or_else(|| FrankenError::internal("page size must be non-zero"))?;
+        let db_size = u32::try_from(db_pages).map_err(|_| FrankenError::OutOfRange {
+            what: "database page count".to_owned(),
+            value: db_pages.to_string(),
+        })?;
         let next_page = if db_size >= 2 { db_size + 1 } else { 2 };
 
         Ok(Self {
@@ -161,9 +163,9 @@ pub struct SimpleTransaction<V: Vfs> {
 
 impl<V: Vfs> traits::sealed::Sealed for SimpleTransaction<V> {}
 
-impl<V: Vfs> TransactionHandle for SimpleTransaction<V>
+impl<V> TransactionHandle for SimpleTransaction<V>
 where
-    V: Send,
+    V: Vfs + Send,
     V::File: Send + Sync,
 {
     fn get_page(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
@@ -176,6 +178,7 @@ where
             .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
         let data = inner.read_page_copy(cx, page_no)?;
+        drop(inner);
         Ok(PageData::from_vec(data))
     }
 
@@ -214,6 +217,7 @@ where
 
         let raw = inner.next_page;
         inner.next_page = inner.next_page.saturating_add(1);
+        drop(inner);
         PageNumber::new(raw).ok_or_else(|| FrankenError::OutOfRange {
             what: "allocated page number".to_owned(),
             value: raw.to_string(),
@@ -262,6 +266,7 @@ where
         })();
 
         inner.writer_active = false;
+        drop(inner);
         if commit_result.is_ok() {
             self.write_set.clear();
             self.committed = true;
