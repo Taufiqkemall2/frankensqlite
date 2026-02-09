@@ -13,6 +13,7 @@ use tempfile::tempdir;
 
 const PAGE_SIZE: u32 = 4096;
 const BEAD_ID: &str = "bd-1hi.11";
+type TestDecoder = Box<dyn FnMut(&WalFecGroupMeta, &[(u32, Vec<u8>)]) -> Result<Vec<Vec<u8>>>>;
 
 #[derive(Clone)]
 struct GroupFixture {
@@ -77,8 +78,8 @@ fn build_fixture(
     .expect("fixture metadata should be valid");
     let repair_symbols =
         generate_wal_fec_repair_symbols(&meta, &source_pages).expect("repair symbols should build");
-    let record =
-        WalFecGroupRecord::new(meta.clone(), repair_symbols).expect("fixture record should validate");
+    let record = WalFecGroupRecord::new(meta.clone(), repair_symbols)
+        .expect("fixture record should validate");
     GroupFixture {
         meta,
         source_pages,
@@ -125,8 +126,11 @@ fn corrupt_first_repair_symbol_record(sidecar_path: &Path) {
     let meta_len = u32::from_le_bytes(bytes[0..4].try_into().expect("meta len prefix"));
     let meta_len_usize = usize::try_from(meta_len).expect("meta len fits usize");
     let repair_len_offset = 4 + meta_len_usize;
-    let repair_len =
-        u32::from_le_bytes(bytes[repair_len_offset..repair_len_offset + 4].try_into().expect("repair prefix"));
+    let repair_len = u32::from_le_bytes(
+        bytes[repair_len_offset..repair_len_offset + 4]
+            .try_into()
+            .expect("repair prefix"),
+    );
     let repair_len_usize = usize::try_from(repair_len).expect("repair len fits usize");
     let repair_payload_offset = repair_len_offset + 4;
     assert!(repair_payload_offset + repair_len_usize <= bytes.len());
@@ -134,15 +138,15 @@ fn corrupt_first_repair_symbol_record(sidecar_path: &Path) {
     fs::write(sidecar_path, bytes).expect("sidecar write should succeed");
 }
 
-fn decoder_from_expected(expected_pages: Vec<Vec<u8>>) -> impl FnMut(&WalFecGroupMeta, &[(u32, Vec<u8>)]) -> Result<Vec<Vec<u8>>> {
-    move |meta, available| {
+fn decoder_from_expected(expected_pages: Vec<Vec<u8>>) -> TestDecoder {
+    Box::new(move |meta, available| {
         if available.len() < usize::try_from(meta.k_source).expect("k_source fits usize") {
             return Err(FrankenError::WalCorrupt {
                 detail: "decoder invoked with insufficient symbols".to_owned(),
             });
         }
         Ok(expected_pages.clone())
-    }
+    })
 }
 
 #[test]
@@ -250,7 +254,7 @@ fn test_recovery_intact_wal() {
         salts,
         fixture.meta.end_frame_no + 1,
         &candidates,
-        decoder_from_expected(fixture.source_pages.clone()),
+        decoder_from_expected(fixture.source_pages),
     )
     .expect("recovery should not error");
 
@@ -294,7 +298,7 @@ fn test_recovery_single_and_boundary_corruption() {
         salts,
         fixture.meta.start_frame_no + 1,
         &two_corrupt,
-        decoder_from_expected(fixture.source_pages.clone()),
+        decoder_from_expected(fixture.source_pages),
     )
     .expect("max-corruption recovery should run");
     assert!(matches!(two_outcome, WalFecRecoveryOutcome::Recovered(_)));
@@ -377,7 +381,7 @@ fn test_recovery_missing_or_corrupt_sidecar_fallback() {
         salts,
         fixture.meta.start_frame_no,
         &candidates,
-        decoder_from_expected(fixture.source_pages.clone()),
+        decoder_from_expected(fixture.source_pages),
     )
     .expect("corrupt sidecar should return fallback outcome");
     let WalFecRecoveryOutcome::TruncateBeforeGroup { decode_proof, .. } = corrupt_outcome else {
@@ -413,7 +417,7 @@ fn test_recovery_source_hash_and_repair_symbol_filtering() {
         salts,
         fixture.meta.start_frame_no + 1,
         &candidates,
-        decoder_from_expected(fixture.source_pages.clone()),
+        decoder_from_expected(fixture.source_pages),
     )
     .expect("recovery should run");
 
@@ -455,7 +459,7 @@ fn test_recovery_multiple_groups_and_chain_break_behavior() {
         salts,
         mismatch_frame,
         &candidates,
-        decoder_from_expected(group_b.source_pages.clone()),
+        decoder_from_expected(group_b.source_pages),
     )
     .expect("group-b recovery should run");
     assert!(matches!(outcome, WalFecRecoveryOutcome::Recovered(_)));
