@@ -24,6 +24,7 @@ pub mod witness_objects;
 pub mod witness_plane;
 pub mod witness_publication;
 pub mod witness_refinement;
+pub mod write_coordinator;
 pub mod xor_delta;
 
 pub use cache_aligned::{
@@ -93,6 +94,11 @@ pub use witness_publication::{
 pub use witness_refinement::{
     RefinementBudget, RefinementDecision, RefinementPriority, RefinementResult, VoiMetrics,
     refine_edges,
+};
+pub use write_coordinator::{
+    CommitWriteSet, CompatCommitRequest, CompatCommitResponse, CoordinatorLease, CoordinatorMode,
+    DEFAULT_MAX_BATCH_SIZE, DEFAULT_SPILL_THRESHOLD, NativePublishRequest, NativePublishResponse,
+    SpillHandle, SpillLoc, SpilledWriteSet, WriteCoordinator,
 };
 pub use xor_delta::{
     DEFAULT_DELTA_THRESHOLD_PCT, DELTA_FIXED_OVERHEAD_BYTES, DELTA_HEADER_BYTES, DELTA_MAGIC,
