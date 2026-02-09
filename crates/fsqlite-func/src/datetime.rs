@@ -1007,6 +1007,12 @@ mod tests {
     }
 
     #[test]
+    fn test_modifier_auto_out_of_range_returns_null() {
+        let r = DateTimeFunc.invoke(&[float(1.0e20), text("auto")]).unwrap();
+        assert_eq!(r, SqliteValue::Null);
+    }
+
+    #[test]
     fn test_modifier_order_matters() {
         // 'start of month' then '+1 day' = March 2nd.
         let r1 = DateFunc
@@ -1019,6 +1025,15 @@ mod tests {
             .invoke(&[text("2024-03-15"), text("+1 days"), text("start of month")])
             .unwrap();
         assert_text(&r2, "2024-03-01");
+    }
+
+    #[test]
+    fn test_modifier_weekday_same_day_advances_next_week() {
+        // 2024-03-17 is Sunday; SQLite semantics advance to the NEXT Sunday.
+        let r = DateFunc
+            .invoke(&[text("2024-03-17"), text("weekday 0")])
+            .unwrap();
+        assert_text(&r, "2024-03-24");
     }
 
     // ── Input formats ─────────────────────────────────────────────────
@@ -1053,6 +1068,12 @@ mod tests {
             DateFunc.invoke(&[text("not-a-date")]).unwrap(),
             SqliteValue::Null
         );
+    }
+
+    #[test]
+    fn test_negative_time_component_invalid() {
+        let r = TimeFunc.invoke(&[text("-01:00")]).unwrap();
+        assert_eq!(r, SqliteValue::Null);
     }
 
     // ── Leap year ─────────────────────────────────────────────────────
