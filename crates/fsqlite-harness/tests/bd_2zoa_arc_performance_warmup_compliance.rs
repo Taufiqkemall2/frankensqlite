@@ -103,7 +103,10 @@ const PREWARM_REQUIREMENTS: [Requirement; 4] = [
     },
     Requirement {
         key: "sqlite_master_root_pages",
-        alternatives: &["sqlite_master root pages", "root pages of all tables/indexes"],
+        alternatives: &[
+            "sqlite_master root pages",
+            "root pages of all tables/indexes",
+        ],
     },
 ];
 
@@ -410,10 +413,7 @@ fn test_e2e_bd_2zoa_compliance() -> Result<(), String> {
         )
     })?;
 
-    let json_row_count = report
-        .lines()
-        .filter(|line| line.starts_with('{'))
-        .count();
+    let json_row_count = report.lines().filter(|line| line.starts_with('{')).count();
     if json_row_count == 0 {
         return Err(format!(
             "bead_id={BEAD_ID} case=empty_report path={} expected_non_zero_json_rows",

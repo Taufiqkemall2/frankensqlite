@@ -78,10 +78,15 @@ fn load_issue_description(issue_id: &str) -> String {
     panic!("bead_id={issue_id} not found in {ISSUES_JSONL}");
 }
 
+fn contains_identifier(text: &str, expected_marker: &str) -> bool {
+    text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .any(|token| token == expected_marker)
+}
+
 fn evaluate_description(description: &str) -> ComplianceEvaluation {
     let missing_unit_ids = UNIT_TEST_IDS
         .into_iter()
-        .filter(|id| !description.contains(id))
+        .filter(|id| !contains_identifier(description, id))
         .collect::<Vec<_>>();
 
     let missing_log_levels = LOG_LEVEL_MARKERS
@@ -91,7 +96,7 @@ fn evaluate_description(description: &str) -> ComplianceEvaluation {
 
     ComplianceEvaluation {
         missing_unit_ids,
-        missing_e2e_id: !description.contains(E2E_TEST_ID),
+        missing_e2e_id: !contains_identifier(description, E2E_TEST_ID),
         missing_log_levels,
         missing_log_standard_ref: !description.contains(LOG_STANDARD_REF),
     }
