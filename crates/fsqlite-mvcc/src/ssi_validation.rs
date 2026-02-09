@@ -374,7 +374,7 @@ fn committed_writer_overlaps(writer: &CommittedWriterInfo, read_key: &WitnessKey
 }
 
 /// Extract the page number from a witness key.
-fn witness_key_page(key: &WitnessKey) -> u32 {
+pub(crate) fn witness_key_page(key: &WitnessKey) -> u32 {
     match key {
         WitnessKey::Page(p) => p.get(),
         WitnessKey::Cell { btree_root, .. } | WitnessKey::KeyRange { btree_root, .. } => {

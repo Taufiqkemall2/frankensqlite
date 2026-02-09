@@ -19,6 +19,7 @@ pub mod shared_lock_table;
 pub mod shm;
 pub mod ssi_validation;
 pub mod witness_hierarchy;
+pub mod witness_refinement;
 pub mod witness_objects;
 pub mod witness_plane;
 pub mod witness_publication;
@@ -79,6 +80,10 @@ pub use witness_objects::{
     WitnessParticipation, WriteKind, cold_plane_refine, hot_plane_discover,
 };
 pub use witness_plane::{WitnessSet, validate_txn_token, witness_keys_overlap};
+pub use witness_refinement::{
+    RefinementBudget, RefinementDecision, RefinementPriority, RefinementResult, VoiMetrics,
+    refine_edges,
+};
 pub use witness_publication::{
     ActiveSlotSnapshot, CommitMarkerStore, CommittedPublication, DefaultProofValidator,
     GcEligibility, ProofCarryingCommit, ProofCarryingValidator, PublicationError, PublicationPhase,
