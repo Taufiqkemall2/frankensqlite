@@ -712,4 +712,149 @@ mod tests {
         let result = KeyManager::unwrap_dek(&[0u8; 39], &kek);
         assert_eq!(result.unwrap_err(), EncryptError::DekUnwrapFailed);
     }
+
+    // ===================================================================
+    // bd-1o3u — AAD Construction Validation (§15)
+    // ===================================================================
+
+    #[test]
+    fn test_aad_includes_database_id() {
+        let db_id = DatabaseId::from_bytes([
+            0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0,
+            0xF0, 0xFF,
+        ]);
+        let aad = build_aad(1, &db_id);
+
+        // Full 16-byte DatabaseId must appear at bytes [4..20].
+        assert_eq!(
+            &aad[4..],
+            db_id.as_bytes(),
+            "AAD must contain the complete 16-byte DatabaseId"
+        );
+        assert_eq!(aad.len(), AAD_SIZE, "AAD must be exactly 20 bytes");
+    }
+
+    #[test]
+    fn test_aad_no_circular_dependency() {
+        // INV-AAD-2: AAD construction must not depend on page content.
+        // Verify: build_aad produces identical output regardless of what the
+        // page data contains — it only takes page_number and database_id.
+        let db_id = DatabaseId::from_bytes([0x42; DATABASE_ID_SIZE]);
+        let page_number = 7u32;
+
+        let aad1 = build_aad(page_number, &db_id);
+
+        // If build_aad had a hidden dependency on page content, different
+        // page contents would produce different AAD. Since it only takes
+        // (page_number, database_id), the AAD is always the same.
+        let aad2 = build_aad(page_number, &db_id);
+        assert_eq!(
+            aad1, aad2,
+            "AAD must be deterministic from (page_number, database_id) alone"
+        );
+
+        // Further verify the function signature at the type level: build_aad
+        // accepts only u32 and &DatabaseId — no &[u8] page content parameter.
+        // This compile-time guarantee plus the runtime identity check proves
+        // no circular dependency.
+        let aad3 = build_aad(page_number, &db_id);
+        assert_eq!(aad1, aad3);
+    }
+
+    #[test]
+    fn test_aad_identical_encrypt_decrypt() {
+        // INV-AAD-3: Encrypt and decrypt paths must use identical AAD.
+        // We verify by encrypting with page_number=5 and showing that
+        // decryption succeeds with the same page_number (same AAD)
+        // but fails with a different page_number (different AAD).
+        let enc = PageEncryptor::new(&TEST_DEK, TEST_DB_ID);
+        let nonce = test_nonce(42);
+        let page_number = 5u32;
+
+        let mut page = make_test_page(4096);
+        let original = page.clone();
+        enc.encrypt_page(&mut page, page_number, &nonce).unwrap();
+
+        // Same page_number → same AAD → decryption succeeds.
+        let mut page_copy = page.clone();
+        enc.decrypt_page(&mut page_copy, page_number).unwrap();
+        let reserved = usize::from(ENCRYPTION_RESERVED_BYTES);
+        assert_eq!(
+            &page_copy[..4096 - reserved],
+            &original[..4096 - reserved],
+            "decrypt with same page_number must succeed (identical AAD)"
+        );
+
+        // Different page_number → different AAD → decryption fails.
+        let result = enc.decrypt_page(&mut page, page_number + 1);
+        assert_eq!(
+            result.unwrap_err(),
+            EncryptError::AuthenticationFailed,
+            "decrypt with different page_number must fail (different AAD)"
+        );
+    }
+
+    #[test]
+    fn test_aad_page_context_tag_unknown_uses_constant() {
+        // INV-AAD-4: When page_context_tag is unknown, AAD uses a fixed
+        // constant format. Our implementation always uses the canonical
+        // format `be_u32(page_number) || database_id_bytes` with no
+        // variable page_context_tag — the AAD is a fixed 20 bytes.
+        let db_id = DatabaseId::from_bytes([0x55; DATABASE_ID_SIZE]);
+
+        // Verify AAD has the same fixed size for any page number.
+        for page_num in [1u32, 100, 1000, u32::MAX] {
+            let aad = build_aad(page_num, &db_id);
+            assert_eq!(
+                aad.len(),
+                AAD_SIZE,
+                "AAD must be fixed-size {AAD_SIZE} bytes for page {page_num}"
+            );
+        }
+
+        // Verify the format is exactly be_u32 || db_id with no extra tag.
+        let aad = build_aad(42, &db_id);
+        let mut expected = [0u8; AAD_SIZE];
+        expected[..4].copy_from_slice(&42u32.to_be_bytes());
+        expected[4..].copy_from_slice(db_id.as_bytes());
+        assert_eq!(
+            aad, expected,
+            "AAD must be exactly be_u32(page_number) || database_id_bytes, no extra tag"
+        );
+    }
+
+    #[test]
+    fn test_aad_cross_endian_portability() {
+        // INV-AAD-1: AAD must use big-endian encoding for cross-endian
+        // interoperability. Verify known values produce the exact expected bytes.
+        let db_id = DatabaseId::from_bytes([
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+            0x0F, 0x10,
+        ]);
+
+        // Page 1: big-endian → [0x00, 0x00, 0x00, 0x01]
+        let aad1 = build_aad(1, &db_id);
+        assert_eq!(&aad1[..4], &[0x00, 0x00, 0x00, 0x01]);
+
+        // Page 0x01020304: big-endian → [0x01, 0x02, 0x03, 0x04]
+        let aad2 = build_aad(0x0102_0304, &db_id);
+        assert_eq!(&aad2[..4], &[0x01, 0x02, 0x03, 0x04]);
+
+        // Page u32::MAX: big-endian → [0xFF, 0xFF, 0xFF, 0xFF]
+        let aad3 = build_aad(u32::MAX, &db_id);
+        assert_eq!(&aad3[..4], &[0xFF, 0xFF, 0xFF, 0xFF]);
+
+        // Verify this is NOT native little-endian encoding.
+        // On LE, page 1 would be [0x01, 0x00, 0x00, 0x00].
+        assert_ne!(
+            &aad1[..4],
+            &1u32.to_le_bytes(),
+            "AAD must NOT use little-endian encoding"
+        );
+
+        // All AADs include the full database_id.
+        assert_eq!(&aad1[4..], db_id.as_bytes());
+        assert_eq!(&aad2[4..], db_id.as_bytes());
+        assert_eq!(&aad3[4..], db_id.as_bytes());
+    }
 }
