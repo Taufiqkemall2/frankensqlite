@@ -1106,6 +1106,503 @@ pub fn find_wal_fec_group(
         .find(|group| group.meta.group_id() == group_id))
 }
 
+const BD_1HI_11_BEAD_ID: &str = "bd-1hi.11";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WalFecRecoveryGroupRecord {
+    meta: WalFecGroupMeta,
+    repair_symbols: Vec<SymbolRecord>,
+}
+
+/// Locate the commit group containing the first checksum-mismatching frame.
+#[must_use]
+pub fn identify_damaged_commit_group(
+    groups: &[WalFecGroupRecord],
+    wal_salts: WalSalts,
+    damaged_frame_no: u32,
+) -> Option<WalFecGroupId> {
+    groups
+        .iter()
+        .find(|group| {
+            let meta = &group.meta;
+            meta.wal_salt1 == wal_salts.salt1
+                && meta.wal_salt2 == wal_salts.salt2
+                && meta.start_frame_no <= damaged_frame_no
+                && damaged_frame_no <= meta.end_frame_no
+        })
+        .map(|group| group.meta.group_id())
+}
+
+/// Recover one WAL-FEC commit group with caller-provided decode logic.
+///
+/// This implements the §3.4.1 compatibility-mode recovery flow:
+/// 1. locate group metadata by `(wal_salt1, wal_salt2, end_frame_no)`;
+/// 2. validate source payloads from `.wal` (independent xxh3 at/after chain break);
+/// 3. collect valid repair symbols from `.wal-fec`;
+/// 4. decode if at least `K` symbols are available;
+/// 5. otherwise fall back to SQLite-compatible truncation.
+pub fn recover_wal_fec_group_with_decoder<F>(
+    sidecar_path: &Path,
+    group_id: WalFecGroupId,
+    wal_salts: WalSalts,
+    first_checksum_mismatch_frame_no: u32,
+    wal_frames: &[WalFrameCandidate],
+    mut decode: F,
+) -> Result<WalFecRecoveryOutcome>
+where
+    F: FnMut(&WalFecGroupMeta, &[(u32, Vec<u8>)]) -> Result<Vec<Vec<u8>>>,
+{
+    let groups = match scan_wal_fec_for_recovery(sidecar_path) {
+        Ok(groups) => groups,
+        Err(err) => {
+            warn!(
+                bead_id = BD_1HI_11_BEAD_ID,
+                group_id = %group_id,
+                sidecar = %sidecar_path.display(),
+                error = %err,
+                "wal-fec sidecar unreadable; falling back to sqlite-compatible truncation"
+            );
+            return Ok(truncate_outcome(
+                group_id,
+                first_checksum_mismatch_frame_no,
+                0,
+                0,
+                0,
+                false,
+                false,
+                Vec::new(),
+                WalFecRecoveryFallbackReason::SidecarUnreadable,
+            ));
+        }
+    };
+
+    let Some(group) = groups.into_iter().find(|group| group.meta.group_id() == group_id) else {
+        warn!(
+            bead_id = BD_1HI_11_BEAD_ID,
+            group_id = %group_id,
+            sidecar = %sidecar_path.display(),
+            "wal-fec group metadata missing; falling back to sqlite-compatible truncation"
+        );
+        return Ok(truncate_outcome(
+            group_id,
+            first_checksum_mismatch_frame_no,
+            0,
+            0,
+            0,
+            false,
+            false,
+            Vec::new(),
+            WalFecRecoveryFallbackReason::MissingSidecarGroup,
+        ));
+    };
+
+    if group.meta.verify_salt_binding(wal_salts).is_err() {
+        warn!(
+            bead_id = BD_1HI_11_BEAD_ID,
+            group_id = %group_id,
+            "wal-fec group salt mismatch; rejecting sidecar group and truncating"
+        );
+        return Ok(truncate_outcome(
+            group_id,
+            group.meta.start_frame_no,
+            group.meta.k_source,
+            0,
+            0,
+            false,
+            false,
+            Vec::new(),
+            WalFecRecoveryFallbackReason::SaltMismatch,
+        ));
+    }
+
+    recover_wal_fec_group_record_with_decoder(
+        &group,
+        first_checksum_mismatch_frame_no,
+        wal_frames,
+        &mut decode,
+    )
+}
+
+fn recover_wal_fec_group_record_with_decoder<F>(
+    group: &WalFecRecoveryGroupRecord,
+    first_checksum_mismatch_frame_no: u32,
+    wal_frames: &[WalFrameCandidate],
+    decode: &mut F,
+) -> Result<WalFecRecoveryOutcome>
+where
+    F: FnMut(&WalFecGroupMeta, &[(u32, Vec<u8>)]) -> Result<Vec<Vec<u8>>>,
+{
+    let meta = &group.meta;
+    let group_id = meta.group_id();
+    let k_required = usize::try_from(meta.k_source).map_err(|_| FrankenError::WalCorrupt {
+        detail: format!("k_source {} does not fit in usize", meta.k_source),
+    })?;
+    let page_len = usize::try_from(meta.page_size).map_err(|_| FrankenError::WalCorrupt {
+        detail: format!("page_size {} does not fit in usize", meta.page_size),
+    })?;
+
+    let mut frame_payload_by_no: BTreeMap<u32, &[u8]> = BTreeMap::new();
+    for frame in wal_frames {
+        frame_payload_by_no
+            .entry(frame.frame_no)
+            .or_insert(frame.page_data.as_slice());
+    }
+
+    let mut available_symbols: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut validated_source_symbols = 0_u32;
+    let mut validated_repair_symbols = 0_u32;
+    let mut source_pages: Vec<Option<Vec<u8>>> = vec![None; k_required];
+
+    for source_esi in 0..meta.k_source {
+        let index = usize::try_from(source_esi).map_err(|_| FrankenError::WalCorrupt {
+            detail: format!("source ESI {source_esi} does not fit in usize"),
+        })?;
+        let frame_no =
+            meta.start_frame_no
+                .checked_add(source_esi)
+                .ok_or_else(|| FrankenError::WalCorrupt {
+                    detail: "frame number overflow while collecting source symbols".to_owned(),
+                })?;
+        let Some(payload) = frame_payload_by_no.get(&frame_no).copied() else {
+            debug!(
+                bead_id = BD_1HI_11_BEAD_ID,
+                group_id = %group_id,
+                frame_no,
+                "source frame missing from wal candidates"
+            );
+            continue;
+        };
+        if payload.len() != page_len {
+            warn!(
+                bead_id = BD_1HI_11_BEAD_ID,
+                group_id = %group_id,
+                frame_no,
+                payload_len = payload.len(),
+                expected_len = page_len,
+                "source frame payload length mismatch; excluding from decoder input"
+            );
+            continue;
+        }
+        if frame_no >= first_checksum_mismatch_frame_no
+            && !verify_wal_fec_source_hash(payload, meta.source_page_xxh3_128[index])
+        {
+            warn!(
+                bead_id = BD_1HI_11_BEAD_ID,
+                group_id = %group_id,
+                frame_no,
+                esi = source_esi,
+                "source frame hash mismatch at/after wal chain break; excluding from decoder input"
+            );
+            continue;
+        }
+        if frame_no >= first_checksum_mismatch_frame_no {
+            debug!(
+                bead_id = BD_1HI_11_BEAD_ID,
+                group_id = %group_id,
+                frame_no,
+                esi = source_esi,
+                "source frame validated via independent xxh3 hash"
+            );
+        }
+        let payload_vec = payload.to_vec();
+        source_pages[index] = Some(payload_vec.clone());
+        available_symbols.push((source_esi, payload_vec));
+        validated_source_symbols = validated_source_symbols.saturating_add(1);
+    }
+
+    for symbol in &group.repair_symbols {
+        if !repair_symbol_matches_meta(meta, symbol) {
+            warn!(
+                bead_id = BD_1HI_11_BEAD_ID,
+                group_id = %group_id,
+                esi = symbol.esi,
+                "repair symbol failed metadata binding checks; excluding from decoder input"
+            );
+            continue;
+        }
+        validated_repair_symbols = validated_repair_symbols.saturating_add(1);
+        available_symbols.push((symbol.esi, symbol.symbol_data.clone()));
+    }
+    available_symbols.sort_unstable_by_key(|(esi, _)| *esi);
+
+    let available_count = usize_to_u32(available_symbols.len());
+    if available_symbols.len() < k_required {
+        error!(
+            bead_id = BD_1HI_11_BEAD_ID,
+            group_id = %group_id,
+            required_symbols = meta.k_source,
+            available_symbols = available_count,
+            "insufficient symbols for wal-fec decode; truncating before group"
+        );
+        return Ok(truncate_outcome(
+            group_id,
+            meta.start_frame_no,
+            meta.k_source,
+            available_count,
+            validated_source_symbols,
+            false,
+            false,
+            Vec::new(),
+            WalFecRecoveryFallbackReason::InsufficientSymbols,
+        ));
+    }
+
+    if validated_source_symbols == meta.k_source {
+        let recovered_pages = source_pages
+            .into_iter()
+            .map(|page| page.expect("source_pages are complete when all sources validated"))
+            .collect::<Vec<_>>();
+        let decode_proof = build_decode_proof(
+            group_id,
+            meta.k_source,
+            available_count,
+            validated_source_symbols,
+            validated_repair_symbols,
+            false,
+            true,
+            Vec::new(),
+            None,
+        );
+        info!(
+            bead_id = BD_1HI_11_BEAD_ID,
+            group_id = %group_id,
+            validated_source_symbols,
+            "wal-fec recovery fast path: group fully intact"
+        );
+        return Ok(WalFecRecoveryOutcome::Recovered(WalFecRecoveredGroup {
+            meta: meta.clone(),
+            recovered_pages,
+            recovered_frame_nos: Vec::new(),
+            db_size_pages: meta.db_size_pages,
+            decode_proof,
+        }));
+    }
+
+    let decoded_pages = match decode(meta, &available_symbols) {
+        Ok(decoded) => decoded,
+        Err(err) => {
+            error!(
+                bead_id = BD_1HI_11_BEAD_ID,
+                group_id = %group_id,
+                error = %err,
+                "wal-fec decode failed; truncating before group"
+            );
+            return Ok(truncate_outcome(
+                group_id,
+                meta.start_frame_no,
+                meta.k_source,
+                available_count,
+                validated_source_symbols,
+                true,
+                false,
+                Vec::new(),
+                WalFecRecoveryFallbackReason::DecodeFailed,
+            ));
+        }
+    };
+
+    if !decoded_pages_match_expected(meta, &decoded_pages, page_len) {
+        error!(
+            bead_id = BD_1HI_11_BEAD_ID,
+            group_id = %group_id,
+            "decoded payload failed structural/hash verification; truncating before group"
+        );
+        return Ok(truncate_outcome(
+            group_id,
+            meta.start_frame_no,
+            meta.k_source,
+            available_count,
+            validated_source_symbols,
+            true,
+            false,
+            Vec::new(),
+            WalFecRecoveryFallbackReason::DecodedPayloadMismatch,
+        ));
+    }
+
+    let recovered_frame_nos = source_pages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, page)| {
+            if page.is_some() {
+                None
+            } else {
+                let idx = u32::try_from(index).ok()?;
+                meta.start_frame_no.checked_add(idx)
+            }
+        })
+        .collect::<Vec<_>>();
+    let recovered_count = usize_to_u32(recovered_frame_nos.len());
+    if recovered_count >= meta.r_repair.saturating_sub(1) {
+        warn!(
+            bead_id = BD_1HI_11_BEAD_ID,
+            group_id = %group_id,
+            recovered_frames = recovered_count,
+            repair_capacity = meta.r_repair,
+            "wal-fec recovery near repair-capacity limit"
+        );
+    }
+    info!(
+        bead_id = BD_1HI_11_BEAD_ID,
+        group_id = %group_id,
+        recovered_frames = recovered_count,
+        db_size_pages = meta.db_size_pages,
+        "wal-fec recovery succeeded"
+    );
+
+    let decode_proof = build_decode_proof(
+        group_id,
+        meta.k_source,
+        available_count,
+        validated_source_symbols,
+        validated_repair_symbols,
+        true,
+        true,
+        recovered_frame_nos.clone(),
+        None,
+    );
+    Ok(WalFecRecoveryOutcome::Recovered(WalFecRecoveredGroup {
+        meta: meta.clone(),
+        recovered_pages: decoded_pages,
+        recovered_frame_nos,
+        db_size_pages: meta.db_size_pages,
+        decode_proof,
+    }))
+}
+
+fn decoded_pages_match_expected(meta: &WalFecGroupMeta, decoded_pages: &[Vec<u8>], page_len: usize) -> bool {
+    let k_required = match usize::try_from(meta.k_source) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    if decoded_pages.len() != k_required {
+        return false;
+    }
+    decoded_pages
+        .iter()
+        .enumerate()
+        .all(|(index, payload)| {
+            payload.len() == page_len
+                && verify_wal_fec_source_hash(payload, meta.source_page_xxh3_128[index])
+        })
+}
+
+fn repair_symbol_matches_meta(meta: &WalFecGroupMeta, symbol: &SymbolRecord) -> bool {
+    if symbol.object_id != meta.object_id || symbol.oti != meta.oti {
+        return false;
+    }
+    let repair_start = meta.k_source;
+    let repair_end = match meta.k_source.checked_add(meta.r_repair) {
+        Some(value) => value,
+        None => return false,
+    };
+    symbol.esi >= repair_start && symbol.esi < repair_end
+}
+
+fn scan_wal_fec_for_recovery(sidecar_path: &Path) -> Result<Vec<WalFecRecoveryGroupRecord>> {
+    if !sidecar_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let bytes = fs::read(sidecar_path)?;
+    let mut cursor = 0usize;
+    let mut groups = Vec::new();
+
+    while cursor < bytes.len() {
+        let Some(meta_bytes) = read_length_prefixed(&bytes, &mut cursor)? else {
+            break;
+        };
+        let meta = WalFecGroupMeta::from_record_bytes(meta_bytes)?;
+        let mut repair_symbols = Vec::new();
+
+        let mut truncated_tail = false;
+        for _ in 0..meta.r_repair {
+            let Some(symbol_bytes) = read_length_prefixed(&bytes, &mut cursor)? else {
+                truncated_tail = true;
+                break;
+            };
+            match SymbolRecord::from_bytes(symbol_bytes) {
+                Ok(symbol) => repair_symbols.push(symbol),
+                Err(err) => {
+                    warn!(
+                        bead_id = BD_1HI_11_BEAD_ID,
+                        group_id = %meta.group_id(),
+                        error = %err,
+                        "invalid wal-fec repair SymbolRecord excluded from recovery set"
+                    );
+                }
+            }
+        }
+        if truncated_tail {
+            break;
+        }
+        groups.push(WalFecRecoveryGroupRecord {
+            meta,
+            repair_symbols,
+        });
+    }
+
+    Ok(groups)
+}
+
+fn truncate_outcome(
+    group_id: WalFecGroupId,
+    truncate_before_frame_no: u32,
+    required_symbols: u32,
+    available_symbols: u32,
+    validated_source_symbols: u32,
+    decode_attempted: bool,
+    decode_succeeded: bool,
+    recovered_frame_nos: Vec<u32>,
+    fallback_reason: WalFecRecoveryFallbackReason,
+) -> WalFecRecoveryOutcome {
+    WalFecRecoveryOutcome::TruncateBeforeGroup {
+        truncate_before_frame_no,
+        decode_proof: build_decode_proof(
+            group_id,
+            required_symbols,
+            available_symbols,
+            validated_source_symbols,
+            available_symbols.saturating_sub(validated_source_symbols),
+            decode_attempted,
+            decode_succeeded,
+            recovered_frame_nos,
+            Some(fallback_reason),
+        ),
+    }
+}
+
+fn build_decode_proof(
+    group_id: WalFecGroupId,
+    required_symbols: u32,
+    available_symbols: u32,
+    validated_source_symbols: u32,
+    validated_repair_symbols: u32,
+    decode_attempted: bool,
+    decode_succeeded: bool,
+    recovered_frame_nos: Vec<u32>,
+    fallback_reason: Option<WalFecRecoveryFallbackReason>,
+) -> WalFecDecodeProof {
+    WalFecDecodeProof {
+        group_id,
+        required_symbols,
+        available_symbols,
+        validated_source_symbols,
+        validated_repair_symbols,
+        decode_attempted,
+        decode_succeeded,
+        recovered_frame_nos,
+        fallback_reason,
+    }
+}
+
+fn usize_to_u32(value: usize) -> u32 {
+    match u32::try_from(value) {
+        Ok(v) => v,
+        Err(_) => u32::MAX,
+    }
+}
+
 fn write_length_prefixed(file: &mut File, payload: &[u8], what: &str) -> Result<()> {
     let len_u32 = u32::try_from(payload.len()).map_err(|_| FrankenError::WalCorrupt {
         detail: format!(

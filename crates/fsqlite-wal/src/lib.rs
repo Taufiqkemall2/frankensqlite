@@ -30,9 +30,11 @@ pub use checksum::{
 pub use wal_fec::{
     WAL_FEC_GROUP_META_MAGIC, WAL_FEC_GROUP_META_VERSION, WalFecGroupId, WalFecGroupMeta,
     WalFecGroupMetaInit, WalFecGroupRecord, WalFecRepairPipeline, WalFecRepairPipelineConfig,
-    WalFecRepairPipelineStats, WalFecRepairWorkItem, WalFecScanResult, append_wal_fec_group,
-    build_source_page_hashes, ensure_wal_with_fec_sidecar, find_wal_fec_group,
-    generate_wal_fec_repair_symbols, scan_wal_fec, wal_fec_path_for_wal,
+    WalFecDecodeProof, WalFecRepairPipelineStats, WalFecRepairWorkItem, WalFecRecoveredGroup,
+    WalFecRecoveryFallbackReason, WalFecRecoveryOutcome, WalFecScanResult, WalFrameCandidate,
+    append_wal_fec_group, build_source_page_hashes, ensure_wal_with_fec_sidecar,
+    find_wal_fec_group, generate_wal_fec_repair_symbols, identify_damaged_commit_group,
+    recover_wal_fec_group_with_decoder, scan_wal_fec, wal_fec_path_for_wal,
 };
 pub use wal_index::{
     WAL_CKPT_INFO_BYTES, WAL_CKPT_LOCK, WAL_INDEX_HASH_MASK, WAL_INDEX_HASH_MULTIPLIER,
