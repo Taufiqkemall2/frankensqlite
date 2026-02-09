@@ -9,11 +9,190 @@
 //! Cursor-based opcodes (OpenRead, Rewind, Next, Column, etc.) are stubbed
 //! and will be wired to the B-tree layer in Phase 5.
 
+use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use fsqlite_error::{FrankenError, Result};
+use fsqlite_func::FunctionRegistry;
 use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
 use fsqlite_types::value::SqliteValue;
 
 use crate::VdbeProgram;
+
+// ── In-Memory Table Store ──────────────────────────────────────────────────
+//
+// Phase 4 in-memory cursor backend. Allows the VDBE engine to execute
+// CREATE TABLE / INSERT / SELECT / UPDATE / DELETE against a lightweight
+// row store without requiring the full B-tree + pager + VFS stack.
+
+/// A row in an in-memory table: (rowid, column values).
+#[derive(Debug, Clone, PartialEq)]
+struct MemRow {
+    rowid: i64,
+    values: Vec<SqliteValue>,
+}
+
+/// In-memory table storage (Phase 4 backend).
+#[derive(Debug, Clone)]
+pub struct MemTable {
+    /// Column count for this table (used when creating the table;
+    /// actual row widths may vary).
+    pub num_columns: usize,
+    /// Rows stored in insertion order.
+    rows: Vec<MemRow>,
+    /// Next auto-increment rowid.
+    next_rowid: i64,
+}
+
+impl MemTable {
+    /// Create a new empty table with the given column count.
+    fn new(num_columns: usize) -> Self {
+        Self {
+            num_columns,
+            rows: Vec::new(),
+            next_rowid: 1,
+        }
+    }
+
+    /// Allocate a new unique rowid.
+    fn alloc_rowid(&mut self) -> i64 {
+        let id = self.next_rowid;
+        self.next_rowid += 1;
+        id
+    }
+
+    /// Insert a row with the given rowid and values.
+    fn insert(&mut self, rowid: i64, values: Vec<SqliteValue>) {
+        // Update next_rowid if needed.
+        if rowid >= self.next_rowid {
+            self.next_rowid = rowid + 1;
+        }
+        // Replace if rowid already exists (UPSERT semantics).
+        if let Some(existing) = self.rows.iter_mut().find(|r| r.rowid == rowid) {
+            existing.values = values;
+        } else {
+            self.rows.push(MemRow { rowid, values });
+        }
+    }
+
+    /// Delete the row at the given index.
+    fn delete_at(&mut self, index: usize) {
+        if index < self.rows.len() {
+            self.rows.remove(index);
+        }
+    }
+
+    /// Find a row by rowid. Returns the index.
+    fn find_by_rowid(&self, rowid: i64) -> Option<usize> {
+        self.rows.iter().position(|r| r.rowid == rowid)
+    }
+}
+
+/// Cursor state for traversing an in-memory table.
+#[derive(Debug, Clone)]
+struct MemCursor {
+    /// Root page (used as table identifier).
+    root_page: i32,
+    /// Whether this cursor is writable (enforced at the Connection level).
+    #[allow(dead_code)]
+    writable: bool,
+    /// Current row position (None = not positioned).
+    position: Option<usize>,
+    /// Pseudo-table data (for OpenPseudo: a single row set by RowData/MakeRecord).
+    pseudo_row: Option<Vec<SqliteValue>>,
+    /// Whether this is a pseudo cursor (OpenPseudo).
+    is_pseudo: bool,
+}
+
+impl MemCursor {
+    fn new(root_page: i32, writable: bool) -> Self {
+        Self {
+            root_page,
+            writable,
+            position: None,
+            pseudo_row: None,
+            is_pseudo: false,
+        }
+    }
+
+    fn new_pseudo() -> Self {
+        Self {
+            root_page: -1,
+            writable: false,
+            position: None,
+            pseudo_row: None,
+            is_pseudo: true,
+        }
+    }
+}
+
+/// Cursor state for sorter opcodes (`SorterOpen`, `SorterInsert`, ...).
+#[derive(Debug, Clone)]
+struct SorterCursor {
+    /// Number of leading columns used as sort key.
+    key_columns: usize,
+    /// Inserted records decoded from `MakeRecord` blobs.
+    rows: Vec<Vec<SqliteValue>>,
+    /// Current position after `SorterSort`/`SorterNext`.
+    position: Option<usize>,
+}
+
+impl SorterCursor {
+    fn new(key_columns: usize) -> Self {
+        Self {
+            key_columns: key_columns.max(1),
+            rows: Vec::new(),
+            position: None,
+        }
+    }
+
+    fn sort(&mut self) {
+        let key_columns = self.key_columns;
+        self.rows
+            .sort_by(|lhs, rhs| compare_sorter_rows(lhs, rhs, key_columns));
+    }
+}
+
+/// Shared in-memory database backing the VDBE engine's cursor operations.
+///
+/// Maps root page numbers to in-memory tables. The Connection layer
+/// populates this when processing CREATE TABLE and passes it to the engine.
+#[derive(Debug, Clone, Default)]
+pub struct MemDatabase {
+    /// Tables indexed by root page number.
+    pub tables: HashMap<i32, MemTable>,
+    /// Next available root page number.
+    next_root_page: i32,
+}
+
+impl MemDatabase {
+    /// Create a new empty in-memory database.
+    pub fn new() -> Self {
+        Self {
+            tables: HashMap::new(),
+            next_root_page: 2, // Page 1 is reserved for sqlite_master.
+        }
+    }
+
+    /// Create a table and return its root page number.
+    pub fn create_table(&mut self, num_columns: usize) -> i32 {
+        let root_page = self.next_root_page;
+        self.next_root_page += 1;
+        self.tables.insert(root_page, MemTable::new(num_columns));
+        root_page
+    }
+
+    /// Get a reference to a table by root page.
+    pub fn get_table(&self, root_page: i32) -> Option<&MemTable> {
+        self.tables.get(&root_page)
+    }
+
+    /// Get a mutable reference to a table by root page.
+    pub fn get_table_mut(&mut self, root_page: i32) -> Option<&mut MemTable> {
+        self.tables.get_mut(&root_page)
+    }
+}
 
 const VDBE_TRACE_ENV: &str = "FSQLITE_VDBE_TRACE_OPCODES";
 const VDBE_TRACE_LOGGING_STANDARD: &str = "bd-1fpm";
@@ -48,8 +227,8 @@ pub enum ExecOutcome {
 /// The VDBE bytecode interpreter.
 ///
 /// Executes a program produced by the code generator, maintaining a register
-/// file and collecting result rows.
-#[derive(Debug)]
+/// file and collecting result rows. In Phase 4, cursor operations use an
+/// in-memory table store (`MemDatabase`) rather than the full B-tree stack.
 pub struct VdbeEngine {
     /// Register file (1-indexed; index 0 is unused/sentinel).
     registers: Vec<SqliteValue>,
@@ -59,6 +238,14 @@ pub struct VdbeEngine {
     trace_opcodes: bool,
     /// Result rows accumulated during execution.
     results: Vec<Vec<SqliteValue>>,
+    /// Open cursors (keyed by cursor number, i.e. p1 of OpenRead/OpenWrite).
+    cursors: HashMap<i32, MemCursor>,
+    /// Open sorter cursors keyed by cursor number.
+    sorters: HashMap<i32, SorterCursor>,
+    /// In-memory database backing cursor operations (shared with Connection).
+    db: Option<MemDatabase>,
+    /// Scalar/aggregate/window function registry for Function/PureFunc opcodes.
+    func_registry: Option<Arc<FunctionRegistry>>,
 }
 
 impl VdbeEngine {
@@ -73,7 +260,26 @@ impl VdbeEngine {
             bindings: Vec::new(),
             trace_opcodes: opcode_trace_enabled(),
             results: Vec::new(),
+            cursors: HashMap::new(),
+            sorters: HashMap::new(),
+            db: None,
+            func_registry: None,
         }
+    }
+
+    /// Attach an in-memory database for cursor operations.
+    pub fn set_database(&mut self, db: MemDatabase) {
+        self.db = Some(db);
+    }
+
+    /// Take ownership of the in-memory database back from the engine.
+    pub fn take_database(&mut self) -> Option<MemDatabase> {
+        self.db.take()
+    }
+
+    /// Attach a function registry for `Function`/`PureFunc` opcode dispatch.
+    pub fn set_function_registry(&mut self, registry: Arc<FunctionRegistry>) {
+        self.func_registry = Some(registry);
     }
 
     /// Replace the current set of bound SQL parameters.
@@ -577,84 +783,489 @@ impl VdbeEngine {
                     pc += 1;
                 }
 
-                // ── Cursor ops (stub) ───────────────────────────────────
-                Opcode::OpenRead
-                | Opcode::OpenWrite
-                | Opcode::OpenEphemeral
-                | Opcode::OpenAutoindex
-                | Opcode::OpenPseudo
-                | Opcode::OpenDup
-                | Opcode::ReopenIdx
-                | Opcode::SorterOpen
-                | Opcode::Close
-                | Opcode::ColumnsUsed => {
-                    // Stub: cursor operations will be wired in Phase 5.
+                // ── Cursor operations (in-memory backend) ──────────────
+                Opcode::OpenRead | Opcode::OpenWrite => {
+                    let cursor_id = op.p1;
+                    let root_page = op.p2;
+                    let writable = op.opcode == Opcode::OpenWrite;
+                    self.cursors
+                        .insert(cursor_id, MemCursor::new(root_page, writable));
+                    pc += 1;
+                }
+
+                Opcode::OpenEphemeral | Opcode::OpenAutoindex => {
+                    // Ephemeral table: create an in-memory table on-the-fly.
+                    let cursor_id = op.p1;
+                    let num_cols = op.p2.max(1);
+                    if let Some(db) = self.db.as_mut() {
+                        let root_page = db.create_table(num_cols as usize);
+                        self.cursors
+                            .insert(cursor_id, MemCursor::new(root_page, true));
+                    }
+                    pc += 1;
+                }
+
+                Opcode::OpenPseudo => {
+                    let cursor_id = op.p1;
+                    self.cursors.insert(cursor_id, MemCursor::new_pseudo());
+                    pc += 1;
+                }
+
+                Opcode::OpenDup | Opcode::ReopenIdx => {
+                    // Reopen: reuse existing cursor configuration.
+                    pc += 1;
+                }
+
+                Opcode::SorterOpen => {
+                    let cursor_id = op.p1;
+                    let key_columns = usize::try_from(op.p2.max(1)).unwrap_or(1);
+                    self.sorters
+                        .insert(cursor_id, SorterCursor::new(key_columns));
+                    // A cursor id cannot be both table and sorter cursor.
+                    self.cursors.remove(&cursor_id);
+                    pc += 1;
+                }
+
+                Opcode::Close => {
+                    self.cursors.remove(&op.p1);
+                    self.sorters.remove(&op.p1);
+                    pc += 1;
+                }
+
+                Opcode::ColumnsUsed => {
                     pc += 1;
                 }
 
                 Opcode::Rewind | Opcode::Sort | Opcode::SorterSort => {
-                    // Stub: jump to p2 (table empty / no cursor).
-                    pc = op.p2 as usize;
+                    // Position cursor at the first row. Jump to p2 if empty.
+                    let cursor_id = op.p1;
+                    let is_empty = if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
+                        if matches!(op.opcode, Opcode::Sort | Opcode::SorterSort) {
+                            sorter.sort();
+                        }
+                        if sorter.rows.is_empty() {
+                            sorter.position = None;
+                            true
+                        } else {
+                            sorter.position = Some(0);
+                            false
+                        }
+                    } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
+                        if cursor.is_pseudo {
+                            cursor.pseudo_row.is_none()
+                        } else if let Some(db) = self.db.as_ref() {
+                            if let Some(table) = db.get_table(cursor.root_page) {
+                                if table.rows.is_empty() {
+                                    true
+                                } else {
+                                    cursor.position = Some(0);
+                                    false
+                                }
+                            } else {
+                                true
+                            }
+                        } else {
+                            true
+                        }
+                    } else {
+                        true
+                    };
+                    if is_empty {
+                        pc = op.p2 as usize;
+                    } else {
+                        pc += 1;
+                    }
                 }
 
-                Opcode::Next | Opcode::Prev | Opcode::SorterNext => {
-                    // Stub: no more rows, fall through.
+                Opcode::Next | Opcode::SorterNext => {
+                    // Advance cursor to the next row. Jump to p2 if more rows.
+                    let cursor_id = op.p1;
+                    let has_next = if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
+                        if let Some(pos) = sorter.position {
+                            let next = pos + 1;
+                            if next < sorter.rows.len() {
+                                sorter.position = Some(next);
+                                true
+                            } else {
+                                sorter.position = None;
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
+                        if cursor.is_pseudo {
+                            false
+                        } else if let Some(db) = self.db.as_ref() {
+                            if let Some(table) = db.get_table(cursor.root_page) {
+                                if let Some(pos) = cursor.position {
+                                    let next = pos + 1;
+                                    if next < table.rows.len() {
+                                        cursor.position = Some(next);
+                                        true
+                                    } else {
+                                        cursor.position = None;
+                                        false
+                                    }
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if has_next {
+                        pc = op.p2 as usize;
+                    } else {
+                        pc += 1;
+                    }
+                }
+
+                Opcode::Prev => {
+                    // Move cursor backward. Jump to p2 if more rows.
+                    let cursor_id = op.p1;
+                    let has_prev = if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
+                        if let Some(pos) = cursor.position {
+                            if pos > 0 {
+                                cursor.position = Some(pos - 1);
+                                true
+                            } else {
+                                cursor.position = None;
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if has_prev {
+                        pc = op.p2 as usize;
+                    } else {
+                        pc += 1;
+                    }
+                }
+
+                Opcode::Column => {
+                    // Read column p2 from cursor p1 into register p3.
+                    let cursor_id = op.p1;
+                    let col_idx = op.p2 as usize;
+                    let target = op.p3;
+                    let val = self.cursor_column(cursor_id, col_idx);
+                    self.set_reg(target, val);
                     pc += 1;
                 }
 
-                Opcode::Column
-                | Opcode::Rowid
-                | Opcode::RowData
-                | Opcode::NullRow
-                | Opcode::Offset => {
-                    // Stub: set result to NULL.
-                    self.set_reg(op.p3.max(op.p2), SqliteValue::Null);
+                Opcode::Rowid => {
+                    // Get rowid from cursor p1 into register p2.
+                    let cursor_id = op.p1;
+                    let target = op.p2;
+                    let val = self.cursor_rowid(cursor_id);
+                    self.set_reg(target, val);
                     pc += 1;
                 }
 
-                // ── Seek ops (stub) ─────────────────────────────────────
-                Opcode::SeekGE
-                | Opcode::SeekGT
-                | Opcode::SeekLE
-                | Opcode::SeekLT
-                | Opcode::SeekRowid
-                | Opcode::SeekScan
-                | Opcode::SeekEnd
-                | Opcode::SeekHit => {
-                    // Stub: seek not found, jump to p2.
-                    pc = op.p2 as usize;
+                Opcode::RowData => {
+                    // Store raw row data as a blob in register p2.
+                    // For pseudo-cursors, retrieve the blob from p2.
+                    let cursor_id = op.p1;
+                    let target = op.p2;
+                    if let Some(cursor) = self.cursors.get(&cursor_id) {
+                        if cursor.is_pseudo {
+                            // Pseudo cursor: the "row data" was already set via
+                            // a prior MakeRecord → set_reg. Leave register as-is.
+                        } else {
+                            self.set_reg(target, SqliteValue::Null);
+                        }
+                    } else {
+                        self.set_reg(target, SqliteValue::Null);
+                    }
+                    pc += 1;
+                }
+
+                Opcode::NullRow => {
+                    // Set cursor p1 to a null row.
+                    if let Some(cursor) = self.cursors.get_mut(&op.p1) {
+                        cursor.position = None;
+                    }
+                    pc += 1;
+                }
+
+                Opcode::Offset => {
+                    self.set_reg(op.p3, SqliteValue::Null);
+                    pc += 1;
+                }
+
+                // ── Seek operations (in-memory) ─────────────────────────
+                Opcode::SeekRowid => {
+                    // Seek cursor p1 to the row with rowid in register p3.
+                    // If not found, jump to p2.
+                    let cursor_id = op.p1;
+                    let rowid_val = self.get_reg(op.p3).to_integer();
+                    let found = if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
+                        if let Some(db) = self.db.as_ref() {
+                            if let Some(table) = db.get_table(cursor.root_page) {
+                                if let Some(idx) = table.find_by_rowid(rowid_val) {
+                                    cursor.position = Some(idx);
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if found {
+                        pc += 1;
+                    } else {
+                        pc = op.p2 as usize;
+                    }
+                }
+
+                Opcode::SeekGE | Opcode::SeekGT | Opcode::SeekLE | Opcode::SeekLT => {
+                    // Simplified seek: position at first/last row.
+                    // Full index seeks require B-tree; for in-memory mode,
+                    // position at the start (GE/GT) or end (LE/LT).
+                    let cursor_id = op.p1;
+                    let found = if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
+                        if let Some(db) = self.db.as_ref() {
+                            if let Some(table) = db.get_table(cursor.root_page) {
+                                if table.rows.is_empty() {
+                                    false
+                                } else {
+                                    match op.opcode {
+                                        Opcode::SeekLE | Opcode::SeekLT => {
+                                            cursor.position = Some(table.rows.len() - 1);
+                                        }
+                                        _ => {
+                                            cursor.position = Some(0);
+                                        }
+                                    }
+                                    true
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if found {
+                        pc += 1;
+                    } else {
+                        pc = op.p2 as usize;
+                    }
+                }
+
+                Opcode::SeekScan | Opcode::SeekEnd | Opcode::SeekHit => {
+                    pc += 1;
                 }
 
                 Opcode::NotFound | Opcode::NotExists | Opcode::IfNoHope => {
-                    // Stub: key not found, jump to p2.
-                    pc = op.p2 as usize;
+                    // Check if rowid in register p3 exists in cursor p1.
+                    let cursor_id = op.p1;
+                    let rowid_val = self.get_reg(op.p3).to_integer();
+                    let exists = if let Some(cursor) = self.cursors.get(&cursor_id) {
+                        if let Some(db) = self.db.as_ref() {
+                            if let Some(table) = db.get_table(cursor.root_page) {
+                                table.find_by_rowid(rowid_val).is_some()
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if exists {
+                        pc += 1; // Found: fall through.
+                    } else {
+                        pc = op.p2 as usize; // Not found: jump.
+                    }
                 }
 
                 Opcode::Found | Opcode::NoConflict => {
-                    // Stub: key not found, fall through.
+                    // Check if key exists; jump to p2 if found.
+                    let cursor_id = op.p1;
+                    let rowid_val = self.get_reg(op.p3).to_integer();
+                    let exists = if let Some(cursor) = self.cursors.get(&cursor_id) {
+                        if let Some(db) = self.db.as_ref() {
+                            if let Some(table) = db.get_table(cursor.root_page) {
+                                table.find_by_rowid(rowid_val).is_some()
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if exists {
+                        pc = op.p2 as usize;
+                    } else {
+                        pc += 1;
+                    }
+                }
+
+                // ── Insert / Delete / NewRowid (in-memory) ──────────────
+                Opcode::NewRowid => {
+                    // Allocate a new rowid for cursor p1, store in register p2.
+                    let cursor_id = op.p1;
+                    let target = op.p2;
+                    let rowid = if let Some(cursor) = self.cursors.get(&cursor_id) {
+                        if let Some(db) = self.db.as_mut() {
+                            if let Some(table) = db.get_table_mut(cursor.root_page) {
+                                table.alloc_rowid()
+                            } else {
+                                1
+                            }
+                        } else {
+                            1
+                        }
+                    } else {
+                        1
+                    };
+                    self.set_reg(target, SqliteValue::Integer(rowid));
                     pc += 1;
                 }
 
-                // ── Insert/Delete (stub) ────────────────────────────────
-                Opcode::Insert
-                | Opcode::Delete
-                | Opcode::NewRowid
-                | Opcode::IdxInsert
-                | Opcode::IdxDelete
-                | Opcode::SorterInsert
-                | Opcode::SorterCompare
-                | Opcode::SorterData
-                | Opcode::RowCell
-                | Opcode::ResetCount => {
+                Opcode::Insert => {
+                    // Insert record in register p2 with rowid from register p3
+                    // into cursor p1.
+                    let cursor_id = op.p1;
+                    let record_reg = op.p2;
+                    let rowid_reg = op.p3;
+                    let rowid = self.get_reg(rowid_reg).to_integer();
+                    let record_val = self.get_reg(record_reg).clone();
+                    // The record is stored as a Blob containing packed SqliteValues
+                    // from MakeRecord. We decode it back.
+                    let values = decode_mem_record(&record_val);
+                    if let Some(cursor) = self.cursors.get(&cursor_id) {
+                        let root = cursor.root_page;
+                        if let Some(db) = self.db.as_mut() {
+                            if let Some(table) = db.get_table_mut(root) {
+                                table.insert(rowid, values);
+                            }
+                        }
+                    }
                     pc += 1;
                 }
 
-                // ── Record building ─────────────────────────────────────
+                Opcode::Delete => {
+                    // Delete the row at the current cursor position.
+                    let cursor_id = op.p1;
+                    if let Some(cursor) = self.cursors.get(&cursor_id) {
+                        if let Some(pos) = cursor.position {
+                            let root = cursor.root_page;
+                            if let Some(db) = self.db.as_mut() {
+                                if let Some(table) = db.get_table_mut(root) {
+                                    table.delete_at(pos);
+                                }
+                            }
+                        }
+                    }
+                    pc += 1;
+                }
+
+                Opcode::IdxInsert => {
+                    // Index insert is a no-op in this in-memory backend.
+                    pc += 1;
+                }
+
+                Opcode::SorterInsert => {
+                    let cursor_id = op.p1;
+                    let record = self.get_reg(op.p2).clone();
+                    if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
+                        sorter.rows.push(decode_mem_record(&record));
+                    }
+                    pc += 1;
+                }
+
+                Opcode::IdxDelete => {
+                    pc += 1;
+                }
+
+                Opcode::SorterCompare => {
+                    // Compare current sorter key with packed record in register p3.
+                    // Jump to p2 when keys differ.
+                    let cursor_id = op.p1;
+                    let differs = if let Some(sorter) = self.sorters.get(&cursor_id) {
+                        if let Some(pos) = sorter.position {
+                            if let Some(current) = sorter.rows.get(pos) {
+                                let probe = decode_mem_record(self.get_reg(op.p3));
+                                !sorter_keys_equal(current, &probe, sorter.key_columns)
+                            } else {
+                                true
+                            }
+                        } else {
+                            true
+                        }
+                    } else {
+                        true
+                    };
+                    if differs {
+                        pc = op.p2 as usize;
+                    } else {
+                        pc += 1;
+                    }
+                }
+
+                Opcode::SorterData => {
+                    // Encode current sorter row into register p2.
+                    let cursor_id = op.p1;
+                    let target = op.p2;
+                    let value = if let Some(sorter) = self.sorters.get(&cursor_id) {
+                        if let Some(pos) = sorter.position {
+                            if let Some(row) = sorter.rows.get(pos) {
+                                encode_mem_record(row)
+                            } else {
+                                SqliteValue::Null
+                            }
+                        } else {
+                            SqliteValue::Null
+                        }
+                    } else {
+                        SqliteValue::Null
+                    };
+                    self.set_reg(target, value);
+                    pc += 1;
+                }
+
+                Opcode::RowCell => {
+                    pc += 1;
+                }
+
+                Opcode::ResetCount => {
+                    pc += 1;
+                }
+
+                // ── Record building (in-memory format) ──────────────────
                 Opcode::MakeRecord => {
-                    // Build a record from p1..p1+p2-1 into p3.
-                    // Placeholder: store as empty blob. Full record format
-                    // will use fsqlite-types::record in Phase 5.
-                    self.set_reg(op.p3, SqliteValue::Blob(Vec::new()));
+                    // Build a record from registers p1..p1+p2-1 into register p3.
+                    // We use a simple encoding: store the SqliteValues as a
+                    // JSON-like blob that we can decode back in Insert.
+                    let start = op.p1;
+                    let count = op.p2;
+                    let target = op.p3;
+                    let mut values = Vec::with_capacity(count as usize);
+                    for i in 0..count {
+                        values.push(self.get_reg(start + i).clone());
+                    }
+                    self.set_reg(target, encode_mem_record(&values));
                     pc += 1;
                 }
 
@@ -740,13 +1351,25 @@ impl VdbeEngine {
                 }
 
                 Opcode::IfNullRow => {
-                    // Stub: cursor p1 always has null row in stub mode.
-                    pc = op.p2 as usize;
+                    // Jump to p2 if cursor p1 is not positioned on a row.
+                    let is_null = self
+                        .cursors
+                        .get(&op.p1)
+                        .is_none_or(|c| c.position.is_none() && !c.is_pseudo);
+                    if is_null {
+                        pc = op.p2 as usize;
+                    } else {
+                        pc += 1;
+                    }
                 }
 
                 Opcode::IfNotOpen => {
-                    // Stub: cursor is never open in stub mode.
-                    pc = op.p2 as usize;
+                    // Jump to p2 if cursor p1 is not open.
+                    if self.cursors.contains_key(&op.p1) {
+                        pc += 1;
+                    } else {
+                        pc = op.p2 as usize;
+                    }
                 }
 
                 Opcode::TypeCheck
@@ -770,8 +1393,31 @@ impl VdbeEngine {
                 }
 
                 Opcode::Last => {
-                    // Stub: table empty, jump to p2.
-                    pc = op.p2 as usize;
+                    // Position cursor at the last row. Jump to p2 if empty.
+                    let cursor_id = op.p1;
+                    let is_empty = if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
+                        if let Some(db) = self.db.as_ref() {
+                            if let Some(table) = db.get_table(cursor.root_page) {
+                                if table.rows.is_empty() {
+                                    true
+                                } else {
+                                    cursor.position = Some(table.rows.len() - 1);
+                                    false
+                                }
+                            } else {
+                                true
+                            }
+                        } else {
+                            true
+                        }
+                    } else {
+                        true
+                    };
+                    if is_empty {
+                        pc = op.p2 as usize;
+                    } else {
+                        pc += 1;
+                    }
                 }
 
                 Opcode::IfSizeBetween | Opcode::IfEmpty => {
@@ -790,16 +1436,51 @@ impl VdbeEngine {
                 }
 
                 // ── Schema / DDL ────────────────────────────────────────
-                Opcode::CreateBtree
-                | Opcode::SqlExec
+                Opcode::CreateBtree => {
+                    // Create a new B-tree (table) and store the root page in
+                    // register p2. In memory mode, allocate a new MemTable.
+                    let target = op.p2;
+                    let root_page = if let Some(db) = self.db.as_mut() {
+                        db.create_table(0) // Column count set later.
+                    } else {
+                        0
+                    };
+                    self.set_reg(target, SqliteValue::Integer(i64::from(root_page)));
+                    pc += 1;
+                }
+
+                Opcode::Clear => {
+                    // Clear all rows from a table. p1 = root page.
+                    if let Some(db) = self.db.as_mut() {
+                        if let Some(table) = db.get_table_mut(op.p1) {
+                            table.rows.clear();
+                        }
+                    }
+                    pc += 1;
+                }
+
+                Opcode::Destroy => {
+                    // Remove a table. p1 = root page.
+                    if let Some(db) = self.db.as_mut() {
+                        db.tables.remove(&op.p1);
+                    }
+                    pc += 1;
+                }
+
+                Opcode::SqlExec
                 | Opcode::ParseSchema
                 | Opcode::LoadAnalysis
                 | Opcode::DropTable
                 | Opcode::DropIndex
-                | Opcode::DropTrigger
-                | Opcode::Destroy
-                | Opcode::Clear
-                | Opcode::ResetSorter => {
+                | Opcode::DropTrigger => {
+                    pc += 1;
+                }
+
+                Opcode::ResetSorter => {
+                    if let Some(sorter) = self.sorters.get_mut(&op.p1) {
+                        sorter.rows.clear();
+                        sorter.position = None;
+                    }
                     pc += 1;
                 }
 
@@ -840,6 +1521,51 @@ impl VdbeEngine {
                     pc += 1;
                 }
 
+                // ── Scalar function call ──────────────────────────────────
+                //
+                // Function/PureFunc: p1 = constant-p5-flags, p2 = first-arg register,
+                // p3 = output register, p4 = FuncName, p5 = arg count.
+                // Arguments are in registers p2..p2+p5.
+                Opcode::Function | Opcode::PureFunc => {
+                    let func_name = match &op.p4 {
+                        P4::FuncName(name) => name.as_str(),
+                        _ => {
+                            return Err(FrankenError::Internal(
+                                "Function opcode missing P4::FuncName".to_owned(),
+                            ));
+                        }
+                    };
+                    let arg_count = op.p5 as usize;
+                    let first_arg_reg = op.p2;
+                    let output_reg = op.p3;
+
+                    let registry = self.func_registry.as_ref().ok_or_else(|| {
+                        FrankenError::Internal(
+                            "Function opcode executed without function registry".to_owned(),
+                        )
+                    })?;
+
+                    #[allow(clippy::cast_possible_wrap)]
+                    let func = registry
+                        .find_scalar(func_name, arg_count as i32)
+                        .ok_or_else(|| {
+                            FrankenError::Internal(format!(
+                                "no such function: {func_name}/{arg_count}",
+                            ))
+                        })?;
+
+                    let mut args = Vec::with_capacity(arg_count);
+                    for i in 0..arg_count {
+                        #[allow(clippy::cast_possible_wrap)]
+                        let reg_idx = first_arg_reg + i as i32;
+                        args.push(self.get_reg(reg_idx).clone());
+                    }
+
+                    let result = func.invoke(&args)?;
+                    self.set_reg(output_reg, result);
+                    pc += 1;
+                }
+
                 // ── Catch-all for remaining opcodes ─────────────────────
                 _ => {
                     // Unimplemented opcode: skip (no-op for now).
@@ -875,6 +1601,50 @@ impl VdbeEngine {
         self.registers[idx] = val;
     }
 
+    /// Read a column value from the cursor's current row.
+    fn cursor_column(&self, cursor_id: i32, col_idx: usize) -> SqliteValue {
+        if let Some(cursor) = self.cursors.get(&cursor_id) {
+            if cursor.is_pseudo {
+                return cursor
+                    .pseudo_row
+                    .as_ref()
+                    .and_then(|row| row.get(col_idx))
+                    .cloned()
+                    .unwrap_or(SqliteValue::Null);
+            }
+            if let Some(pos) = cursor.position {
+                if let Some(db) = self.db.as_ref() {
+                    if let Some(table) = db.get_table(cursor.root_page) {
+                        if let Some(row) = table.rows.get(pos) {
+                            return row
+                                .values
+                                .get(col_idx)
+                                .cloned()
+                                .unwrap_or(SqliteValue::Null);
+                        }
+                    }
+                }
+            }
+        }
+        SqliteValue::Null
+    }
+
+    /// Get the rowid from the cursor's current row.
+    fn cursor_rowid(&self, cursor_id: i32) -> SqliteValue {
+        if let Some(cursor) = self.cursors.get(&cursor_id) {
+            if let Some(pos) = cursor.position {
+                if let Some(db) = self.db.as_ref() {
+                    if let Some(table) = db.get_table(cursor.root_page) {
+                        if let Some(row) = table.rows.get(pos) {
+                            return SqliteValue::Integer(row.rowid);
+                        }
+                    }
+                }
+            }
+        }
+        SqliteValue::Null
+    }
+
     fn trace_opcode(&self, pc: usize, op: &VdbeOp) {
         if !self.trace_opcodes || !tracing::enabled!(tracing::Level::DEBUG) {
             return;
@@ -896,6 +1666,170 @@ impl VdbeEngine {
             "executing vdbe opcode",
         );
     }
+}
+
+// ── In-memory record encoding ───────────────────────────────────────────
+//
+// MakeRecord packs register values into a Blob that Insert can decode.
+// We use a simple tagged encoding:
+//   - 0x00 → Null
+//   - 0x01 + 8 bytes (i64 LE) → Integer
+//   - 0x02 + 8 bytes (f64 LE) → Float
+//   - 0x03 + 4 bytes (u32 LE, length) + N bytes → Text
+//   - 0x04 + 4 bytes (u32 LE, length) + N bytes → Blob
+
+#[allow(clippy::cast_possible_truncation)]
+fn encode_mem_record(values: &[SqliteValue]) -> SqliteValue {
+    let mut buf = Vec::new();
+    for val in values {
+        match val {
+            SqliteValue::Null => buf.push(0x00),
+            SqliteValue::Integer(n) => {
+                buf.push(0x01);
+                buf.extend_from_slice(&n.to_le_bytes());
+            }
+            SqliteValue::Float(f) => {
+                buf.push(0x02);
+                buf.extend_from_slice(&f.to_le_bytes());
+            }
+            SqliteValue::Text(s) => {
+                buf.push(0x03);
+                let bytes = s.as_bytes();
+                buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(bytes);
+            }
+            SqliteValue::Blob(b) => {
+                buf.push(0x04);
+                buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                buf.extend_from_slice(b);
+            }
+        }
+    }
+    SqliteValue::Blob(buf)
+}
+
+fn decode_mem_record(val: &SqliteValue) -> Vec<SqliteValue> {
+    let SqliteValue::Blob(bytes) = val else {
+        return Vec::new();
+    };
+
+    let mut result = Vec::new();
+    let mut pos = 0;
+    while pos < bytes.len() {
+        match bytes[pos] {
+            0x00 => {
+                result.push(SqliteValue::Null);
+                pos += 1;
+            }
+            0x01 => {
+                pos += 1;
+                if pos + 8 <= bytes.len() {
+                    let n = i64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap_or_default());
+                    result.push(SqliteValue::Integer(n));
+                    pos += 8;
+                } else {
+                    break;
+                }
+            }
+            0x02 => {
+                pos += 1;
+                if pos + 8 <= bytes.len() {
+                    let f = f64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap_or_default());
+                    result.push(SqliteValue::Float(f));
+                    pos += 8;
+                } else {
+                    break;
+                }
+            }
+            0x03 => {
+                pos += 1;
+                if pos + 4 <= bytes.len() {
+                    let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap_or_default())
+                        as usize;
+                    pos += 4;
+                    if pos + len <= bytes.len() {
+                        let s = String::from_utf8_lossy(&bytes[pos..pos + len]).into_owned();
+                        result.push(SqliteValue::Text(s));
+                        pos += len;
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            0x04 => {
+                pos += 1;
+                if pos + 4 <= bytes.len() {
+                    let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap_or_default())
+                        as usize;
+                    pos += 4;
+                    if pos + len <= bytes.len() {
+                        result.push(SqliteValue::Blob(bytes[pos..pos + len].to_vec()));
+                        pos += len;
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            _ => {
+                // Unknown tag: stop parsing.
+                break;
+            }
+        }
+    }
+    result
+}
+
+fn sorter_keys_equal(lhs: &[SqliteValue], rhs: &[SqliteValue], key_columns: usize) -> bool {
+    compare_sorter_rows(lhs, rhs, key_columns) == Ordering::Equal
+}
+
+fn compare_sorter_rows(lhs: &[SqliteValue], rhs: &[SqliteValue], key_columns: usize) -> Ordering {
+    let key_count = key_columns.max(1);
+    for idx in 0..key_count {
+        let Some(lhs_value) = lhs.get(idx) else {
+            return if rhs.get(idx).is_some() {
+                Ordering::Less
+            } else {
+                break;
+            };
+        };
+        let Some(rhs_value) = rhs.get(idx) else {
+            return Ordering::Greater;
+        };
+
+        match lhs_value
+            .partial_cmp(rhs_value)
+            .unwrap_or(Ordering::Equal)
+        {
+            Ordering::Equal => {}
+            non_equal => return non_equal,
+        }
+    }
+
+    // Deterministic tie-breaker: compare full rows so sort order is stable.
+    let full_len = lhs.len().max(rhs.len());
+    for idx in 0..full_len {
+        match (lhs.get(idx), rhs.get(idx)) {
+            (Some(lhs_value), Some(rhs_value)) => {
+                match lhs_value
+                    .partial_cmp(rhs_value)
+                    .unwrap_or(Ordering::Equal)
+                {
+                    Ordering::Equal => {}
+                    non_equal => return non_equal,
+                }
+            }
+            (Some(_), None) => return Ordering::Greater,
+            (None, Some(_)) => return Ordering::Less,
+            (None, None) => break,
+        }
+    }
+
+    Ordering::Equal
 }
 
 fn opcode_trace_enabled() -> bool {
@@ -1726,6 +2660,123 @@ mod tests {
         assert_eq!(outcome, ExecOutcome::Done);
         assert_eq!(engine.results().len(), 1);
         assert_eq!(engine.results()[0], vec![SqliteValue::Integer(200)]);
+    }
+
+    #[test]
+    fn test_sorter_opcodes_sort_and_emit_rows() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            let loop_start = b.emit_label();
+            let empty = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_value = b.alloc_reg();
+            let r_record = b.alloc_reg();
+            let r_sorted = b.alloc_reg();
+
+            b.emit_op(Opcode::SorterOpen, 0, 1, 0, P4::None, 0);
+
+            for value in [30, 10, 20] {
+                b.emit_op(Opcode::Integer, value, r_value, 0, P4::None, 0);
+                b.emit_op(Opcode::MakeRecord, r_value, 1, r_record, P4::None, 0);
+                b.emit_op(Opcode::SorterInsert, 0, r_record, 0, P4::None, 0);
+            }
+
+            b.emit_jump_to_label(Opcode::SorterSort, 0, 0, empty, P4::None, 0);
+            b.resolve_label(loop_start);
+            b.emit_op(Opcode::SorterData, 0, r_sorted, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_sorted, 1, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SorterNext, 0, 0, loop_start, P4::None, 0);
+            b.resolve_label(empty);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        let decoded: Vec<i64> = rows
+            .into_iter()
+            .map(|row| decode_mem_record(&row[0])[0].to_integer())
+            .collect();
+        assert_eq!(decoded, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn test_sorter_compare_jumps_on_key_difference() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            let diff = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_value = b.alloc_reg();
+            let r_record = b.alloc_reg();
+            let r_probe = b.alloc_reg();
+            let r_probe_record = b.alloc_reg();
+            let r_out = b.alloc_reg();
+
+            b.emit_op(Opcode::SorterOpen, 0, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 10, r_value, 0, P4::None, 0);
+            b.emit_op(Opcode::MakeRecord, r_value, 1, r_record, P4::None, 0);
+            b.emit_op(Opcode::SorterInsert, 0, r_record, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SorterSort, 0, 0, diff, P4::None, 0);
+
+            b.emit_op(Opcode::Integer, 20, r_probe, 0, P4::None, 0);
+            b.emit_op(
+                Opcode::MakeRecord,
+                r_probe,
+                1,
+                r_probe_record,
+                P4::None,
+                0,
+            );
+            b.emit_jump_to_label(
+                Opcode::SorterCompare,
+                0,
+                r_probe_record,
+                diff,
+                P4::None,
+                0,
+            );
+
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+            b.resolve_label(diff);
+            b.emit_op(Opcode::Integer, 2, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(2)]]);
+    }
+
+    #[test]
+    fn test_reset_sorter_clears_entries() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            let empty = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_value = b.alloc_reg();
+            let r_record = b.alloc_reg();
+            let r_out = b.alloc_reg();
+
+            b.emit_op(Opcode::SorterOpen, 0, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 7, r_value, 0, P4::None, 0);
+            b.emit_op(Opcode::MakeRecord, r_value, 1, r_record, P4::None, 0);
+            b.emit_op(Opcode::SorterInsert, 0, r_record, 0, P4::None, 0);
+            b.emit_op(Opcode::ResetSorter, 0, 0, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SorterSort, 0, 0, empty, P4::None, 0);
+
+            // If ResetSorter failed, this row would be emitted.
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.resolve_label(empty);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert!(rows.is_empty());
     }
 
     // ── Codegen → Engine Integration Tests ──────────────────────────────

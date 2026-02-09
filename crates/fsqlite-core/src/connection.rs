@@ -1,19 +1,40 @@
-//! Minimal SQL connection API for the Phase 4 query pipeline.
+//! SQL connection API for the Phase 4 query pipeline.
 //!
-//! This module intentionally starts with a narrow execution path:
-//! expression-only `SELECT` statements (no `FROM`) compiled to VDBE bytecode
-//! and executed by the VDBE engine.
+//! Supports expression-only SELECT statements as well as table-backed DML:
+//! CREATE TABLE, INSERT, SELECT (with FROM), UPDATE, and DELETE. All table
+//! storage uses the in-memory `MemDatabase` backend until the B-tree layer
+//! is wired in Phase 5.
+
+use std::cell::RefCell;
+use std::sync::Arc;
 
 use fsqlite_ast::{
-    BinaryOp, Distinctness, Expr, FunctionArgs, Literal, PlaceholderType, ResultColumn, SelectCore,
-    SelectStatement, Statement, UnaryOp,
+    BinaryOp, CreateTableBody, Distinctness, Expr, FunctionArgs, InSet, LikeOp, Literal,
+    PlaceholderType, ResultColumn, SelectCore, SelectStatement, Statement, UnaryOp,
 };
 use fsqlite_error::{FrankenError, Result};
+use fsqlite_func::FunctionRegistry;
 use fsqlite_parser::Parser;
 use fsqlite_types::opcode::{Opcode, P4};
 use fsqlite_types::value::SqliteValue;
-use fsqlite_vdbe::engine::{ExecOutcome, VdbeEngine};
+use fsqlite_vdbe::codegen::{
+    CodegenContext, CodegenError, ColumnInfo, TableSchema, codegen_delete, codegen_insert,
+    codegen_select, codegen_update,
+};
+use fsqlite_vdbe::engine::{ExecOutcome, MemDatabase, VdbeEngine};
 use fsqlite_vdbe::{ProgramBuilder, VdbeProgram};
+
+/// Build a [`FunctionRegistry`] populated with all built-in scalar,
+/// aggregate, datetime, and math functions.
+fn default_function_registry() -> Arc<FunctionRegistry> {
+    let mut registry = FunctionRegistry::new();
+    fsqlite_func::register_builtins(&mut registry);
+    fsqlite_func::register_datetime_builtins(&mut registry);
+    fsqlite_func::register_math_builtins(&mut registry);
+    fsqlite_func::register_aggregate_builtins(&mut registry);
+    fsqlite_func::register_window_builtins(&mut registry);
+    Arc::new(registry)
+}
 
 /// Map a SQL type name to its SQLite affinity byte (§3.1 Type Affinity Rules).
 fn type_name_to_affinity(name: &str) -> u8 {
@@ -50,20 +71,38 @@ impl Row {
 }
 
 /// A prepared SQL statement.
-#[derive(Debug, Clone, PartialEq)]
 pub struct PreparedStatement {
     program: VdbeProgram,
+    func_registry: Option<Arc<FunctionRegistry>>,
+}
+
+impl std::fmt::Debug for PreparedStatement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedStatement")
+            .field("program", &self.program)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PreparedStatement {
     /// Execute as a query and return all result rows.
     pub fn query(&self) -> Result<Vec<Row>> {
-        execute_program(&self.program, None)
+        execute_program(&self.program, None, self.func_registry.as_ref())
     }
 
     /// Execute as a query with bound SQL parameters (`?1`, `?2`, ...).
     pub fn query_with_params(&self, params: &[SqliteValue]) -> Result<Vec<Row>> {
-        execute_program(&self.program, Some(params))
+        execute_program(&self.program, Some(params), self.func_registry.as_ref())
+    }
+
+    /// Execute as a query and return exactly one row.
+    pub fn query_row(&self) -> Result<Row> {
+        first_row_or_error(self.query()?)
+    }
+
+    /// Execute as a query with parameters and return exactly one row.
+    pub fn query_row_with_params(&self, params: &[SqliteValue]) -> Result<Row> {
+        first_row_or_error(self.query_with_params(params)?)
     }
 
     /// Execute and return affected/output row count.
@@ -82,17 +121,34 @@ impl PreparedStatement {
     }
 }
 
-/// A lightweight connection façade over the parser + VDBE path.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A database connection holding in-memory tables and schema metadata.
+///
+/// In Phase 4, all table storage uses `MemDatabase`. The B-tree + pager +
+/// VFS stack will replace this in Phase 5.
 pub struct Connection {
     path: String,
+    /// In-memory table storage (shared with the VDBE engine during execution).
+    db: RefCell<MemDatabase>,
+    /// Schema registry: table metadata used by the code generator.
+    schema: RefCell<Vec<TableSchema>>,
+    /// Scalar/aggregate/window function registry shared with the VDBE engine.
+    func_registry: Arc<FunctionRegistry>,
+}
+
+impl std::fmt::Debug for Connection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Connection")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Connection {
     /// Open a connection.
     ///
-    /// At this stage, the path is tracked but storage-backed statements are
-    /// not implemented yet. Expression-only SELECT is supported.
+    /// Creates an empty in-memory database. Expression-only SELECT and
+    /// table-backed DML (CREATE TABLE, INSERT, SELECT FROM, UPDATE, DELETE)
+    /// are supported.
     pub fn open(path: impl Into<String>) -> Result<Self> {
         let path = path.into();
         if path.is_empty() {
@@ -100,7 +156,12 @@ impl Connection {
                 path: std::path::PathBuf::from(path),
             });
         }
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            db: RefCell::new(MemDatabase::new()),
+            schema: RefCell::new(Vec::new()),
+            func_registry: default_function_registry(),
+        })
     }
 
     /// Returns the configured database path.
@@ -111,36 +172,286 @@ impl Connection {
     /// Prepare SQL into a statement.
     pub fn prepare(&self, sql: &str) -> Result<PreparedStatement> {
         let statement = parse_single_statement(sql)?;
-        let program = compile_statement(&statement)?;
-        Ok(PreparedStatement { program })
+        self.compile_and_wrap(&statement)
     }
 
     /// Prepare and execute SQL as a query.
     pub fn query(&self, sql: &str) -> Result<Vec<Row>> {
-        self.prepare(sql)?.query()
+        let statement = parse_single_statement(sql)?;
+        self.execute_statement(statement, None)
     }
 
     /// Prepare and execute SQL as a query with bound SQL parameters.
     pub fn query_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<Row>> {
-        self.prepare(sql)?.query_with_params(params)
+        let statement = parse_single_statement(sql)?;
+        self.execute_statement(statement, Some(params))
+    }
+
+    /// Prepare and execute SQL as a query, returning exactly one row.
+    pub fn query_row(&self, sql: &str) -> Result<Row> {
+        first_row_or_error(self.query(sql)?)
+    }
+
+    /// Prepare and execute SQL as a query with bound SQL parameters, returning exactly one row.
+    pub fn query_row_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<Row> {
+        first_row_or_error(self.query_with_params(sql, params)?)
     }
 
     /// Prepare and execute SQL, returning output/affected row count.
     pub fn execute(&self, sql: &str) -> Result<usize> {
-        self.prepare(sql)?.execute()
+        Ok(self.query(sql)?.len())
     }
 
     /// Prepare and execute SQL with bound SQL parameters.
     pub fn execute_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<usize> {
-        self.prepare(sql)?.execute_with_params(params)
+        Ok(self.query_with_params(sql, params)?.len())
+    }
+
+    // ── Internal helpers ──────────────────────────────────────────────────
+
+    /// Execute a parsed statement, handling both DDL (CREATE TABLE) and
+    /// DML (SELECT/INSERT/UPDATE/DELETE).
+    fn execute_statement(
+        &self,
+        statement: Statement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<Row>> {
+        match statement {
+            Statement::CreateTable(create) => {
+                self.execute_create_table(&create)?;
+                Ok(Vec::new())
+            }
+            Statement::Select(ref select) => {
+                // Check if this is an expression-only SELECT (no FROM clause).
+                if is_expression_only_select(select) {
+                    let program = compile_expression_select(select)?;
+                    execute_program(&program, params, Some(&self.func_registry))
+                } else {
+                    let program = self.compile_table_select(select)?;
+                    self.execute_table_program(&program, params)
+                }
+            }
+            Statement::Insert(ref insert) => {
+                let program = self.compile_table_insert(insert)?;
+                self.execute_table_program(&program, params)
+            }
+            Statement::Update(ref update) => {
+                let program = self.compile_table_update(update)?;
+                self.execute_table_program(&program, params)
+            }
+            Statement::Delete(ref delete) => {
+                let program = self.compile_table_delete(delete)?;
+                self.execute_table_program(&program, params)
+            }
+            _ => Err(FrankenError::NotImplemented(
+                "only SELECT, INSERT, UPDATE, DELETE, and CREATE TABLE are supported".to_owned(),
+            )),
+        }
+    }
+
+    /// Compile and wrap a statement into a `PreparedStatement`.
+    fn compile_and_wrap(&self, statement: &Statement) -> Result<PreparedStatement> {
+        let registry = Some(Arc::clone(&self.func_registry));
+        match statement {
+            Statement::Select(select) if is_expression_only_select(select) => {
+                let program = compile_expression_select(select)?;
+                Ok(PreparedStatement {
+                    program,
+                    func_registry: registry,
+                })
+            }
+            Statement::Select(select) => {
+                let program = self.compile_table_select(select)?;
+                Ok(PreparedStatement {
+                    program,
+                    func_registry: registry,
+                })
+            }
+            _ => Err(FrankenError::NotImplemented(
+                "prepare() currently supports SELECT statements only".to_owned(),
+            )),
+        }
+    }
+
+    /// Process a CREATE TABLE statement: register the schema and create the
+    /// in-memory table.
+    fn execute_create_table(&self, create: &fsqlite_ast::CreateTableStatement) -> Result<()> {
+        let table_name = create.name.name.clone();
+
+        // Check for duplicate table names.
+        let schema = self.schema.borrow();
+        if schema
+            .iter()
+            .any(|t| t.name.eq_ignore_ascii_case(&table_name))
+        {
+            if create.if_not_exists {
+                return Ok(());
+            }
+            return Err(FrankenError::Internal(format!(
+                "table {table_name} already exists",
+            )));
+        }
+        drop(schema);
+
+        let columns = match &create.body {
+            CreateTableBody::Columns { columns, .. } => columns,
+            CreateTableBody::AsSelect(_) => {
+                return Err(FrankenError::NotImplemented(
+                    "CREATE TABLE AS SELECT is not supported yet".to_owned(),
+                ));
+            }
+        };
+
+        let col_infos: Vec<ColumnInfo> = columns
+            .iter()
+            .map(|col| {
+                let affinity = col
+                    .type_name
+                    .as_ref()
+                    .map_or('B', |tn| type_name_to_affinity_char(&tn.name));
+                ColumnInfo {
+                    name: col.name.clone(),
+                    affinity,
+                }
+            })
+            .collect();
+
+        let num_columns = col_infos.len();
+        let root_page = self.db.borrow_mut().create_table(num_columns);
+
+        self.schema.borrow_mut().push(TableSchema {
+            name: table_name,
+            root_page,
+            columns: col_infos,
+            indexes: Vec::new(),
+        });
+
+        Ok(())
+    }
+
+    /// Compile a table-backed SELECT through the VDBE codegen.
+    fn compile_table_select(&self, select: &SelectStatement) -> Result<VdbeProgram> {
+        let schema = self.schema.borrow();
+        let mut builder = ProgramBuilder::new();
+        let ctx = CodegenContext::default();
+        codegen_select(&mut builder, select, &schema, &ctx).map_err(codegen_error_to_franken)?;
+        builder.finish()
+    }
+
+    /// Compile an INSERT through the VDBE codegen.
+    fn compile_table_insert(&self, insert: &fsqlite_ast::InsertStatement) -> Result<VdbeProgram> {
+        let schema = self.schema.borrow();
+        let mut builder = ProgramBuilder::new();
+        let ctx = CodegenContext::default();
+        codegen_insert(&mut builder, insert, &schema, &ctx).map_err(codegen_error_to_franken)?;
+        builder.finish()
+    }
+
+    /// Compile an UPDATE through the VDBE codegen.
+    fn compile_table_update(&self, update: &fsqlite_ast::UpdateStatement) -> Result<VdbeProgram> {
+        let schema = self.schema.borrow();
+        let mut builder = ProgramBuilder::new();
+        let ctx = CodegenContext::default();
+        codegen_update(&mut builder, update, &schema, &ctx).map_err(codegen_error_to_franken)?;
+        builder.finish()
+    }
+
+    /// Compile a DELETE through the VDBE codegen.
+    fn compile_table_delete(&self, delete: &fsqlite_ast::DeleteStatement) -> Result<VdbeProgram> {
+        let schema = self.schema.borrow();
+        let mut builder = ProgramBuilder::new();
+        let ctx = CodegenContext::default();
+        codegen_delete(&mut builder, delete, &schema, &ctx).map_err(codegen_error_to_franken)?;
+        builder.finish()
+    }
+
+    /// Execute a VDBE program with the in-memory database attached.
+    fn execute_table_program(
+        &self,
+        program: &VdbeProgram,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<Row>> {
+        let mut engine = VdbeEngine::new(program.register_count());
+        if let Some(params) = params {
+            validate_bound_parameters(program, params)?;
+            engine.set_bindings(params.to_vec());
+        }
+
+        engine.set_function_registry(Arc::clone(&self.func_registry));
+
+        // Lend the MemDatabase to the engine for the duration of execution.
+        let db = self.db.replace(MemDatabase::new());
+        engine.set_database(db);
+
+        let outcome = engine.execute(program)?;
+
+        // Take the database back from the engine.
+        if let Some(db) = engine.take_database() {
+            *self.db.borrow_mut() = db;
+        }
+
+        match outcome {
+            ExecOutcome::Done => Ok(engine
+                .take_results()
+                .into_iter()
+                .map(|values| Row { values })
+                .collect()),
+            ExecOutcome::Error { code, message } => Err(FrankenError::Internal(format!(
+                "VDBE halted with code {code}: {message}",
+            ))),
+        }
     }
 }
 
-fn execute_program(program: &VdbeProgram, params: Option<&[SqliteValue]>) -> Result<Vec<Row>> {
+/// Check if a SELECT statement has no FROM clause (expression-only).
+fn is_expression_only_select(select: &SelectStatement) -> bool {
+    match &select.body.select {
+        SelectCore::Select { from, .. } => from.is_none(),
+        SelectCore::Values(_) => true,
+    }
+}
+
+/// Map an AST type name to a codegen affinity character.
+fn type_name_to_affinity_char(name: &str) -> char {
+    let upper = name.to_uppercase();
+    if upper.contains("INT") {
+        'd' // INTEGER affinity
+    } else if upper.contains("CHAR") || upper.contains("TEXT") || upper.contains("CLOB") {
+        'C' // TEXT affinity
+    } else if upper.contains("BLOB") || upper.is_empty() {
+        'B' // BLOB (none) affinity
+    } else if upper.contains("REAL") || upper.contains("FLOA") || upper.contains("DOUB") {
+        'E' // REAL affinity
+    } else {
+        'A' // NUMERIC affinity
+    }
+}
+
+/// Convert a `CodegenError` to a `FrankenError`.
+fn codegen_error_to_franken(e: CodegenError) -> FrankenError {
+    match e {
+        CodegenError::TableNotFound(name) => {
+            FrankenError::Internal(format!("no such table: {name}",))
+        }
+        CodegenError::ColumnNotFound { table, column } => {
+            FrankenError::Internal(format!("no such column: {column} in table {table}",))
+        }
+        CodegenError::Unsupported(msg) => FrankenError::NotImplemented(msg),
+    }
+}
+
+fn execute_program(
+    program: &VdbeProgram,
+    params: Option<&[SqliteValue]>,
+    func_registry: Option<&Arc<FunctionRegistry>>,
+) -> Result<Vec<Row>> {
     let mut engine = VdbeEngine::new(program.register_count());
     if let Some(params) = params {
         validate_bound_parameters(program, params)?;
         engine.set_bindings(params.to_vec());
+    }
+    if let Some(registry) = func_registry {
+        engine.set_function_registry(Arc::clone(registry));
     }
 
     match engine.execute(program)? {
@@ -153,6 +464,12 @@ fn execute_program(program: &VdbeProgram, params: Option<&[SqliteValue]>) -> Res
             "VDBE halted with code {code}: {message}",
         ))),
     }
+}
+
+fn first_row_or_error(rows: Vec<Row>) -> Result<Row> {
+    rows.into_iter()
+        .next()
+        .ok_or(FrankenError::QueryReturnedNoRows)
 }
 
 fn validate_bound_parameters(program: &VdbeProgram, params: &[SqliteValue]) -> Result<()> {
@@ -208,15 +525,6 @@ fn parse_single_statement(sql: &str) -> Result<Statement> {
     }
 
     Ok(statement)
-}
-
-fn compile_statement(statement: &Statement) -> Result<VdbeProgram> {
-    match statement {
-        Statement::Select(select) => compile_expression_select(select),
-        _ => Err(FrankenError::NotImplemented(
-            "only expression-only SELECT statements are supported".to_owned(),
-        )),
-    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -384,6 +692,7 @@ fn compile_expression_select(select: &SelectStatement) -> Result<VdbeProgram> {
     builder.finish()
 }
 
+#[allow(clippy::too_many_lines)]
 fn emit_expr(
     builder: &mut ProgramBuilder,
     expr: &Expr,
@@ -416,6 +725,7 @@ fn emit_expr(
             filter.is_some(),
             over.is_some(),
             target_reg,
+            bind_state,
         ),
         Expr::Placeholder(placeholder, _) => {
             let param_index = placeholder_to_index(placeholder, bind_state)?;
@@ -468,6 +778,42 @@ fn emit_expr(
             builder.resolve_label(lbl_done);
             Ok(())
         }
+        // ── BETWEEN: expr [NOT] BETWEEN low AND high ──────────────────
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            not,
+            ..
+        } => emit_between_expr(builder, inner, low, high, *not, target_reg, bind_state),
+
+        // ── IN: expr [NOT] IN (list) ──────────────────────────────────
+        Expr::In {
+            expr: inner,
+            set,
+            not,
+            ..
+        } => emit_in_expr(builder, inner, set, *not, target_reg, bind_state),
+
+        // ── LIKE/GLOB/MATCH/REGEXP ────────────────────────────────────
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            op,
+            not,
+            ..
+        } => emit_like_expr(
+            builder,
+            inner,
+            pattern,
+            escape.as_deref(),
+            *op,
+            *not,
+            target_reg,
+            bind_state,
+        ),
+
         _ => Err(FrankenError::NotImplemented(format!(
             "expression form is not supported in this connection path: {expr:?}",
         ))),
@@ -601,6 +947,13 @@ fn emit_unary_expr(
     }
 }
 
+/// Emit a scalar function call as a `PureFunc` opcode.
+///
+/// Layout: arguments are evaluated into consecutive registers starting at
+/// `first_arg_reg`. The opcode carries `P4::FuncName(name)`, with `p2` =
+/// first arg register, `p3` = output register, and `p5` = arg count. The
+/// VDBE engine looks up the function by name in its `FunctionRegistry`.
+#[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
 fn emit_function_call(
     builder: &mut ProgramBuilder,
     name: &str,
@@ -609,6 +962,7 @@ fn emit_function_call(
     has_filter: bool,
     has_over: bool,
     target_reg: i32,
+    bind_state: &mut BindParamState,
 ) -> Result<()> {
     if distinct || has_filter || has_over {
         return Err(FrankenError::NotImplemented(
@@ -616,43 +970,41 @@ fn emit_function_call(
         ));
     }
 
-    if !name.eq_ignore_ascii_case("typeof") {
-        return Err(FrankenError::NotImplemented(format!(
-            "function is not supported in this connection path: {name}",
-        )));
-    }
-
     let arguments = match args {
         FunctionArgs::List(arguments) => arguments,
         FunctionArgs::Star => {
             return Err(FrankenError::NotImplemented(
-                "typeof(*) is not supported".to_owned(),
+                "function(*) is not supported in expression-only SELECT".to_owned(),
             ));
         }
     };
 
-    if arguments.len() != 1 {
-        return Err(FrankenError::TooManyArguments {
-            name: "typeof".to_owned(),
-        });
+    let arg_count = arguments.len();
+    let arg_count_u16 = u16::try_from(arg_count).map_err(|_| FrankenError::TooManyArguments {
+        name: name.to_owned(),
+    })?;
+
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    let first_arg_reg = builder.alloc_regs(arg_count as i32);
+
+    // Evaluate each argument into consecutive registers.
+    for (i, arg_expr) in arguments.iter().enumerate() {
+        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+        let reg = first_arg_reg + i as i32;
+        emit_expr(builder, arg_expr, reg, bind_state)?;
     }
 
-    match &arguments[0] {
-        Expr::Literal(literal, _) => {
-            builder.emit_op(
-                Opcode::String8,
-                0,
-                target_reg,
-                0,
-                P4::Str(literal_typeof(literal).to_owned()),
-                0,
-            );
-            Ok(())
-        }
-        _ => Err(FrankenError::NotImplemented(
-            "typeof() currently supports literal arguments only".to_owned(),
-        )),
-    }
+    // Emit PureFunc: p1 = 0 (flags), p2 = first_arg_reg, p3 = output_reg,
+    // p4 = FuncName, p5 = arg_count.
+    builder.emit_op(
+        Opcode::PureFunc,
+        0,
+        first_arg_reg,
+        target_reg,
+        P4::FuncName(name.to_owned()),
+        arg_count_u16,
+    );
+    Ok(())
 }
 
 fn emit_literal(builder: &mut ProgramBuilder, literal: &Literal, target_reg: i32) {
@@ -679,19 +1031,6 @@ fn emit_literal(builder: &mut ProgramBuilder, literal: &Literal, target_reg: i32
         Literal::Blob(value) => {
             builder.emit_op(Opcode::Blob, 0, target_reg, 0, P4::Blob(value.clone()), 0);
         }
-    }
-}
-
-fn literal_typeof(literal: &Literal) -> &'static str {
-    match literal {
-        Literal::Null => "null",
-        Literal::Integer(_) | Literal::True | Literal::False => "integer",
-        Literal::Float(_) => "real",
-        Literal::String(_)
-        | Literal::CurrentTime
-        | Literal::CurrentDate
-        | Literal::CurrentTimestamp => "text",
-        Literal::Blob(_) => "blob",
     }
 }
 
@@ -802,6 +1141,178 @@ fn emit_case_expr(
     Ok(())
 }
 
+/// Compile `expr [NOT] BETWEEN low AND high` into comparison opcodes.
+///
+/// Equivalent to `(expr >= low) AND (expr <= high)`, optionally negated.
+fn emit_between_expr(
+    builder: &mut ProgramBuilder,
+    expr: &Expr,
+    low: &Expr,
+    high: &Expr,
+    not: bool,
+    target_reg: i32,
+    bind_state: &mut BindParamState,
+) -> Result<()> {
+    let expr_reg = builder.alloc_temp();
+    let low_reg = builder.alloc_temp();
+    let high_reg = builder.alloc_temp();
+
+    emit_expr(builder, expr, expr_reg, bind_state)?;
+    emit_expr(builder, low, low_reg, bind_state)?;
+    emit_expr(builder, high, high_reg, bind_state)?;
+
+    // Labels for the short-circuit evaluation.
+    let lbl_false = builder.emit_label();
+    let lbl_true = builder.emit_label();
+    let lbl_done = builder.emit_label();
+
+    // expr >= low  (jump to true_of_ge if true, fall through to false)
+    let lbl_ge_ok = builder.emit_label();
+    builder.emit_jump_to_label(Opcode::Ge, low_reg, expr_reg, lbl_ge_ok, P4::None, 0);
+    // expr < low → not between
+    builder.emit_jump_to_label(Opcode::Goto, 0, 0, lbl_false, P4::None, 0);
+    builder.resolve_label(lbl_ge_ok);
+
+    // expr <= high
+    builder.emit_jump_to_label(Opcode::Le, high_reg, expr_reg, lbl_true, P4::None, 0);
+    // expr > high → not between
+    builder.emit_jump_to_label(Opcode::Goto, 0, 0, lbl_false, P4::None, 0);
+
+    // Both conditions satisfied: BETWEEN is true.
+    builder.resolve_label(lbl_true);
+    builder.emit_op(Opcode::Integer, i32::from(!not), target_reg, 0, P4::None, 0);
+    builder.emit_jump_to_label(Opcode::Goto, 0, 0, lbl_done, P4::None, 0);
+
+    // At least one condition failed: BETWEEN is false.
+    builder.resolve_label(lbl_false);
+    builder.emit_op(Opcode::Integer, i32::from(not), target_reg, 0, P4::None, 0);
+
+    builder.resolve_label(lbl_done);
+
+    builder.free_temp(high_reg);
+    builder.free_temp(low_reg);
+    builder.free_temp(expr_reg);
+    Ok(())
+}
+
+/// Compile `expr [NOT] IN (e1, e2, ...)` into a chain of equality checks.
+///
+/// Only `InSet::List` is supported; subqueries and table references return
+/// `NotImplemented`.
+fn emit_in_expr(
+    builder: &mut ProgramBuilder,
+    expr: &Expr,
+    set: &InSet,
+    not: bool,
+    target_reg: i32,
+    bind_state: &mut BindParamState,
+) -> Result<()> {
+    let list = match set {
+        InSet::List(list) => list,
+        InSet::Subquery(_) => {
+            return Err(FrankenError::NotImplemented(
+                "IN (SELECT ...) subquery is not yet supported".to_owned(),
+            ));
+        }
+        InSet::Table(_) => {
+            return Err(FrankenError::NotImplemented(
+                "IN table_name is not yet supported".to_owned(),
+            ));
+        }
+    };
+
+    if list.is_empty() {
+        // Empty list: `expr IN ()` is always false, `NOT IN ()` always true.
+        let val = i32::from(not);
+        builder.emit_op(Opcode::Integer, val, target_reg, 0, P4::None, 0);
+        return Ok(());
+    }
+
+    let expr_reg = builder.alloc_temp();
+    emit_expr(builder, expr, expr_reg, bind_state)?;
+
+    let lbl_found = builder.emit_label();
+    let lbl_done = builder.emit_label();
+
+    // Check each list element against expr.
+    let elem_reg = builder.alloc_temp();
+    for elem in list {
+        emit_expr(builder, elem, elem_reg, bind_state)?;
+        builder.emit_jump_to_label(Opcode::Eq, elem_reg, expr_reg, lbl_found, P4::None, 0);
+    }
+    builder.free_temp(elem_reg);
+
+    // No match found.
+    builder.emit_op(Opcode::Integer, i32::from(not), target_reg, 0, P4::None, 0);
+    builder.emit_jump_to_label(Opcode::Goto, 0, 0, lbl_done, P4::None, 0);
+
+    // Match found.
+    builder.resolve_label(lbl_found);
+    let found_val = i32::from(!not);
+    builder.emit_op(Opcode::Integer, found_val, target_reg, 0, P4::None, 0);
+
+    builder.resolve_label(lbl_done);
+    builder.free_temp(expr_reg);
+    Ok(())
+}
+
+/// Compile `expr [NOT] LIKE/GLOB pattern [ESCAPE escape]` as a PureFunc call.
+///
+/// Emits a call to the `like` (or `glob`) scalar function with 2-3 arguments:
+/// `like(pattern, expr)` or `like(pattern, expr, escape)`. The result is
+/// negated if `not` is true.
+#[allow(clippy::too_many_arguments)]
+fn emit_like_expr(
+    builder: &mut ProgramBuilder,
+    expr: &Expr,
+    pattern: &Expr,
+    escape: Option<&Expr>,
+    op: LikeOp,
+    not: bool,
+    target_reg: i32,
+    bind_state: &mut BindParamState,
+) -> Result<()> {
+    let func_name = match op {
+        LikeOp::Like => "like",
+        LikeOp::Glob => "glob",
+        LikeOp::Match | LikeOp::Regexp => {
+            return Err(FrankenError::NotImplemented(format!(
+                "{op:?} operator is not yet supported",
+            )));
+        }
+    };
+
+    let has_escape = escape.is_some();
+    let arg_count: i32 = if has_escape { 3 } else { 2 };
+    let first_arg_reg = builder.alloc_regs(arg_count);
+
+    // SQLite like() takes (pattern, string [, escape]).
+    emit_expr(builder, pattern, first_arg_reg, bind_state)?;
+    emit_expr(builder, expr, first_arg_reg + 1, bind_state)?;
+    if let Some(esc) = escape {
+        emit_expr(builder, esc, first_arg_reg + 2, bind_state)?;
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let arg_count_u16 = arg_count as u16;
+
+    builder.emit_op(
+        Opcode::PureFunc,
+        0,
+        first_arg_reg,
+        target_reg,
+        P4::FuncName(func_name.to_owned()),
+        arg_count_u16,
+    );
+
+    // Negate the result if NOT LIKE / NOT GLOB.
+    if not {
+        builder.emit_op(Opcode::Not, target_reg, target_reg, 0, P4::None, 0);
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Connection, Row};
@@ -831,12 +1342,12 @@ mod tests {
     }
 
     #[test]
-    fn test_reject_select_with_from() {
+    fn test_select_from_nonexistent_table_errors() {
         let connection = Connection::open(":memory:").expect("in-memory path should open");
         let error = connection
             .query("SELECT a FROM t;")
-            .expect_err("SELECT with FROM must be rejected in this narrow path");
-        assert!(matches!(error, FrankenError::NotImplemented(_)));
+            .expect_err("SELECT from nonexistent table should fail");
+        assert!(matches!(error, FrankenError::Internal(_)));
     }
 
     #[test]
@@ -1011,6 +1522,248 @@ mod tests {
                 SqliteValue::Integer(30),
                 SqliteValue::Integer(40),
             ]
+        );
+    }
+
+    #[test]
+    fn test_query_row_returns_first_row() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn.query_row("VALUES (1), (2), (3);").unwrap();
+        assert_eq!(row_values(&row), vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
+    fn test_query_row_with_params_returns_first_row() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn
+            .query_row_with_params(
+                "VALUES (?1), (?2);",
+                &[SqliteValue::Integer(11), SqliteValue::Integer(22)],
+            )
+            .unwrap();
+        assert_eq!(row_values(&row), vec![SqliteValue::Integer(11)]);
+    }
+
+    #[test]
+    fn test_query_row_no_rows_error() {
+        let conn = Connection::open(":memory:").unwrap();
+        let error = conn
+            .query_row("SELECT 1 WHERE 0;")
+            .expect_err("query_row should fail when resultset is empty");
+        assert!(matches!(error, FrankenError::QueryReturnedNoRows));
+    }
+
+    #[test]
+    fn test_prepared_statement_query_row_with_params() {
+        let conn = Connection::open(":memory:").unwrap();
+        let stmt = conn.prepare("VALUES (?1), (?2);").unwrap();
+        let row = stmt
+            .query_row_with_params(&[SqliteValue::Integer(5), SqliteValue::Integer(9)])
+            .unwrap();
+        assert_eq!(row_values(&row), vec![SqliteValue::Integer(5)]);
+    }
+
+    // ── Phase 4 end-to-end DML tests ─────────────────────────────────
+
+    #[test]
+    fn test_create_table_and_insert_select() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER, b TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'hello');").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (2, 'world');").unwrap();
+
+        let rows = conn.query("SELECT a, b FROM t1;").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("hello".to_owned())
+            ]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![
+                SqliteValue::Integer(2),
+                SqliteValue::Text("world".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn test_create_table_if_not_exists() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (x INTEGER);").unwrap();
+        conn.execute("CREATE TABLE IF NOT EXISTS t1 (x INTEGER);")
+            .unwrap();
+        let err = conn
+            .execute("CREATE TABLE t1 (x INTEGER);")
+            .expect_err("duplicate table should fail");
+        assert!(matches!(err, FrankenError::Internal(_)));
+    }
+
+    #[test]
+    fn test_insert_select_integer_column() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE nums (val INTEGER);").unwrap();
+        conn.execute("INSERT INTO nums VALUES (42);").unwrap();
+        conn.execute("INSERT INTO nums VALUES (100);").unwrap();
+        conn.execute("INSERT INTO nums VALUES (-7);").unwrap();
+
+        let rows = conn.query("SELECT val FROM nums;").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(42)]);
+        assert_eq!(row_values(&rows[1]), vec![SqliteValue::Integer(100)]);
+        assert_eq!(row_values(&rows[2]), vec![SqliteValue::Integer(-7)]);
+    }
+
+    #[test]
+    fn test_select_from_empty_table() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE empty (a INTEGER);").unwrap();
+        let rows = conn.query("SELECT a FROM empty;").unwrap();
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_multiple_tables_independent() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (b TEXT);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES ('x');").unwrap();
+
+        let rows1 = conn.query("SELECT a FROM t1;").unwrap();
+        let rows2 = conn.query("SELECT b FROM t2;").unwrap();
+        assert_eq!(rows1.len(), 1);
+        assert_eq!(rows2.len(), 1);
+        assert_eq!(row_values(&rows1[0]), vec![SqliteValue::Integer(1)]);
+        assert_eq!(
+            row_values(&rows2[0]),
+            vec![SqliteValue::Text("x".to_owned())]
+        );
+    }
+
+    #[test]
+    fn test_insert_string_values() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE words (w TEXT);").unwrap();
+        conn.execute("INSERT INTO words VALUES ('alpha');").unwrap();
+        conn.execute("INSERT INTO words VALUES ('beta');").unwrap();
+
+        let rows = conn.query("SELECT w FROM words;").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Text("alpha".to_owned())]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![SqliteValue::Text("beta".to_owned())]
+        );
+    }
+
+    #[test]
+    fn test_update_rows() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'alice');").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'bob');").unwrap();
+
+        conn.execute("UPDATE t SET name = 'ALICE' WHERE id = 1;")
+            .unwrap();
+
+        let rows = conn.query("SELECT id, name FROM t;").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Integer(1), SqliteValue::Text("ALICE".to_owned())]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![SqliteValue::Integer(2), SqliteValue::Text("bob".to_owned())]
+        );
+    }
+
+    #[test]
+    fn test_delete_rows() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (val INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (10);").unwrap();
+        conn.execute("INSERT INTO t VALUES (20);").unwrap();
+        conn.execute("INSERT INTO t VALUES (30);").unwrap();
+
+        conn.execute("DELETE FROM t WHERE val = 20;").unwrap();
+
+        let rows = conn.query("SELECT val FROM t;").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(10)]);
+        assert_eq!(row_values(&rows[1]), vec![SqliteValue::Integer(30)]);
+    }
+
+    #[test]
+    fn test_delete_all_rows() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t VALUES (2);").unwrap();
+
+        conn.execute("DELETE FROM t;").unwrap();
+
+        let rows = conn.query("SELECT x FROM t;").unwrap();
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_update_all_rows() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (v INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t VALUES (2);").unwrap();
+        conn.execute("INSERT INTO t VALUES (3);").unwrap();
+
+        conn.execute("UPDATE t SET v = 0;").unwrap();
+
+        let rows = conn.query("SELECT v FROM t;").unwrap();
+        assert_eq!(rows.len(), 3);
+        for row in &rows {
+            assert_eq!(row_values(row), vec![SqliteValue::Integer(0)]);
+        }
+    }
+
+    #[test]
+    fn test_full_dml_cycle() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE users (id INTEGER, name TEXT);")
+            .unwrap();
+
+        // INSERT
+        conn.execute("INSERT INTO users VALUES (1, 'alice');")
+            .unwrap();
+        conn.execute("INSERT INTO users VALUES (2, 'bob');")
+            .unwrap();
+        let rows = conn.query("SELECT id, name FROM users;").unwrap();
+        assert_eq!(rows.len(), 2);
+
+        // UPDATE
+        conn.execute("UPDATE users SET name = 'BOB' WHERE id = 2;")
+            .unwrap();
+        let rows = conn.query("SELECT name FROM users WHERE id = 2;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Text("BOB".to_owned())]
+        );
+
+        // DELETE
+        conn.execute("DELETE FROM users WHERE id = 1;").unwrap();
+        let rows = conn.query("SELECT id, name FROM users;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Integer(2), SqliteValue::Text("BOB".to_owned())]
         );
     }
 }

@@ -244,6 +244,7 @@ struct GateSpec {
     expected_exit_code: i32,
 }
 
+#[allow(clippy::too_many_lines)]
 fn gate_specs() -> Vec<GateSpec> {
     vec![
         GateSpec {
@@ -532,10 +533,8 @@ mod tests {
 
             let exit_code = if self.fail_gate_ids.contains(gate_id) {
                 2
-            } else if gate_id == "phase2.no_unsafe" {
-                1
             } else {
-                0
+                i32::from(gate_id == "phase2.no_unsafe")
             };
 
             Ok(GateCommandOutput {

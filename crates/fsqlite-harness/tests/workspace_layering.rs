@@ -4,12 +4,14 @@
 //! dependency hierarchy documented in the spec. They run `cargo metadata`
 //! and verify the resolved dependency graph against the documented layering.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::sync::OnceLock;
 
 const BEAD_ID: &str = "bd-1wwc";
+const ARCH_BEAD_ID: &str = "bd-3an";
 
 /// The 23 crates specified in §8.1.
 const EXPECTED_CRATES: [&str; 23] = [
@@ -198,6 +200,81 @@ fn internal_dep_graph(metadata: &serde_json::Value) -> BTreeMap<String, BTreeSet
     graph
 }
 
+fn cross_layer_backedge_violations(
+    graph: &BTreeMap<String, BTreeSet<String>>,
+    layers: &HashMap<&'static str, u8>,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+
+    for (crate_name, deps) in graph {
+        let Some(&from_layer) = layers.get(crate_name.as_str()) else {
+            continue;
+        };
+
+        for dep in deps {
+            let Some(&to_layer) = layers.get(dep.as_str()) else {
+                continue;
+            };
+            if to_layer > from_layer {
+                violations.push(format!(
+                    "{crate_name} (L{from_layer}) -> {dep} (L{to_layer})"
+                ));
+            }
+        }
+    }
+
+    violations
+}
+
+fn cycle_participants(graph: &BTreeMap<String, BTreeSet<String>>) -> Vec<String> {
+    let mut indegree: BTreeMap<String, usize> =
+        graph.keys().cloned().map(|name| (name, 0_usize)).collect();
+
+    for deps in graph.values() {
+        for dep in deps {
+            if let Some(count) = indegree.get_mut(dep) {
+                *count += 1;
+            }
+        }
+    }
+
+    let mut queue = VecDeque::new();
+    for (name, degree) in &indegree {
+        if *degree == 0 {
+            queue.push_back(name.clone());
+        }
+    }
+
+    let mut local_graph = graph.clone();
+    while let Some(node) = queue.pop_front() {
+        if let Some(deps) = local_graph.remove(&node) {
+            for dep in deps {
+                if let Some(count) = indegree.get_mut(&dep) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        queue.push_back(dep);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut remaining = local_graph.keys().cloned().collect::<Vec<_>>();
+    remaining.sort();
+    remaining
+}
+
+fn workspace_cargo_toml() -> Result<String, String> {
+    let path = workspace_root().join("Cargo.toml");
+    fs::read_to_string(&path).map_err(|error| {
+        format!(
+            "bead_id={ARCH_BEAD_ID} case=read_workspace_cargo_toml \
+             path={} error={error}",
+            path.display()
+        )
+    })
+}
+
 // ---------------------------------------------------------------------------
 // §8.1 tests
 // ---------------------------------------------------------------------------
@@ -287,26 +364,7 @@ fn test_no_cross_layer_backedges() {
     let metadata = cargo_metadata_cached();
     let graph = internal_dep_graph(metadata);
     let layers = layer_assignments();
-    let mut violations = Vec::new();
-
-    for (crate_name, deps) in &graph {
-        let Some(&from_layer) = layers.get(crate_name.as_str()) else {
-            continue; // skip if not in layer map (shouldn't happen)
-        };
-
-        for dep in deps {
-            let Some(&to_layer) = layers.get(dep.as_str()) else {
-                continue;
-            };
-
-            // A crate must NOT depend on a strictly higher layer.
-            if to_layer > from_layer {
-                violations.push(format!(
-                    "{crate_name} (L{from_layer}) -> {dep} (L{to_layer})"
-                ));
-            }
-        }
-    }
+    let violations = cross_layer_backedge_violations(&graph, &layers);
 
     assert!(
         violations.is_empty(),
@@ -342,6 +400,111 @@ fn test_mvcc_at_layer_3() {
 }
 
 // ---------------------------------------------------------------------------
+// §8 architecture enforcement checks (bd-3an)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_all_23_crates_exist() {
+    let metadata = cargo_metadata_cached();
+    let members = workspace_member_names(metadata);
+    let expected: BTreeSet<String> = EXPECTED_CRATES
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+
+    assert_eq!(
+        members.len(),
+        23,
+        "bead_id={ARCH_BEAD_ID} case=all_23_crates_exist expected=23 actual={}",
+        members.len()
+    );
+    assert_eq!(
+        members, expected,
+        "bead_id={ARCH_BEAD_ID} case=all_23_crates_exist_names_mismatch"
+    );
+}
+
+#[test]
+fn test_layer_ordering_respected() {
+    let metadata = cargo_metadata_cached();
+    let graph = internal_dep_graph(metadata);
+    let layers = layer_assignments();
+    let violations = cross_layer_backedge_violations(&graph, &layers);
+
+    assert!(
+        violations.is_empty(),
+        "bead_id={ARCH_BEAD_ID} case=layer_ordering_respected \
+         layer_violations_count={} violations:\n{}",
+        violations.len(),
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn test_dependency_graph_is_acyclic() {
+    let metadata = cargo_metadata_cached();
+    let graph = internal_dep_graph(metadata);
+    let cycle_nodes = cycle_participants(&graph);
+
+    assert!(
+        cycle_nodes.is_empty(),
+        "bead_id={ARCH_BEAD_ID} case=dependency_graph_is_acyclic \
+         cycle_nodes={cycle_nodes:?}"
+    );
+}
+
+#[test]
+fn test_unsafe_code_forbidden() -> Result<(), String> {
+    let cargo_toml = workspace_cargo_toml()?;
+
+    assert!(
+        cargo_toml.contains("[workspace.lints.rust]"),
+        "bead_id={ARCH_BEAD_ID} case=workspace_lints_rust_section_missing"
+    );
+    assert!(
+        cargo_toml.contains("unsafe_code = \"forbid\""),
+        "bead_id={ARCH_BEAD_ID} case=unsafe_code_forbid_missing"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_build_configuration_matches_spec() -> Result<(), String> {
+    let cargo_toml = workspace_cargo_toml()?;
+    let required_markers = [
+        "[workspace.package]",
+        "edition = \"2024\"",
+        "rust-version = \"1.85\"",
+        "[workspace.lints.clippy]",
+        "pedantic = { level = \"deny\", priority = -1 }",
+        "nursery = { level = \"deny\", priority = -1 }",
+        "[profile.release]",
+        "opt-level = \"z\"",
+        "lto = true",
+        "codegen-units = 1",
+        "panic = \"abort\"",
+        "strip = true",
+        "[profile.release-perf]",
+        "inherits = \"release\"",
+        "opt-level = 3",
+    ];
+
+    let missing = required_markers
+        .iter()
+        .copied()
+        .filter(|marker| !cargo_toml.contains(marker))
+        .collect::<Vec<_>>();
+
+    assert!(
+        missing.is_empty(),
+        "bead_id={ARCH_BEAD_ID} case=build_configuration_matches_spec missing={missing:?}"
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // E2E: combined workspace sanity check
 // ---------------------------------------------------------------------------
 
@@ -366,22 +529,7 @@ fn test_e2e_bd_1wwc() {
     );
 
     // 3. Layer violations
-    let mut layer_violations = Vec::new();
-    for (crate_name, deps) in &graph {
-        let Some(&from_layer) = layers.get(crate_name.as_str()) else {
-            continue;
-        };
-        for dep in deps {
-            let Some(&to_layer) = layers.get(dep.as_str()) else {
-                continue;
-            };
-            if to_layer > from_layer {
-                layer_violations.push(format!(
-                    "{crate_name} (L{from_layer}) -> {dep} (L{to_layer})"
-                ));
-            }
-        }
-    }
+    let layer_violations = cross_layer_backedge_violations(&graph, &layers);
 
     // Summary output (grep-friendly per bead requirement)
     eprintln!("member_count={member_count}");

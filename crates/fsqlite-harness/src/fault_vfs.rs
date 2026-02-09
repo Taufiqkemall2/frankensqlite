@@ -255,125 +255,6 @@ impl<V: Vfs> FaultInjectingVfs<V> {
         info!(bead_id = BEAD_ID, "FaultInjectingVfs: power restored");
     }
 
-    /// Check if a write operation should be faulted.
-    #[allow(clippy::significant_drop_tightening)]
-    fn check_write_fault(
-        &self,
-        path: &Path,
-        offset: u64,
-        buf_len: usize,
-    ) -> Option<(usize, FaultKind)> {
-        let mut faults = self.faults.lock().expect("fault lock poisoned");
-        for (idx, spec) in faults.iter_mut().enumerate() {
-            if spec.triggered {
-                continue;
-            }
-            if !spec.matches_path(path) {
-                continue;
-            }
-            match &spec.kind {
-                FaultKind::TornWrite { valid_bytes } => {
-                    // Check if the write spans the target offset.
-                    let write_end =
-                        offset.saturating_add(u64::try_from(buf_len).unwrap_or(u64::MAX));
-                    let target = spec.at_offset.unwrap_or(offset); // If no offset specified, any write matches.
-                    if offset <= target && target < write_end {
-                        spec.triggered = true;
-                        let vb = *valid_bytes;
-                        self.record_trigger(
-                            idx,
-                            path,
-                            spec.kind.clone(),
-                            format!("offset={offset}"),
-                        );
-                        return Some((idx, FaultKind::TornWrite { valid_bytes: vb }));
-                    }
-                }
-                FaultKind::IoError if spec.at_offset.is_none() && spec.after_nth_sync.is_none() => {
-                    spec.triggered = true;
-                    self.record_trigger(
-                        idx,
-                        path,
-                        spec.kind.clone(),
-                        format!("write_offset={offset}"),
-                    );
-                    return Some((idx, FaultKind::IoError));
-                }
-                _ => {}
-            }
-        }
-        None
-    }
-
-    /// Check if a sync operation should be faulted.
-    #[allow(clippy::significant_drop_tightening)]
-    fn check_sync_fault(&self, path: &Path) -> Option<(usize, FaultKind)> {
-        let current_sync = self.sync_counter.fetch_add(1, Ordering::AcqRel);
-        let mut faults = self.faults.lock().expect("fault lock poisoned");
-
-        for (idx, spec) in faults.iter_mut().enumerate() {
-            if spec.triggered {
-                continue;
-            }
-            if !spec.matches_path(path) {
-                continue;
-            }
-            match spec.kind {
-                FaultKind::PowerCut => {
-                    let target_sync = spec.after_nth_sync.unwrap_or(0);
-                    if current_sync >= target_sync {
-                        spec.triggered = true;
-                        self.powered_off.store(true, Ordering::Release);
-                        self.record_trigger(
-                            idx,
-                            path,
-                            FaultKind::PowerCut,
-                            format!("sync_index={current_sync}"),
-                        );
-                        return Some((idx, FaultKind::PowerCut));
-                    }
-                }
-                FaultKind::IoError if spec.after_nth_sync.is_some() => {
-                    let target_sync = spec.after_nth_sync.unwrap_or(0);
-                    if current_sync >= target_sync {
-                        spec.triggered = true;
-                        self.record_trigger(
-                            idx,
-                            path,
-                            FaultKind::IoError,
-                            format!("sync_index={current_sync}"),
-                        );
-                        return Some((idx, FaultKind::IoError));
-                    }
-                }
-                _ => {}
-            }
-        }
-        None
-    }
-
-    /// Record a triggered fault for post-test inspection.
-    fn record_trigger(&self, spec_index: usize, path: &Path, kind: FaultKind, detail: String) {
-        warn!(
-            bead_id = BEAD_ID,
-            spec_index = spec_index,
-            path = %path.display(),
-            fault_kind = ?kind,
-            detail = %detail,
-            triggered = true,
-            "FaultInjectingVfs: fault triggered"
-        );
-        self.trigger_log
-            .lock()
-            .expect("trigger log lock poisoned")
-            .push(FaultTriggerRecord {
-                spec_index,
-                path: path.to_path_buf(),
-                kind,
-                detail,
-            });
-    }
-
     /// Check power state and return error if powered off.
     fn check_power(&self) -> Result<()> {
         if self.powered_off.load(Ordering::Acquire) {
@@ -401,11 +282,9 @@ impl<V: Vfs> Vfs for FaultInjectingVfs<V> {
     ) -> Result<(Self::File, VfsOpenFlags)> {
         self.check_power()?;
         let (inner_file, out_flags) = self.inner.open(cx, path, flags)?;
-        let file_path = path.map(Path::to_path_buf).unwrap_or_default();
         Ok((
             FaultInjectingFile {
                 inner: inner_file,
-                path: file_path,
                 // Fault state is checked at VFS level via shared Mutex-protected state.
             },
             out_flags,
@@ -446,7 +325,6 @@ impl<V: Vfs> Vfs for FaultInjectingVfs<V> {
 /// File-level operations delegate fault checks to the parent VFS via shared state.
 pub struct FaultInjectingFile<F: VfsFile> {
     inner: F,
-    path: PathBuf,
 }
 
 impl<F: VfsFile> VfsFile for FaultInjectingFile<F> {
@@ -872,7 +750,6 @@ mod tests {
         // under seed 0xDEAD_BEEF. This tests the scheduling infrastructure
         // that will underpin SI verification once Database is implemented.
         use crate::fslab::FsLab;
-        use asupersync::types::Budget;
 
         let lab = FsLab::new(0xDEAD_BEEF).worker_count(4).max_steps(100_000);
 
@@ -888,9 +765,8 @@ mod tests {
 
             // "writer" task — simulates concurrent write.
             let (t2, _) = crate::fslab::FsLab::spawn_named(runtime, root, "writer", async {
-                let new_val = 999_u64;
                 // In a full implementation, this would update the row.
-                new_val
+                999_u64
             });
 
             let mut sched = runtime.scheduler.lock().expect("lock");
@@ -931,8 +807,8 @@ mod tests {
         // Simulate writing frames 1-5.
         for frame_idx in 0_u64..5 {
             let offset = 32 + frame_idx * (24 + 4096);
-            let frame_size = 24 + 4096;
-            let decision = state.check_write(wal, offset, frame_size as usize);
+            let frame_size: usize = 24 + 4096;
+            let decision = state.check_write(wal, offset, frame_size);
 
             if frame_idx == 2 {
                 // Frame 3 (0-indexed frame 2) should be torn.

@@ -704,6 +704,7 @@ dependencies = [
  "fsqlite-ast",
  "fsqlite-btree",
  "fsqlite-error",
+ "fsqlite-func",
  "fsqlite-mvcc",
  "fsqlite-pager",
  "fsqlite-parser",

@@ -25,6 +25,7 @@ pub mod snapshot_shipping;
 pub mod source_block_partition;
 pub mod symbol_log;
 pub mod symbol_size_policy;
+pub mod tiered_storage;
 pub mod transaction;
 
 use std::num::NonZeroUsize;

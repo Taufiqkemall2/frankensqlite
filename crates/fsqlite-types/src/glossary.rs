@@ -589,20 +589,88 @@ impl SymbolValidityWindow {
 #[repr(transparent)]
 pub struct RemoteCap([u8; 16]);
 
+impl RemoteCap {
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
 /// Capability token for the symbol authentication master key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[repr(transparent)]
 pub struct SymbolAuthMasterKeyCap([u8; 32]);
+
+impl SymbolAuthMasterKeyCap {
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
 
 /// Stable idempotency key for retry-safe operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[repr(transparent)]
 pub struct IdempotencyKey([u8; 16]);
 
+impl IdempotencyKey {
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
 /// Saga identifier (ties together a multi-step idempotent workflow).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Saga {
     pub key: IdempotencyKey,
+}
+
+impl IdempotencyKey {
+    /// Deterministically derive a key from request bytes + ECS epoch.
+    ///
+    /// Domain separation:
+    /// `BLAKE3("fsqlite:idempotency:v1" || le_u64(ecs_epoch) || request_bytes)`.
+    #[must_use]
+    pub fn derive(ecs_epoch: u64, request_bytes: &[u8]) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"fsqlite:idempotency:v1");
+        hasher.update(&ecs_epoch.to_le_bytes());
+        hasher.update(request_bytes);
+        let digest = hasher.finalize();
+        let mut out = [0_u8; 16];
+        out.copy_from_slice(&digest.as_bytes()[..16]);
+        Self(out)
+    }
+}
+
+impl Saga {
+    /// Create a saga identifier from an idempotency key.
+    #[must_use]
+    pub const fn new(key: IdempotencyKey) -> Self {
+        Self { key }
+    }
+
+    /// Access the saga idempotency key.
+    #[must_use]
+    pub const fn key(self) -> IdempotencyKey {
+        self.key
+    }
 }
 
 /// Logical region identifier (tiering / placement / replication scope).
@@ -1417,6 +1485,51 @@ mod tests {
         assert_debug_clone::<RootManifest>();
         assert_debug_clone::<TxnSlot>();
         assert_debug_clone::<OperatingMode>();
+    }
+
+    #[test]
+    fn test_remote_cap_from_bytes_roundtrip() {
+        let raw = [0xAB_u8; 16];
+        let cap = RemoteCap::from_bytes(raw);
+        assert_eq!(cap.as_bytes(), &raw);
+    }
+
+    #[test]
+    fn test_idempotency_key_derivation_is_deterministic() {
+        let req = b"fetch:object=42";
+        let a = IdempotencyKey::derive(7, req);
+        let b = IdempotencyKey::derive(7, req);
+        let c = IdempotencyKey::derive(8, req);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn test_remote_cap_roundtrip() {
+        let raw = [0xAB_u8; 16];
+        let cap = RemoteCap::from_bytes(raw);
+        assert_eq!(cap.as_bytes(), &raw);
+    }
+
+    #[test]
+    fn test_symbol_auth_master_key_cap_roundtrip() {
+        let raw = [0xCD_u8; 32];
+        let cap = SymbolAuthMasterKeyCap::from_bytes(raw);
+        assert_eq!(cap.as_bytes(), &raw);
+    }
+
+    #[test]
+    fn test_idempotency_key_roundtrip() {
+        let raw = [0x11_u8; 16];
+        let key = IdempotencyKey::from_bytes(raw);
+        assert_eq!(key.as_bytes(), &raw);
+    }
+
+    #[test]
+    fn test_saga_constructor() {
+        let key = IdempotencyKey::from_bytes([0x22_u8; 16]);
+        let saga = Saga::new(key);
+        assert_eq!(saga.key(), key);
     }
 
     fn arb_budget() -> impl Strategy<Value = Budget> {

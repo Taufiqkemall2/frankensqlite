@@ -15,6 +15,7 @@ fsqlite-btree = { workspace = true }
 fsqlite-ast = { workspace = true }
 fsqlite-mvcc = { workspace = true }
 fsqlite-wal = { workspace = true }
+fsqlite-func = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

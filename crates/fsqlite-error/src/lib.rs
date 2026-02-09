@@ -60,6 +60,10 @@ pub enum FrankenError {
     #[error("SQL error at offset {offset}: {detail}")]
     ParseError { offset: usize, detail: String },
 
+    /// Query executed successfully but produced no rows.
+    #[error("query returned no rows")]
+    QueryReturnedNoRows,
+
     /// No such table.
     #[error("no such table: {name}")]
     NoSuchTable { name: String },
@@ -324,6 +328,7 @@ impl FrankenError {
             | Self::CheckpointFailed { .. } => ErrorCode::IoErr,
             Self::SyntaxError { .. }
             | Self::ParseError { .. }
+            | Self::QueryReturnedNoRows
             | Self::NoSuchTable { .. }
             | Self::NoSuchColumn { .. }
             | Self::NoSuchIndex { .. }
@@ -375,6 +380,7 @@ impl FrankenError {
                 | Self::Unsupported
                 | Self::SyntaxError { .. }
                 | Self::ParseError { .. }
+                | Self::QueryReturnedNoRows
                 | Self::NoSuchTable { .. }
                 | Self::NoSuchColumn { .. }
                 | Self::TypeMismatch { .. }
@@ -402,6 +408,7 @@ impl FrankenError {
             Self::ConcurrentUnavailable => Some(
                 "Use a filesystem that supports shared memory, or use BEGIN (serialized) instead",
             ),
+            Self::QueryReturnedNoRows => Some("Use query() when zero rows are acceptable"),
             _ => None,
         }
     }
@@ -493,6 +500,10 @@ mod tests {
     #[test]
     fn error_code_mapping() {
         assert_eq!(FrankenError::syntax("x").error_code(), ErrorCode::Error);
+        assert_eq!(
+            FrankenError::QueryReturnedNoRows.error_code(),
+            ErrorCode::Error
+        );
         assert_eq!(FrankenError::Busy.error_code(), ErrorCode::Busy);
         assert_eq!(
             FrankenError::DatabaseCorrupt {
@@ -510,6 +521,7 @@ mod tests {
     #[test]
     fn user_recoverable() {
         assert!(FrankenError::Busy.is_user_recoverable());
+        assert!(FrankenError::QueryReturnedNoRows.is_user_recoverable());
         assert!(FrankenError::syntax("x").is_user_recoverable());
         assert!(!FrankenError::internal("bug").is_user_recoverable());
         assert!(!FrankenError::DatabaseFull.is_user_recoverable());
