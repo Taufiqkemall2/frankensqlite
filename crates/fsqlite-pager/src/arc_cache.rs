@@ -549,15 +549,18 @@ impl ArcCacheInner {
     pub fn apply_pragma_cache_size(&mut self, n: i32, page_size: usize) {
         assert!(page_size > 0, "page_size must be > 0");
 
-        let (new_capacity, new_max_bytes) = if n > 0 {
-            let cap = usize::try_from(n).expect("positive cache_size fits usize");
-            (cap, cap.saturating_mul(page_size))
-        } else if n < 0 {
-            let kib = usize::try_from(n.unsigned_abs()).expect("cache_size magnitude fits usize");
-            let max_bytes = kib.saturating_mul(1024);
-            (max_bytes / page_size, max_bytes)
-        } else {
-            (0, 0)
+        let (new_capacity, new_max_bytes) = match n.cmp(&0) {
+            std::cmp::Ordering::Greater => {
+                let cap = usize::try_from(n).expect("positive cache_size fits usize");
+                (cap, cap.saturating_mul(page_size))
+            }
+            std::cmp::Ordering::Less => {
+                let kib =
+                    usize::try_from(n.unsigned_abs()).expect("cache_size magnitude fits usize");
+                let max_bytes = kib.saturating_mul(1024);
+                (max_bytes / page_size, max_bytes)
+            }
+            std::cmp::Ordering::Equal => (0, 0),
         };
 
         self.resize(new_capacity, new_max_bytes);
