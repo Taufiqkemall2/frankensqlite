@@ -23,12 +23,14 @@ fsqlite-func = { workspace = true }
 tracing = { workspace = true }
 xxhash-rust = { workspace = true }
 blake3 = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 asupersync = { path = "/dp/asupersync" }
 criterion = { workspace = true }
 tracing = { workspace = true }
 tempfile = { workspace = true }
+proptest = { workspace = true }
 
 [lints]
 workspace = true

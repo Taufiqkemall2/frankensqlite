@@ -9,11 +9,13 @@
 use std::collections::{HashMap, HashSet};
 
 use fsqlite_error::{FrankenError, Result};
+use fsqlite_types::ObjectId;
 use tracing::{debug, error, info, warn};
 
+use crate::decode_proofs::{DecodeAuditEntry, EcsDecodeProof};
 use crate::replication_sender::{
     CHANGESET_HEADER_SIZE, ChangesetHeader, ChangesetId, DEFAULT_RPC_MESSAGE_CAP_BYTES, PageEntry,
-    ReplicationPacket,
+    ReplicationPacket, ReplicationWireVersion,
 };
 use crate::source_block_partition::K_MAX;
 
@@ -77,6 +79,32 @@ impl DecoderState {
         self.received_count() >= self.k_source
     }
 
+    /// Number of collected source symbols (`isi < k_source`).
+    #[must_use]
+    pub fn source_symbol_count(&self) -> u32 {
+        let count = self
+            .symbols
+            .keys()
+            .filter(|&&isi| isi < self.k_source)
+            .count();
+        u32::try_from(count).unwrap_or(u32::MAX)
+    }
+
+    /// Whether any collected symbol is a repair symbol (`isi >= k_source`).
+    #[must_use]
+    pub fn has_repair_symbols(&self) -> bool {
+        self.symbols.keys().any(|&isi| isi >= self.k_source)
+    }
+
+    /// Sorted unique ISIs of all collected symbols.
+    #[must_use]
+    pub fn sorted_isis(&self) -> Vec<u32> {
+        let mut isis: Vec<u32> = self.symbols.keys().copied().collect();
+        isis.sort_unstable();
+        isis.dedup();
+        isis
+    }
+
     /// Add a symbol. Returns `true` if the symbol was new (accepted).
     fn add_symbol(&mut self, isi: u32, data: Vec<u8>) -> bool {
         if self.received_isis.contains(&isi) {
@@ -101,11 +129,7 @@ impl DecoderState {
         }
 
         // Count source symbols available.
-        let source_count = self
-            .symbols
-            .keys()
-            .filter(|&&isi| isi < self.k_source)
-            .count();
+        let source_count = usize::try_from(self.source_symbol_count()).unwrap_or(usize::MAX);
 
         let k = self.k_source as usize;
         let t = self.symbol_size as usize;
@@ -155,11 +179,26 @@ pub struct DecodeResult {
     pub pages: Vec<DecodedPage>,
     /// Number of symbols used for decoding.
     pub symbols_used: u32,
+    /// Optional decode proof emitted under policy control.
+    pub decode_proof: Option<EcsDecodeProof>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DecodeProofBuildInput<'a> {
+    changeset_id: ChangesetId,
+    k_source: u32,
+    symbol_size: u32,
+    seed: u64,
+    received_isis: &'a [u32],
+    decode_success: bool,
+    intermediate_rank: Option<u32>,
+    symbols_used: u32,
 }
 
 /// Replication receiver state machine.
 #[derive(Debug)]
 pub struct ReplicationReceiver {
+    config: ReceiverConfig,
     state: ReceiverState,
     /// Per-changeset decoder states.
     decoders: HashMap<ChangesetId, DecoderState>,
@@ -169,19 +208,87 @@ pub struct ReplicationReceiver {
     pending_results: Vec<DecodeResult>,
     /// Applied results (for metrics/ACK).
     applied_count: u64,
+    /// Decode-proof audit entries emitted by this receiver.
+    decode_audit: Vec<DecodeAuditEntry>,
+    /// Monotonic audit sequence.
+    decode_audit_seq: u64,
+}
+
+/// Receiver policy knobs for packet integrity/auth enforcement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeProofEmissionPolicy {
+    /// Emit proofs on decode failure (durability-critical requirement).
+    pub emit_on_decode_failure: bool,
+    /// Emit proofs on successful decode that included repair symbols.
+    pub emit_on_repair_success: bool,
+}
+
+impl DecodeProofEmissionPolicy {
+    /// Default production posture: disabled.
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            emit_on_decode_failure: false,
+            emit_on_repair_success: false,
+        }
+    }
+
+    /// Durability-critical posture for replication apply paths.
+    #[must_use]
+    pub const fn durability_critical() -> Self {
+        Self {
+            emit_on_decode_failure: true,
+            emit_on_repair_success: true,
+        }
+    }
+}
+
+impl Default for DecodeProofEmissionPolicy {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+/// Receiver policy knobs for packet integrity/auth enforcement.
+#[derive(Debug, Clone, Default)]
+pub struct ReceiverConfig {
+    /// Optional auth key for validating packet auth tags.
+    pub auth_key: Option<[u8; 32]>,
+    /// Decode proof emission hooks.
+    pub decode_proof_policy: DecodeProofEmissionPolicy,
+}
+
+impl ReceiverConfig {
+    /// Build a receiver config with authenticated transport enabled.
+    #[must_use]
+    pub const fn with_auth_key(auth_key: [u8; 32]) -> Self {
+        Self {
+            auth_key: Some(auth_key),
+            decode_proof_policy: DecodeProofEmissionPolicy::disabled(),
+        }
+    }
 }
 
 impl ReplicationReceiver {
-    /// Create a new receiver in LISTENING state.
+    /// Create a new receiver with explicit configuration.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn with_config(config: ReceiverConfig) -> Self {
         Self {
+            config,
             state: ReceiverState::Listening,
             decoders: HashMap::new(),
             received_counts: HashMap::new(),
             pending_results: Vec::new(),
             applied_count: 0,
+            decode_audit: Vec::new(),
+            decode_audit_seq: 0,
         }
+    }
+
+    /// Create a new receiver in LISTENING state.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_config(ReceiverConfig::default())
     }
 
     /// Current state.
@@ -202,6 +309,17 @@ impl ReplicationReceiver {
         self.decoders.len()
     }
 
+    /// View decode-proof audit entries emitted so far.
+    #[must_use]
+    pub fn decode_audit_entries(&self) -> &[DecodeAuditEntry] {
+        &self.decode_audit
+    }
+
+    /// Drain decode-proof audit entries.
+    pub fn take_decode_audit_entries(&mut self) -> Vec<DecodeAuditEntry> {
+        std::mem::take(&mut self.decode_audit)
+    }
+
     /// Process a raw packet from the wire.
     ///
     /// # Errors
@@ -216,6 +334,15 @@ impl ReplicationReceiver {
             return Err(FrankenError::TooBig);
         }
         let packet = ReplicationPacket::from_bytes(packet_bytes)?;
+        if !packet.verify_integrity(self.config.auth_key.as_ref()) {
+            warn!(
+                bead_id = BEAD_ID,
+                wire_version = ?packet.wire_version,
+                has_auth = packet.auth_tag.is_some(),
+                "packet integrity/auth verification failed; treating as erasure"
+            );
+            return Ok(PacketResult::Erasure);
+        }
         self.process_parsed_packet(&packet)
     }
 
@@ -253,12 +380,17 @@ impl ReplicationReceiver {
             });
         }
 
-        // Compute symbol_size from packet.
-        let symbol_size =
-            u32::try_from(packet.symbol_data.len()).map_err(|_| FrankenError::OutOfRange {
-                what: "symbol_data_len".to_owned(),
-                value: packet.symbol_data.len().to_string(),
-            })?;
+        // Compute symbol_size from packet header and validate payload consistency.
+        if usize::from(packet.symbol_size_t) != packet.symbol_data.len() {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "symbol_size_t mismatch: header={}, payload={}",
+                    packet.symbol_size_t,
+                    packet.symbol_data.len()
+                ),
+            });
+        }
+        let symbol_size = u32::from(packet.symbol_size_t);
         if symbol_size == 0 {
             return Err(FrankenError::OutOfRange {
                 what: "symbol_size".to_owned(),
@@ -305,9 +437,31 @@ impl ReplicationReceiver {
                     ),
                 });
             }
+            if packet.wire_version == ReplicationWireVersion::FramedV2
+                && decoder.seed != packet.seed
+            {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "seed mismatch: expected {}, got {}",
+                        decoder.seed, packet.seed
+                    ),
+                });
+            }
         } else {
             // Create new decoder state.
-            let seed = crate::replication_sender::derive_seed_from_changeset_id(&changeset_id);
+            let expected_seed =
+                crate::replication_sender::derive_seed_from_changeset_id(&changeset_id);
+            if packet.wire_version == ReplicationWireVersion::FramedV2
+                && packet.seed != expected_seed
+            {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "seed does not match deterministic derivation for changeset: expected {expected_seed}, got {}",
+                        packet.seed
+                    ),
+                });
+            }
+            let seed = expected_seed;
             debug!(
                 bead_id = BEAD_ID,
                 k_source = packet.k_source,
@@ -322,11 +476,30 @@ impl ReplicationReceiver {
             self.received_counts.insert(changeset_id, 0);
         }
 
-        // Add symbol to decoder (with ISI deduplication).
-        let decoder = self.decoders.get_mut(&changeset_id).expect("just inserted");
-        let accepted = decoder.add_symbol(packet.esi, packet.symbol_data.clone());
+        // Add symbol to decoder (with ISI deduplication) and capture decode context.
+        let (
+            ready_to_decode,
+            k_source_ctx,
+            symbol_size_ctx,
+            seed_ctx,
+            received_isis_ctx,
+            received_count_ctx,
+            source_count_ctx,
+            has_repair_ctx,
+            decoded_padded,
+        ) = {
+            let decoder = self.decoders.get_mut(&changeset_id).expect("just inserted");
+            let accepted = decoder.add_symbol(packet.esi, packet.symbol_data.clone());
 
-        if accepted {
+            if !accepted {
+                debug!(
+                    bead_id = BEAD_ID,
+                    isi = packet.esi,
+                    "duplicate ISI, symbol ignored"
+                );
+                return Ok(PacketResult::Duplicate);
+            }
+
             let count = self.received_counts.entry(changeset_id).or_insert(0);
             *count += 1;
             debug!(
@@ -336,30 +509,56 @@ impl ReplicationReceiver {
                 k_source = packet.k_source,
                 "symbol accepted"
             );
-        } else {
-            debug!(
-                bead_id = BEAD_ID,
-                isi = packet.esi,
-                "duplicate ISI, symbol ignored"
-            );
-            return Ok(PacketResult::Duplicate);
-        }
 
-        // Check if ready to decode.
-        if decoder.ready_to_decode() {
+            let ready = decoder.ready_to_decode();
+            let padded = if ready { decoder.try_decode() } else { None };
+            (
+                ready,
+                decoder.k_source,
+                decoder.symbol_size,
+                decoder.seed,
+                decoder.sorted_isis(),
+                decoder.received_count(),
+                decoder.source_symbol_count(),
+                decoder.has_repair_symbols(),
+                padded,
+            )
+        };
+
+        if ready_to_decode {
             info!(
                 bead_id = BEAD_ID,
-                received = decoder.received_count(),
-                k_source = decoder.k_source,
+                received = received_count_ctx,
+                k_source = k_source_ctx,
                 "attempting decode"
             );
             self.state = ReceiverState::Decoding;
 
-            if let Some(padded_bytes) = decoder.try_decode() {
+            if let Some(padded_bytes) = decoded_padded {
+                let success_proof =
+                    if self.config.decode_proof_policy.emit_on_repair_success && has_repair_ctx {
+                        Some(Self::build_decode_proof(DecodeProofBuildInput {
+                            changeset_id,
+                            k_source: k_source_ctx,
+                            symbol_size: symbol_size_ctx,
+                            seed: seed_ctx,
+                            received_isis: &received_isis_ctx,
+                            decode_success: true,
+                            intermediate_rank: Some(k_source_ctx),
+                            symbols_used: received_count_ctx,
+                        }))
+                    } else {
+                        None
+                    };
+
                 // Decode succeeded: truncate to total_len and parse pages.
                 match self.parse_and_validate_changeset(changeset_id, &padded_bytes) {
-                    Ok(result) => {
+                    Ok(mut result) => {
                         let n_pages = result.pages.len();
+                        if let Some(proof) = success_proof {
+                            self.record_decode_proof(proof.clone());
+                            result.decode_proof = Some(proof);
+                        }
                         self.pending_results.push(result);
                         self.state = ReceiverState::Applying;
                         info!(
@@ -390,9 +589,25 @@ impl ReplicationReceiver {
                 }
             }
 
+            if self.config.decode_proof_policy.emit_on_decode_failure {
+                let failure_proof = Self::build_decode_proof(DecodeProofBuildInput {
+                    changeset_id,
+                    k_source: k_source_ctx,
+                    symbol_size: symbol_size_ctx,
+                    seed: seed_ctx,
+                    received_isis: &received_isis_ctx,
+                    decode_success: false,
+                    intermediate_rank: Some(source_count_ctx),
+                    symbols_used: received_count_ctx,
+                });
+                self.record_decode_proof(failure_proof);
+            }
+
             // Decode failed (need more symbols).
             warn!(
                 bead_id = BEAD_ID,
+                source_count = source_count_ctx,
+                k_source = k_source_ctx,
                 "decode failed at K_source, continuing collection"
             );
             self.state = ReceiverState::Collecting;
@@ -507,7 +722,33 @@ impl ReplicationReceiver {
             changeset_id,
             pages,
             symbols_used: decoder_state_symbols,
+            decode_proof: None,
         })
+    }
+
+    fn build_decode_proof(input: DecodeProofBuildInput<'_>) -> EcsDecodeProof {
+        let object_id = ObjectId::from_bytes(*input.changeset_id.as_bytes());
+        let timing_ns =
+            deterministic_timing_ns(input.k_source, input.symbol_size, input.symbols_used);
+        EcsDecodeProof::from_esis(
+            object_id,
+            input.k_source,
+            input.received_isis,
+            input.decode_success,
+            input.intermediate_rank,
+            timing_ns,
+            input.seed,
+        )
+        .with_changeset_id(*input.changeset_id.as_bytes())
+    }
+
+    fn record_decode_proof(&mut self, proof: EcsDecodeProof) {
+        self.decode_audit_seq = self.decode_audit_seq.saturating_add(1);
+        self.decode_audit.push(DecodeAuditEntry {
+            proof,
+            seq: self.decode_audit_seq,
+            lab_mode: false,
+        });
     }
 
     /// Apply pending decoded results. Returns applied page counts.
@@ -575,11 +816,21 @@ impl Default for ReplicationReceiver {
     }
 }
 
+fn deterministic_timing_ns(k_source: u32, symbol_size: u32, symbols_used: u32) -> u64 {
+    let mut material = [0_u8; 12];
+    material[..4].copy_from_slice(&k_source.to_le_bytes());
+    material[4..8].copy_from_slice(&symbol_size.to_le_bytes());
+    material[8..12].copy_from_slice(&symbols_used.to_le_bytes());
+    xxhash_rust::xxh3::xxh3_64(&material)
+}
+
 /// Result of processing a single packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketResult {
     /// Symbol accepted, need more for decode.
     Accepted,
+    /// Integrity/auth invalid; packet ignored as erasure.
+    Erasure,
     /// Duplicate ISI, silently ignored.
     Duplicate,
     /// Enough symbols collected, decode succeeded and ready to apply.
@@ -640,11 +891,20 @@ pub fn parse_changeset_pages(changeset_bytes: &[u8]) -> Result<(ChangesetHeader,
 
 #[cfg(test)]
 mod tests {
+    use asupersync::runtime::RuntimeBuilder;
+    use asupersync::security::authenticated::AuthenticatedSymbol;
+    use asupersync::security::tag::AuthenticationTag;
+    use asupersync::transport::{
+        SimNetwork, SimTransportConfig, SymbolSinkExt as _, SymbolStreamExt as _,
+    };
+    use asupersync::types::{Symbol, SymbolId, SymbolKind};
+    use std::collections::HashSet;
+
     use super::*;
     use crate::replication_sender::{
         CHANGESET_HEADER_SIZE, ChangesetId, PageEntry, REPLICATION_HEADER_SIZE, ReplicationPacket,
-        ReplicationSender, SenderConfig, compute_changeset_id, derive_seed_from_changeset_id,
-        encode_changeset,
+        ReplicationPacketV2Header, ReplicationSender, ReplicationWireVersion, SenderConfig,
+        compute_changeset_id, derive_seed_from_changeset_id, encode_changeset,
     };
 
     const TEST_BEAD_ID: &str = "bd-1hi.14";
@@ -669,11 +929,20 @@ mod tests {
         page_numbers: &[u32],
         symbol_size: u16,
     ) -> Vec<Vec<u8>> {
+        generate_sender_packets_with_multiplier(page_size, page_numbers, symbol_size, 1)
+    }
+
+    fn generate_sender_packets_with_multiplier(
+        page_size: u32,
+        page_numbers: &[u32],
+        symbol_size: u16,
+        max_isi_multiplier: u32,
+    ) -> Vec<Vec<u8>> {
         let mut sender = ReplicationSender::new();
         let mut pages = make_pages(page_size, page_numbers);
         let config = SenderConfig {
             symbol_size,
-            max_isi_multiplier: 1, // only source symbols
+            max_isi_multiplier,
         };
         sender
             .prepare(page_size, &mut pages, config)
@@ -685,6 +954,140 @@ mod tests {
             packets.push(packet.to_bytes().expect("encode"));
         }
         packets
+    }
+
+    #[derive(Debug)]
+    struct SimNetworkDelivery {
+        sent_count: usize,
+        delivered: Vec<(u32, Vec<u8>)>,
+    }
+
+    fn packet_symbol(esi: u32, wire_bytes: Vec<u8>) -> AuthenticatedSymbol {
+        let symbol_id = SymbolId::new_for_test(0xBEEF, 0, esi);
+        let symbol = Symbol::new(symbol_id, wire_bytes, SymbolKind::Source);
+        AuthenticatedSymbol::new_verified(symbol, AuthenticationTag::zero())
+    }
+
+    fn transmit_packets_simnetwork(
+        config: SimTransportConfig,
+        packet_bytes: &[Vec<u8>],
+    ) -> SimNetworkDelivery {
+        let network = SimNetwork::fully_connected(2, config);
+        let (mut sink, mut stream) = network.transport(0, 1);
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            for (index, bytes) in packet_bytes.iter().enumerate() {
+                let esi = u32::try_from(index).expect("test packet index fits u32");
+                sink.send(packet_symbol(esi, bytes.clone()))
+                    .await
+                    .expect("send simulated symbol");
+            }
+            sink.close().await.expect("close simulated sink");
+
+            let mut delivered = Vec::new();
+            while let Some(item) = stream.next().await {
+                let auth = item.expect("sim stream item");
+                delivered.push((auth.symbol().id().esi(), auth.symbol().data().to_vec()));
+            }
+
+            SimNetworkDelivery {
+                sent_count: packet_bytes.len(),
+                delivered,
+            }
+        })
+    }
+
+    fn has_duplicate_esies(delivery: &SimNetworkDelivery) -> bool {
+        let mut seen = HashSet::new();
+        delivery.delivered.iter().any(|(esi, _)| !seen.insert(*esi))
+    }
+
+    fn has_reordered_esies(delivery: &SimNetworkDelivery) -> bool {
+        delivery
+            .delivered
+            .windows(2)
+            .any(|window| window[0].0 > window[1].0)
+    }
+
+    fn has_corrupted_wire_bytes(delivery: &SimNetworkDelivery, original: &[Vec<u8>]) -> bool {
+        delivery.delivered.iter().any(|(esi, bytes)| {
+            usize::try_from(*esi)
+                .ok()
+                .and_then(|index| original.get(index))
+                .is_some_and(|expected| expected.as_slice() != bytes.as_slice())
+        })
+    }
+
+    fn decode_from_wire_packets(
+        delivered: &[(u32, Vec<u8>)],
+    ) -> (Option<Vec<DecodedPage>>, usize, usize) {
+        let mut receiver = ReplicationReceiver::new();
+        let mut erasures = 0_usize;
+        let mut parse_errors = 0_usize;
+
+        for (_, wire) in delivered {
+            match receiver.process_packet(wire) {
+                Ok(PacketResult::DecodeReady) => {
+                    let mut applied = receiver.apply_pending().expect("apply decoded changeset");
+                    let pages = applied.pop().expect("decode result pages").pages;
+                    return (Some(pages), erasures, parse_errors);
+                }
+                Ok(PacketResult::Erasure) => erasures += 1,
+                Ok(PacketResult::Accepted | PacketResult::Duplicate | PacketResult::NeedMore) => {}
+                Err(_) => parse_errors += 1,
+            }
+        }
+
+        (None, erasures, parse_errors)
+    }
+
+    fn decoded_matches_original(decoded: &[DecodedPage], original: &[PageEntry]) -> bool {
+        if decoded.len() != original.len() {
+            return false;
+        }
+        for (decoded, original) in decoded.iter().zip(original.iter()) {
+            if decoded.page_number != original.page_number {
+                return false;
+            }
+            if decoded.page_data != original.page_bytes {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn make_packet(
+        changeset_id: ChangesetId,
+        sbn: u8,
+        esi: u32,
+        k_source: u32,
+        symbol_data: Vec<u8>,
+    ) -> ReplicationPacket {
+        let symbol_size_t =
+            u16::try_from(symbol_data.len()).expect("test symbol payload must fit u16");
+        let seed = derive_seed_from_changeset_id(&changeset_id);
+        ReplicationPacket::new_v2(
+            ReplicationPacketV2Header {
+                changeset_id,
+                sbn,
+                esi,
+                k_source,
+                r_repair: 0,
+                symbol_size_t,
+                seed,
+            },
+            symbol_data,
+        )
+    }
+
+    fn receiver_with_decode_proofs() -> ReplicationReceiver {
+        ReplicationReceiver::with_config(ReceiverConfig {
+            auth_key: None,
+            decode_proof_policy: DecodeProofEmissionPolicy::durability_critical(),
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -744,13 +1147,13 @@ mod tests {
     #[test]
     fn test_receiver_v1_reject_sbn_nonzero() {
         let mut receiver = ReplicationReceiver::new();
-        let packet = ReplicationPacket {
-            changeset_id: ChangesetId::from_bytes([0xAA; 16]),
-            sbn: 1, // V1 violation
-            esi: 0,
-            k_source: 10,
-            symbol_data: vec![0x55; 512],
-        };
+        let packet = make_packet(
+            ChangesetId::from_bytes([0xAA; 16]),
+            1, // V1 violation
+            0,
+            10,
+            vec![0x55; 512],
+        );
         let wire = packet.to_bytes().expect("encode");
         let result = receiver.process_packet(&wire);
         assert!(
@@ -764,13 +1167,13 @@ mod tests {
         let mut receiver = ReplicationReceiver::new();
 
         // K_source = 0 → rejected.
-        let packet_zero = ReplicationPacket {
-            changeset_id: ChangesetId::from_bytes([0xBB; 16]),
-            sbn: 0,
-            esi: 0,
-            k_source: 0,
-            symbol_data: vec![0x55; 512],
-        };
+        let packet_zero = make_packet(
+            ChangesetId::from_bytes([0xBB; 16]),
+            0,
+            0,
+            0,
+            vec![0x55; 512],
+        );
         let wire_zero = packet_zero.to_bytes().expect("encode");
         assert!(
             receiver.process_packet(&wire_zero).is_err(),
@@ -778,13 +1181,13 @@ mod tests {
         );
 
         // K_source = K_MAX + 1 → rejected.
-        let packet_over = ReplicationPacket {
-            changeset_id: ChangesetId::from_bytes([0xCC; 16]),
-            sbn: 0,
-            esi: 0,
-            k_source: K_MAX + 1,
-            symbol_data: vec![0x55; 512],
-        };
+        let packet_over = make_packet(
+            ChangesetId::from_bytes([0xCC; 16]),
+            0,
+            0,
+            K_MAX + 1,
+            vec![0x55; 512],
+        );
         // ESI only has 24 bits, K_source > K_MAX might not fit in packet format
         // but we test the validation path directly.
         let result = receiver.process_parsed_packet(&packet_over);
@@ -794,13 +1197,13 @@ mod tests {
         );
 
         // K_source = K_MAX → accepted.
-        let packet_max = ReplicationPacket {
-            changeset_id: ChangesetId::from_bytes([0xDD; 16]),
-            sbn: 0,
-            esi: 0,
-            k_source: K_MAX,
-            symbol_data: vec![0x55; 512],
-        };
+        let packet_max = make_packet(
+            ChangesetId::from_bytes([0xDD; 16]),
+            0,
+            0,
+            K_MAX,
+            vec![0x55; 512],
+        );
         let result = receiver.process_parsed_packet(&packet_max);
         assert!(
             result.is_ok(),
@@ -811,13 +1214,13 @@ mod tests {
     #[test]
     fn test_receiver_symbol_size_inference() {
         let mut receiver = ReplicationReceiver::new();
-        let packet = ReplicationPacket {
-            changeset_id: ChangesetId::from_bytes([0xEE; 16]),
-            sbn: 0,
-            esi: 0,
-            k_source: 100,
-            symbol_data: vec![0x42; 1024],
-        };
+        let packet = make_packet(
+            ChangesetId::from_bytes([0xEE; 16]),
+            0,
+            0,
+            100,
+            vec![0x42; 1024],
+        );
         receiver
             .process_parsed_packet(&packet)
             .expect("accept packet");
@@ -834,13 +1237,7 @@ mod tests {
 
         // Zero-length symbol data → rejected.
         let mut receiver2 = ReplicationReceiver::new();
-        let empty_packet = ReplicationPacket {
-            changeset_id: ChangesetId::from_bytes([0xFF; 16]),
-            sbn: 0,
-            esi: 0,
-            k_source: 10,
-            symbol_data: vec![],
-        };
+        let empty_packet = make_packet(ChangesetId::from_bytes([0xFF; 16]), 0, 0, 10, vec![]);
         assert!(
             receiver2.process_parsed_packet(&empty_packet).is_err(),
             "bead_id={TEST_BEAD_ID} case=zero_symbol_size_rejected"
@@ -852,25 +1249,13 @@ mod tests {
         let mut receiver = ReplicationReceiver::new();
         let id = ChangesetId::from_bytes([0x11; 16]);
 
-        let p1 = ReplicationPacket {
-            changeset_id: id,
-            sbn: 0,
-            esi: 0,
-            k_source: 100,
-            symbol_data: vec![0x42; 512],
-        };
+        let p1 = make_packet(id, 0, 0, 100, vec![0x42; 512]);
         receiver
             .process_parsed_packet(&p1)
             .expect("first packet ok");
 
         // Same changeset_id, different K_source.
-        let p2 = ReplicationPacket {
-            changeset_id: id,
-            sbn: 0,
-            esi: 1,
-            k_source: 200, // mismatch
-            symbol_data: vec![0x42; 512],
-        };
+        let p2 = make_packet(id, 0, 1, 200, vec![0x42; 512]); // mismatch
         assert!(
             receiver.process_parsed_packet(&p2).is_err(),
             "bead_id={TEST_BEAD_ID} case=k_source_mismatch_rejected"
@@ -882,25 +1267,13 @@ mod tests {
         let mut receiver = ReplicationReceiver::new();
         let id = ChangesetId::from_bytes([0x22; 16]);
 
-        let p1 = ReplicationPacket {
-            changeset_id: id,
-            sbn: 0,
-            esi: 0,
-            k_source: 100,
-            symbol_data: vec![0x42; 512],
-        };
+        let p1 = make_packet(id, 0, 0, 100, vec![0x42; 512]);
         receiver
             .process_parsed_packet(&p1)
             .expect("first packet ok");
 
         // Same changeset_id, different symbol_size.
-        let p2 = ReplicationPacket {
-            changeset_id: id,
-            sbn: 0,
-            esi: 1,
-            k_source: 100,
-            symbol_data: vec![0x42; 1024], // different size
-        };
+        let p2 = make_packet(id, 0, 1, 100, vec![0x42; 1024]); // different size
         assert!(
             receiver.process_parsed_packet(&p2).is_err(),
             "bead_id={TEST_BEAD_ID} case=symbol_size_mismatch_rejected"
@@ -912,13 +1285,7 @@ mod tests {
         let mut receiver = ReplicationReceiver::new();
         let id = ChangesetId::from_bytes([0x33; 16]);
 
-        let p1 = ReplicationPacket {
-            changeset_id: id,
-            sbn: 0,
-            esi: 0,
-            k_source: 100,
-            symbol_data: vec![0x42; 512],
-        };
+        let p1 = make_packet(id, 0, 0, 100, vec![0x42; 512]);
 
         let r1 = receiver.process_parsed_packet(&p1).expect("first");
         assert_eq!(
@@ -941,6 +1308,68 @@ mod tests {
             count, 1,
             "bead_id={TEST_BEAD_ID} case=dedup_count_unchanged"
         );
+    }
+
+    #[test]
+    fn test_receiver_treats_payload_hash_mismatch_as_erasure() {
+        let mut receiver = ReplicationReceiver::new();
+        let mut packet = make_packet(
+            ChangesetId::from_bytes([0x44; 16]),
+            0,
+            0,
+            100,
+            vec![0x42; 512],
+        );
+        packet.payload_xxh3 ^= 0xDEAD_BEEF;
+        let wire = packet.to_bytes().expect("encode tampered packet");
+        let result = receiver.process_packet(&wire).expect("process packet");
+        assert_eq!(result, PacketResult::Erasure);
+    }
+
+    #[test]
+    fn test_receiver_treats_invalid_auth_tag_as_erasure() {
+        let receiver_key = [0x11_u8; 32];
+        let sender_key = [0x22_u8; 32];
+        let mut receiver =
+            ReplicationReceiver::with_config(ReceiverConfig::with_auth_key(receiver_key));
+        let mut packet = make_packet(
+            ChangesetId::from_bytes([0x45; 16]),
+            0,
+            0,
+            100,
+            vec![0x24; 512],
+        );
+        packet.attach_auth_tag(&sender_key);
+        let wire = packet.to_bytes().expect("encode auth packet");
+        let result = receiver.process_packet(&wire).expect("process packet");
+        assert_eq!(result, PacketResult::Erasure);
+    }
+
+    #[test]
+    fn test_receiver_accepts_legacy_v1_packets() {
+        let mut receiver = ReplicationReceiver::new();
+        let id = ChangesetId::from_bytes([0x46; 16]);
+        let symbol_data = vec![0x5A; 512];
+        let legacy = ReplicationPacket {
+            wire_version: ReplicationWireVersion::LegacyV1,
+            changeset_id: id,
+            sbn: 0,
+            esi: 0,
+            k_source: 100,
+            r_repair: 0,
+            symbol_size_t: 512,
+            seed: derive_seed_from_changeset_id(&id),
+            payload_xxh3: ReplicationPacket::compute_payload_xxh3(&symbol_data),
+            auth_tag: None,
+            symbol_data,
+        };
+        let wire = legacy.to_bytes().expect("encode legacy packet");
+        let parsed = ReplicationPacket::from_bytes(&wire).expect("decode legacy packet");
+        assert_eq!(parsed.wire_version, ReplicationWireVersion::LegacyV1);
+        let result = receiver
+            .process_packet(&wire)
+            .expect("process legacy packet");
+        assert_eq!(result, PacketResult::Accepted);
     }
 
     #[test]
@@ -968,6 +1397,95 @@ mod tests {
             ReceiverState::Applying,
             "bead_id={TEST_BEAD_ID} case=state_applying_after_decode"
         );
+    }
+
+    #[test]
+    fn test_receiver_decode_failure_emits_proof_when_enabled() {
+        let mut receiver = receiver_with_decode_proofs();
+        let changeset_id = ChangesetId::from_bytes([0x5A; 16]);
+
+        // Two repair-only symbols at K=2: ready_to_decode => true, but decode fails.
+        let p1 = make_packet(changeset_id, 0, 2, 2, vec![0xA1; 64]);
+        let p2 = make_packet(changeset_id, 0, 3, 2, vec![0xA2; 64]);
+
+        let r1 = receiver.process_parsed_packet(&p1).expect("first packet");
+        assert_eq!(r1, PacketResult::Accepted);
+        let r2 = receiver.process_parsed_packet(&p2).expect("second packet");
+        assert_eq!(r2, PacketResult::NeedMore);
+
+        let audit = receiver.take_decode_audit_entries();
+        assert_eq!(audit.len(), 1, "bead_id=bd-faz4 case=failure_proof_emitted");
+        let proof = &audit[0].proof;
+        assert!(
+            !proof.decode_success,
+            "bead_id=bd-faz4 case=failure_proof_decode_success_false"
+        );
+        assert_eq!(proof.changeset_id, Some(*changeset_id.as_bytes()));
+        assert!(
+            proof.is_consistent(),
+            "bead_id=bd-faz4 case=failure_proof_consistent"
+        );
+    }
+
+    #[test]
+    fn test_receiver_decode_success_with_repair_emits_proof_when_enabled() {
+        let mut receiver = ReplicationReceiver::with_config(ReceiverConfig {
+            auth_key: None,
+            decode_proof_policy: DecodeProofEmissionPolicy {
+                emit_on_decode_failure: false,
+                emit_on_repair_success: true,
+            },
+        });
+        let page_size = 64_u32;
+        let mut pages = make_pages(page_size, &[7]);
+        let changeset_bytes = encode_changeset(page_size, &mut pages).expect("encode changeset");
+        let changeset_id = compute_changeset_id(&changeset_bytes);
+
+        // Build K=2 source symbols from encoded bytes.
+        let symbol_size = 64_usize;
+        let mut s0 = vec![0_u8; symbol_size];
+        let mut s1 = vec![0_u8; symbol_size];
+        let split = changeset_bytes.len().min(symbol_size);
+        s0[..split].copy_from_slice(&changeset_bytes[..split]);
+        if changeset_bytes.len() > symbol_size {
+            let rem = changeset_bytes.len() - symbol_size;
+            s1[..rem].copy_from_slice(&changeset_bytes[symbol_size..]);
+        }
+
+        // Interleave source+repair so K is reached with at least one repair symbol present.
+        let p0 = make_packet(changeset_id, 0, 0, 2, s0);
+        let p_repair = make_packet(changeset_id, 0, 2, 2, vec![0xCC; symbol_size]);
+        let p1 = make_packet(changeset_id, 0, 1, 2, s1);
+
+        assert_eq!(
+            receiver.process_parsed_packet(&p0).expect("p0"),
+            PacketResult::Accepted
+        );
+        assert_eq!(
+            receiver.process_parsed_packet(&p_repair).expect("repair"),
+            PacketResult::NeedMore
+        );
+        assert_eq!(
+            receiver.process_parsed_packet(&p1).expect("p1"),
+            PacketResult::DecodeReady
+        );
+        assert_eq!(receiver.state(), ReceiverState::Applying);
+
+        let results = receiver.apply_pending().expect("apply");
+        assert_eq!(results.len(), 1);
+        let decode_proof = results[0]
+            .decode_proof
+            .as_ref()
+            .expect("bead_id=bd-faz4 case=success_proof_attached_to_result");
+        assert!(decode_proof.decode_success);
+        assert!(decode_proof.is_repair());
+        assert!(
+            decode_proof.is_consistent(),
+            "bead_id=bd-faz4 case=success_proof_consistent"
+        );
+
+        let audit = receiver.take_decode_audit_entries();
+        assert_eq!(audit.len(), 1, "bead_id=bd-faz4 case=success_proof_emitted");
     }
 
     #[test]
@@ -1079,13 +1597,7 @@ mod tests {
         let id = ChangesetId::from_bytes([0x77; 16]);
 
         // Feed the same ISI multiple times within a single decoder session.
-        let p1 = ReplicationPacket {
-            changeset_id: id,
-            sbn: 0,
-            esi: 0,
-            k_source: 100, // large enough that one symbol won't trigger decode
-            symbol_data: vec![0x42; 512],
-        };
+        let p1 = make_packet(id, 0, 0, 100, vec![0x42; 512]); // large enough that one symbol won't trigger decode
 
         let r1 = receiver.process_parsed_packet(&p1).expect("first");
         assert_eq!(
@@ -1287,6 +1799,180 @@ mod tests {
         assert_eq!(receiver.applied_count(), 1);
     }
 
+    #[test]
+    fn test_simnetwork_loss_profiles_converge_with_repair_symbols() {
+        let page_size = 128_u32;
+        let page_numbers = [1_u32, 2];
+        let original_pages = make_pages(page_size, &page_numbers);
+        let packets = generate_sender_packets_with_multiplier(page_size, &page_numbers, 128, 2);
+        let loss_packets: Vec<Vec<u8>> = packets
+            .iter()
+            .flat_map(|packet| [packet.clone(), packet.clone()])
+            .collect();
+
+        for (loss_rate, require_observed_drop) in [(0.05_f64, false), (0.30_f64, true)] {
+            let mut found_seed = None;
+            for seed in 1_u64..=20_000 {
+                let mut config = SimTransportConfig::deterministic(seed);
+                config.loss_rate = loss_rate;
+                config.preserve_order = true;
+
+                let delivery = transmit_packets_simnetwork(config, &loss_packets);
+                let observed_drop = delivery.delivered.len() < delivery.sent_count;
+                if require_observed_drop && !observed_drop {
+                    continue;
+                }
+                let saw_repair_symbol = delivery.delivered.iter().any(|(_, wire)| {
+                    ReplicationPacket::from_bytes(wire)
+                        .is_ok_and(|packet| !packet.is_source_symbol())
+                });
+                if !saw_repair_symbol {
+                    continue;
+                }
+
+                let (decoded, _erasures, _parse_errors) =
+                    decode_from_wire_packets(&delivery.delivered);
+                if decoded
+                    .as_ref()
+                    .is_some_and(|pages| decoded_matches_original(pages, &original_pages))
+                {
+                    found_seed = Some(seed);
+                    break;
+                }
+            }
+
+            assert!(
+                found_seed.is_some(),
+                "bead_id=bd-xgoe case=loss_profile_convergence loss_rate={loss_rate} require_drop={require_observed_drop} did not find deterministic convergent seed"
+            );
+        }
+    }
+
+    #[test]
+    fn test_simnetwork_reorder_and_dup_converge() {
+        let page_size = 128_u32;
+        let page_numbers = [7_u32, 11];
+        let original_pages = make_pages(page_size, &page_numbers);
+        let packets = generate_sender_packets_with_multiplier(page_size, &page_numbers, 128, 2);
+
+        let mut found_seed = None;
+        for seed in 1_u64..=2_000 {
+            let mut config = SimTransportConfig::deterministic(seed);
+            config.preserve_order = false;
+            config.duplication_rate = 0.35;
+
+            let delivery = transmit_packets_simnetwork(config, &packets);
+            if !has_duplicate_esies(&delivery) || !has_reordered_esies(&delivery) {
+                continue;
+            }
+
+            let (decoded, _erasures, _parse_errors) = decode_from_wire_packets(&delivery.delivered);
+            if decoded
+                .as_ref()
+                .is_some_and(|pages| decoded_matches_original(pages, &original_pages))
+            {
+                found_seed = Some(seed);
+                break;
+            }
+        }
+
+        assert!(
+            found_seed.is_some(),
+            "bead_id=bd-xgoe case=reorder_dup_convergence no deterministic seed achieved reorder+dup convergence"
+        );
+    }
+
+    #[test]
+    fn test_simnetwork_corruption_is_rejected_and_recovered() {
+        let page_size = 128_u32;
+        let page_numbers = [21_u32, 34];
+        let original_pages = make_pages(page_size, &page_numbers);
+        let packets = generate_sender_packets_with_multiplier(page_size, &page_numbers, 128, 2);
+
+        let mut found_seed = None;
+        for seed in 1_u64..=20_000 {
+            let mut config = SimTransportConfig::deterministic(seed);
+            config.corruption_rate = 0.20;
+            config.preserve_order = false;
+
+            let delivery = transmit_packets_simnetwork(config, &packets);
+            if !has_corrupted_wire_bytes(&delivery, &packets) {
+                continue;
+            }
+
+            let (decoded, erasures, parse_errors) = decode_from_wire_packets(&delivery.delivered);
+            if erasures + parse_errors == 0 {
+                continue;
+            }
+            if decoded
+                .as_ref()
+                .is_some_and(|pages| decoded_matches_original(pages, &original_pages))
+            {
+                found_seed = Some(seed);
+                break;
+            }
+        }
+
+        assert!(
+            found_seed.is_some(),
+            "bead_id=bd-xgoe case=corruption_recovery no deterministic seed achieved corruption rejection + convergence"
+        );
+    }
+
+    #[test]
+    fn test_simnetwork_stop_early_reduces_traffic() {
+        let page_size = 256_u32;
+        let page_numbers = [1_u32, 2, 3];
+        let packets = generate_sender_packets_with_multiplier(page_size, &page_numbers, 256, 2);
+
+        let full_delivery = transmit_packets_simnetwork(SimTransportConfig::reliable(), &packets);
+        let full_sent = full_delivery.sent_count;
+
+        let network = SimNetwork::fully_connected(2, SimTransportConfig::reliable());
+        let (mut sink, mut stream) = network.transport(0, 1);
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        let mut receiver = ReplicationReceiver::new();
+        let mut stop_early_sent = 0_usize;
+        let mut decoded = false;
+
+        runtime.block_on(async {
+            for (index, bytes) in packets.iter().enumerate() {
+                let esi = u32::try_from(index).expect("test packet index fits u32");
+                sink.send(packet_symbol(esi, bytes.clone()))
+                    .await
+                    .expect("send simulated symbol");
+                stop_early_sent += 1;
+
+                let delivered = stream
+                    .next()
+                    .await
+                    .expect("delivered packet")
+                    .expect("stream item");
+                let wire = delivered.symbol().data().to_vec();
+                if matches!(
+                    receiver.process_packet(&wire).expect("receiver process"),
+                    PacketResult::DecodeReady
+                ) {
+                    decoded = true;
+                    break;
+                }
+            }
+            sink.close().await.expect("close simulated sink");
+        });
+
+        assert!(
+            decoded,
+            "bead_id=bd-xgoe case=stop_early_decode_not_reached"
+        );
+        assert!(
+            stop_early_sent < full_sent,
+            "bead_id=bd-xgoe case=stop_early_not_reduced stop_early_sent={stop_early_sent} full_sent={full_sent}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Compliance gate tests
     // -----------------------------------------------------------------------
@@ -1301,6 +1987,7 @@ mod tests {
         let _ = ReceiverState::Complete;
 
         let _ = PacketResult::Accepted;
+        let _ = PacketResult::Erasure;
         let _ = PacketResult::Duplicate;
         let _ = PacketResult::DecodeReady;
         let _ = PacketResult::NeedMore;
@@ -1311,7 +1998,7 @@ mod tests {
         assert_eq!(receiver.active_decoders(), 0);
 
         // Verify REPLICATION_HEADER_SIZE is correct.
-        assert_eq!(REPLICATION_HEADER_SIZE, 24);
+        assert_eq!(REPLICATION_HEADER_SIZE, 72);
     }
 
     #[test]

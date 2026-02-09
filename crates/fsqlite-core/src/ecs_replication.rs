@@ -84,6 +84,44 @@ pub struct CommitMarker {
     pub timestamp_ns: u64,
 }
 
+/// Idempotency key for commit-level replication deduplication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct IdempotencyKey([u8; 16]);
+
+impl IdempotencyKey {
+    /// Derive an idempotency key from commit identity fields.
+    #[must_use]
+    pub fn from_marker(marker: &CommitMarker) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"fsqlite:repl:idempotency:v1");
+        hasher.update(&marker.commit_seq.to_le_bytes());
+        hasher.update(marker.capsule_id.as_bytes());
+        let hash = hasher.finalize();
+        let mut out = [0_u8; 16];
+        out.copy_from_slice(&hash.as_bytes()[..16]);
+        Self(out)
+    }
+}
+
+/// Tracks replicated commits and suppresses duplicates by idempotency key.
+#[derive(Debug, Default)]
+pub struct CommitDeduplicator {
+    seen: HashSet<IdempotencyKey>,
+}
+
+impl CommitDeduplicator {
+    /// Returns true if the marker is new and should be replicated/applied.
+    pub fn should_accept(&mut self, marker: &CommitMarker) -> bool {
+        self.seen.insert(IdempotencyKey::from_marker(marker))
+    }
+
+    /// Number of unique commits seen.
+    #[must_use]
+    pub fn seen_count(&self) -> usize {
+        self.seen.len()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Anti-entropy protocol
 // ---------------------------------------------------------------------------
@@ -1300,6 +1338,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_ecs_replication_commit_capsules() {
+        // Commit capsules replicate as ECS objects and appear in missing-set diff.
+        let local_capsules: BTreeSet<ObjectId> = [make_oid(1), make_oid(2)].into();
+        let remote_capsules: BTreeSet<ObjectId> = [make_oid(1), make_oid(2), make_oid(3)].into();
+
+        let mut session = AntiEntropySession::new();
+        session
+            .exchange_tips(
+                ReplicaTip {
+                    root_manifest_id: make_oid(10),
+                    marker_position: 1,
+                    index_segment_tips: vec![],
+                },
+                ReplicaTip {
+                    root_manifest_id: make_oid(11),
+                    marker_position: 2,
+                    index_segment_tips: vec![],
+                },
+            )
+            .unwrap();
+
+        let missing = session
+            .compute_missing(&local_capsules, &remote_capsules)
+            .unwrap();
+        assert_eq!(missing.needed, [make_oid(3)].into());
+    }
+
+    #[test]
+    fn test_ecs_replication_dedup() {
+        // Duplicate commit markers are suppressed by idempotency key.
+        let marker = CommitMarker {
+            commit_seq: 77,
+            capsule_id: make_oid(9),
+            timestamp_ns: 1_234,
+        };
+        let mut dedup = CommitDeduplicator::default();
+
+        assert!(dedup.should_accept(&marker));
+        assert!(!dedup.should_accept(&marker));
+        assert_eq!(dedup.seen_count(), 1);
+    }
+
     // -- E2E tests --
 
     #[test]
@@ -1362,5 +1443,60 @@ mod tests {
 
         // Quorum satisfied (A + C = 2 of 3).
         assert!(gate.try_publish().is_some());
+    }
+
+    #[test]
+    fn test_e2e_lossy_replication_convergence() {
+        // Deterministic 10% lossy delivery across anti-entropy rounds converges.
+        fn delivered_with_loss(oid: &ObjectId, round: u32, loss_per_mille: u64) -> bool {
+            let mut material = [0_u8; 20];
+            material[..16].copy_from_slice(oid.as_bytes());
+            material[16..].copy_from_slice(&round.to_le_bytes());
+            xxhash_rust::xxh3::xxh3_64(&material) % 1000 >= loss_per_mille
+        }
+
+        let leader_objects: BTreeSet<ObjectId> = (0_u8..100).map(make_oid).collect();
+        let mut follower_objects: BTreeSet<ObjectId> = BTreeSet::new();
+
+        for round in 0_u32..32 {
+            if follower_objects == leader_objects {
+                break;
+            }
+
+            let mut session = AntiEntropySession::new();
+            session
+                .exchange_tips(
+                    ReplicaTip {
+                        root_manifest_id: make_oid(1),
+                        marker_position: follower_objects.len() as u64,
+                        index_segment_tips: vec![],
+                    },
+                    ReplicaTip {
+                        root_manifest_id: make_oid(2),
+                        marker_position: leader_objects.len() as u64,
+                        index_segment_tips: vec![],
+                    },
+                )
+                .unwrap();
+
+            let missing = session
+                .compute_missing(&follower_objects, &leader_objects)
+                .unwrap()
+                .needed
+                .clone();
+
+            for oid in missing {
+                if delivered_with_loss(&oid, round, 100) {
+                    session.record_decoded(oid).unwrap();
+                    follower_objects.insert(oid);
+                }
+            }
+
+            if session.phase() == AntiEntropyPhase::PersistAndUpdate {
+                session.finalize().unwrap();
+            }
+        }
+
+        assert_eq!(follower_objects, leader_objects);
     }
 }

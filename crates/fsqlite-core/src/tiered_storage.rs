@@ -891,10 +891,12 @@ fn rejection_reason_code(reason: SymbolRejectionReason) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
 
     use fsqlite_types::cx::{Cx, cap};
     use fsqlite_types::{ObjectId, Oti, SymbolRecordFlags};
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config as ProptestConfig, RngAlgorithm, RngSeed, TestRunner};
 
     use super::*;
 
@@ -1070,6 +1072,24 @@ mod tests {
         }
 
         out
+    }
+
+    fn rejected_esis_set(proof: &EcsDecodeProof) -> BTreeSet<u32> {
+        proof
+            .rejected_symbols
+            .iter()
+            .map(|entry| entry.esi)
+            .collect()
+    }
+
+    fn decode_proof_report_ok(proof: &EcsDecodeProof) -> bool {
+        proof
+            .verification_report(
+                crate::decode_proofs::DecodeProofVerificationConfig::default(),
+                &proof.symbol_digests,
+                &proof.rejected_symbols,
+            )
+            .ok
     }
 
     #[test]
@@ -1390,6 +1410,115 @@ mod tests {
             proof_a, proof_b,
             "proof artifacts must be stable for identical fallback input sets"
         );
+    }
+
+    #[test]
+    fn test_symbolrecord_corruption_erasures_seeded_property() {
+        let mut runner = TestRunner::new(ProptestConfig {
+            cases: 96,
+            failure_persistence: None,
+            rng_algorithm: RngAlgorithm::ChaCha,
+            rng_seed: RngSeed::Fixed(0x0BAD_C0DE_u64),
+            ..ProptestConfig::default()
+        });
+
+        let strategy = (
+            prop::collection::vec(any::<u8>(), 17..96),
+            prop::collection::vec(0_u8..7, 0..4),
+            prop::collection::vec(0_u8..7, 0..4),
+        );
+
+        runner
+            .run(&strategy, |(payload, dropped_raw, corrupted_raw)| {
+                let object_id = object_id_from_u64(77);
+                let full = make_symbol_records(object_id, &payload, 8, 4);
+
+                let dropped: BTreeSet<u32> = dropped_raw.into_iter().map(u32::from).collect();
+                let corrupted: BTreeSet<u32> = corrupted_raw.into_iter().map(u32::from).collect();
+
+                let mut remote_records = Vec::new();
+                let mut expected_rejected = BTreeSet::new();
+                let mut accepted_esis = BTreeSet::new();
+
+                for mut record in full {
+                    if dropped.contains(&record.esi) {
+                        continue;
+                    }
+                    // Always force the non-systematic fallback path while preserving
+                    // source-symbol availability semantics for success/failure checks.
+                    if record.esi == 0 {
+                        record = SymbolRecord::new(
+                            record.object_id,
+                            record.oti,
+                            record.esi,
+                            record.symbol_data.clone(),
+                            SymbolRecordFlags::empty(),
+                        );
+                    }
+                    if corrupted.contains(&record.esi) {
+                        if let Some(first) = record.symbol_data.first_mut() {
+                            *first ^= 0x5A;
+                        }
+                        expected_rejected.insert(record.esi);
+                    } else {
+                        accepted_esis.insert(record.esi);
+                    }
+                    remote_records.push(record);
+                }
+
+                let source_symbols = payload.len().div_ceil(8);
+                let required_symbols = source_symbols.saturating_add(DEFAULT_FALLBACK_DECODE_SLACK);
+                let has_complete_source_run = (0..source_symbols).all(|index| {
+                    let esi = u32::try_from(index).expect("source index fits in u32");
+                    accepted_esis.contains(&esi)
+                });
+                let expect_success =
+                    accepted_esis.len() >= required_symbols && has_complete_source_run;
+
+                let mut storage = TieredStorage::new(DurabilityMode::local());
+                let mut remote = MockRemoteTier::default();
+                remote.set_object_symbols(object_id, remote_records);
+                let cx = Cx::<cap::All>::new();
+
+                let result = storage.fetch_object(
+                    &cx,
+                    object_id,
+                    56,
+                    Some(&mut remote),
+                    Some(remote_cap(12)),
+                );
+
+                if expect_success {
+                    let outcome =
+                        result.expect("decode should succeed when enough valid symbols remain");
+                    let used_fallback =
+                        matches!(outcome.read_path, SymbolReadPath::FullDecodeFallback { .. });
+                    prop_assert!(used_fallback);
+                    prop_assert_eq!(outcome.bytes, payload);
+                    let proof = outcome
+                        .decode_proof
+                        .expect("fallback-success path should emit decode proof");
+                    prop_assert!(proof.decode_success);
+                    prop_assert_eq!(rejected_esis_set(&proof), expected_rejected);
+                    prop_assert!(decode_proof_report_ok(&proof));
+                } else {
+                    let is_corrupt_error =
+                        matches!(result, Err(FrankenError::DatabaseCorrupt { .. }));
+                    prop_assert!(is_corrupt_error);
+                    let audit = storage.take_decode_audit_entries();
+                    let Some(failure_entry) = audit.iter().find(|entry| !entry.decode_success)
+                    else {
+                        return Err(TestCaseError::fail(
+                            "expected failure decode proof artifact",
+                        ));
+                    };
+                    prop_assert_eq!(rejected_esis_set(&failure_entry.proof), expected_rejected);
+                    prop_assert!(decode_proof_report_ok(&failure_entry.proof));
+                }
+
+                Ok(())
+            })
+            .expect("seeded SymbolRecord corruption property should hold");
     }
 
     #[test]

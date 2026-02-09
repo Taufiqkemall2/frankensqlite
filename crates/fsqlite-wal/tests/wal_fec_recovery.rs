@@ -1,5 +1,7 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::{ObjectId, Oti};
@@ -13,6 +15,8 @@ use tempfile::tempdir;
 
 const PAGE_SIZE: u32 = 4096;
 const BEAD_ID: &str = "bd-1hi.11";
+const BEAD_1OHZ_ID: &str = "bd-1ohz";
+const BEAD_9NBW_ID: &str = "bd-9nbw";
 type TestDecoder = Box<dyn FnMut(&WalFecGroupMeta, &[(u32, Vec<u8>)]) -> Result<Vec<Vec<u8>>>>;
 
 #[derive(Clone)]
@@ -109,6 +113,109 @@ fn corrupt_frame(candidates: &mut [WalFrameCandidate], frame_no: u32) {
         .find(|candidate| candidate.frame_no == frame_no)
         .expect("target frame should exist");
     target.page_data[0] ^= 0x7A;
+}
+
+#[derive(Clone, Copy)]
+struct DeterministicFaultRng {
+    state: u64,
+}
+
+impl DeterministicFaultRng {
+    const fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        self.state ^= self.state << 13;
+        self.state ^= self.state >> 7;
+        self.state ^= self.state << 17;
+        let upper = (self.state >> 32) & u64::from(u32::MAX);
+        u32::try_from(upper).expect("upper 32 bits always fit")
+    }
+
+    fn unique_offsets(&mut self, upper_exclusive: u32, count: usize) -> Vec<u32> {
+        if upper_exclusive == 0 || count == 0 {
+            return Vec::new();
+        }
+        let mut picked = BTreeSet::new();
+        let target = count.min(usize::try_from(upper_exclusive).expect("small range fits usize"));
+        while picked.len() < target {
+            picked.insert(self.next_u32() % upper_exclusive);
+        }
+        picked.into_iter().collect()
+    }
+}
+
+fn drop_frame(candidates: &mut Vec<WalFrameCandidate>, frame_no: u32) {
+    candidates.retain(|candidate| candidate.frame_no != frame_no);
+}
+
+fn split_fault_offsets(offsets: &[u32], drop_count: usize) -> (Vec<u32>, Vec<u32>) {
+    let split = drop_count.min(offsets.len());
+    (offsets[..split].to_vec(), offsets[split..].to_vec())
+}
+
+fn build_faulted_candidates(
+    fixture: &GroupFixture,
+    drop_offsets: &[u32],
+    corrupt_offsets: &[u32],
+) -> (Vec<WalFrameCandidate>, u32) {
+    let mut candidates = frame_candidates(fixture);
+    let mut mismatch_frame = fixture.meta.end_frame_no.saturating_add(1);
+
+    for offset in drop_offsets {
+        let frame_no = fixture.meta.start_frame_no.saturating_add(*offset);
+        mismatch_frame = mismatch_frame.min(frame_no);
+        drop_frame(&mut candidates, frame_no);
+    }
+    for offset in corrupt_offsets {
+        let frame_no = fixture.meta.start_frame_no.saturating_add(*offset);
+        mismatch_frame = mismatch_frame.min(frame_no);
+        if candidates
+            .iter()
+            .any(|candidate| candidate.frame_no == frame_no)
+        {
+            corrupt_frame(&mut candidates, frame_no);
+        }
+    }
+
+    (candidates, mismatch_frame)
+}
+
+fn seeded_fault_scenario(
+    rng: &mut DeterministicFaultRng,
+    fixture: &GroupFixture,
+    total_faults: usize,
+    require_drop: bool,
+) -> (Vec<WalFrameCandidate>, u32) {
+    let raw_drop_count =
+        usize::try_from(rng.next_u32()).expect("u32 fits usize") % (total_faults + 1);
+    let drop_count = if require_drop {
+        raw_drop_count.clamp(1, total_faults)
+    } else {
+        raw_drop_count
+    };
+    let offsets = rng.unique_offsets(fixture.meta.k_source, total_faults);
+    let (drop_offsets, corrupt_offsets) = split_fault_offsets(&offsets, drop_count);
+    build_faulted_candidates(fixture, &drop_offsets, &corrupt_offsets)
+}
+
+fn recover_with_expected_pages(
+    sidecar_path: &Path,
+    fixture: &GroupFixture,
+    salts: WalSalts,
+    mismatch_frame: u32,
+    candidates: &[WalFrameCandidate],
+) -> WalFecRecoveryOutcome {
+    recover_wal_fec_group_with_decoder(
+        sidecar_path,
+        fixture.meta.group_id(),
+        salts,
+        mismatch_frame,
+        candidates,
+        decoder_from_expected(fixture.source_pages.clone()),
+    )
+    .expect("recovery should run")
 }
 
 fn mutate_sidecar_meta_payload(sidecar_path: &Path, payload_offset: usize) {
@@ -426,6 +533,7 @@ fn test_recovery_source_hash_and_repair_symbol_filtering() {
     };
     assert_eq!(recovered.decode_proof.validated_repair_symbols, 1);
     assert_eq!(recovered.decode_proof.validated_source_symbols, 4);
+    assert_eq!(recovered.decode_proof.corruption_observations, 1);
 }
 
 #[test]
@@ -515,4 +623,425 @@ fn test_e2e_bd_1hi_11_compliance() {
     assert!(recovered.decode_proof.decode_attempted);
     assert!(recovered.decode_proof.decode_succeeded);
     assert_eq!(recovered.decode_proof.fallback_reason, None);
+}
+
+#[test]
+fn test_bd_1ohz_deterministic_e2e_self_healing_with_restart_consistency() {
+    assert_eq!(BEAD_1OHZ_ID, "bd-1ohz");
+
+    let temp_dir = tempdir().expect("tempdir should be created");
+    let sidecar_path = temp_dir.path().join("bd_1ohz_e2e.wal-fec");
+    let salts = WalSalts {
+        salt1: 0x1234_5678,
+        salt2: 0x90AB_CDEF,
+    };
+
+    let mut fixtures = Vec::new();
+    for group_index in 0_u32..12 {
+        let fixture = build_fixture(
+            (group_index * 6) + 1,
+            6,
+            2,
+            salts,
+            format!("bd-1ohz-{group_index}").as_bytes(),
+            u8::try_from(17 + group_index).expect("small index fits u8"),
+            50_000 + group_index,
+        );
+        append_fixture(&sidecar_path, &fixture);
+        fixtures.push(fixture);
+    }
+
+    let mut rng = DeterministicFaultRng::new(0x1A2B_3C4D_5E6F_7788_u64);
+    let target_index = usize::try_from(rng.next_u32() % 12).expect("index fits usize");
+    let target = fixtures
+        .get(target_index)
+        .cloned()
+        .expect("target fixture must exist");
+
+    let repair_budget = usize::try_from(target.meta.r_repair).expect("repair budget fits usize");
+    let within_total_faults = repair_budget;
+    let (within_candidates, within_mismatch_frame) =
+        seeded_fault_scenario(&mut rng, &target, within_total_faults, false);
+    let within_outcome = recover_with_expected_pages(
+        &sidecar_path,
+        &target,
+        salts,
+        within_mismatch_frame,
+        &within_candidates,
+    );
+    let WalFecRecoveryOutcome::Recovered(within_recovered) = within_outcome else {
+        panic!("bead_id={BEAD_1OHZ_ID} case=within_budget_expected_recovery");
+    };
+    assert_eq!(within_recovered.recovered_pages, target.source_pages);
+    assert!(within_recovered.decode_proof.decode_attempted);
+    assert!(within_recovered.decode_proof.decode_succeeded);
+    assert_eq!(within_recovered.decode_proof.fallback_reason, None);
+
+    let beyond_total_faults = repair_budget.saturating_add(1);
+    let (beyond_candidates, beyond_mismatch_frame) =
+        seeded_fault_scenario(&mut rng, &target, beyond_total_faults, true);
+    let beyond_outcome = recover_with_expected_pages(
+        &sidecar_path,
+        &target,
+        salts,
+        beyond_mismatch_frame,
+        &beyond_candidates,
+    );
+    let WalFecRecoveryOutcome::TruncateBeforeGroup {
+        truncate_before_frame_no,
+        decode_proof,
+    } = &beyond_outcome
+    else {
+        panic!("bead_id={BEAD_1OHZ_ID} case=beyond_budget_expected_truncate");
+    };
+    assert_eq!(*truncate_before_frame_no, target.meta.start_frame_no);
+    assert_eq!(
+        decode_proof.fallback_reason,
+        Some(WalFecRecoveryFallbackReason::InsufficientSymbols)
+    );
+    assert!(
+        decode_proof.available_symbols < decode_proof.required_symbols,
+        "bead_id={BEAD_1OHZ_ID} case=beyond_budget_expected_insufficient_symbols decode_proof={decode_proof:?}"
+    );
+
+    let scan = scan_wal_fec(&sidecar_path).expect("restart scan should parse sidecar");
+    assert_eq!(
+        identify_damaged_commit_group(&scan.groups, salts, beyond_mismatch_frame),
+        Some(target.meta.group_id()),
+        "bead_id={BEAD_1OHZ_ID} case=restart_group_identification_mismatch"
+    );
+
+    let replay_outcome = recover_wal_fec_group_with_decoder(
+        &sidecar_path,
+        target.meta.group_id(),
+        salts,
+        beyond_mismatch_frame,
+        &beyond_candidates,
+        decoder_from_expected(target.source_pages),
+    )
+    .expect("restart replay should run");
+    assert_eq!(
+        replay_outcome, beyond_outcome,
+        "bead_id={BEAD_1OHZ_ID} case=restart_replay_outcome_mismatch"
+    );
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn test_raptorq_symbol_loss_within_R() {
+    let temp_dir = tempdir().expect("tempdir should be created");
+    let sidecar_path = temp_dir.path().join("loss_within_r.wal-fec");
+    let salts = WalSalts {
+        salt1: 0xAAAA_0101,
+        salt2: 0xBBBB_0202,
+    };
+    let fixture = build_fixture(1, 6, 2, salts, b"bd-9nbw-loss-within-r", 23, 1_111);
+    append_fixture(&sidecar_path, &fixture);
+
+    let mut candidates = frame_candidates(&fixture);
+    let first_corrupt = fixture.meta.start_frame_no + 1;
+    let second_corrupt = fixture.meta.start_frame_no + 4;
+    corrupt_frame(&mut candidates, first_corrupt);
+    corrupt_frame(&mut candidates, second_corrupt);
+
+    let outcome = recover_wal_fec_group_with_decoder(
+        &sidecar_path,
+        fixture.meta.group_id(),
+        salts,
+        first_corrupt,
+        &candidates,
+        decoder_from_expected(fixture.source_pages.clone()),
+    )
+    .expect("recovery should run");
+
+    let WalFecRecoveryOutcome::Recovered(recovered) = outcome else {
+        panic!("bead_id={BEAD_9NBW_ID} expected successful recovery when losses <= R");
+    };
+    assert!(recovered.decode_proof.decode_attempted);
+    assert!(recovered.decode_proof.decode_succeeded);
+    assert_eq!(recovered.decode_proof.fallback_reason, None);
+    assert_eq!(recovered.recovered_pages, fixture.source_pages);
+    assert!(
+        recovered
+            .decode_proof
+            .recovered_frame_nos
+            .contains(&first_corrupt),
+        "bead_id={BEAD_9NBW_ID} case=within_r_first_corrupt_missing"
+    );
+    assert!(
+        recovered
+            .decode_proof
+            .recovered_frame_nos
+            .contains(&second_corrupt),
+        "bead_id={BEAD_9NBW_ID} case=within_r_second_corrupt_missing"
+    );
+    eprintln!(
+        "WARN bead_id={BEAD_9NBW_ID} case=loss_boundary_within_r recovered_frames={:?}",
+        recovered.decode_proof.recovered_frame_nos
+    );
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn test_raptorq_symbol_loss_beyond_R() {
+    let temp_dir = tempdir().expect("tempdir should be created");
+    let sidecar_path = temp_dir.path().join("loss_beyond_r.wal-fec");
+    let salts = WalSalts {
+        salt1: 0xCCCC_0303,
+        salt2: 0xDDDD_0404,
+    };
+    let fixture = build_fixture(1, 6, 2, salts, b"bd-9nbw-loss-beyond-r", 31, 2_222);
+    append_fixture(&sidecar_path, &fixture);
+
+    let mut candidates = frame_candidates(&fixture);
+    let first_corrupt = fixture.meta.start_frame_no;
+    corrupt_frame(&mut candidates, first_corrupt);
+    corrupt_frame(&mut candidates, fixture.meta.start_frame_no + 2);
+    corrupt_frame(&mut candidates, fixture.meta.start_frame_no + 5);
+
+    let outcome = recover_wal_fec_group_with_decoder(
+        &sidecar_path,
+        fixture.meta.group_id(),
+        salts,
+        first_corrupt,
+        &candidates,
+        decoder_from_expected(fixture.source_pages),
+    )
+    .expect("recovery should return fallback outcome");
+
+    let WalFecRecoveryOutcome::TruncateBeforeGroup {
+        truncate_before_frame_no,
+        decode_proof,
+    } = outcome
+    else {
+        panic!("bead_id={BEAD_9NBW_ID} expected truncate fallback when losses > R");
+    };
+    assert_eq!(truncate_before_frame_no, fixture.meta.start_frame_no);
+    assert_eq!(
+        decode_proof.fallback_reason,
+        Some(WalFecRecoveryFallbackReason::InsufficientSymbols)
+    );
+    assert!(
+        decode_proof.available_symbols < decode_proof.required_symbols,
+        "bead_id={BEAD_9NBW_ID} case=beyond_r_expected_insufficient_symbols decode_proof={decode_proof:?}"
+    );
+}
+
+#[test]
+fn test_raptorq_bitflip_detected() {
+    let temp_dir = tempdir().expect("tempdir should be created");
+    let sidecar_path = temp_dir.path().join("bitflip_detected.wal-fec");
+    let salts = WalSalts {
+        salt1: 0xABCD_1111,
+        salt2: 0xEF01_2222,
+    };
+    let fixture = build_fixture(1, 5, 2, salts, b"bd-9nbw-bitflip-detected", 41, 3_333);
+    append_fixture(&sidecar_path, &fixture);
+
+    let mut candidates = frame_candidates(&fixture);
+    let corrupted_frame = fixture.meta.start_frame_no + 2;
+    corrupt_frame(&mut candidates, corrupted_frame);
+
+    let outcome = recover_wal_fec_group_with_decoder(
+        &sidecar_path,
+        fixture.meta.group_id(),
+        salts,
+        corrupted_frame,
+        &candidates,
+        decoder_from_expected(fixture.source_pages),
+    )
+    .expect("recovery should run");
+
+    let WalFecRecoveryOutcome::Recovered(recovered) = outcome else {
+        panic!("bead_id={BEAD_9NBW_ID} expected recovery for single bitflip");
+    };
+    assert!(recovered.decode_proof.decode_attempted);
+    assert_eq!(
+        recovered.decode_proof.validated_source_symbols,
+        fixture.meta.k_source - 1,
+        "bead_id={BEAD_9NBW_ID} case=bitflip_must_reduce_validated_sources"
+    );
+    assert!(
+        recovered
+            .decode_proof
+            .recovered_frame_nos
+            .contains(&corrupted_frame),
+        "bead_id={BEAD_9NBW_ID} case=bitflip_frame_not_recorded"
+    );
+}
+
+#[test]
+fn test_raptorq_bitflip_repair() {
+    let temp_dir = tempdir().expect("tempdir should be created");
+    let sidecar_path = temp_dir.path().join("bitflip_repair.wal-fec");
+    let salts = WalSalts {
+        salt1: 0xABCD_3333,
+        salt2: 0xEF01_4444,
+    };
+    let fixture = build_fixture(1, 5, 2, salts, b"bd-9nbw-bitflip-repair", 47, 4_444);
+    append_fixture(&sidecar_path, &fixture);
+
+    let mut candidates = frame_candidates(&fixture);
+    let corrupted_frame = fixture.meta.start_frame_no + 1;
+    corrupt_frame(&mut candidates, corrupted_frame);
+
+    let outcome = recover_wal_fec_group_with_decoder(
+        &sidecar_path,
+        fixture.meta.group_id(),
+        salts,
+        corrupted_frame,
+        &candidates,
+        decoder_from_expected(fixture.source_pages.clone()),
+    )
+    .expect("recovery should run");
+
+    let WalFecRecoveryOutcome::Recovered(recovered) = outcome else {
+        panic!("bead_id={BEAD_9NBW_ID} expected successful repair");
+    };
+    assert_eq!(
+        recovered.recovered_pages, fixture.source_pages,
+        "bead_id={BEAD_9NBW_ID} case=bitflip_repair_pages_mismatch"
+    );
+    assert!(recovered.decode_proof.decode_succeeded);
+    assert_eq!(recovered.decode_proof.fallback_reason, None);
+}
+
+#[test]
+fn test_raptorq_decode_proof() {
+    let temp_dir = tempdir().expect("tempdir should be created");
+    let sidecar_path = temp_dir.path().join("decode_proof.wal-fec");
+    let salts = WalSalts {
+        salt1: 0xFACE_5555,
+        salt2: 0xC0DE_6666,
+    };
+    let fixture = build_fixture(1, 5, 2, salts, b"bd-9nbw-decode-proof", 53, 5_555);
+    append_fixture(&sidecar_path, &fixture);
+
+    let mut candidates = frame_candidates(&fixture);
+    corrupt_frame(&mut candidates, fixture.meta.start_frame_no);
+    corrupt_frame(&mut candidates, fixture.meta.start_frame_no + 2);
+    corrupt_frame(&mut candidates, fixture.meta.start_frame_no + 4);
+
+    let outcome = recover_wal_fec_group_with_decoder(
+        &sidecar_path,
+        fixture.meta.group_id(),
+        salts,
+        fixture.meta.start_frame_no,
+        &candidates,
+        decoder_from_expected(fixture.source_pages),
+    )
+    .expect("recovery should return decode proof");
+
+    let WalFecRecoveryOutcome::TruncateBeforeGroup { decode_proof, .. } = outcome else {
+        panic!("bead_id={BEAD_9NBW_ID} expected decode proof fallback");
+    };
+    assert_eq!(decode_proof.group_id, fixture.meta.group_id());
+    assert_eq!(decode_proof.required_symbols, fixture.meta.k_source);
+    assert!(
+        decode_proof.available_symbols < decode_proof.required_symbols,
+        "bead_id={BEAD_9NBW_ID} case=decode_proof_availability_invalid decode_proof={decode_proof:?}"
+    );
+    assert_eq!(
+        decode_proof.fallback_reason,
+        Some(WalFecRecoveryFallbackReason::InsufficientSymbols)
+    );
+}
+
+#[test]
+fn test_e2e_raptorq_harness() {
+    let temp_dir = tempdir().expect("tempdir should be created");
+    let sidecar_path = temp_dir.path().join("bd_9nbw_e2e.wal-fec");
+    let salts = WalSalts {
+        salt1: 0x9090_A0A0,
+        salt2: 0xB0B0_C0C0,
+    };
+    let fixture = build_fixture(1, 8, 2, salts, b"bd-9nbw-e2e", 61, 6_666);
+    append_fixture(&sidecar_path, &fixture);
+
+    let scenarios: [(&str, &[u32], bool); 4] = [
+        ("intact", &[], true),
+        ("single_loss", &[1], true),
+        ("boundary_loss", &[0, 5], true),
+        ("beyond_budget_loss", &[0, 3, 6], false),
+    ];
+
+    let mut recovered_scenarios = 0_u32;
+    let mut truncated_scenarios = 0_u32;
+    let mut fast_path_elapsed = Duration::ZERO;
+    let mut decode_path_elapsed = Duration::ZERO;
+
+    for (label, offsets, should_recover) in scenarios {
+        let mut candidates = frame_candidates(&fixture);
+        for offset in offsets {
+            let frame_no = fixture.meta.start_frame_no + *offset;
+            corrupt_frame(&mut candidates, frame_no);
+        }
+        let mismatch_frame_no = offsets
+            .first()
+            .map_or(fixture.meta.end_frame_no + 1, |offset| {
+                fixture.meta.start_frame_no + *offset
+            });
+
+        let started = Instant::now();
+        let outcome = recover_wal_fec_group_with_decoder(
+            &sidecar_path,
+            fixture.meta.group_id(),
+            salts,
+            mismatch_frame_no,
+            &candidates,
+            decoder_from_expected(fixture.source_pages.clone()),
+        )
+        .expect("scenario recovery should run");
+        let elapsed = started.elapsed();
+
+        match (outcome, should_recover) {
+            (WalFecRecoveryOutcome::Recovered(recovered), true) => {
+                recovered_scenarios = recovered_scenarios.saturating_add(1);
+                if offsets.is_empty() {
+                    fast_path_elapsed = fast_path_elapsed.saturating_add(elapsed);
+                } else {
+                    decode_path_elapsed = decode_path_elapsed.saturating_add(elapsed);
+                }
+                assert_eq!(recovered.recovered_pages, fixture.source_pages);
+                eprintln!(
+                    "DEBUG bead_id={BEAD_9NBW_ID} case=scenario_recovered label={label} elapsed_ms={}",
+                    elapsed.as_millis()
+                );
+            }
+            (WalFecRecoveryOutcome::TruncateBeforeGroup { decode_proof, .. }, false) => {
+                truncated_scenarios = truncated_scenarios.saturating_add(1);
+                assert_eq!(
+                    decode_proof.fallback_reason,
+                    Some(WalFecRecoveryFallbackReason::InsufficientSymbols)
+                );
+                eprintln!(
+                    "ERROR bead_id={BEAD_9NBW_ID} case=scenario_truncated label={label} decode_proof={decode_proof:?}"
+                );
+            }
+            (unexpected, expected_recover) => {
+                panic!(
+                    "bead_id={BEAD_9NBW_ID} case=scenario_outcome_mismatch label={label} expected_recover={expected_recover} outcome={unexpected:?}"
+                );
+            }
+        }
+    }
+
+    assert_eq!(recovered_scenarios, 3);
+    assert_eq!(truncated_scenarios, 1);
+    assert!(fast_path_elapsed > Duration::ZERO);
+    assert!(decode_path_elapsed > Duration::ZERO);
+
+    let decode_budget = Duration::from_millis(500);
+    assert!(
+        decode_path_elapsed < decode_budget,
+        "bead_id={BEAD_9NBW_ID} case=decode_path_exceeded_budget decode_ms={} budget_ms={}",
+        decode_path_elapsed.as_millis(),
+        decode_budget.as_millis()
+    );
+
+    eprintln!(
+        "INFO bead_id={BEAD_9NBW_ID} case=e2e_summary recovered_scenarios={recovered_scenarios} truncated_scenarios={truncated_scenarios} fast_path_ms={} decode_path_ms={}",
+        fast_path_elapsed.as_millis(),
+        decode_path_elapsed.as_millis()
+    );
 }
