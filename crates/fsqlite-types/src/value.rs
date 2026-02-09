@@ -281,6 +281,17 @@ impl SqliteValue {
         matches!(self.partial_cmp(other), Some(Ordering::Equal))
     }
 
+    /// Convert a floating-point arithmetic result into a SQLite value.
+    ///
+    /// SQLite does not surface NaN; NaN is normalized to NULL while ±Inf remain REAL.
+    fn float_result_or_null(result: f64) -> Self {
+        if result.is_nan() {
+            Self::Null
+        } else {
+            Self::Float(result)
+        }
+    }
+
     /// Add two values following SQLite's overflow semantics.
     ///
     /// - Integer + Integer: checked add; overflows promote to REAL.
@@ -294,9 +305,9 @@ impl SqliteValue {
             (Self::Null, _) | (_, Self::Null) => Self::Null,
             (Self::Integer(a), Self::Integer(b)) => match a.checked_add(*b) {
                 Some(result) => Self::Integer(result),
-                None => Self::Float(*a as f64 + *b as f64),
+                None => Self::float_result_or_null(*a as f64 + *b as f64),
             },
-            _ => Self::Float(self.to_float() + other.to_float()),
+            _ => Self::float_result_or_null(self.to_float() + other.to_float()),
         }
     }
 
@@ -310,9 +321,9 @@ impl SqliteValue {
             (Self::Null, _) | (_, Self::Null) => Self::Null,
             (Self::Integer(a), Self::Integer(b)) => match a.checked_sub(*b) {
                 Some(result) => Self::Integer(result),
-                None => Self::Float(*a as f64 - *b as f64),
+                None => Self::float_result_or_null(*a as f64 - *b as f64),
             },
-            _ => Self::Float(self.to_float() - other.to_float()),
+            _ => Self::float_result_or_null(self.to_float() - other.to_float()),
         }
     }
 
@@ -326,9 +337,9 @@ impl SqliteValue {
             (Self::Null, _) | (_, Self::Null) => Self::Null,
             (Self::Integer(a), Self::Integer(b)) => match a.checked_mul(*b) {
                 Some(result) => Self::Integer(result),
-                None => Self::Float(*a as f64 * *b as f64),
+                None => Self::float_result_or_null(*a as f64 * *b as f64),
             },
-            _ => Self::Float(self.to_float() * other.to_float()),
+            _ => Self::float_result_or_null(self.to_float() * other.to_float()),
         }
     }
 
@@ -608,7 +619,7 @@ impl From<i32> for SqliteValue {
 
 impl From<f64> for SqliteValue {
     fn from(f: f64) -> Self {
-        Self::Float(f)
+        Self::float_result_or_null(f)
     }
 }
 
@@ -1198,6 +1209,47 @@ mod tests {
         assert!(i.sql_add(&n).is_null());
         assert!(n.sql_sub(&i).is_null());
         assert!(n.sql_mul(&i).is_null());
+    }
+
+    #[test]
+    fn test_sql_inf_arithmetic_nan_normalized_to_null() {
+        // +Inf + (-Inf) is NaN in IEEE-754 and must be normalized to NULL.
+        let pos_inf = SqliteValue::Float(f64::INFINITY);
+        let neg_inf = SqliteValue::Float(f64::NEG_INFINITY);
+        assert!(pos_inf.sql_add(&neg_inf).is_null());
+
+        // +Inf - +Inf is also NaN and must normalize to NULL.
+        assert!(pos_inf.sql_sub(&pos_inf).is_null());
+    }
+
+    #[test]
+    fn test_sql_mul_zero_times_inf_normalized_to_null() {
+        // 0 * +Inf is NaN in IEEE-754 and must be normalized to NULL.
+        let zero = SqliteValue::Float(0.0);
+        let pos_inf = SqliteValue::Float(f64::INFINITY);
+        assert!(zero.sql_mul(&pos_inf).is_null());
+    }
+
+    #[test]
+    fn test_sql_inf_propagates_when_not_nan() {
+        let pos_inf = SqliteValue::Float(f64::INFINITY);
+        let one = SqliteValue::Integer(1);
+        match pos_inf.sql_add(&one) {
+            SqliteValue::Float(v) => assert!(v.is_infinite() && v.is_sign_positive()),
+            other => panic!("expected +Inf propagation, got {other:?}"),
+        }
+
+        let neg_inf = SqliteValue::Float(f64::NEG_INFINITY);
+        match neg_inf.sql_sub(&one) {
+            SqliteValue::Float(v) => assert!(v.is_infinite() && v.is_sign_negative()),
+            other => panic!("expected -Inf propagation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_from_f64_nan_normalizes_to_null() {
+        let value = SqliteValue::from(f64::NAN);
+        assert!(value.is_null());
     }
 
     // ── bd-13r.7: Empty String vs NULL Semantics ──
