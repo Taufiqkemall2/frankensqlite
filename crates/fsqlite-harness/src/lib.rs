@@ -9,7 +9,9 @@ pub mod eprocess;
 pub mod fslab;
 pub mod log;
 pub mod oracle;
+pub mod perf_loop;
 pub mod scheduler;
+pub mod spec_to_beads_audit;
 pub mod supervision;
 pub mod tla;
 
