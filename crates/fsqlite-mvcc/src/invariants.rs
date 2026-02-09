@@ -1355,5 +1355,147 @@ mod tests {
             deduped.dedup();
             prop_assert_eq!(ids.len(), deduped.len(), "all TxnIds must be unique");
         }
+
+        // INV-PBT-4 (bd-2sm1): Snapshot isolation under multi-writer workload.
+        //
+        // Generate N writers that each commit to random pages at sequential
+        // commit_seqs. Then take snapshots at various high values and verify:
+        //   1. Every resolved version has commit_seq <= snapshot.high
+        //   2. The resolved version is the *maximum* commit_seq <= high for that page
+        //   3. Resolving the same page twice yields the same result (determinism)
+        #[test]
+        fn prop_snapshot_isolation_multi_writer(
+            num_writers in 2_usize..8,
+            ops_per_writer in 1_usize..20,
+            num_pages in 1_u32..16,
+            snapshot_highs in proptest::collection::vec(0_u64..100, 1..10),
+        ) {
+            let store = VersionStore::new(PageSize::DEFAULT);
+            let mgr = TxnManager::default();
+
+            // Track the latest commit_seq per page for oracle verification.
+            let mut page_history: std::collections::BTreeMap<u32, Vec<u64>> =
+                std::collections::BTreeMap::new();
+
+            // Each writer commits ops_per_writer pages.
+            for _ in 0..num_writers {
+                let txn_id = mgr.alloc_txn_id().unwrap();
+                let seq = mgr.alloc_commit_seq();
+
+                for _ in 0..ops_per_writer {
+                    #[allow(clippy::cast_possible_truncation)] // modulo num_pages (< 16) always fits u32
+                    let pgno_raw =
+                        ((seq.get() * 7 + txn_id.get() * 3) % u64::from(num_pages)) as u32 + 1;
+                    let pgno = PageNumber::new(pgno_raw).unwrap();
+
+                    // Look up previous head to chain versions properly.
+                    let prev = store.chain_head(pgno).map(idx_to_version_pointer);
+                    let version = PageVersion {
+                        pgno,
+                        commit_seq: seq,
+                        created_by: TxnToken::new(txn_id, TxnEpoch::new(0)),
+                        data: PageData::zeroed(PageSize::DEFAULT),
+                        prev,
+                    };
+                    store.publish(version);
+                    page_history.entry(pgno_raw).or_default().push(seq.get());
+                }
+            }
+
+            // Sort each page's history so we can binary-search for the oracle answer.
+            for seqs in page_history.values_mut() {
+                seqs.sort_unstable();
+            }
+
+            // Verify snapshot isolation for each generated snapshot high value.
+            for &high in &snapshot_highs {
+                let snap = make_snapshot(high);
+
+                for (&pgno_raw, seqs) in &page_history {
+                    let pgno = PageNumber::new(pgno_raw).unwrap();
+
+                    // Oracle: the expected visible version is the max seq <= high.
+                    let expected_seq = seqs.iter().copied().filter(|&s| s <= high).max();
+
+                    let resolved = store.resolve(pgno, &snap);
+                    match (expected_seq, resolved) {
+                        (None, None) => {} // correctly invisible
+                        (Some(exp), Some(idx)) => {
+                            let v = store.get_version(idx).unwrap();
+                            // INV-PBT-4a: commit_seq <= snapshot.high
+                            prop_assert!(
+                                v.commit_seq.get() <= high,
+                                "page {} resolved commit_seq {} > snapshot high {}",
+                                pgno_raw, v.commit_seq.get(), high
+                            );
+                            // INV-PBT-4b: resolved version is the max visible
+                            prop_assert_eq!(
+                                v.commit_seq.get(), exp,
+                                "page {} expected seq {} but got {}",
+                                pgno_raw, exp, v.commit_seq.get()
+                            );
+                        }
+                        (Some(exp), None) => {
+                            prop_assert!(
+                                false,
+                                "page {} expected visible at seq {} but resolve returned None",
+                                pgno_raw, exp
+                            );
+                        }
+                        (None, Some(idx)) => {
+                            let v = store.get_version(idx).unwrap();
+                            prop_assert!(
+                                false,
+                                "page {} expected invisible but resolved to seq {}",
+                                pgno_raw, v.commit_seq.get()
+                            );
+                        }
+                    }
+
+                    // INV-PBT-4c: Determinism — resolving again yields same result.
+                    let resolved2 = store.resolve(pgno, &snap);
+                    prop_assert_eq!(
+                        resolved, resolved2,
+                        "resolve must be deterministic for page {} at high {}",
+                        pgno_raw, high
+                    );
+                }
+            }
+        }
+
+        // bd-2sm1: Version chain walk must yield strictly descending commit_seq.
+        #[test]
+        fn prop_version_chain_strictly_descending(
+            chain_len in 2_usize..30,
+        ) {
+            let store = VersionStore::new(PageSize::DEFAULT);
+            let pgno = PageNumber::new(99).unwrap();
+            let mut prev: Option<VersionPointer> = None;
+
+            for seq in 1..=chain_len as u64 {
+                let version = PageVersion {
+                    pgno,
+                    commit_seq: CommitSeq::new(seq),
+                    created_by: TxnToken::new(TxnId::new(seq).unwrap(), TxnEpoch::new(0)),
+                    data: PageData::zeroed(PageSize::DEFAULT),
+                    prev,
+                };
+                let idx = store.publish(version);
+                prev = Some(idx_to_version_pointer(idx));
+            }
+
+            let chain = store.walk_chain(pgno);
+            prop_assert!(chain.len() >= 2, "chain too short: {}", chain.len());
+
+            // Chain must be strictly descending (newest first).
+            for window in chain.windows(2) {
+                prop_assert!(
+                    window[0].commit_seq > window[1].commit_seq,
+                    "version chain not strictly descending: {} >= {}",
+                    window[0].commit_seq.get(),
+                    window[1].commit_seq.get()
+                );
+            }
+        }
     }
 }
