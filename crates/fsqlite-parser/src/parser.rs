@@ -706,16 +706,27 @@ impl Parser {
         if !self.eat_kw(&TokenKind::KwLimit) {
             return Ok(None);
         }
-        let limit = self.parse_expr()?;
-        let offset = if self.eat_kw(&TokenKind::KwOffset) {
-            Some(self.parse_expr()?)
-        } else if self.eat(&TokenKind::Comma) {
-            // LIMIT count, offset — SQLite compat (offset is second arg).
-            Some(self.parse_expr()?)
-        } else {
-            None
-        };
-        Ok(Some(LimitClause { limit, offset }))
+        let first = self.parse_expr()?;
+        if self.eat_kw(&TokenKind::KwOffset) {
+            return Ok(Some(LimitClause {
+                limit: first,
+                offset: Some(self.parse_expr()?),
+            }));
+        }
+
+        if self.eat(&TokenKind::Comma) {
+            // LIMIT offset, count — SQLite/MySQL compatibility form.
+            let second = self.parse_expr()?;
+            return Ok(Some(LimitClause {
+                limit: second,
+                offset: Some(first),
+            }));
+        }
+
+        Ok(Some(LimitClause {
+            limit: first,
+            offset: None,
+        }))
     }
 
     // -----------------------------------------------------------------------
@@ -1968,6 +1979,102 @@ mod tests {
     }
 
     #[test]
+    fn select_limit_comma_syntax_uses_offset_then_count() {
+        let stmt = parse_one("SELECT a FROM t LIMIT 5, 10");
+        if let Statement::Select(s) = stmt {
+            let limit = s.limit.expect("LIMIT clause");
+            assert!(matches!(
+                limit.limit,
+                Expr::Literal(Literal::Integer(10), _)
+            ));
+            assert!(matches!(
+                limit.offset,
+                Some(Expr::Literal(Literal::Integer(5), _))
+            ));
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn select_order_by_nulls_first_last() {
+        let stmt = parse_one("SELECT a FROM t ORDER BY a ASC NULLS FIRST, b DESC NULLS LAST");
+        if let Statement::Select(s) = stmt {
+            assert_eq!(s.order_by.len(), 2);
+            assert_eq!(s.order_by[0].direction, Some(SortDirection::Asc));
+            assert_eq!(s.order_by[0].nulls, Some(NullsOrder::First));
+            assert_eq!(s.order_by[1].direction, Some(SortDirection::Desc));
+            assert_eq!(s.order_by[1].nulls, Some(NullsOrder::Last));
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn select_from_indexed_by_hint() {
+        let stmt = parse_one("SELECT * FROM t INDEXED BY idx_t");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { from, .. } = &s.body.select {
+                let from = from.as_ref().expect("FROM clause");
+                match &from.source {
+                    TableOrSubquery::Table {
+                        index_hint: Some(IndexHint::IndexedBy(name)),
+                        ..
+                    } => assert_eq!(name, "idx_t"),
+                    other => unreachable!("expected indexed table source, got {other:?}"),
+                }
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn select_from_not_indexed_hint() {
+        let stmt = parse_one("SELECT * FROM t NOT INDEXED");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { from, .. } = &s.body.select {
+                let from = from.as_ref().expect("FROM clause");
+                match &from.source {
+                    TableOrSubquery::Table {
+                        index_hint: Some(IndexHint::NotIndexed),
+                        ..
+                    } => {}
+                    other => unreachable!("expected not-indexed table source, got {other:?}"),
+                }
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn select_from_table_valued_function() {
+        let stmt = parse_one("SELECT * FROM generate_series(1, 100) AS gs");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { from, .. } = &s.body.select {
+                let from = from.as_ref().expect("FROM clause");
+                match &from.source {
+                    TableOrSubquery::TableFunction { name, args, alias } => {
+                        assert_eq!(name, "generate_series");
+                        assert_eq!(args.len(), 2);
+                        assert_eq!(alias.as_deref(), Some("gs"));
+                    }
+                    other => unreachable!("expected table-valued function source, got {other:?}"),
+                }
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
     fn select_window_function_over_clause() {
         let stmt = parse_one(
             "SELECT sum(x) OVER (PARTITION BY y ORDER BY z \
@@ -2764,6 +2871,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_parser_keyword_lookup_all_150() {
         use crate::token::TokenKind;
 
@@ -2960,5 +3068,464 @@ mod tests {
         // Non-keyword should return None.
         assert!(TokenKind::lookup_keyword("FOOBAR").is_none());
         assert!(TokenKind::lookup_keyword("").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Round-trip: parse → Display → re-parse → compare ASTs
+    // -----------------------------------------------------------------------
+
+    /// Parse SQL, convert back to string via Display, re-parse, convert back
+    /// again, and assert the two rendered strings are identical.  We compare
+    /// rendered strings (not ASTs) because Display may normalise constructs
+    /// (e.g. `INSERT OR REPLACE` → `REPLACE`) which changes SQL length and
+    /// therefore Span positions, while the logical content is identical.
+    fn assert_roundtrip(sql: &str) {
+        let ast1 = parse_one(sql);
+        let rendered1 = ast1.to_string();
+        let ast2 = parse_one(&rendered1);
+        let rendered2 = ast2.to_string();
+        assert_eq!(
+            rendered1, rendered2,
+            "round-trip failed for:\n  input: {sql}\n  rendered1: {rendered1}\n  rendered2: {rendered2}"
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_select_simple() {
+        assert_roundtrip("SELECT 1");
+        assert_roundtrip("SELECT 1, 2, 3");
+        assert_roundtrip("SELECT *");
+        assert_roundtrip("SELECT * FROM t");
+        assert_roundtrip("SELECT a, b FROM t WHERE a > 10");
+        assert_roundtrip("SELECT a FROM t ORDER BY a DESC");
+        assert_roundtrip("SELECT a FROM t LIMIT 10 OFFSET 5");
+    }
+
+    #[test]
+    fn test_roundtrip_select_distinct() {
+        assert_roundtrip("SELECT DISTINCT a, b FROM t");
+    }
+
+    #[test]
+    fn test_roundtrip_select_alias() {
+        assert_roundtrip("SELECT a AS x, b AS y FROM t AS u");
+    }
+
+    #[test]
+    fn test_roundtrip_select_join_types() {
+        assert_roundtrip("SELECT * FROM a INNER JOIN b ON a.id = b.id");
+        assert_roundtrip("SELECT * FROM a LEFT JOIN b ON a.id = b.id");
+        assert_roundtrip("SELECT * FROM a RIGHT JOIN b ON a.id = b.id");
+        assert_roundtrip("SELECT * FROM a FULL JOIN b ON a.id = b.id");
+        assert_roundtrip("SELECT * FROM a CROSS JOIN b");
+        assert_roundtrip("SELECT * FROM a NATURAL INNER JOIN b");
+        assert_roundtrip("SELECT * FROM a LEFT JOIN b USING (id)");
+    }
+
+    #[test]
+    fn test_roundtrip_select_subquery() {
+        assert_roundtrip("SELECT * FROM (SELECT 1 AS x) AS sub");
+    }
+
+    #[test]
+    fn test_roundtrip_select_group_by_having() {
+        assert_roundtrip("SELECT a, count(*) FROM t GROUP BY a HAVING count(*) > 1");
+    }
+
+    #[test]
+    fn test_roundtrip_select_window() {
+        assert_roundtrip("SELECT sum(x) OVER (PARTITION BY g ORDER BY x) FROM t");
+    }
+
+    #[test]
+    fn test_roundtrip_select_cte() {
+        assert_roundtrip("WITH cte AS (SELECT 1 AS n) SELECT * FROM cte");
+        assert_roundtrip(
+            "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 10) SELECT * FROM cnt",
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_select_compound() {
+        assert_roundtrip("SELECT 1 UNION SELECT 2");
+        assert_roundtrip("SELECT 1 UNION ALL SELECT 2");
+        assert_roundtrip("SELECT 1 INTERSECT SELECT 2");
+        assert_roundtrip("SELECT 1 EXCEPT SELECT 2");
+    }
+
+    #[test]
+    fn test_roundtrip_insert() {
+        assert_roundtrip("INSERT INTO t (a, b) VALUES (1, 2)");
+        assert_roundtrip("INSERT INTO t DEFAULT VALUES");
+        assert_roundtrip("INSERT INTO t SELECT * FROM u");
+        assert_roundtrip("INSERT OR REPLACE INTO t (a) VALUES (1)");
+        assert_roundtrip("REPLACE INTO t (a) VALUES (1)");
+    }
+
+    #[test]
+    fn test_roundtrip_insert_returning() {
+        assert_roundtrip("INSERT INTO t (a) VALUES (1) RETURNING *");
+        assert_roundtrip("INSERT INTO t (a) VALUES (1) RETURNING a, b");
+    }
+
+    #[test]
+    fn test_roundtrip_insert_on_conflict() {
+        assert_roundtrip("INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO NOTHING");
+        assert_roundtrip(
+            "INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET a = excluded.a",
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_update() {
+        assert_roundtrip("UPDATE t SET a = 1");
+        assert_roundtrip("UPDATE t SET a = 1, b = 2 WHERE c > 3");
+        assert_roundtrip("UPDATE t SET a = 1 RETURNING *");
+    }
+
+    #[test]
+    fn test_roundtrip_delete() {
+        assert_roundtrip("DELETE FROM t");
+        assert_roundtrip("DELETE FROM t WHERE a = 1");
+        assert_roundtrip("DELETE FROM t RETURNING *");
+    }
+
+    #[test]
+    fn test_roundtrip_create_table() {
+        assert_roundtrip("CREATE TABLE t (a INTEGER, b TEXT)");
+        assert_roundtrip("CREATE TABLE IF NOT EXISTS t (a INTEGER PRIMARY KEY)");
+        assert_roundtrip("CREATE TEMP TABLE t (a TEXT NOT NULL, b REAL DEFAULT 0.0)");
+    }
+
+    #[test]
+    fn test_roundtrip_create_index() {
+        assert_roundtrip("CREATE INDEX idx ON t (a)");
+        assert_roundtrip("CREATE UNIQUE INDEX IF NOT EXISTS idx ON t (a, b DESC)");
+        assert_roundtrip("CREATE INDEX idx ON t (a) WHERE a > 0");
+    }
+
+    #[test]
+    fn test_roundtrip_drop() {
+        assert_roundtrip("DROP TABLE t");
+        assert_roundtrip("DROP TABLE IF EXISTS t");
+        assert_roundtrip("DROP INDEX idx");
+        assert_roundtrip("DROP VIEW v");
+    }
+
+    #[test]
+    fn test_roundtrip_alter_table() {
+        assert_roundtrip("ALTER TABLE t RENAME TO u");
+        assert_roundtrip("ALTER TABLE t ADD COLUMN c TEXT");
+        assert_roundtrip("ALTER TABLE t DROP COLUMN c");
+    }
+
+    #[test]
+    fn test_roundtrip_transaction() {
+        assert_roundtrip("BEGIN");
+        assert_roundtrip("BEGIN IMMEDIATE");
+        assert_roundtrip("BEGIN EXCLUSIVE");
+        assert_roundtrip("COMMIT");
+        assert_roundtrip("ROLLBACK");
+        assert_roundtrip("SAVEPOINT sp1");
+        assert_roundtrip("RELEASE sp1");
+    }
+
+    #[test]
+    fn test_roundtrip_pragma() {
+        assert_roundtrip("PRAGMA journal_mode");
+        assert_roundtrip("PRAGMA journal_mode = wal");
+    }
+
+    #[test]
+    fn test_roundtrip_explain() {
+        assert_roundtrip("EXPLAIN SELECT 1");
+        assert_roundtrip("EXPLAIN QUERY PLAN SELECT * FROM t");
+    }
+
+    #[test]
+    fn test_roundtrip_expressions() {
+        assert_roundtrip("SELECT 1 + 2 * 3");
+        assert_roundtrip("SELECT NOT a");
+        assert_roundtrip("SELECT -x");
+        assert_roundtrip("SELECT ~x");
+        assert_roundtrip("SELECT a BETWEEN 1 AND 10");
+        assert_roundtrip("SELECT a NOT BETWEEN 1 AND 10");
+        assert_roundtrip("SELECT a IN (1, 2, 3)");
+        assert_roundtrip("SELECT a NOT IN (1, 2, 3)");
+        assert_roundtrip("SELECT a LIKE '%foo%'");
+        assert_roundtrip("SELECT a GLOB '*foo*'");
+        assert_roundtrip("SELECT CASE WHEN a = 1 THEN 'one' ELSE 'other' END");
+        assert_roundtrip("SELECT CASE x WHEN 1 THEN 'a' WHEN 2 THEN 'b' END");
+        assert_roundtrip("SELECT CAST(a AS TEXT)");
+        assert_roundtrip("SELECT EXISTS (SELECT 1)");
+        assert_roundtrip("SELECT (SELECT 1)");
+        assert_roundtrip("SELECT a COLLATE NOCASE");
+    }
+
+    #[test]
+    fn test_roundtrip_literals() {
+        assert_roundtrip("SELECT NULL");
+        assert_roundtrip("SELECT TRUE");
+        assert_roundtrip("SELECT FALSE");
+        assert_roundtrip("SELECT 42");
+        assert_roundtrip("SELECT 3.14");
+        assert_roundtrip("SELECT 'hello'");
+        assert_roundtrip("SELECT X'DEADBEEF'");
+        assert_roundtrip("SELECT CURRENT_TIME");
+        assert_roundtrip("SELECT CURRENT_DATE");
+        assert_roundtrip("SELECT CURRENT_TIMESTAMP");
+    }
+
+    #[test]
+    fn test_roundtrip_placeholders() {
+        assert_roundtrip("SELECT ?");
+        assert_roundtrip("SELECT ?1");
+        assert_roundtrip("SELECT :name");
+        assert_roundtrip("SELECT @name");
+        assert_roundtrip("SELECT $name");
+    }
+
+    #[test]
+    fn test_roundtrip_json_arrows() {
+        assert_roundtrip("SELECT a -> 'key'");
+        assert_roundtrip("SELECT a ->> 'key'");
+    }
+
+    #[test]
+    fn test_roundtrip_function_calls() {
+        assert_roundtrip("SELECT count(*)");
+        assert_roundtrip("SELECT count(DISTINCT a)");
+        assert_roundtrip("SELECT sum(x) FILTER (WHERE x > 0)");
+    }
+
+    #[test]
+    fn test_roundtrip_isnull_notnull() {
+        assert_roundtrip("SELECT a ISNULL");
+        assert_roundtrip("SELECT a IS NOT NULL");
+    }
+
+    #[test]
+    fn test_roundtrip_create_view() {
+        assert_roundtrip("CREATE VIEW v AS SELECT * FROM t");
+        assert_roundtrip("CREATE VIEW IF NOT EXISTS v (a, b) AS SELECT 1, 2");
+    }
+
+    #[test]
+    fn test_roundtrip_create_trigger() {
+        assert_roundtrip(
+            "CREATE TRIGGER tr BEFORE DELETE ON t FOR EACH ROW BEGIN DELETE FROM log WHERE id = OLD.id; END",
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_attach_detach() {
+        assert_roundtrip("ATTACH 'file.db' AS db2");
+        assert_roundtrip("DETACH db2");
+    }
+
+    #[test]
+    fn test_roundtrip_vacuum() {
+        assert_roundtrip("VACUUM");
+    }
+
+    #[test]
+    fn test_roundtrip_analyze_reindex() {
+        assert_roundtrip("ANALYZE");
+        assert_roundtrip("ANALYZE t");
+        assert_roundtrip("REINDEX");
+        assert_roundtrip("REINDEX t");
+    }
+
+    #[test]
+    fn test_roundtrip_cte_materialized() {
+        assert_roundtrip("WITH cte AS MATERIALIZED (SELECT 1) SELECT * FROM cte");
+        assert_roundtrip("WITH cte AS NOT MATERIALIZED (SELECT 1) SELECT * FROM cte");
+    }
+
+    // -----------------------------------------------------------------------
+    // Proptest: round-trip property test (bd-2kvo acceptance criterion #12)
+    // -----------------------------------------------------------------------
+
+    mod proptest_roundtrip {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Returns `true` if the string is a SQL keyword.
+        fn is_keyword(s: &str) -> bool {
+            TokenKind::lookup_keyword(s).is_some()
+        }
+
+        /// Generate a random identifier (simple alphanumeric, not a SQL keyword).
+        fn arb_ident() -> BoxedStrategy<String> {
+            prop::string::string_regex("[a-z][a-z0-9]{0,5}")
+                .expect("valid regex")
+                .prop_filter("must not be keyword", |s| !is_keyword(s))
+                .boxed()
+        }
+
+        /// Generate a random literal value.
+        fn arb_literal() -> BoxedStrategy<String> {
+            prop_oneof![
+                any::<i32>().prop_map(|n| n.to_string()),
+                (1i32..1000).prop_map(|n| format!("{n}.{}", n % 100)),
+                arb_ident().prop_map(|s| format!("'{s}'")),
+                Just("NULL".to_string()),
+                Just("TRUE".to_string()),
+                Just("FALSE".to_string()),
+            ]
+            .boxed()
+        }
+
+        /// Generate a random expression of bounded depth.
+        fn arb_expr(depth: u32) -> BoxedStrategy<String> {
+            if depth == 0 {
+                prop_oneof![
+                    arb_literal(),
+                    arb_ident(),
+                    (arb_ident(), arb_ident()).prop_map(|(t, c)| format!("{t}.{c}")),
+                ]
+                .boxed()
+            } else {
+                let leaf = arb_expr(0);
+                prop_oneof![
+                    4 => leaf,
+                    // Binary ops (always parenthesized by display)
+                    2 => (arb_expr(depth - 1), prop_oneof![
+                        Just("+"), Just("-"), Just("*"), Just("/"),
+                        Just("="), Just("!="), Just("<"), Just("<="),
+                        Just(">"), Just(">="), Just("AND"), Just("OR"),
+                        Just("||"),
+                    ], arb_expr(depth - 1))
+                        .prop_map(|(l, op, r)| format!("({l} {op} {r})")),
+                    // Unary ops
+                    1 => arb_expr(depth - 1).prop_map(|e| format!("(-{e})")),
+                    1 => arb_expr(depth - 1).prop_map(|e| format!("(NOT {e})")),
+                    // IS NULL / IS NOT NULL
+                    1 => arb_expr(depth - 1).prop_map(|e| format!("{e} IS NULL")),
+                    1 => arb_expr(depth - 1).prop_map(|e| format!("{e} IS NOT NULL")),
+                    // BETWEEN
+                    1 => (arb_expr(depth - 1), arb_expr(0), arb_expr(0))
+                        .prop_map(|(e, lo, hi)| format!("{e} BETWEEN {lo} AND {hi}")),
+                    // IN list
+                    1 => (arb_expr(depth - 1), proptest::collection::vec(arb_expr(0), 1..4))
+                        .prop_map(|(e, items)| format!("{e} IN ({})", items.join(", "))),
+                    // LIKE
+                    1 => (arb_expr(depth - 1), arb_ident())
+                        .prop_map(|(e, p)| format!("{e} LIKE '{p}'")),
+                    // CAST
+                    1 => arb_expr(depth - 1).prop_map(|e| format!("CAST({e} AS TEXT)")),
+                    // CASE
+                    1 => (arb_expr(depth - 1), arb_expr(0), arb_expr(0))
+                        .prop_map(|(c, t, el)| format!("CASE WHEN {c} THEN {t} ELSE {el} END")),
+                    // Function call
+                    1 => (arb_ident(), proptest::collection::vec(arb_expr(0), 0..3))
+                        .prop_map(|(name, args)| format!("{name}({})", args.join(", "))),
+                    // Subquery
+                    1 => arb_expr(0).prop_map(|e| format!("(SELECT {e})")),
+                ]
+                .boxed()
+            }
+        }
+
+        /// Generate a random SELECT statement.
+        fn arb_select() -> BoxedStrategy<String> {
+            use std::fmt::Write as _;
+
+            let cols =
+                proptest::collection::vec(arb_expr(1), 1..4).prop_map(|cols| cols.join(", "));
+            let table = arb_ident();
+            let where_clause = prop::option::of(arb_expr(1));
+            let order_by = prop::option::of(arb_ident());
+            let limit = prop::option::of(1u32..100);
+
+            (cols, table, where_clause, order_by, limit)
+                .prop_map(|(cols, tbl, wh, ord, lim)| {
+                    let mut sql = format!("SELECT {cols} FROM {tbl}");
+                    if let Some(w) = wh {
+                        write!(sql, " WHERE {w}").expect("writing to String should not fail");
+                    }
+                    if let Some(o) = ord {
+                        write!(sql, " ORDER BY {o}").expect("writing to String should not fail");
+                    }
+                    if let Some(l) = lim {
+                        write!(sql, " LIMIT {l}").expect("writing to String should not fail");
+                    }
+                    sql
+                })
+                .boxed()
+        }
+
+        /// Generate a random INSERT statement.
+        fn arb_insert() -> BoxedStrategy<String> {
+            let ncols = 1usize..4;
+            ncols
+                .prop_flat_map(|n| {
+                    let tbl = arb_ident();
+                    let cols = proptest::collection::vec(arb_ident(), n..=n);
+                    let vals = proptest::collection::vec(arb_literal(), n..=n);
+                    (tbl, cols, vals).prop_map(|(t, cs, vs): (String, Vec<String>, Vec<String>)| {
+                        format!(
+                            "INSERT INTO {t} ({}) VALUES ({})",
+                            cs.join(", "),
+                            vs.join(", ")
+                        )
+                    })
+                })
+                .boxed()
+        }
+
+        /// Generate a random statement.
+        fn arb_statement() -> BoxedStrategy<String> {
+            prop_oneof![
+                6 => arb_select(),
+                3 => arb_insert(),
+                1 => arb_expr(2).prop_map(|e| format!("SELECT {e}")),
+                1 => (arb_ident(), arb_expr(1))
+                    .prop_map(|(t, w)| format!("DELETE FROM {t} WHERE {w}")),
+                1 => (arb_ident(), arb_ident(), arb_literal(), arb_expr(1))
+                    .prop_map(|(t, c, v, w)| format!("UPDATE {t} SET {c} = {v} WHERE {w}")),
+            ]
+            .boxed()
+        }
+
+        /// Try to parse SQL into a single statement; returns `None` if unparseable.
+        fn try_parse_one(sql: &str) -> Option<Statement> {
+            let mut p = Parser::from_sql(sql);
+            let (stmts, errs) = p.parse_all();
+            if errs.is_empty() && stmts.len() == 1 {
+                Some(stmts.into_iter().next().unwrap())
+            } else {
+                None
+            }
+        }
+
+        proptest::proptest! {
+            #![proptest_config(proptest::prelude::ProptestConfig::with_cases(1000))]
+
+            #[test]
+            fn test_parser_roundtrip_proptest(sql in arb_statement()) {
+                // Phase 1: parse the generated SQL.
+                let Some(ast1) = try_parse_one(&sql) else {
+                    return Ok(()); // skip unparseable inputs
+                };
+
+                // Phase 2: display the AST back to SQL text.
+                let rendered1 = ast1.to_string();
+
+                // Phase 3: re-parse the rendered SQL.
+                let Some(ast2) = try_parse_one(&rendered1) else {
+                    let msg = format!("re-parse failed for rendered SQL: {rendered1:?}");
+                    prop_assert!(false, "{}", msg);
+                    unreachable!()
+                };
+
+                // Phase 4: display again and compare (idempotency check).
+                let rendered2 = ast2.to_string();
+                let msg = format!(
+                    "round-trip not idempotent:\n  original: {sql}\n  rendered1: {rendered1}\n  rendered2: {rendered2}"
+                );
+                prop_assert_eq!(rendered1, rendered2, "{}", msg);
+            }
+        }
     }
 }
