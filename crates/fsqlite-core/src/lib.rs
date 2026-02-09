@@ -13,6 +13,7 @@ pub mod region;
 pub mod repair_symbols;
 pub mod replication_receiver;
 pub mod replication_sender;
+pub mod snapshot_shipping;
 pub mod source_block_partition;
 pub mod symbol_size_policy;
 
