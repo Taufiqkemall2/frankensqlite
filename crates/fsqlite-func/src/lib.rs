@@ -33,7 +33,10 @@ pub use agg_builtins::register_aggregate_builtins;
 pub use aggregate::{AggregateAdapter, AggregateFunction};
 pub use authorizer::{AuthAction, AuthResult, Authorizer, AuthorizerAction, AuthorizerDecision};
 pub use builtins::register_builtins;
-pub use collation::{BinaryCollation, CollationFunction, NoCaseCollation, RtrimCollation};
+pub use collation::{
+    BinaryCollation, CollationAnnotation, CollationFunction, CollationRegistry, CollationSource,
+    NoCaseCollation, RtrimCollation, resolve_collation,
+};
 pub use datetime::register_datetime_builtins;
 pub use math::register_math_builtins;
 pub use scalar::ScalarFunction;

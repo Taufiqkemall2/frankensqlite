@@ -417,13 +417,7 @@ mod tests {
 
         // Push 5 different trigger frames.
         for i in 0..5 {
-            let frame = make_frame(
-                i32::try_from(i).unwrap(),
-                16,
-                1,
-                i32::try_from(i).unwrap(),
-                format!("trg_chain_{i}"),
-            );
+            let frame = make_frame(i, 16, 1, i, format!("trg_chain_{i}"));
             stack.push_frame(frame).unwrap();
         }
         assert_eq!(stack.depth(), 5);
@@ -468,7 +462,7 @@ mod tests {
         let mut parent_frame = make_frame(100, 7, 1, 0, "trg_update");
         parent_frame.registers[1] = SqliteValue::Integer(10); // OLD.a
         parent_frame.registers[2] = SqliteValue::Text("hello".to_owned()); // OLD.b
-        parent_frame.registers[3] = SqliteValue::Float(3.14); // OLD.c
+        parent_frame.registers[3] = SqliteValue::Float(std::f64::consts::PI); // OLD.c
         parent_frame.registers[4] = SqliteValue::Integer(20); // NEW.a
         parent_frame.registers[5] = SqliteValue::Text("world".to_owned()); // NEW.b
         parent_frame.registers[6] = SqliteValue::Float(2.72); // NEW.c
@@ -488,31 +482,57 @@ mod tests {
         let mapping = parent.pseudo_tables.as_ref().unwrap();
 
         // Read OLD.a (register at old_base + 0).
-        let old_base = mapping.old_base.unwrap() as usize;
+        let old_base = usize::try_from(mapping.old_base.expect("old_base must exist"))
+            .expect("old_base must be non-negative");
         assert!(matches!(
             parent.registers[old_base],
             SqliteValue::Integer(10)
         ));
 
         // Read NEW.b (register at new_base + 1).
-        let new_base = mapping.new_base.unwrap() as usize;
+        let new_base = usize::try_from(mapping.new_base.expect("new_base must exist"))
+            .expect("new_base must be non-negative");
         assert!(matches!(&parent.registers[new_base + 1], SqliteValue::Text(s) if s == "world"));
 
         // Modify NEW.a in parent frame (simulates trigger body setting NEW value).
         let parent_mut = &mut stack.frames[0];
-        let new_base_mut = parent_mut.pseudo_tables.as_ref().unwrap().new_base.unwrap() as usize;
+        let new_base_mut = usize::try_from(
+            parent_mut
+                .pseudo_tables
+                .as_ref()
+                .unwrap()
+                .new_base
+                .expect("new_base must exist"),
+        )
+        .expect("new_base must be non-negative");
         parent_mut.registers[new_base_mut] = SqliteValue::Integer(999);
 
         // Verify the modification persists.
         let parent = &stack.frames[0];
-        let new_base = parent.pseudo_tables.as_ref().unwrap().new_base.unwrap() as usize;
+        let new_base = usize::try_from(
+            parent
+                .pseudo_tables
+                .as_ref()
+                .unwrap()
+                .new_base
+                .expect("new_base must exist"),
+        )
+        .expect("new_base must be non-negative");
         assert!(matches!(
             parent.registers[new_base],
             SqliteValue::Integer(999)
         ));
 
         // Verify OLD is unchanged.
-        let old_base = parent.pseudo_tables.as_ref().unwrap().old_base.unwrap() as usize;
+        let old_base = usize::try_from(
+            parent
+                .pseudo_tables
+                .as_ref()
+                .unwrap()
+                .old_base
+                .expect("old_base must exist"),
+        )
+        .expect("old_base must be non-negative");
         assert!(matches!(
             parent.registers[old_base],
             SqliteValue::Integer(10)
@@ -567,13 +587,7 @@ mod tests {
         stack.set_recursive_triggers(true);
 
         for i in 0..5 {
-            let frame = make_frame(
-                i32::try_from(i).unwrap(),
-                4,
-                0,
-                i32::try_from(i).unwrap(),
-                format!("trg_{i}"),
-            );
+            let frame = make_frame(i, 4, 0, i, format!("trg_{i}"));
             stack.push_frame(frame).unwrap();
         }
 
