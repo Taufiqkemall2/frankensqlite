@@ -16,7 +16,7 @@ use fsqlite_vfs::{Vfs, VfsFile};
 
 use crate::journal::{JournalHeader, JournalPageRecord};
 use crate::page_cache::PageCache;
-use crate::traits::{self, MvccPager, TransactionHandle, TransactionMode};
+use crate::traits::{self, JournalMode, MvccPager, TransactionHandle, TransactionMode, WalBackend};
 
 /// The inner mutable pager state protected by a mutex.
 struct PagerInner<F: VfsFile> {
@@ -34,11 +34,24 @@ struct PagerInner<F: VfsFile> {
     writer_active: bool,
     /// Deallocated pages available for reuse.
     freelist: Vec<PageNumber>,
+    /// Current journal mode (rollback journal vs WAL).
+    journal_mode: JournalMode,
+    /// Optional WAL backend for WAL-mode operation.
+    wal_backend: Option<Box<dyn WalBackend>>,
 }
 
 impl<F: VfsFile> PagerInner<F> {
-    /// Read a page through the cache and return an owned copy.
+    /// Read a page through WAL (if present) → cache → disk and return an owned copy.
     fn read_page_copy(&mut self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
+        // In WAL mode, check the WAL for the latest version of the page first.
+        if self.journal_mode == JournalMode::Wal {
+            if let Some(ref mut wal) = self.wal_backend {
+                if let Some(wal_data) = wal.read_page(cx, page_no.get())? {
+                    return Ok(wal_data);
+                }
+            }
+        }
+
         if let Some(data) = self.cache.get(page_no) {
             return Ok(data.to_vec());
         }
@@ -108,6 +121,7 @@ where
             inner.writer_active = true;
         }
         let original_db_size = inner.db_size;
+        let journal_mode = inner.journal_mode;
         drop(inner);
 
         Ok(SimpleTransaction {
@@ -121,7 +135,45 @@ where
             committed: false,
             original_db_size,
             savepoint_stack: Vec::new(),
+            journal_mode,
         })
+    }
+
+    fn journal_mode(&self) -> JournalMode {
+        self.inner
+            .lock()
+            .map(|inner| inner.journal_mode)
+            .unwrap_or_default()
+    }
+
+    fn set_journal_mode(&self, _cx: &Cx, mode: JournalMode) -> Result<JournalMode> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+
+        if inner.writer_active {
+            // Cannot switch journal mode while a writer is active.
+            return Err(FrankenError::Busy);
+        }
+
+        if mode == JournalMode::Wal && inner.wal_backend.is_none() {
+            return Err(FrankenError::Unsupported);
+        }
+
+        inner.journal_mode = mode;
+        drop(inner);
+        Ok(mode)
+    }
+
+    fn set_wal_backend(&self, backend: Box<dyn WalBackend>) -> Result<()> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+        inner.wal_backend = Some(backend);
+        drop(inner);
+        Ok(())
     }
 }
 
@@ -177,6 +229,8 @@ where
                 next_page,
                 writer_active: false,
                 freelist: Vec::new(),
+                journal_mode: JournalMode::Delete,
+                wal_backend: None,
             })),
         })
     }
@@ -284,6 +338,8 @@ pub struct SimpleTransaction<V: Vfs> {
     original_db_size: u32,
     /// Stack of savepoints, pushed on SAVEPOINT and popped on RELEASE.
     savepoint_stack: Vec<SavepointEntry>,
+    /// Journal mode captured at transaction start.
+    journal_mode: JournalMode,
 }
 
 impl<V: Vfs> traits::sealed::Sealed for SimpleTransaction<V> {}
@@ -293,6 +349,120 @@ where
     V: Vfs + Send,
     V::File: Send + Sync,
 {
+    /// Commit using the rollback journal protocol.
+    #[allow(clippy::too_many_lines)]
+    fn commit_journal(
+        cx: &Cx,
+        vfs: &Arc<V>,
+        journal_path: &Path,
+        inner: &mut PagerInner<V::File>,
+        write_set: &HashMap<PageNumber, Vec<u8>>,
+        freed_pages: &mut Vec<PageNumber>,
+        original_db_size: u32,
+    ) -> Result<()> {
+        if !write_set.is_empty() {
+            // Phase 1: Write rollback journal with pre-images.
+            let nonce = 0x4652_414E; // "FRAN" — deterministic nonce.
+            let page_size = inner.page_size;
+            let ps = page_size.as_usize();
+
+            let jrnl_flags =
+                VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
+            let (mut jrnl_file, _) = vfs.open(cx, Some(journal_path), jrnl_flags)?;
+
+            let header = JournalHeader {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                page_count: write_set.len() as i32,
+                nonce,
+                initial_db_size: original_db_size,
+                sector_size: 512,
+                page_size: page_size.get(),
+            };
+            let hdr_bytes = header.encode_padded();
+            jrnl_file.write(cx, &hdr_bytes, 0)?;
+
+            let mut jrnl_offset = hdr_bytes.len() as u64;
+            for &page_no in write_set.keys() {
+                // Read current on-disk content as the pre-image.
+                let mut pre_image = vec![0u8; ps];
+                if page_no.get() <= inner.db_size {
+                    let disk_offset = u64::from(page_no.get() - 1) * ps as u64;
+                    let _ = inner.db_file.read(cx, &mut pre_image, disk_offset)?;
+                }
+
+                let record = JournalPageRecord::new(page_no.get(), pre_image, nonce);
+                let rec_bytes = record.encode();
+                jrnl_file.write(cx, &rec_bytes, jrnl_offset)?;
+                jrnl_offset += rec_bytes.len() as u64;
+            }
+
+            // Sync journal to ensure durability before modifying database.
+            jrnl_file.sync(cx, SyncFlags::NORMAL)?;
+
+            // Phase 2: Write dirty pages to database.
+            for (page_no, data) in write_set {
+                inner.flush_page(cx, *page_no, data)?;
+                inner.db_size = inner.db_size.max(page_no.get());
+            }
+            inner.db_file.sync(cx, SyncFlags::NORMAL)?;
+
+            // Phase 3: Delete journal (commit point).
+            let _ = vfs.delete(cx, journal_path, true);
+        }
+
+        for page_no in freed_pages.drain(..) {
+            inner.freelist.push(page_no);
+        }
+        Ok(())
+    }
+
+    /// Commit using the WAL protocol (append frames to WAL file).
+    fn commit_wal(
+        cx: &Cx,
+        inner: &mut PagerInner<V::File>,
+        write_set: &HashMap<PageNumber, Vec<u8>>,
+        freed_pages: &mut Vec<PageNumber>,
+    ) -> Result<()> {
+        if !write_set.is_empty() {
+            let wal = inner.wal_backend.as_mut().ok_or_else(|| {
+                FrankenError::internal("WAL mode active but no WAL backend installed")
+            })?;
+
+            let page_count = write_set.len();
+            let mut written = 0_usize;
+
+            for (page_no, data) in write_set {
+                written += 1;
+                // The last frame in the commit gets db_size > 0 as commit marker.
+                let db_size_if_commit = if written == page_count {
+                    // Compute final database size: max of current and all written pages.
+                    let max_written = write_set.keys().map(|p| p.get()).max().unwrap_or(0);
+                    inner.db_size.max(max_written)
+                } else {
+                    0
+                };
+                wal.append_frame(cx, page_no.get(), data, db_size_if_commit)?;
+            }
+
+            // Sync WAL to ensure durability.
+            let wal = inner
+                .wal_backend
+                .as_mut()
+                .ok_or_else(|| FrankenError::internal("WAL backend disappeared during commit"))?;
+            wal.sync(cx)?;
+
+            // Update db_size for any new pages.
+            for page_no in write_set.keys() {
+                inner.db_size = inner.db_size.max(page_no.get());
+            }
+        }
+
+        for page_no in freed_pages.drain(..) {
+            inner.freelist.push(page_no);
+        }
+        Ok(())
+    }
+
     fn ensure_writer(&mut self) -> Result<()> {
         if self.is_writer {
             return Ok(());
@@ -405,62 +575,19 @@ where
             .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
 
-        let commit_result = (|| -> Result<()> {
-            if !self.write_set.is_empty() {
-                // Phase 1: Write rollback journal with pre-images.
-                let nonce = 0x4652_414E; // "FRAN" — deterministic nonce.
-                let page_size = inner.page_size;
-                let ps = page_size.as_usize();
-
-                let jrnl_flags =
-                    VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
-                let (mut jrnl_file, _) = self.vfs.open(cx, Some(&self.journal_path), jrnl_flags)?;
-
-                let header = JournalHeader {
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                    page_count: self.write_set.len() as i32,
-                    nonce,
-                    initial_db_size: self.original_db_size,
-                    sector_size: 512,
-                    page_size: page_size.get(),
-                };
-                let hdr_bytes = header.encode_padded();
-                jrnl_file.write(cx, &hdr_bytes, 0)?;
-
-                let mut jrnl_offset = hdr_bytes.len() as u64;
-                for &page_no in self.write_set.keys() {
-                    // Read current on-disk content as the pre-image.
-                    let mut pre_image = vec![0u8; ps];
-                    if page_no.get() <= inner.db_size {
-                        let disk_offset = u64::from(page_no.get() - 1) * ps as u64;
-                        let _ = inner.db_file.read(cx, &mut pre_image, disk_offset)?;
-                    }
-
-                    let record = JournalPageRecord::new(page_no.get(), pre_image, nonce);
-                    let rec_bytes = record.encode();
-                    jrnl_file.write(cx, &rec_bytes, jrnl_offset)?;
-                    jrnl_offset += rec_bytes.len() as u64;
-                }
-
-                // Sync journal to ensure durability before modifying database.
-                jrnl_file.sync(cx, SyncFlags::NORMAL)?;
-
-                // Phase 2: Write dirty pages to database.
-                for (page_no, data) in &self.write_set {
-                    inner.flush_page(cx, *page_no, data)?;
-                    inner.db_size = inner.db_size.max(page_no.get());
-                }
-                inner.db_file.sync(cx, SyncFlags::NORMAL)?;
-
-                // Phase 3: Delete journal (commit point).
-                let _ = self.vfs.delete(cx, &self.journal_path, true);
-            }
-
-            for page_no in self.freed_pages.drain(..) {
-                inner.freelist.push(page_no);
-            }
-            Ok(())
-        })();
+        let commit_result = if self.journal_mode == JournalMode::Wal {
+            Self::commit_wal(cx, &mut inner, &self.write_set, &mut self.freed_pages)
+        } else {
+            Self::commit_journal(
+                cx,
+                &self.vfs,
+                &self.journal_path,
+                &mut inner,
+                &self.write_set,
+                &mut self.freed_pages,
+                self.original_db_size,
+            )
+        };
 
         inner.writer_active = false;
         drop(inner);
@@ -1508,6 +1635,305 @@ mod tests {
             data.as_ref()[0],
             0x00,
             "bead_id={BEAD_ID} case=3level_committed"
+        );
+    }
+
+    // ── WAL mode integration tests ──────────────────────────────────────
+
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+    /// (page_number, page_data, db_size_if_commit)
+    type WalFrame = (u32, Vec<u8>, u32);
+    type SharedFrames = StdArc<StdMutex<Vec<WalFrame>>>;
+
+    /// In-memory WAL backend for testing WAL-mode commit and page lookup.
+    struct MockWalBackend {
+        frames: SharedFrames,
+    }
+
+    impl MockWalBackend {
+        fn new() -> (Self, SharedFrames) {
+            let frames: SharedFrames = StdArc::new(StdMutex::new(Vec::new()));
+            (
+                Self {
+                    frames: StdArc::clone(&frames),
+                },
+                frames,
+            )
+        }
+    }
+
+    impl crate::traits::WalBackend for MockWalBackend {
+        fn append_frame(
+            &mut self,
+            _cx: &Cx,
+            page_number: u32,
+            page_data: &[u8],
+            db_size_if_commit: u32,
+        ) -> fsqlite_error::Result<()> {
+            self.frames
+                .lock()
+                .unwrap()
+                .push((page_number, page_data.to_vec(), db_size_if_commit));
+            Ok(())
+        }
+
+        fn read_page(
+            &mut self,
+            _cx: &Cx,
+            page_number: u32,
+        ) -> fsqlite_error::Result<Option<Vec<u8>>> {
+            let frames = self.frames.lock().unwrap();
+            // Scan backwards for the latest version of the page.
+            let result = frames
+                .iter()
+                .rev()
+                .find(|(pn, _, _)| *pn == page_number)
+                .map(|(_, data, _)| data.clone());
+            drop(frames);
+            Ok(result)
+        }
+
+        fn sync(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
+            Ok(())
+        }
+
+        fn frame_count(&self) -> usize {
+            self.frames.lock().unwrap().len()
+        }
+    }
+
+    fn wal_pager() -> (SimplePager<MemoryVfs>, SharedFrames) {
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/wal_test.db");
+        let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
+        let cx = Cx::new();
+        let (backend, frames) = MockWalBackend::new();
+        pager.set_wal_backend(Box::new(backend)).unwrap();
+        pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+        (pager, frames)
+    }
+
+    #[test]
+    fn test_journal_mode_default_is_delete() {
+        let (pager, _) = test_pager();
+        assert_eq!(
+            pager.journal_mode(),
+            JournalMode::Delete,
+            "bead_id={BEAD_ID} case=default_journal_mode"
+        );
+    }
+
+    #[test]
+    fn test_set_journal_mode_wal_requires_backend() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        // Without a WAL backend, switching to WAL should fail.
+        let result = pager.set_journal_mode(&cx, JournalMode::Wal);
+        assert!(
+            result.is_err(),
+            "bead_id={BEAD_ID} case=wal_requires_backend"
+        );
+    }
+
+    #[test]
+    fn test_set_journal_mode_wal_with_backend() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let (backend, _frames) = MockWalBackend::new();
+        pager.set_wal_backend(Box::new(backend)).unwrap();
+        let mode = pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+        assert_eq!(
+            mode,
+            JournalMode::Wal,
+            "bead_id={BEAD_ID} case=wal_mode_set"
+        );
+        assert_eq!(
+            pager.journal_mode(),
+            JournalMode::Wal,
+            "bead_id={BEAD_ID} case=wal_mode_persisted"
+        );
+    }
+
+    #[test]
+    fn test_set_journal_mode_blocked_during_write() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let _writer = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let (backend, _frames) = MockWalBackend::new();
+        pager.set_wal_backend(Box::new(backend)).unwrap();
+        let result = pager.set_journal_mode(&cx, JournalMode::Wal);
+        assert!(
+            result.is_err(),
+            "bead_id={BEAD_ID} case=mode_switch_blocked_during_write"
+        );
+    }
+
+    #[test]
+    fn test_wal_commit_appends_frames() {
+        let (pager, frames) = wal_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p1 = txn.allocate_page(&cx).unwrap();
+        let data = vec![0xAA_u8; ps];
+        txn.write_page(&cx, p1, &data).unwrap();
+        txn.commit(&cx).unwrap();
+
+        let locked_frames = frames.lock().unwrap();
+        assert_eq!(
+            locked_frames.len(),
+            1,
+            "bead_id={BEAD_ID} case=wal_one_frame_appended"
+        );
+        assert_eq!(
+            locked_frames[0].0,
+            p1.get(),
+            "bead_id={BEAD_ID} case=wal_frame_page_number"
+        );
+        assert_eq!(
+            locked_frames[0].1[0], 0xAA,
+            "bead_id={BEAD_ID} case=wal_frame_data"
+        );
+        // Commit frame should have db_size > 0.
+        assert!(
+            locked_frames[0].2 > 0,
+            "bead_id={BEAD_ID} case=wal_commit_marker"
+        );
+        drop(locked_frames);
+    }
+
+    #[test]
+    fn test_wal_commit_multi_page() {
+        let (pager, frames) = wal_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p1 = txn.allocate_page(&cx).unwrap();
+        let p2 = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, p1, &vec![0x11; ps]).unwrap();
+        txn.write_page(&cx, p2, &vec![0x22; ps]).unwrap();
+        txn.commit(&cx).unwrap();
+
+        let locked_frames = frames.lock().unwrap();
+        assert_eq!(
+            locked_frames.len(),
+            2,
+            "bead_id={BEAD_ID} case=wal_multi_page_count"
+        );
+        // Exactly one frame should be the commit frame (db_size > 0).
+        let commit_count = locked_frames.iter().filter(|f| f.2 > 0).count();
+        drop(locked_frames);
+        assert_eq!(
+            commit_count, 1,
+            "bead_id={BEAD_ID} case=wal_exactly_one_commit_marker"
+        );
+    }
+
+    #[test]
+    fn test_wal_read_page_from_wal() {
+        let (pager, _frames) = wal_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        // Write and commit via WAL.
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p1 = txn.allocate_page(&cx).unwrap();
+        let data = vec![0xBB_u8; ps];
+        txn.write_page(&cx, p1, &data).unwrap();
+        txn.commit(&cx).unwrap();
+
+        // Read back in a new transaction — should find the page in WAL.
+        let txn2 = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let read_back = txn2.get_page(&cx, p1).unwrap();
+        assert_eq!(
+            read_back.as_ref()[0],
+            0xBB,
+            "bead_id={BEAD_ID} case=wal_read_back_from_wal"
+        );
+    }
+
+    #[test]
+    fn test_wal_no_journal_file_created() {
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/wal_no_jrnl.db");
+        let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+        let cx = Cx::new();
+        let (backend, _frames) = MockWalBackend::new();
+        pager.set_wal_backend(Box::new(backend)).unwrap();
+        pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p1 = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, p1, &vec![0xFF; 4096]).unwrap();
+        txn.commit(&cx).unwrap();
+
+        // In WAL mode, no journal file should be created.
+        let journal_path = SimplePager::<MemoryVfs>::journal_path(&path);
+        assert!(
+            !vfs.access(&cx, &journal_path, AccessFlags::EXISTS).unwrap(),
+            "bead_id={BEAD_ID} case=wal_no_journal_created"
+        );
+    }
+
+    #[test]
+    fn test_wal_mode_switch_back_to_delete() {
+        let (pager, _frames) = wal_pager();
+        let cx = Cx::new();
+
+        assert_eq!(pager.journal_mode(), JournalMode::Wal);
+        let mode = pager.set_journal_mode(&cx, JournalMode::Delete).unwrap();
+        assert_eq!(
+            mode,
+            JournalMode::Delete,
+            "bead_id={BEAD_ID} case=switch_back_to_delete"
+        );
+    }
+
+    #[test]
+    fn test_wal_overwrite_page_reads_latest() {
+        let (pager, _frames) = wal_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        // First commit: write 0x11.
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p1 = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, p1, &vec![0x11; ps]).unwrap();
+        txn.commit(&cx).unwrap();
+
+        // Second commit: overwrite with 0x22.
+        let mut txn2 = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        txn2.write_page(&cx, p1, &vec![0x22; ps]).unwrap();
+        txn2.commit(&cx).unwrap();
+
+        // Read should see 0x22 (latest WAL entry).
+        let txn3 = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let data = txn3.get_page(&cx, p1).unwrap();
+        assert_eq!(
+            data.as_ref()[0],
+            0x22,
+            "bead_id={BEAD_ID} case=wal_latest_version"
+        );
+    }
+
+    #[test]
+    fn test_wal_rollback_does_not_append_frames() {
+        let (pager, frames) = wal_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p1 = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, p1, &vec![0xDD; ps]).unwrap();
+        txn.rollback(&cx).unwrap();
+
+        assert_eq!(
+            frames.lock().unwrap().len(),
+            0,
+            "bead_id={BEAD_ID} case=wal_rollback_no_frames"
         );
     }
 }

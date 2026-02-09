@@ -28,6 +28,71 @@ pub(crate) mod sealed {
 }
 
 // ---------------------------------------------------------------------------
+// Journal mode
+// ---------------------------------------------------------------------------
+
+/// The journal mode for database persistence (PRAGMA journal_mode).
+///
+/// Determines how changes are committed — either through a rollback journal
+/// (the default) or through a write-ahead log (WAL mode). WAL mode enables
+/// concurrent readers alongside a single writer without blocking.
+///
+/// Only `Delete` and `Wal` are currently supported; the remaining SQLite
+/// journal modes (`Truncate`, `Persist`, `Memory`, `Off`) may be added in
+/// future phases.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum JournalMode {
+    /// Rollback journal — the journal file is deleted after each commit.
+    /// This is the default mode.
+    #[default]
+    Delete,
+    /// Write-ahead log — frames are appended to a WAL file; checkpoints
+    /// transfer committed pages back to the database. Concurrent readers
+    /// see consistent snapshots without blocking the writer.
+    Wal,
+}
+
+// ---------------------------------------------------------------------------
+// WAL backend trait (open, for `fsqlite-core` adapter)
+// ---------------------------------------------------------------------------
+
+/// Backend interface for WAL operations consumed by the pager.
+///
+/// This trait breaks the `pager ↔ wal` circular dependency: it is defined
+/// here in `fsqlite-pager` but implemented by an adapter in `fsqlite-core`
+/// that wraps `WalFile` from `fsqlite-wal`.
+///
+/// The pager calls into this trait during WAL-mode commits and page lookups
+/// instead of writing a rollback journal.
+pub trait WalBackend: Send {
+    /// Append a single frame to the WAL.
+    ///
+    /// `page_number` is the 1-based database page.
+    /// `page_data` must be exactly `page_size` bytes.
+    /// `db_size_if_commit` is the database size in pages for commit frames,
+    /// or 0 for non-commit frames.
+    fn append_frame(
+        &mut self,
+        cx: &Cx,
+        page_number: u32,
+        page_data: &[u8],
+        db_size_if_commit: u32,
+    ) -> Result<()>;
+
+    /// Look up the latest version of a page in the WAL.
+    ///
+    /// Scans backwards from the most recent frame. Returns `None` if the
+    /// page has no WAL entry (caller should fall through to disk).
+    fn read_page(&mut self, cx: &Cx, page_number: u32) -> Result<Option<Vec<u8>>>;
+
+    /// Sync the WAL file to stable storage.
+    fn sync(&mut self, cx: &Cx) -> Result<()>;
+
+    /// Number of valid frames currently in the WAL.
+    fn frame_count(&self) -> usize;
+}
+
+// ---------------------------------------------------------------------------
 // Transaction mode
 // ---------------------------------------------------------------------------
 
@@ -83,6 +148,24 @@ pub trait MvccPager: sealed::Sealed + Send + Sync {
     /// within the transaction's snapshot. The handle is `Send` so it
     /// can be moved to another thread if needed.
     fn begin(&self, cx: &Cx, mode: TransactionMode) -> Result<Self::Txn>;
+
+    /// Return the current journal mode.
+    fn journal_mode(&self) -> JournalMode;
+
+    /// Switch the journal mode.
+    ///
+    /// Switching from `Delete` to `Wal` requires providing a [`WalBackend`]
+    /// via [`set_wal_backend`](Self::set_wal_backend) first; otherwise the
+    /// call returns `FrankenError::Unsupported`.
+    ///
+    /// Returns the mode that is actually in effect after the call.
+    fn set_journal_mode(&self, cx: &Cx, mode: JournalMode) -> Result<JournalMode>;
+
+    /// Install a WAL backend for WAL-mode operation.
+    ///
+    /// The backend is consumed and stored internally. It must be set before
+    /// calling `set_journal_mode(Wal)`.
+    fn set_wal_backend(&self, backend: Box<dyn WalBackend>) -> Result<()>;
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +288,18 @@ impl MvccPager for MockMvccPager {
             next_page: 2,
             savepoint_names: Vec::new(),
         })
+    }
+
+    fn journal_mode(&self) -> JournalMode {
+        JournalMode::Delete
+    }
+
+    fn set_journal_mode(&self, _cx: &Cx, mode: JournalMode) -> Result<JournalMode> {
+        Ok(mode)
+    }
+
+    fn set_wal_backend(&self, _backend: Box<dyn WalBackend>) -> Result<()> {
+        Ok(())
     }
 }
 

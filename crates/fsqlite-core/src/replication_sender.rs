@@ -316,12 +316,13 @@ impl VirtualTcp {
         }
 
         let mut wire = payload.to_vec();
-        let mut corrupted = false;
-        if !wire.is_empty() && self.coin_flip(self.faults.corrupt_per_million) {
+        let corrupted = if !wire.is_empty() && self.coin_flip(self.faults.corrupt_per_million) {
             let idx = (self.next_u32() as usize) % wire.len();
             wire[idx] ^= 0x01;
-            corrupted = true;
-        }
+            true
+        } else {
+            false
+        };
 
         if self.coin_flip(self.faults.reorder_per_million) && self.pending_reorder.is_none() {
             self.push_trace(VirtualTcpTraceKind::BufferedForReorder, &wire);
@@ -370,10 +371,10 @@ impl VirtualTcp {
     }
 
     fn coin_flip(&mut self, per_million: u32) -> bool {
+        const PPM_MAX: u32 = 1_000_000;
         if per_million == 0 {
             return false;
         }
-        const PPM_MAX: u32 = 1_000_000;
         if per_million >= PPM_MAX {
             return true;
         }
