@@ -10,6 +10,8 @@ rust-version.workspace = true
 [dependencies]
 fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
+fsqlite-func = { workspace = true }
+tracing = { workspace = true }
 
 [lints]
 workspace = true
