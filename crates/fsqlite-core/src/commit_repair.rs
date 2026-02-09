@@ -460,7 +460,7 @@ pub enum CommitRepairEventKind {
 #[derive(Debug, Clone, Copy)]
 pub struct CommitRepairEvent {
     pub commit_seq: u64,
-    /// Monotonic event sequence number (logical time, no ambient authority).
+    /// Monotonic per-commit event sequence number (logical time, no ambient authority).
     pub seq: u64,
     pub kind: CommitRepairEventKind,
 }
@@ -897,9 +897,11 @@ fn record_event_into(
     kind: CommitRepairEventKind,
 ) {
     let mut guard = lock_with_recovery(events, "repair_events");
-    let seq = u64::try_from(guard.len())
-        .unwrap_or(u64::MAX)
-        .saturating_add(1);
+    let seq = guard
+        .iter()
+        .rev()
+        .find(|event| event.commit_seq == commit_seq)
+        .map_or(1, |event| event.seq.saturating_add(1));
     guard.push(CommitRepairEvent {
         commit_seq,
         seq,
