@@ -1904,6 +1904,31 @@ mod tests {
     }
 
     #[test]
+    fn test_unix_vfs_concurrent_readers() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("concurrent_readers.db");
+
+        let (mut writer, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        writer.write(&cx, b"shared-reader-bytes", 0).unwrap();
+        writer.close(&cx).unwrap();
+
+        let read_flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE;
+        let (mut reader_a, _) = vfs.open(&cx, Some(&path), read_flags).unwrap();
+        let (mut reader_b, _) = vfs.open(&cx, Some(&path), read_flags).unwrap();
+
+        let mut a = [0_u8; 19];
+        let mut b = [0_u8; 19];
+        assert_eq!(reader_a.read(&cx, &mut a, 0).unwrap(), 19);
+        assert_eq!(reader_b.read(&cx, &mut b, 0).unwrap(), 19);
+        assert_eq!(&a, b"shared-reader-bytes");
+        assert_eq!(a, b);
+
+        reader_a.close(&cx).unwrap();
+        reader_b.close(&cx).unwrap();
+    }
+
+    #[test]
     fn test_unix_vfs_read_past_end_zeroes() {
         let cx = Cx::new();
         let vfs = UnixVfs::new();
