@@ -623,4 +623,730 @@ mod tests {
         assert!(!err.is_transient());
         assert!(err.suggestion().is_some());
     }
+
+    // ---- Additional comprehensive tests for bd-2ddl coverage ----
+
+    #[test]
+    fn display_database_not_found() {
+        let err = FrankenError::DatabaseNotFound {
+            path: PathBuf::from("/tmp/test.db"),
+        };
+        assert_eq!(err.to_string(), "database not found: '/tmp/test.db'");
+    }
+
+    #[test]
+    fn display_database_locked() {
+        let err = FrankenError::DatabaseLocked {
+            path: PathBuf::from("/tmp/test.db"),
+        };
+        assert_eq!(err.to_string(), "database is locked: '/tmp/test.db'");
+    }
+
+    #[test]
+    fn display_not_a_database() {
+        let err = FrankenError::NotADatabase {
+            path: PathBuf::from("/tmp/random.bin"),
+        };
+        assert_eq!(err.to_string(), "file is not a database: '/tmp/random.bin'");
+    }
+
+    #[test]
+    fn display_database_full() {
+        assert_eq!(FrankenError::DatabaseFull.to_string(), "database is full");
+    }
+
+    #[test]
+    fn display_schema_changed() {
+        assert_eq!(
+            FrankenError::SchemaChanged.to_string(),
+            "database schema has changed"
+        );
+    }
+
+    #[test]
+    fn display_io_read_write() {
+        let err = FrankenError::IoRead { page: 17 };
+        assert_eq!(err.to_string(), "disk I/O error reading page 17");
+
+        let err = FrankenError::IoWrite { page: 42 };
+        assert_eq!(err.to_string(), "disk I/O error writing page 42");
+    }
+
+    #[test]
+    fn display_short_read() {
+        let err = FrankenError::ShortRead {
+            expected: 4096,
+            actual: 2048,
+        };
+        assert_eq!(err.to_string(), "short read: expected 4096 bytes, got 2048");
+    }
+
+    #[test]
+    fn display_no_such_table_column_index() {
+        assert_eq!(
+            FrankenError::NoSuchTable {
+                name: "users".to_owned()
+            }
+            .to_string(),
+            "no such table: users"
+        );
+        assert_eq!(
+            FrankenError::NoSuchColumn {
+                name: "email".to_owned()
+            }
+            .to_string(),
+            "no such column: email"
+        );
+        assert_eq!(
+            FrankenError::NoSuchIndex {
+                name: "idx_email".to_owned()
+            }
+            .to_string(),
+            "no such index: idx_email"
+        );
+    }
+
+    #[test]
+    fn display_already_exists() {
+        assert_eq!(
+            FrankenError::TableExists {
+                name: "t1".to_owned()
+            }
+            .to_string(),
+            "table t1 already exists"
+        );
+        assert_eq!(
+            FrankenError::IndexExists {
+                name: "i1".to_owned()
+            }
+            .to_string(),
+            "index i1 already exists"
+        );
+    }
+
+    #[test]
+    fn display_ambiguous_column() {
+        let err = FrankenError::AmbiguousColumn {
+            name: "id".to_owned(),
+        };
+        assert_eq!(err.to_string(), "ambiguous column name: id");
+    }
+
+    #[test]
+    fn display_transaction_errors() {
+        assert_eq!(
+            FrankenError::NestedTransaction.to_string(),
+            "cannot start a transaction within a transaction"
+        );
+        assert_eq!(
+            FrankenError::NoActiveTransaction.to_string(),
+            "cannot commit - no transaction is active"
+        );
+        assert_eq!(
+            FrankenError::TransactionRolledBack {
+                reason: "constraint".to_owned()
+            }
+            .to_string(),
+            "transaction rolled back: constraint"
+        );
+    }
+
+    #[test]
+    fn display_serialization_failure() {
+        let err = FrankenError::SerializationFailure { page: 99 };
+        assert_eq!(
+            err.to_string(),
+            "serialization failure: page 99 was modified after snapshot"
+        );
+    }
+
+    #[test]
+    fn display_snapshot_too_old() {
+        let err = FrankenError::SnapshotTooOld { txn_id: 100 };
+        assert_eq!(
+            err.to_string(),
+            "snapshot too old: transaction 100 is below GC horizon"
+        );
+    }
+
+    #[test]
+    fn display_busy_variants() {
+        assert_eq!(FrankenError::Busy.to_string(), "database is busy");
+        assert_eq!(
+            FrankenError::BusyRecovery.to_string(),
+            "database is busy (recovery in progress)"
+        );
+    }
+
+    #[test]
+    fn display_concurrent_unavailable() {
+        let err = FrankenError::ConcurrentUnavailable;
+        assert!(err.to_string().contains("BEGIN CONCURRENT unavailable"));
+    }
+
+    #[test]
+    fn display_type_errors() {
+        let err = FrankenError::TypeMismatch {
+            expected: "INTEGER".to_owned(),
+            actual: "TEXT".to_owned(),
+        };
+        assert_eq!(err.to_string(), "type mismatch: expected INTEGER, got TEXT");
+
+        assert_eq!(
+            FrankenError::IntegerOverflow.to_string(),
+            "integer overflow"
+        );
+
+        let err = FrankenError::OutOfRange {
+            what: "page number".to_owned(),
+            value: "0".to_owned(),
+        };
+        assert_eq!(err.to_string(), "page number out of range: 0");
+    }
+
+    #[test]
+    fn display_limit_errors() {
+        assert_eq!(
+            FrankenError::TooBig.to_string(),
+            "string or BLOB exceeds size limit"
+        );
+
+        let err = FrankenError::TooManyColumns {
+            count: 2001,
+            max: 2000,
+        };
+        assert_eq!(err.to_string(), "too many columns: 2001 (max 2000)");
+
+        let err = FrankenError::SqlTooLong {
+            length: 2_000_000,
+            max: 1_000_000,
+        };
+        assert_eq!(
+            err.to_string(),
+            "SQL statement too long: 2000000 bytes (max 1000000)"
+        );
+
+        let err = FrankenError::ExpressionTooDeep { max: 1000 };
+        assert_eq!(err.to_string(), "expression tree too deep (max 1000)");
+
+        let err = FrankenError::TooManyAttached { max: 10 };
+        assert_eq!(err.to_string(), "too many attached databases (max 10)");
+
+        let err = FrankenError::TooManyArguments {
+            name: "my_func".to_owned(),
+        };
+        assert_eq!(err.to_string(), "too many arguments to function my_func");
+    }
+
+    #[test]
+    fn display_wal_errors() {
+        let err = FrankenError::WalCorrupt {
+            detail: "invalid checksum".to_owned(),
+        };
+        assert_eq!(err.to_string(), "WAL file is corrupt: invalid checksum");
+
+        let err = FrankenError::CheckpointFailed {
+            detail: "busy".to_owned(),
+        };
+        assert_eq!(err.to_string(), "WAL checkpoint failed: busy");
+    }
+
+    #[test]
+    fn display_vfs_errors() {
+        let err = FrankenError::LockFailed {
+            detail: "permission denied".to_owned(),
+        };
+        assert_eq!(err.to_string(), "file locking failed: permission denied");
+
+        let err = FrankenError::CannotOpen {
+            path: PathBuf::from("/readonly/test.db"),
+        };
+        assert_eq!(
+            err.to_string(),
+            "unable to open database file: '/readonly/test.db'"
+        );
+    }
+
+    #[test]
+    fn display_internal_errors() {
+        assert_eq!(
+            FrankenError::Internal("assertion failed".to_owned()).to_string(),
+            "internal error: assertion failed"
+        );
+        assert_eq!(
+            FrankenError::Unsupported.to_string(),
+            "unsupported operation"
+        );
+        assert_eq!(
+            FrankenError::NotImplemented("CTE".to_owned()).to_string(),
+            "not implemented: CTE"
+        );
+        assert_eq!(
+            FrankenError::Abort.to_string(),
+            "callback requested query abort"
+        );
+        assert_eq!(FrankenError::AuthDenied.to_string(), "authorization denied");
+        assert_eq!(FrankenError::OutOfMemory.to_string(), "out of memory");
+        assert_eq!(
+            FrankenError::ReadOnly.to_string(),
+            "attempt to write a readonly database"
+        );
+    }
+
+    #[test]
+    fn display_function_error() {
+        let err = FrankenError::FunctionError("domain error".to_owned());
+        assert_eq!(err.to_string(), "domain error");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn error_code_comprehensive_mapping() {
+        // Database errors
+        assert_eq!(
+            FrankenError::DatabaseNotFound {
+                path: PathBuf::new()
+            }
+            .error_code(),
+            ErrorCode::CantOpen
+        );
+        assert_eq!(
+            FrankenError::DatabaseLocked {
+                path: PathBuf::new()
+            }
+            .error_code(),
+            ErrorCode::Busy
+        );
+        assert_eq!(
+            FrankenError::NotADatabase {
+                path: PathBuf::new()
+            }
+            .error_code(),
+            ErrorCode::NotADb
+        );
+        assert_eq!(FrankenError::SchemaChanged.error_code(), ErrorCode::Schema);
+
+        // I/O errors
+        assert_eq!(
+            FrankenError::IoRead { page: 1 }.error_code(),
+            ErrorCode::IoErr
+        );
+        assert_eq!(
+            FrankenError::IoWrite { page: 1 }.error_code(),
+            ErrorCode::IoErr
+        );
+        assert_eq!(
+            FrankenError::ShortRead {
+                expected: 1,
+                actual: 0
+            }
+            .error_code(),
+            ErrorCode::IoErr
+        );
+
+        // SQL errors map to Error
+        assert_eq!(
+            FrankenError::NoSuchTable {
+                name: String::new()
+            }
+            .error_code(),
+            ErrorCode::Error
+        );
+        assert_eq!(
+            FrankenError::NoSuchColumn {
+                name: String::new()
+            }
+            .error_code(),
+            ErrorCode::Error
+        );
+        assert_eq!(
+            FrankenError::NoSuchIndex {
+                name: String::new()
+            }
+            .error_code(),
+            ErrorCode::Error
+        );
+        assert_eq!(
+            FrankenError::TableExists {
+                name: String::new()
+            }
+            .error_code(),
+            ErrorCode::Error
+        );
+        assert_eq!(
+            FrankenError::IndexExists {
+                name: String::new()
+            }
+            .error_code(),
+            ErrorCode::Error
+        );
+        assert_eq!(
+            FrankenError::AmbiguousColumn {
+                name: String::new()
+            }
+            .error_code(),
+            ErrorCode::Error
+        );
+
+        // Transaction errors
+        assert_eq!(
+            FrankenError::NestedTransaction.error_code(),
+            ErrorCode::Error
+        );
+        assert_eq!(
+            FrankenError::NoActiveTransaction.error_code(),
+            ErrorCode::Error
+        );
+
+        // MVCC errors map to Busy
+        assert_eq!(
+            FrankenError::SerializationFailure { page: 1 }.error_code(),
+            ErrorCode::Busy
+        );
+        assert_eq!(
+            FrankenError::SnapshotTooOld { txn_id: 1 }.error_code(),
+            ErrorCode::Busy
+        );
+        assert_eq!(
+            FrankenError::LockFailed {
+                detail: String::new()
+            }
+            .error_code(),
+            ErrorCode::Busy
+        );
+
+        // Type errors
+        assert_eq!(
+            FrankenError::TypeMismatch {
+                expected: String::new(),
+                actual: String::new()
+            }
+            .error_code(),
+            ErrorCode::Mismatch
+        );
+        assert_eq!(FrankenError::IntegerOverflow.error_code(), ErrorCode::Range);
+        assert_eq!(
+            FrankenError::OutOfRange {
+                what: String::new(),
+                value: String::new()
+            }
+            .error_code(),
+            ErrorCode::Range
+        );
+
+        // Limit errors
+        assert_eq!(
+            FrankenError::TooManyColumns { count: 1, max: 1 }.error_code(),
+            ErrorCode::Error
+        );
+        assert_eq!(
+            FrankenError::SqlTooLong { length: 1, max: 1 }.error_code(),
+            ErrorCode::Error
+        );
+        assert_eq!(
+            FrankenError::ExpressionTooDeep { max: 1 }.error_code(),
+            ErrorCode::Error
+        );
+        assert_eq!(
+            FrankenError::TooManyAttached { max: 1 }.error_code(),
+            ErrorCode::Error
+        );
+        assert_eq!(
+            FrankenError::TooManyArguments {
+                name: String::new()
+            }
+            .error_code(),
+            ErrorCode::Error
+        );
+
+        // WAL errors
+        assert_eq!(
+            FrankenError::WalCorrupt {
+                detail: String::new()
+            }
+            .error_code(),
+            ErrorCode::Corrupt
+        );
+        assert_eq!(
+            FrankenError::CheckpointFailed {
+                detail: String::new()
+            }
+            .error_code(),
+            ErrorCode::IoErr
+        );
+
+        // VFS errors
+        assert_eq!(
+            FrankenError::CannotOpen {
+                path: PathBuf::new()
+            }
+            .error_code(),
+            ErrorCode::CantOpen
+        );
+
+        // Internal/misc errors
+        assert_eq!(
+            FrankenError::Internal(String::new()).error_code(),
+            ErrorCode::Internal
+        );
+        assert_eq!(FrankenError::Unsupported.error_code(), ErrorCode::NoLfs);
+        assert_eq!(FrankenError::Abort.error_code(), ErrorCode::Abort);
+        assert_eq!(FrankenError::ReadOnly.error_code(), ErrorCode::ReadOnly);
+        assert_eq!(
+            FrankenError::FunctionError(String::new()).error_code(),
+            ErrorCode::Error
+        );
+        assert_eq!(
+            FrankenError::ConcurrentUnavailable.error_code(),
+            ErrorCode::Error
+        );
+    }
+
+    #[test]
+    fn is_user_recoverable_comprehensive() {
+        // Recoverable
+        assert!(
+            FrankenError::DatabaseNotFound {
+                path: PathBuf::new()
+            }
+            .is_user_recoverable()
+        );
+        assert!(
+            FrankenError::DatabaseLocked {
+                path: PathBuf::new()
+            }
+            .is_user_recoverable()
+        );
+        assert!(FrankenError::BusyRecovery.is_user_recoverable());
+        assert!(FrankenError::Unsupported.is_user_recoverable());
+        assert!(
+            FrankenError::ParseError {
+                offset: 0,
+                detail: String::new()
+            }
+            .is_user_recoverable()
+        );
+        assert!(
+            FrankenError::NoSuchTable {
+                name: String::new()
+            }
+            .is_user_recoverable()
+        );
+        assert!(
+            FrankenError::NoSuchColumn {
+                name: String::new()
+            }
+            .is_user_recoverable()
+        );
+        assert!(
+            FrankenError::TypeMismatch {
+                expected: String::new(),
+                actual: String::new()
+            }
+            .is_user_recoverable()
+        );
+        assert!(
+            FrankenError::CannotOpen {
+                path: PathBuf::new()
+            }
+            .is_user_recoverable()
+        );
+
+        // Not recoverable
+        assert!(
+            !FrankenError::NotADatabase {
+                path: PathBuf::new()
+            }
+            .is_user_recoverable()
+        );
+        assert!(!FrankenError::TooBig.is_user_recoverable());
+        assert!(!FrankenError::OutOfMemory.is_user_recoverable());
+        assert!(!FrankenError::WriteConflict { page: 1, holder: 1 }.is_user_recoverable());
+        assert!(
+            !FrankenError::UniqueViolation {
+                columns: String::new()
+            }
+            .is_user_recoverable()
+        );
+        assert!(!FrankenError::ReadOnly.is_user_recoverable());
+        assert!(!FrankenError::Abort.is_user_recoverable());
+    }
+
+    #[test]
+    fn is_transient_comprehensive() {
+        // Transient
+        assert!(
+            FrankenError::DatabaseLocked {
+                path: PathBuf::new()
+            }
+            .is_transient()
+        );
+        assert!(FrankenError::SerializationFailure { page: 1 }.is_transient());
+
+        // Not transient
+        assert!(
+            !FrankenError::DatabaseCorrupt {
+                detail: String::new()
+            }
+            .is_transient()
+        );
+        assert!(
+            !FrankenError::NotADatabase {
+                path: PathBuf::new()
+            }
+            .is_transient()
+        );
+        assert!(!FrankenError::TooBig.is_transient());
+        assert!(!FrankenError::Internal(String::new()).is_transient());
+        assert!(!FrankenError::OutOfMemory.is_transient());
+        assert!(
+            !FrankenError::UniqueViolation {
+                columns: String::new()
+            }
+            .is_transient()
+        );
+        assert!(!FrankenError::ReadOnly.is_transient());
+        assert!(!FrankenError::ConcurrentUnavailable.is_transient());
+    }
+
+    #[test]
+    fn suggestion_comprehensive() {
+        // Has suggestion
+        assert!(
+            FrankenError::DatabaseNotFound {
+                path: PathBuf::new()
+            }
+            .suggestion()
+            .is_some()
+        );
+        assert!(
+            FrankenError::DatabaseLocked {
+                path: PathBuf::new()
+            }
+            .suggestion()
+            .is_some()
+        );
+        assert!(FrankenError::BusyRecovery.suggestion().is_some());
+        assert!(
+            FrankenError::WriteConflict { page: 1, holder: 1 }
+                .suggestion()
+                .is_some()
+        );
+        assert!(
+            FrankenError::SerializationFailure { page: 1 }
+                .suggestion()
+                .is_some()
+        );
+        assert!(
+            FrankenError::SnapshotTooOld { txn_id: 1 }
+                .suggestion()
+                .is_some()
+        );
+        assert!(
+            FrankenError::DatabaseCorrupt {
+                detail: String::new()
+            }
+            .suggestion()
+            .is_some()
+        );
+        assert!(FrankenError::TooBig.suggestion().is_some());
+        assert!(FrankenError::ConcurrentUnavailable.suggestion().is_some());
+        assert!(FrankenError::QueryReturnedNoRows.suggestion().is_some());
+
+        // No suggestion
+        assert!(FrankenError::Abort.suggestion().is_none());
+        assert!(FrankenError::AuthDenied.suggestion().is_none());
+        assert!(FrankenError::OutOfMemory.suggestion().is_none());
+        assert!(FrankenError::Internal(String::new()).suggestion().is_none());
+        assert!(FrankenError::ReadOnly.suggestion().is_none());
+    }
+
+    #[test]
+    fn error_code_enum_repr_values() {
+        // Verify all ErrorCode numeric values match C SQLite
+        assert_eq!(ErrorCode::Internal as i32, 2);
+        assert_eq!(ErrorCode::Perm as i32, 3);
+        assert_eq!(ErrorCode::Abort as i32, 4);
+        assert_eq!(ErrorCode::Locked as i32, 6);
+        assert_eq!(ErrorCode::NoMem as i32, 7);
+        assert_eq!(ErrorCode::ReadOnly as i32, 8);
+        assert_eq!(ErrorCode::Interrupt as i32, 9);
+        assert_eq!(ErrorCode::IoErr as i32, 10);
+        assert_eq!(ErrorCode::Corrupt as i32, 11);
+        assert_eq!(ErrorCode::NotFound as i32, 12);
+        assert_eq!(ErrorCode::Full as i32, 13);
+        assert_eq!(ErrorCode::CantOpen as i32, 14);
+        assert_eq!(ErrorCode::Protocol as i32, 15);
+        assert_eq!(ErrorCode::Empty as i32, 16);
+        assert_eq!(ErrorCode::Schema as i32, 17);
+        assert_eq!(ErrorCode::TooBig as i32, 18);
+        assert_eq!(ErrorCode::Mismatch as i32, 20);
+        assert_eq!(ErrorCode::Misuse as i32, 21);
+        assert_eq!(ErrorCode::NoLfs as i32, 22);
+        assert_eq!(ErrorCode::Auth as i32, 23);
+        assert_eq!(ErrorCode::Format as i32, 24);
+        assert_eq!(ErrorCode::Range as i32, 25);
+        assert_eq!(ErrorCode::NotADb as i32, 26);
+        assert_eq!(ErrorCode::Notice as i32, 27);
+        assert_eq!(ErrorCode::Warning as i32, 28);
+    }
+
+    #[test]
+    fn error_code_clone_eq() {
+        let code = ErrorCode::Busy;
+        let cloned = code;
+        assert_eq!(code, cloned);
+        assert_eq!(code, ErrorCode::Busy);
+        assert_ne!(code, ErrorCode::Error);
+    }
+
+    #[test]
+    fn function_error_constructor() {
+        let err = FrankenError::function_error("division by zero");
+        assert!(matches!(err, FrankenError::FunctionError(ref msg) if msg == "division by zero"));
+        assert_eq!(err.error_code(), ErrorCode::Error);
+    }
+
+    #[test]
+    fn constraint_error_codes_all_variants() {
+        assert_eq!(
+            FrankenError::CheckViolation {
+                name: "ck1".to_owned()
+            }
+            .error_code(),
+            ErrorCode::Constraint
+        );
+        assert_eq!(
+            FrankenError::PrimaryKeyViolation.error_code(),
+            ErrorCode::Constraint
+        );
+        assert_eq!(
+            FrankenError::CheckViolation {
+                name: "ck1".to_owned()
+            }
+            .to_string(),
+            "CHECK constraint failed: ck1"
+        );
+        assert_eq!(
+            FrankenError::PrimaryKeyViolation.to_string(),
+            "PRIMARY KEY constraint failed"
+        );
+    }
+
+    #[test]
+    fn exit_code_matches_error_code() {
+        // exit_code() should be the i32 repr of error_code()
+        let cases: Vec<FrankenError> = vec![
+            FrankenError::DatabaseFull,
+            FrankenError::TooBig,
+            FrankenError::OutOfMemory,
+            FrankenError::AuthDenied,
+            FrankenError::Abort,
+            FrankenError::ReadOnly,
+            FrankenError::Unsupported,
+        ];
+        for err in cases {
+            assert_eq!(err.exit_code(), err.error_code() as i32);
+        }
+    }
 }

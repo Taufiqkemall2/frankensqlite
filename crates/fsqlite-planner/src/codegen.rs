@@ -1383,4 +1383,195 @@ mod tests {
             &[Opcode::Insert, Opcode::ResultRow, Opcode::Close,]
         ));
     }
+
+    // ===================================================================
+    // CodegenError Display / Error trait tests
+    // ===================================================================
+
+    #[test]
+    fn test_codegen_error_display_table_not_found() {
+        let err = CodegenError::TableNotFound("users".to_owned());
+        let msg = err.to_string();
+        assert!(msg.contains("table not found"), "got: {msg}");
+        assert!(msg.contains("users"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_codegen_error_display_column_not_found() {
+        let err = CodegenError::ColumnNotFound {
+            table: "users".to_owned(),
+            column: "email".to_owned(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("email"), "got: {msg}");
+        assert!(msg.contains("users"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_codegen_error_display_unsupported() {
+        let err = CodegenError::Unsupported("window functions".to_owned());
+        let msg = err.to_string();
+        assert!(msg.contains("unsupported"), "got: {msg}");
+        assert!(msg.contains("window functions"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_codegen_error_is_error() {
+        let err = CodegenError::TableNotFound("t".to_owned());
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    // ===================================================================
+    // TableSchema method tests
+    // ===================================================================
+
+    #[test]
+    fn test_table_schema_affinity_string() {
+        let schema = TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo {
+                    name: "id".to_owned(),
+                    affinity: 'd',
+                },
+                ColumnInfo {
+                    name: "name".to_owned(),
+                    affinity: 'C',
+                },
+                ColumnInfo {
+                    name: "amount".to_owned(),
+                    affinity: 'e',
+                },
+            ],
+            indexes: vec![],
+        };
+        assert_eq!(schema.affinity_string(), "dCe");
+    }
+
+    #[test]
+    fn test_table_schema_column_index() {
+        let schema = test_schema();
+        // Case-insensitive lookup.
+        assert_eq!(schema[0].column_index("a"), Some(0));
+        assert_eq!(schema[0].column_index("A"), Some(0));
+        assert_eq!(schema[0].column_index("b"), Some(1));
+        assert_eq!(schema[0].column_index("z"), None);
+    }
+
+    #[test]
+    fn test_table_schema_index_for_column() {
+        let schema = test_schema_with_index();
+        let table = &schema[0];
+        // Should find idx_t_b (leftmost column is "b").
+        let found = table.index_for_column("b");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name, "idx_t_b");
+
+        // Case-insensitive.
+        let found = table.index_for_column("B");
+        assert!(found.is_some());
+
+        // No index on column "a".
+        assert!(table.index_for_column("a").is_none());
+    }
+
+    #[test]
+    fn test_table_schema_affinity_string_empty() {
+        let schema = TableSchema {
+            name: "empty".to_owned(),
+            root_page: 2,
+            columns: vec![],
+            indexes: vec![],
+        };
+        assert_eq!(schema.affinity_string(), "");
+    }
+
+    // ===================================================================
+    // CodegenContext tests
+    // ===================================================================
+
+    #[test]
+    fn test_codegen_context_default() {
+        let ctx = CodegenContext::default();
+        assert!(!ctx.concurrent_mode);
+    }
+
+    // ===================================================================
+    // Codegen error path tests
+    // ===================================================================
+
+    #[test]
+    fn test_codegen_select_table_not_found() {
+        let stmt = star_select("nonexistent");
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_select(&mut b, &stmt, &schema, &ctx).expect_err("should fail");
+        assert!(matches!(err, CodegenError::TableNotFound(_)));
+    }
+
+    #[test]
+    fn test_codegen_insert_table_not_found() {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("nonexistent"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::Values(vec![vec![placeholder(1)]]),
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_insert(&mut b, &stmt, &schema, &ctx).expect_err("should fail");
+        assert!(matches!(err, CodegenError::TableNotFound(_)));
+    }
+
+    #[test]
+    fn test_codegen_update_table_not_found() {
+        let stmt = UpdateStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("nonexistent"),
+                alias: None,
+                index_hint: None,
+            },
+            assignments: vec![],
+            from: None,
+            where_clause: None,
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_update(&mut b, &stmt, &schema, &ctx).expect_err("should fail");
+        assert!(matches!(err, CodegenError::TableNotFound(_)));
+    }
+
+    #[test]
+    fn test_codegen_delete_table_not_found() {
+        let stmt = DeleteStatement {
+            with: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("nonexistent"),
+                alias: None,
+                index_hint: None,
+            },
+            where_clause: None,
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_delete(&mut b, &stmt, &schema, &ctx).expect_err("should fail");
+        assert!(matches!(err, CodegenError::TableNotFound(_)));
+    }
 }

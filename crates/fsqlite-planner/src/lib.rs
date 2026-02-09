@@ -9,6 +9,8 @@
 //! Note: AST-to-VDBE compilation is an integration concern and lives above the
 //! planner layer per the workspace layering rules (bd-1wwc).
 
+pub mod codegen;
+
 use fsqlite_ast::{
     BinaryOp as AstBinaryOp, ColumnRef, CompoundOp, Expr, FromClause, InSet, LikeOp, Literal,
     NullsOrder, OrderingTerm, ResultColumn, SelectBody, SelectCore, SortDirection, Span,
@@ -2132,5 +2134,668 @@ mod tests {
         let plan = order_joins(&[], &[], &[], None, &[]);
         assert!(plan.join_order.is_empty());
         assert!((plan.total_cost - 0.0).abs() < f64::EPSILON);
+    }
+
+    // ===================================================================
+    // Error Display / Error trait tests
+    // ===================================================================
+
+    #[test]
+    fn test_compound_order_by_error_display_zero_or_negative() {
+        let err = CompoundOrderByError::IndexZeroOrNegative {
+            value: -3,
+            span: Span::ZERO,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("-3"), "should contain the value: {msg}");
+        assert!(
+            msg.contains("must be positive"),
+            "should say must be positive: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_compound_order_by_error_is_error() {
+        let err = CompoundOrderByError::ColumnNotFound {
+            name: "x".to_owned(),
+            span: Span::ZERO,
+        };
+        // std::error::Error is implemented — verify source() returns None (leaf error).
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn test_single_table_projection_error_display_all_variants() {
+        let cases: Vec<(SingleTableProjectionError, &str)> = vec![
+            (SingleTableProjectionError::NotSelectCore, "SELECT core"),
+            (SingleTableProjectionError::MissingFromClause, "FROM clause"),
+            (
+                SingleTableProjectionError::UnsupportedFromSource,
+                "single-table",
+            ),
+            (
+                SingleTableProjectionError::UnknownTableQualifier {
+                    qualifier: "bad".to_owned(),
+                },
+                "bad",
+            ),
+            (
+                SingleTableProjectionError::ColumnNotFound {
+                    column: "missing_col".to_owned(),
+                },
+                "missing_col",
+            ),
+        ];
+        for (err, expected_fragment) in cases {
+            let msg = err.to_string();
+            assert!(
+                msg.contains(expected_fragment),
+                "{err:?} display should contain '{expected_fragment}': got '{msg}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_single_table_projection_error_is_error() {
+        let err = SingleTableProjectionError::NotSelectCore;
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    // ===================================================================
+    // count_output_columns tests
+    // ===================================================================
+
+    #[test]
+    fn test_count_output_columns_select() {
+        let core = select_core_with_aliases(&["a", "b", "c"]);
+        assert_eq!(count_output_columns(&core), 3);
+    }
+
+    #[test]
+    fn test_count_output_columns_values() {
+        let core = SelectCore::Values(vec![vec![
+            Expr::Literal(Literal::Integer(1), Span::ZERO),
+            Expr::Literal(Literal::Integer(2), Span::ZERO),
+        ]]);
+        assert_eq!(count_output_columns(&core), 2);
+    }
+
+    #[test]
+    fn test_count_output_columns_empty_values() {
+        let core = SelectCore::Values(vec![]);
+        assert_eq!(count_output_columns(&core), 0);
+    }
+
+    // ===================================================================
+    // extract_output_aliases edge cases
+    // ===================================================================
+
+    #[test]
+    fn test_extract_output_aliases_star_is_none() {
+        let core = SelectCore::Select {
+            distinct: Distinctness::All,
+            columns: vec![ResultColumn::Star],
+            from: None,
+            where_clause: None,
+            group_by: vec![],
+            having: None,
+            windows: vec![],
+        };
+        let aliases = extract_output_aliases(&core);
+        assert_eq!(aliases, vec![None]);
+    }
+
+    #[test]
+    fn test_extract_output_aliases_expression_no_alias() {
+        // SELECT 1+2 (expression, no alias) → None
+        let core = SelectCore::Select {
+            distinct: Distinctness::All,
+            columns: vec![ResultColumn::Expr {
+                expr: Expr::BinaryOp {
+                    left: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+                    op: fsqlite_ast::BinaryOp::Add,
+                    right: Box::new(Expr::Literal(Literal::Integer(2), Span::ZERO)),
+                    span: Span::ZERO,
+                },
+                alias: None,
+            }],
+            from: None,
+            where_clause: None,
+            group_by: vec![],
+            having: None,
+            windows: vec![],
+        };
+        let aliases = extract_output_aliases(&core);
+        assert_eq!(aliases, vec![None]);
+    }
+
+    // ===================================================================
+    // resolve_single_table_result_columns edge cases
+    // ===================================================================
+
+    #[test]
+    fn test_resolve_projection_values_core_error() {
+        let core = SelectCore::Values(vec![vec![Expr::Literal(Literal::Integer(1), Span::ZERO)]]);
+        let err = resolve_single_table_result_columns(&core, &["a".to_owned()])
+            .expect_err("VALUES should fail");
+        assert_eq!(err, SingleTableProjectionError::NotSelectCore);
+    }
+
+    #[test]
+    fn test_resolve_projection_missing_from_error() {
+        let core = SelectCore::Select {
+            distinct: Distinctness::All,
+            columns: vec![ResultColumn::Star],
+            from: None,
+            where_clause: None,
+            group_by: vec![],
+            having: None,
+            windows: vec![],
+        };
+        let err = resolve_single_table_result_columns(&core, &["a".to_owned()])
+            .expect_err("missing FROM should fail");
+        assert_eq!(err, SingleTableProjectionError::MissingFromClause);
+    }
+
+    #[test]
+    fn test_resolve_projection_with_joins_error() {
+        use fsqlite_ast::{JoinClause, JoinKind, JoinType};
+        let core = SelectCore::Select {
+            distinct: Distinctness::All,
+            columns: vec![ResultColumn::Star],
+            from: Some(FromClause {
+                source: TableOrSubquery::Table {
+                    name: QualifiedName::bare("t"),
+                    alias: None,
+                    index_hint: None,
+                },
+                joins: vec![JoinClause {
+                    join_type: JoinType {
+                        kind: JoinKind::Inner,
+                        natural: false,
+                    },
+                    table: TableOrSubquery::Table {
+                        name: QualifiedName::bare("u"),
+                        alias: None,
+                        index_hint: None,
+                    },
+                    constraint: None,
+                }],
+            }),
+            where_clause: None,
+            group_by: vec![],
+            having: None,
+            windows: vec![],
+        };
+        let err = resolve_single_table_result_columns(&core, &["a".to_owned()])
+            .expect_err("JOIN should fail");
+        assert_eq!(err, SingleTableProjectionError::UnsupportedFromSource);
+    }
+
+    #[test]
+    fn test_resolve_projection_unknown_table_qualifier() {
+        let core = select_core_single_table(
+            vec![ResultColumn::TableStar("wrong_table".to_owned())],
+            "t",
+            None,
+        );
+        let err = resolve_single_table_result_columns(&core, &["a".to_owned()])
+            .expect_err("wrong qualifier should fail");
+        assert_eq!(
+            err,
+            SingleTableProjectionError::UnknownTableQualifier {
+                qualifier: "wrong_table".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn test_resolve_projection_qualified_column_wrong_table() {
+        let core = select_core_single_table(
+            vec![ResultColumn::Expr {
+                expr: Expr::Column(ColumnRef::qualified("other", "a"), Span::ZERO),
+                alias: None,
+            }],
+            "t",
+            None,
+        );
+        let err = resolve_single_table_result_columns(&core, &["a".to_owned()])
+            .expect_err("wrong table qualifier should fail");
+        assert!(matches!(
+            err,
+            SingleTableProjectionError::UnknownTableQualifier { .. }
+        ));
+    }
+
+    #[test]
+    fn test_resolve_projection_preserves_expression() {
+        // Non-column expressions should be preserved as-is.
+        let core = select_core_single_table(
+            vec![ResultColumn::Expr {
+                expr: Expr::Literal(Literal::Integer(42), Span::ZERO),
+                alias: Some("answer".to_owned()),
+            }],
+            "t",
+            None,
+        );
+        let resolved = resolve_single_table_result_columns(&core, &["a".to_owned()])
+            .expect("expression should be preserved");
+        assert_eq!(resolved.len(), 1);
+        assert!(matches!(
+            &resolved[0],
+            ResultColumn::Expr {
+                alias: Some(a), ..
+            } if a == "answer"
+        ));
+    }
+
+    // ===================================================================
+    // classify_where_term edge cases
+    // ===================================================================
+
+    #[test]
+    fn test_classify_where_term_between() {
+        let expr: &'static Expr = Box::leak(Box::new(Expr::Between {
+            expr: Box::new(Expr::Column(ColumnRef::bare("x"), Span::ZERO)),
+            low: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            high: Box::new(Expr::Literal(Literal::Integer(10), Span::ZERO)),
+            not: false,
+            span: Span::ZERO,
+        }));
+        let term = classify_where_term(expr);
+        assert!(matches!(term.kind, WhereTermKind::Between));
+        assert_eq!(term.column.as_ref().unwrap().column, "x");
+    }
+
+    #[test]
+    fn test_classify_where_term_not_between_is_other() {
+        let expr: &'static Expr = Box::leak(Box::new(Expr::Between {
+            expr: Box::new(Expr::Column(ColumnRef::bare("x"), Span::ZERO)),
+            low: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            high: Box::new(Expr::Literal(Literal::Integer(10), Span::ZERO)),
+            not: true,
+            span: Span::ZERO,
+        }));
+        let term = classify_where_term(expr);
+        assert!(matches!(term.kind, WhereTermKind::Other));
+    }
+
+    #[test]
+    fn test_classify_where_term_in_list() {
+        let term = in_term("col", 5);
+        assert!(matches!(term.kind, WhereTermKind::InList { count: 5 }));
+        assert_eq!(term.column.as_ref().unwrap().column, "col");
+    }
+
+    #[test]
+    fn test_classify_where_term_not_in_is_other() {
+        let expr: &'static Expr = Box::leak(Box::new(Expr::In {
+            expr: Box::new(Expr::Column(ColumnRef::bare("x"), Span::ZERO)),
+            set: InSet::List(vec![Expr::Literal(Literal::Integer(1), Span::ZERO)]),
+            not: true,
+            span: Span::ZERO,
+        }));
+        let term = classify_where_term(expr);
+        assert!(matches!(term.kind, WhereTermKind::Other));
+    }
+
+    #[test]
+    fn test_classify_where_term_like_prefix() {
+        let term = like_term("name", "abc%");
+        assert!(matches!(
+            term.kind,
+            WhereTermKind::LikePrefix { ref prefix } if prefix == "abc"
+        ));
+        assert_eq!(term.column.as_ref().unwrap().column, "name");
+    }
+
+    #[test]
+    fn test_classify_where_term_like_no_prefix_is_other() {
+        let term = like_term("name", "%wildcard");
+        assert!(matches!(term.kind, WhereTermKind::Other));
+    }
+
+    #[test]
+    fn test_classify_where_term_rowid_aliases() {
+        // _rowid_ and oid are also rowid aliases
+        for alias in &["_rowid_", "oid", "ROWID", "OID"] {
+            let expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::bare(*alias), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+                span: Span::ZERO,
+            }));
+            let term = classify_where_term(expr);
+            assert!(
+                matches!(term.kind, WhereTermKind::RowidEquality),
+                "'{alias}' should be classified as RowidEquality"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_where_term_reversed_equality() {
+        // expr = col (column on the right side)
+        let expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Literal(Literal::Integer(42), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Column(ColumnRef::bare("x"), Span::ZERO)),
+            span: Span::ZERO,
+        }));
+        let term = classify_where_term(expr);
+        assert!(matches!(term.kind, WhereTermKind::Equality));
+        assert_eq!(term.column.as_ref().unwrap().column, "x");
+    }
+
+    #[test]
+    fn test_classify_where_term_reversed_rowid_equality() {
+        // 42 = rowid (column on the right side)
+        let expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Literal(Literal::Integer(42), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),
+            span: Span::ZERO,
+        }));
+        let term = classify_where_term(expr);
+        assert!(matches!(term.kind, WhereTermKind::RowidEquality));
+    }
+
+    #[test]
+    fn test_classify_where_term_eq_no_columns_is_other() {
+        // 1 = 2 (no columns on either side)
+        let expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Literal(Literal::Integer(2), Span::ZERO)),
+            span: Span::ZERO,
+        }));
+        let term = classify_where_term(expr);
+        assert!(matches!(term.kind, WhereTermKind::Other));
+        assert!(term.column.is_none());
+    }
+
+    #[test]
+    fn test_classify_where_term_generic_fallback() {
+        // OR expression → Other
+        let expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            op: AstBinaryOp::Or,
+            right: Box::new(Expr::Literal(Literal::Integer(0), Span::ZERO)),
+            span: Span::ZERO,
+        }));
+        let term = classify_where_term(expr);
+        assert!(matches!(term.kind, WhereTermKind::Other));
+    }
+
+    // ===================================================================
+    // decompose_where edge cases
+    // ===================================================================
+
+    #[test]
+    fn test_decompose_where_nested_and() {
+        // (a = 1 AND b = 2) AND c = 3 → 3 terms
+        let inner = Expr::BinaryOp {
+            left: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::BinaryOp {
+                    left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+                    op: AstBinaryOp::Eq,
+                    right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+                    span: Span::ZERO,
+                }),
+                op: AstBinaryOp::And,
+                right: Box::new(Expr::BinaryOp {
+                    left: Box::new(Expr::Column(ColumnRef::bare("b"), Span::ZERO)),
+                    op: AstBinaryOp::Eq,
+                    right: Box::new(Expr::Literal(Literal::Integer(2), Span::ZERO)),
+                    span: Span::ZERO,
+                }),
+                span: Span::ZERO,
+            }),
+            op: AstBinaryOp::And,
+            right: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::bare("c"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(Expr::Literal(Literal::Integer(3), Span::ZERO)),
+                span: Span::ZERO,
+            }),
+            span: Span::ZERO,
+        };
+        let terms = decompose_where(&inner);
+        assert_eq!(terms.len(), 3);
+    }
+
+    #[test]
+    fn test_decompose_where_single_term() {
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            span: Span::ZERO,
+        };
+        let terms = decompose_where(&expr);
+        assert_eq!(terms.len(), 1);
+    }
+
+    // ===================================================================
+    // extract_like_prefix edge cases
+    // ===================================================================
+
+    #[test]
+    fn test_extract_like_prefix_underscore_wildcard() {
+        // "abc_def" → prefix = "abc" (underscore is wildcard)
+        let pat = Expr::Literal(Literal::String("abc_def".to_owned()), Span::ZERO);
+        assert_eq!(extract_like_prefix(&pat), Some("abc".to_owned()));
+    }
+
+    #[test]
+    fn test_extract_like_prefix_no_wildcards() {
+        // "exact" → prefix = "exact" (no wildcards)
+        let pat = Expr::Literal(Literal::String("exact".to_owned()), Span::ZERO);
+        assert_eq!(extract_like_prefix(&pat), Some("exact".to_owned()));
+    }
+
+    #[test]
+    fn test_extract_like_prefix_non_string_expr() {
+        // Non-string expression → None
+        let pat = Expr::Literal(Literal::Integer(42), Span::ZERO);
+        assert_eq!(extract_like_prefix(&pat), None);
+    }
+
+    // ===================================================================
+    // Join ordering / star query edge cases
+    // ===================================================================
+
+    #[test]
+    fn test_detect_star_query_too_few_tables() {
+        let tables = [table_stats("t1", 100, 1000), table_stats("t2", 100, 1000)];
+        let terms = [join_term("t1", "id", "t2", "fk")];
+        assert!(!detect_star_query(&tables, &terms));
+    }
+
+    #[test]
+    fn test_mx_choice_zero_tables() {
+        assert_eq!(compute_mx_choice(0, false), 1);
+    }
+
+    // ===================================================================
+    // best_access_path edge cases
+    // ===================================================================
+
+    #[test]
+    fn test_best_access_path_unique_index_equality() {
+        let table = table_stats("t1", 1000, 50000);
+        let idx = index_info("idx_pk", "t1", &["id"], true, 100);
+        let terms = [eq_term("id")];
+        let ap = best_access_path(&table, &[idx], &terms, None);
+        // Unique index equality → estimated_rows = 1.0
+        assert!(
+            (ap.estimated_rows - 1.0).abs() < f64::EPSILON,
+            "unique index equality should return 1 row, got {}",
+            ap.estimated_rows
+        );
+    }
+
+    #[test]
+    fn test_best_access_path_in_expansion() {
+        let table = table_stats("t1", 100, 1000);
+        let idx = index_info("idx_col", "t1", &["col"], false, 20);
+        let terms = [in_term("col", 3)];
+        let ap = best_access_path(&table, &[idx], &terms, None);
+        assert!(matches!(ap.kind, AccessPathKind::IndexScanEquality));
+        assert!(ap.index.is_some());
+    }
+
+    #[test]
+    fn test_best_access_path_like_prefix() {
+        let table = table_stats("t1", 100, 1000);
+        let idx = index_info("idx_name", "t1", &["name"], false, 20);
+        let terms = [like_term("name", "Jo%")];
+        let ap = best_access_path(&table, &[idx], &terms, None);
+        // LIKE prefix should use index range scan
+        assert!(
+            matches!(
+                ap.kind,
+                AccessPathKind::IndexScanRange { .. } | AccessPathKind::CoveringIndexScan { .. }
+            ),
+            "LIKE prefix should use index scan, got {:?}",
+            ap.kind
+        );
+    }
+
+    #[test]
+    fn test_best_access_path_between_range() {
+        let table = table_stats("t1", 100, 1000);
+        let idx = index_info("idx_a", "t1", &["a"], false, 20);
+        let expr: &'static Expr = Box::leak(Box::new(Expr::Between {
+            expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            low: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            high: Box::new(Expr::Literal(Literal::Integer(100), Span::ZERO)),
+            not: false,
+            span: Span::ZERO,
+        }));
+        let term = classify_where_term(expr);
+        let ap = best_access_path(&table, &[idx], &[term], None);
+        assert!(matches!(ap.kind, AccessPathKind::IndexScanRange { .. }));
+    }
+
+    #[test]
+    fn test_best_access_path_ignores_wrong_table_index() {
+        // Index belongs to different table — should not be used.
+        let table = table_stats("t1", 100, 1000);
+        let idx = index_info("idx_other", "t2", &["a"], false, 20);
+        let terms = [eq_term("a")];
+        let ap = best_access_path(&table, &[idx], &terms, None);
+        assert!(matches!(ap.kind, AccessPathKind::FullTableScan));
+    }
+
+    #[test]
+    fn test_best_access_path_empty_index_columns() {
+        // Index with no columns → not usable.
+        let table = table_stats("t1", 100, 1000);
+        let idx = IndexInfo {
+            name: "idx_empty".to_owned(),
+            table: "t1".to_owned(),
+            columns: vec![],
+            unique: false,
+            n_pages: 10,
+            source: StatsSource::Heuristic,
+        };
+        let terms = [eq_term("a")];
+        let ap = best_access_path(&table, &[idx], &terms, None);
+        assert!(matches!(ap.kind, AccessPathKind::FullTableScan));
+    }
+
+    #[test]
+    fn test_index_usability_between_on_leftmost() {
+        let idx = index_info("idx_a", "t1", &["a"], false, 50);
+        let expr: &'static Expr = Box::leak(Box::new(Expr::Between {
+            expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            low: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            high: Box::new(Expr::Literal(Literal::Integer(10), Span::ZERO)),
+            not: false,
+            span: Span::ZERO,
+        }));
+        let term = classify_where_term(expr);
+        assert!(matches!(
+            analyze_index_usability(&idx, &[term]),
+            IndexUsability::Range { .. }
+        ));
+    }
+
+    // ===================================================================
+    // WhereTermKind / WhereColumn equality tests
+    // ===================================================================
+
+    #[test]
+    fn test_where_term_kind_equality() {
+        assert_eq!(WhereTermKind::Equality, WhereTermKind::Equality);
+        assert_eq!(WhereTermKind::Range, WhereTermKind::Range);
+        assert_eq!(WhereTermKind::Between, WhereTermKind::Between);
+        assert_eq!(
+            WhereTermKind::InList { count: 3 },
+            WhereTermKind::InList { count: 3 }
+        );
+        assert_ne!(
+            WhereTermKind::InList { count: 3 },
+            WhereTermKind::InList { count: 5 }
+        );
+        assert_eq!(
+            WhereTermKind::LikePrefix {
+                prefix: "abc".to_owned()
+            },
+            WhereTermKind::LikePrefix {
+                prefix: "abc".to_owned()
+            }
+        );
+        assert_ne!(WhereTermKind::Equality, WhereTermKind::Range);
+    }
+
+    #[test]
+    fn test_where_column_equality() {
+        let wc1 = WhereColumn {
+            table: Some("t".to_owned()),
+            column: "a".to_owned(),
+        };
+        let wc2 = WhereColumn {
+            table: Some("t".to_owned()),
+            column: "a".to_owned(),
+        };
+        let wc3 = WhereColumn {
+            table: None,
+            column: "a".to_owned(),
+        };
+        assert_eq!(wc1, wc2);
+        assert_ne!(wc1, wc3);
+    }
+
+    // ===================================================================
+    // StatsSource tests
+    // ===================================================================
+
+    #[test]
+    fn test_stats_source_equality() {
+        assert_eq!(StatsSource::Analyze, StatsSource::Analyze);
+        assert_eq!(StatsSource::Heuristic, StatsSource::Heuristic);
+        assert_ne!(StatsSource::Analyze, StatsSource::Heuristic);
+    }
+
+    // ===================================================================
+    // cost model minimum page clamp
+    // ===================================================================
+
+    #[test]
+    fn test_cost_minimum_page_clamp() {
+        // With 0 pages, cost should use max(1) = 1.
+        let cost = estimate_cost(&AccessPathKind::FullTableScan, 0, 0);
+        assert!(
+            (cost - 1.0).abs() < f64::EPSILON,
+            "0 pages should clamp to 1"
+        );
+
+        let cost = estimate_cost(&AccessPathKind::RowidLookup, 0, 0);
+        assert!(
+            (cost - 0.0).abs() < f64::EPSILON,
+            "log2(1) = 0.0 for clamped 0 pages"
+        );
     }
 }

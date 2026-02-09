@@ -2361,4 +2361,601 @@ mod tests {
         assert_eq!(UnaryOp::Negate.to_string(), "-");
         assert_eq!(UnaryOp::Not.to_string(), "NOT");
     }
+
+    // --- Additional coverage tests ---
+
+    #[test]
+    fn test_unary_op_display_all_variants() {
+        assert_eq!(UnaryOp::Plus.to_string(), "+");
+        assert_eq!(UnaryOp::BitNot.to_string(), "~");
+    }
+
+    #[test]
+    fn test_binary_op_display_all_variants() {
+        assert_eq!(BinaryOp::Subtract.to_string(), "-");
+        assert_eq!(BinaryOp::Multiply.to_string(), "*");
+        assert_eq!(BinaryOp::Divide.to_string(), "/");
+        assert_eq!(BinaryOp::Modulo.to_string(), "%");
+        assert_eq!(BinaryOp::Eq.to_string(), "=");
+        assert_eq!(BinaryOp::Ne.to_string(), "!=");
+        assert_eq!(BinaryOp::Lt.to_string(), "<");
+        assert_eq!(BinaryOp::Le.to_string(), "<=");
+        assert_eq!(BinaryOp::Gt.to_string(), ">");
+        assert_eq!(BinaryOp::Ge.to_string(), ">=");
+        assert_eq!(BinaryOp::Is.to_string(), "IS");
+        assert_eq!(BinaryOp::Or.to_string(), "OR");
+        assert_eq!(BinaryOp::BitAnd.to_string(), "&");
+        assert_eq!(BinaryOp::BitOr.to_string(), "|");
+        assert_eq!(BinaryOp::ShiftLeft.to_string(), "<<");
+        assert_eq!(BinaryOp::ShiftRight.to_string(), ">>");
+    }
+
+    #[test]
+    fn test_span_debug_format() {
+        let s = Span::new(10, 25);
+        assert_eq!(format!("{s:?}"), "10..25");
+    }
+
+    #[test]
+    fn test_span_display_format() {
+        let s = Span::new(0, 42);
+        assert_eq!(format!("{s}"), "0..42");
+    }
+
+    #[test]
+    fn test_span_zero_properties() {
+        assert_eq!(Span::ZERO.start, 0);
+        assert_eq!(Span::ZERO.end, 0);
+        assert_eq!(Span::ZERO.len(), 0);
+        assert!(Span::ZERO.is_empty());
+    }
+
+    #[test]
+    fn test_span_merge_overlapping() {
+        let a = Span::new(5, 15);
+        let b = Span::new(10, 20);
+        let merged = a.merge(b);
+        assert_eq!(merged.start, 5);
+        assert_eq!(merged.end, 20);
+    }
+
+    #[test]
+    fn test_span_merge_reversed_order() {
+        let a = Span::new(20, 30);
+        let b = Span::new(5, 10);
+        let merged = a.merge(b);
+        assert_eq!(merged.start, 5);
+        assert_eq!(merged.end, 30);
+    }
+
+    #[test]
+    fn test_table_schema_effective_name_with_alias() {
+        let schema = TableSchema {
+            name: "users".to_owned(),
+            alias: Some("u".to_owned()),
+            columns: vec!["id".to_owned()],
+        };
+        assert_eq!(schema.effective_name(), "u");
+    }
+
+    #[test]
+    fn test_table_schema_effective_name_without_alias() {
+        let schema = TableSchema {
+            name: "users".to_owned(),
+            alias: None,
+            columns: vec!["id".to_owned()],
+        };
+        assert_eq!(schema.effective_name(), "users");
+    }
+
+    #[test]
+    fn test_resolve_case_insensitive_table() {
+        let scope = ResolverScope::new(vec![TableSchema {
+            name: "Users".to_owned(),
+            alias: None,
+            columns: vec!["Id".to_owned(), "Name".to_owned()],
+        }]);
+
+        // Qualified lookup with different case should work.
+        let result = scope
+            .resolve(&ColumnRef::qualified("users", "id"), Span::ZERO)
+            .expect("case-insensitive table match");
+        assert_eq!(result.table_name, "Users");
+        assert_eq!(result.column_name, "Id");
+    }
+
+    #[test]
+    fn test_resolve_case_insensitive_unqualified() {
+        let scope = ResolverScope::new(vec![TableSchema {
+            name: "T".to_owned(),
+            alias: None,
+            columns: vec!["COL_A".to_owned()],
+        }]);
+
+        let result = scope
+            .resolve(&ColumnRef::bare("col_a"), Span::ZERO)
+            .expect("case-insensitive unqualified match");
+        assert_eq!(result.column_name, "COL_A");
+    }
+
+    #[test]
+    fn test_expand_table_star_nonexistent() {
+        let scope = make_scope_t1_t2();
+        let err = scope
+            .expand_table_star("nonexistent", Span::ZERO)
+            .unwrap_err();
+        assert!(matches!(err, ResolveError::NoSuchTable { .. }));
+    }
+
+    #[test]
+    fn test_resolve_error_display_no_such_table() {
+        let err = ResolveError::NoSuchTable {
+            name: "foo".to_owned(),
+            span: Span::new(5, 8),
+        };
+        assert_eq!(err.to_string(), "no such table: foo at 5..8");
+    }
+
+    #[test]
+    fn test_resolve_error_display_no_such_column() {
+        let err = ResolveError::NoSuchColumn {
+            table: "t1".to_owned(),
+            column: "bar".to_owned(),
+            span: Span::new(10, 16),
+        };
+        assert_eq!(err.to_string(), "no such column: t1.bar at 10..16");
+    }
+
+    #[test]
+    fn test_resolve_error_display_ambiguous() {
+        let err = ResolveError::AmbiguousColumn {
+            column: "id".to_owned(),
+            candidates: vec!["users".to_owned(), "orders".to_owned()],
+            span: Span::ZERO,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("ambiguous column name: id"));
+        assert!(msg.contains("users, orders"));
+    }
+
+    #[test]
+    fn test_resolve_error_display_column_not_found() {
+        let err = ResolveError::ColumnNotFound {
+            column: "xyz".to_owned(),
+            span: Span::new(0, 3),
+        };
+        assert_eq!(err.to_string(), "no such column: xyz at 0..3");
+    }
+
+    #[test]
+    fn test_resolve_error_display_no_outer_table() {
+        let err = ResolveError::NoOuterTable {
+            name: "outer_t".to_owned(),
+            span: Span::new(1, 8),
+        };
+        assert_eq!(
+            err.to_string(),
+            "no such table in outer scope: outer_t at 1..8"
+        );
+    }
+
+    #[test]
+    fn test_resolve_error_is_std_error() {
+        let err: Box<dyn std::error::Error> = Box::new(ResolveError::ColumnNotFound {
+            column: "x".to_owned(),
+            span: Span::ZERO,
+        });
+        // Verify it implements std::error::Error
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn test_resolve_unqualified_from_parent_scope() {
+        let outer = ResolverScope::new(vec![TableSchema {
+            name: "outer_t".to_owned(),
+            alias: None,
+            columns: vec!["outer_col".to_owned()],
+        }]);
+        let inner = outer.child(vec![TableSchema {
+            name: "inner_t".to_owned(),
+            alias: None,
+            columns: vec!["inner_col".to_owned()],
+        }]);
+
+        // Unqualified column in inner scope falls through to parent.
+        let result = inner
+            .resolve(&ColumnRef::bare("outer_col"), Span::ZERO)
+            .expect("correlated unqualified from parent");
+        assert_eq!(result.table_name, "outer_t");
+        assert_eq!(result.column_name, "outer_col");
+    }
+
+    #[test]
+    fn test_distinctness_default_is_all() {
+        assert_eq!(Distinctness::default(), Distinctness::All);
+    }
+
+    #[test]
+    fn test_transaction_mode_concurrent() {
+        let begin = BeginStatement {
+            mode: Some(TransactionMode::Concurrent),
+        };
+        assert_eq!(begin.mode, Some(TransactionMode::Concurrent));
+    }
+
+    #[test]
+    fn test_transaction_mode_all_variants() {
+        let modes = [
+            TransactionMode::Deferred,
+            TransactionMode::Immediate,
+            TransactionMode::Exclusive,
+            TransactionMode::Concurrent,
+        ];
+        // Verify all are distinct.
+        for (i, a) in modes.iter().enumerate() {
+            for (j, b) in modes.iter().enumerate() {
+                assert_eq!(i == j, a == b, "modes {i} and {j} distinctness");
+            }
+        }
+    }
+
+    #[test]
+    fn test_conflict_action_all_variants() {
+        let actions = [
+            ConflictAction::Rollback,
+            ConflictAction::Abort,
+            ConflictAction::Fail,
+            ConflictAction::Ignore,
+            ConflictAction::Replace,
+        ];
+        assert_eq!(actions.len(), 5);
+        for (i, a) in actions.iter().enumerate() {
+            for (j, b) in actions.iter().enumerate() {
+                assert_eq!(i == j, a == b);
+            }
+        }
+    }
+
+    #[test]
+    fn test_compound_op_all_variants() {
+        let ops = [
+            CompoundOp::Union,
+            CompoundOp::UnionAll,
+            CompoundOp::Intersect,
+            CompoundOp::Except,
+        ];
+        assert_eq!(ops.len(), 4);
+        assert_ne!(CompoundOp::Union, CompoundOp::UnionAll);
+    }
+
+    #[test]
+    fn test_drop_object_type_variants() {
+        let types = [
+            DropObjectType::Table,
+            DropObjectType::View,
+            DropObjectType::Index,
+            DropObjectType::Trigger,
+        ];
+        assert_eq!(types.len(), 4);
+        assert_ne!(DropObjectType::Table, DropObjectType::View);
+    }
+
+    #[test]
+    fn test_like_op_variants() {
+        let ops = [LikeOp::Like, LikeOp::Glob, LikeOp::Match, LikeOp::Regexp];
+        assert_eq!(ops.len(), 4);
+        assert_ne!(LikeOp::Like, LikeOp::Glob);
+    }
+
+    #[test]
+    fn test_placeholder_type_variants() {
+        let _ = PlaceholderType::Anonymous;
+        let _ = PlaceholderType::Numbered(1);
+        let _ = PlaceholderType::ColonNamed("param".to_owned());
+        let _ = PlaceholderType::AtNamed("param".to_owned());
+        let _ = PlaceholderType::DollarNamed("param".to_owned());
+        assert_ne!(PlaceholderType::Anonymous, PlaceholderType::Numbered(1));
+        // Named variants with different prefixes differ.
+        assert_ne!(
+            PlaceholderType::ColonNamed("a".to_owned()),
+            PlaceholderType::AtNamed("a".to_owned()),
+        );
+    }
+
+    #[test]
+    fn test_raise_action_variants() {
+        let actions = [
+            RaiseAction::Ignore,
+            RaiseAction::Rollback,
+            RaiseAction::Abort,
+            RaiseAction::Fail,
+        ];
+        assert_eq!(actions.len(), 4);
+        assert_ne!(RaiseAction::Ignore, RaiseAction::Rollback);
+    }
+
+    #[test]
+    fn test_trigger_timing_variants() {
+        let timings = [
+            TriggerTiming::Before,
+            TriggerTiming::After,
+            TriggerTiming::InsteadOf,
+        ];
+        assert_eq!(timings.len(), 3);
+        assert_ne!(TriggerTiming::Before, TriggerTiming::After);
+    }
+
+    #[test]
+    fn test_trigger_event_update_with_columns() {
+        let ev = TriggerEvent::Update(vec!["col1".to_owned(), "col2".to_owned()]);
+        assert!(matches!(ev, TriggerEvent::Update(ref cols) if cols.len() == 2));
+        assert_ne!(TriggerEvent::Insert, TriggerEvent::Delete);
+    }
+
+    #[test]
+    fn test_frame_type_variants() {
+        let types = [FrameType::Rows, FrameType::Range, FrameType::Groups];
+        assert_eq!(types.len(), 3);
+        assert_ne!(FrameType::Rows, FrameType::Groups);
+    }
+
+    #[test]
+    fn test_frame_exclude_variants() {
+        let excludes = [
+            FrameExclude::NoOthers,
+            FrameExclude::CurrentRow,
+            FrameExclude::Group,
+            FrameExclude::Ties,
+        ];
+        assert_eq!(excludes.len(), 4);
+    }
+
+    #[test]
+    fn test_sort_direction_and_nulls_order() {
+        assert_ne!(SortDirection::Asc, SortDirection::Desc);
+        assert_ne!(NullsOrder::First, NullsOrder::Last);
+    }
+
+    #[test]
+    fn test_generated_storage_variants() {
+        assert_ne!(GeneratedStorage::Stored, GeneratedStorage::Virtual);
+    }
+
+    #[test]
+    fn test_cte_materialized_variants() {
+        assert_ne!(
+            CteMaterialized::Materialized,
+            CteMaterialized::NotMaterialized
+        );
+    }
+
+    #[test]
+    fn test_in_set_table_variant() {
+        let set = InSet::Table(QualifiedName::bare("lookup"));
+        assert!(matches!(set, InSet::Table(ref n) if n.name == "lookup"));
+    }
+
+    #[test]
+    fn test_function_args_star_vs_list() {
+        let star = FunctionArgs::Star;
+        let list = FunctionArgs::List(vec![]);
+        assert_ne!(star, list);
+    }
+
+    #[test]
+    fn test_insert_source_default_values() {
+        let src = InsertSource::DefaultValues;
+        assert!(matches!(src, InsertSource::DefaultValues));
+        assert_ne!(InsertSource::DefaultValues, InsertSource::Values(vec![]),);
+    }
+
+    #[test]
+    fn test_pragma_value_variants() {
+        let span = Span::ZERO;
+        let assign = PragmaValue::Assign(Expr::Literal(Literal::Integer(100), span));
+        let call = PragmaValue::Call(Expr::Literal(Literal::Integer(100), span));
+        assert_ne!(assign, call);
+    }
+
+    #[test]
+    fn test_column_ref_constructors() {
+        let bare = ColumnRef::bare("col");
+        assert!(bare.table.is_none());
+        assert_eq!(bare.column, "col");
+
+        let qual = ColumnRef::qualified("tbl", "col");
+        assert_eq!(qual.table.as_deref(), Some("tbl"));
+        assert_eq!(qual.column, "col");
+    }
+
+    #[test]
+    fn test_qualified_name_constructors() {
+        let bare = QualifiedName::bare("t");
+        assert!(bare.schema.is_none());
+        assert_eq!(bare.name, "t");
+
+        let qual = QualifiedName::qualified("main", "t");
+        assert_eq!(qual.schema.as_deref(), Some("main"));
+        assert_eq!(qual.name, "t");
+    }
+
+    #[test]
+    fn test_deferrable_initially_variants() {
+        let deferred = Deferrable {
+            not: false,
+            initially: Some(DeferrableInitially::Deferred),
+        };
+        let immediate = Deferrable {
+            not: false,
+            initially: Some(DeferrableInitially::Immediate),
+        };
+        assert_ne!(deferred, immediate);
+
+        let not_deferrable = Deferrable {
+            not: true,
+            initially: None,
+        };
+        assert_ne!(deferred, not_deferrable);
+    }
+
+    #[test]
+    fn test_foreign_key_action_types() {
+        let types = [
+            ForeignKeyActionType::SetNull,
+            ForeignKeyActionType::SetDefault,
+            ForeignKeyActionType::Cascade,
+            ForeignKeyActionType::Restrict,
+            ForeignKeyActionType::NoAction,
+        ];
+        assert_eq!(types.len(), 5);
+        assert_ne!(
+            ForeignKeyActionType::Cascade,
+            ForeignKeyActionType::Restrict
+        );
+    }
+
+    #[test]
+    fn test_foreign_key_trigger_variants() {
+        assert_ne!(ForeignKeyTrigger::OnDelete, ForeignKeyTrigger::OnUpdate);
+    }
+
+    #[test]
+    fn test_index_hint_variants() {
+        let indexed = IndexHint::IndexedBy("idx_name".to_owned());
+        let not_indexed = IndexHint::NotIndexed;
+        assert_ne!(indexed, not_indexed);
+    }
+
+    #[test]
+    fn test_join_kind_all_variants() {
+        let kinds = [
+            JoinKind::Cross,
+            JoinKind::Inner,
+            JoinKind::Left,
+            JoinKind::Right,
+            JoinKind::Full,
+        ];
+        assert_eq!(kinds.len(), 5);
+        assert_ne!(JoinKind::Left, JoinKind::Right);
+    }
+
+    #[test]
+    fn test_join_type_natural_flag() {
+        let natural_inner = JoinType {
+            natural: true,
+            kind: JoinKind::Inner,
+        };
+        let regular_inner = JoinType {
+            natural: false,
+            kind: JoinKind::Inner,
+        };
+        assert_ne!(natural_inner, regular_inner);
+    }
+
+    #[test]
+    fn test_alter_table_all_actions() {
+        let rename = AlterTableAction::RenameTo("new_name".to_owned());
+        let rename_col = AlterTableAction::RenameColumn {
+            old: "old_col".to_owned(),
+            new: "new_col".to_owned(),
+        };
+        let add_col = AlterTableAction::AddColumn(ColumnDef {
+            name: "new_col".to_owned(),
+            type_name: Some(TypeName {
+                name: "INTEGER".to_owned(),
+                arg1: None,
+                arg2: None,
+            }),
+            constraints: vec![],
+        });
+        let drop_col = AlterTableAction::DropColumn("old_col".to_owned());
+
+        // All four variants are distinct.
+        assert_ne!(rename, rename_col);
+        assert_ne!(add_col, drop_col);
+    }
+
+    #[test]
+    #[allow(clippy::approx_constant)]
+    fn test_literal_all_variants() {
+        let _ = Literal::Integer(42);
+        let _ = Literal::Float(3.14);
+        let _ = Literal::String("hello".to_owned());
+        let _ = Literal::Blob(vec![0xDE, 0xAD]);
+        let _ = Literal::Null;
+        let _ = Literal::True;
+        let _ = Literal::False;
+        let _ = Literal::CurrentTime;
+        let _ = Literal::CurrentDate;
+        let _ = Literal::CurrentTimestamp;
+        assert_ne!(Literal::True, Literal::False);
+        assert_ne!(Literal::CurrentTime, Literal::CurrentDate);
+    }
+
+    #[test]
+    fn test_json_arrow_variants() {
+        assert_ne!(JsonArrow::Arrow, JsonArrow::DoubleArrow);
+    }
+
+    #[test]
+    fn test_upsert_action_nothing_vs_update() {
+        let nothing = UpsertAction::Nothing;
+        let update = UpsertAction::Update {
+            assignments: vec![],
+            where_clause: None,
+        };
+        assert_ne!(nothing, update);
+    }
+
+    #[test]
+    fn test_assignment_target_variants() {
+        let single = AssignmentTarget::Column("col".to_owned());
+        let multi = AssignmentTarget::ColumnList(vec!["a".to_owned(), "b".to_owned()]);
+        assert_ne!(single, multi);
+    }
+
+    #[test]
+    fn test_type_name_with_args() {
+        let simple = TypeName {
+            name: "INTEGER".to_owned(),
+            arg1: None,
+            arg2: None,
+        };
+        let varchar = TypeName {
+            name: "VARCHAR".to_owned(),
+            arg1: Some("255".to_owned()),
+            arg2: None,
+        };
+        let decimal = TypeName {
+            name: "DECIMAL".to_owned(),
+            arg1: Some("10".to_owned()),
+            arg2: Some("2".to_owned()),
+        };
+        assert_ne!(simple, varchar);
+        assert_ne!(varchar, decimal);
+    }
+
+    #[test]
+    fn test_frame_bound_variants() {
+        let span = Span::ZERO;
+        let _ = FrameBound::UnboundedPreceding;
+        let _ = FrameBound::Preceding(Box::new(Expr::Literal(Literal::Integer(1), span)));
+        let _ = FrameBound::CurrentRow;
+        let _ = FrameBound::Following(Box::new(Expr::Literal(Literal::Integer(1), span)));
+        let _ = FrameBound::UnboundedFollowing;
+        assert_ne!(FrameBound::UnboundedPreceding, FrameBound::CurrentRow);
+    }
+
+    #[test]
+    fn test_result_column_variants() {
+        let span = Span::ZERO;
+        let star = ResultColumn::Star;
+        let table_star = ResultColumn::TableStar("t1".to_owned());
+        let expr = ResultColumn::Expr {
+            expr: Expr::Literal(Literal::Integer(1), span),
+            alias: Some("one".to_owned()),
+        };
+        assert_ne!(star, table_star);
+        assert!(matches!(expr, ResultColumn::Expr { alias: Some(_), .. }));
+    }
 }
