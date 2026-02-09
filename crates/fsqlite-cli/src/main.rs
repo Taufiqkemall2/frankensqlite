@@ -21,6 +21,7 @@ fn main() {
     let mut stderr = io::stderr();
 
     let exit_code = run(std::env::args_os(), &mut input, &mut stdout, &mut stderr);
+    drop(input);
     if exit_code != 0 {
         std::process::exit(exit_code);
     }
@@ -120,7 +121,7 @@ where
                     ));
                 }
 
-                db_path = arg_str.to_owned();
+                arg_str.clone_into(&mut db_path);
                 has_path = true;
             }
         }
@@ -138,11 +139,7 @@ where
     W: Write,
     E: Write,
 {
-    if execute_sql(connection, command, out, err) {
-        0
-    } else {
-        1
-    }
+    i32::from(!execute_sql(connection, command, out, err))
 }
 
 fn run_repl<R, W, E>(connection: &Connection, input: &mut R, out: &mut W, err: &mut E) -> i32
@@ -161,7 +158,7 @@ where
             PROMPT_CONTINUATION
         };
 
-        if write!(out, "{prompt}").and_then(|_| out.flush()).is_err() {
+        if write!(out, "{prompt}").and_then(|()| out.flush()).is_err() {
             return 1;
         }
 
@@ -207,11 +204,8 @@ where
         pending_sql.push_str(line);
 
         if statement_complete(&pending_sql) {
-            let success = execute_sql(connection, pending_sql.trim(), out, err);
+            let _ = execute_sql(connection, pending_sql.trim(), out, err);
             pending_sql.clear();
-            if !success {
-                continue;
-            }
         }
     }
 }
@@ -389,7 +383,7 @@ mod tests {
         assert!(err.is_empty(), "unexpected stderr: {:?}", err);
 
         let stdout = String::from_utf8(out).expect("output should be utf-8");
-        assert!(stdout.contains("7"), "expected query result in output");
+        assert!(stdout.contains('7'), "expected query result in output");
     }
 
     #[test]
