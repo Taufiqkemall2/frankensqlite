@@ -2652,4 +2652,317 @@ mod tests {
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
     }
+
+    // ── sanitize_db_id tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_sanitize_db_id_basic() {
+        assert_eq!(sanitize_db_id("beads").unwrap(), "beads");
+        assert_eq!(sanitize_db_id("my-project").unwrap(), "my_project");
+        assert_eq!(sanitize_db_id("MY_DB").unwrap(), "my_db");
+    }
+
+    #[test]
+    fn test_sanitize_db_id_trims_underscores() {
+        assert_eq!(sanitize_db_id("__foo__").unwrap(), "foo");
+        assert_eq!(sanitize_db_id("  hello  ").unwrap(), "hello");
+    }
+
+    #[test]
+    fn test_sanitize_db_id_rejects_empty() {
+        assert!(sanitize_db_id("").is_err());
+        assert!(sanitize_db_id("   ").is_err());
+        assert!(sanitize_db_id("___").is_err());
+    }
+
+    // ── upsert_checksum tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_upsert_checksum_creates_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let checksums = dir.path().join("checksums.sha256");
+        let golden = dir.path().join("test.db");
+        fs::write(&golden, b"data").unwrap();
+
+        let hash = "a".repeat(64);
+        upsert_checksum(&checksums, &golden, &hash).unwrap();
+
+        let content = fs::read_to_string(&checksums).unwrap();
+        assert!(content.contains(&format!("{hash}  test.db")));
+    }
+
+    #[test]
+    fn test_upsert_checksum_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let checksums = dir.path().join("checksums.sha256");
+        let golden = dir.path().join("test.db");
+        fs::write(&golden, b"data").unwrap();
+
+        let hash = "b".repeat(64);
+        upsert_checksum(&checksums, &golden, &hash).unwrap();
+        upsert_checksum(&checksums, &golden, &hash).unwrap();
+
+        let content = fs::read_to_string(&checksums).unwrap();
+        // Only one entry, not duplicated.
+        assert_eq!(content.matches("test.db").count(), 1);
+    }
+
+    #[test]
+    fn test_upsert_checksum_refuses_hash_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let checksums = dir.path().join("checksums.sha256");
+        let golden = dir.path().join("test.db");
+        fs::write(&golden, b"data").unwrap();
+
+        let hash1 = "c".repeat(64);
+        let hash2 = "d".repeat(64);
+        upsert_checksum(&checksums, &golden, &hash1).unwrap();
+        let err = upsert_checksum(&checksums, &golden, &hash2);
+        assert!(err.is_err(), "must refuse to overwrite existing hash");
+        assert!(
+            err.unwrap_err().contains("Refusing to overwrite"),
+            "error message should mention immutability"
+        );
+    }
+
+    #[test]
+    fn test_upsert_checksum_maintains_sorted_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let checksums = dir.path().join("checksums.sha256");
+
+        let golden_b = dir.path().join("beta.db");
+        let golden_a = dir.path().join("alpha.db");
+        fs::write(&golden_b, b"b").unwrap();
+        fs::write(&golden_a, b"a").unwrap();
+
+        let hash_b = "b".repeat(64);
+        let hash_a = "a".repeat(64);
+
+        // Insert b first, then a.
+        upsert_checksum(&checksums, &golden_b, &hash_b).unwrap();
+        upsert_checksum(&checksums, &golden_a, &hash_a).unwrap();
+
+        let content = fs::read_to_string(&checksums).unwrap();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[0].contains("alpha.db"),
+            "alpha.db must come first (sorted)"
+        );
+        assert!(
+            lines[1].contains("beta.db"),
+            "beta.db must come second (sorted)"
+        );
+    }
+
+    // ── backup_sqlite_file tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_backup_sqlite_file_produces_valid_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source.db");
+        let dst = dir.path().join("backup.db");
+
+        let conn = Connection::open(&src).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);
+             INSERT INTO items VALUES (1, 'alpha');
+             INSERT INTO items VALUES (2, 'beta');",
+        )
+        .unwrap();
+        drop(conn);
+
+        backup_sqlite_file(&src, &dst).unwrap();
+
+        // The backup must be a valid SQLite database with the same data.
+        let conn = Connection::open_with_flags(&dst, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+
+        let name: String = conn
+            .query_row("SELECT name FROM items WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(name, "alpha");
+    }
+
+    #[test]
+    fn test_backup_passes_integrity_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source.db");
+        let dst = dir.path().join("backup.db");
+
+        let conn = Connection::open(&src).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB);
+             INSERT INTO t VALUES (1, randomblob(1000));
+             INSERT INTO t VALUES (2, randomblob(1000));",
+        )
+        .unwrap();
+        drop(conn);
+
+        backup_sqlite_file(&src, &dst).unwrap();
+        sqlite_integrity_check(&dst).unwrap();
+    }
+
+    // ── corpus import end-to-end ─────────────────────────────────────────
+
+    #[test]
+    fn test_corpus_import_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let golden = dir.path().join("golden");
+        let metadata = dir.path().join("metadata");
+        fs::create_dir(&golden).unwrap();
+        fs::create_dir(&metadata).unwrap();
+
+        // Create a source database.
+        let src = dir.path().join("source.db");
+        let conn = Connection::open(&src).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE widgets (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+             INSERT INTO widgets VALUES (1, 'gear');
+             INSERT INTO widgets VALUES (2, 'cog');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let checksums = dir.path().join("checksums.sha256");
+
+        let exit_code = run_with(&[
+            "realdb-e2e",
+            "corpus",
+            "import",
+            "--db",
+            src.to_str().unwrap(),
+            "--id",
+            "test_import",
+            "--golden-dir",
+            golden.to_str().unwrap(),
+            "--metadata-dir",
+            metadata.to_str().unwrap(),
+            "--checksums",
+            checksums.to_str().unwrap(),
+        ]);
+        assert_eq!(exit_code, 0, "import must succeed");
+
+        // Golden copy must exist.
+        let golden_db = golden.join("test_import.db");
+        assert!(golden_db.exists(), "golden DB must be created");
+
+        // Checksums file must exist and contain the entry.
+        assert!(checksums.exists(), "checksums file must be created");
+        let checksums_content = fs::read_to_string(&checksums).unwrap();
+        assert!(
+            checksums_content.contains("test_import.db"),
+            "checksums must reference the golden file"
+        );
+
+        // Metadata JSON must exist and have correct fields.
+        let meta_path = metadata.join("test_import.json");
+        assert!(meta_path.exists(), "metadata JSON must be created");
+        let meta_json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+        assert_eq!(meta_json["name"], "test_import");
+        assert!(meta_json["page_size"].as_u64().unwrap() > 0);
+        assert!(meta_json["file_size_bytes"].as_u64().unwrap() > 0);
+        assert_eq!(meta_json["tables"][0]["name"], "widgets");
+        assert_eq!(meta_json["tables"][0]["row_count"], 2);
+
+        // Golden copy must pass integrity check.
+        sqlite_integrity_check(&golden_db).unwrap();
+
+        // Checksums hash must match the actual golden file.
+        let actual_hash = sha256_file(&golden_db).unwrap();
+        assert!(
+            checksums_content.contains(&actual_hash),
+            "checksums hash must match actual file"
+        );
+    }
+
+    #[test]
+    fn test_corpus_import_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let golden = dir.path().join("golden");
+        let metadata = dir.path().join("metadata");
+        fs::create_dir(&golden).unwrap();
+        fs::create_dir(&metadata).unwrap();
+
+        let src = dir.path().join("source.db");
+        let conn = Connection::open(&src).unwrap();
+        conn.execute_batch("CREATE TABLE t (x INTEGER);").unwrap();
+        drop(conn);
+
+        let checksums = dir.path().join("checksums.sha256");
+
+        let args = &[
+            "realdb-e2e",
+            "corpus",
+            "import",
+            "--db",
+            src.to_str().unwrap(),
+            "--id",
+            "idempotent_test",
+            "--golden-dir",
+            golden.to_str().unwrap(),
+            "--metadata-dir",
+            metadata.to_str().unwrap(),
+            "--checksums",
+            checksums.to_str().unwrap(),
+        ];
+
+        // First import.
+        assert_eq!(run_with(args), 0);
+
+        // Second import (same fixture) should also succeed.
+        assert_eq!(run_with(args), 0);
+
+        // Only one entry in checksums.
+        let content = fs::read_to_string(&checksums).unwrap();
+        assert_eq!(
+            content.matches("idempotent_test.db").count(),
+            1,
+            "idempotent re-import must not duplicate checksum"
+        );
+    }
+
+    #[test]
+    fn test_corpus_import_no_metadata_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let golden = dir.path().join("golden");
+        let metadata = dir.path().join("metadata");
+        fs::create_dir(&golden).unwrap();
+        fs::create_dir(&metadata).unwrap();
+
+        let src = dir.path().join("source.db");
+        let conn = Connection::open(&src).unwrap();
+        conn.execute_batch("CREATE TABLE t (x INTEGER);").unwrap();
+        drop(conn);
+
+        let checksums = dir.path().join("checksums.sha256");
+
+        let exit_code = run_with(&[
+            "realdb-e2e",
+            "corpus",
+            "import",
+            "--db",
+            src.to_str().unwrap(),
+            "--id",
+            "no_meta",
+            "--golden-dir",
+            golden.to_str().unwrap(),
+            "--metadata-dir",
+            metadata.to_str().unwrap(),
+            "--checksums",
+            checksums.to_str().unwrap(),
+            "--no-metadata",
+        ]);
+        assert_eq!(exit_code, 0);
+
+        assert!(golden.join("no_meta.db").exists());
+        assert!(
+            !metadata.join("no_meta.json").exists(),
+            "metadata must NOT be written with --no-metadata"
+        );
+    }
 }

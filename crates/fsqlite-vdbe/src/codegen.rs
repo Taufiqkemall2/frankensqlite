@@ -470,17 +470,17 @@ fn codegen_select_ordered_scan(
     done_label: crate::Label,
     end_label: crate::Label,
 ) -> Result<(), CodegenError> {
-    // Resolve ORDER BY column indices (relative to the table).
-    let sort_col_indices: Vec<usize> = order_by
+    // Resolve ORDER BY sources (column indices or rowid).
+    let sort_keys: Vec<SortKeySource> = order_by
         .iter()
         .map(|term| {
-            resolve_column_ref(&term.expr, table).ok_or_else(|| {
+            resolve_sort_key(&term.expr, table).ok_or_else(|| {
                 CodegenError::Unsupported("non-column ORDER BY expression".to_owned())
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    let num_sort_keys = sort_col_indices.len();
+    let num_sort_keys = sort_keys.len();
     let num_data_cols = usize::try_from(out_col_count).map_err(|_| {
         CodegenError::Unsupported("negative output column count in ordered SELECT".to_owned())
     })?;
@@ -536,9 +536,16 @@ fn codegen_select_ordered_scan(
     let sorter_base = b.alloc_regs(total_sorter_cols as i32);
     {
         let mut reg = sorter_base;
-        for &col_idx in &sort_col_indices {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            b.emit_op(Opcode::Column, cursor, col_idx as i32, reg, P4::None, 0);
+        for key in &sort_keys {
+            match key {
+                SortKeySource::Column(col_idx) => {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                    b.emit_op(Opcode::Column, cursor, *col_idx as i32, reg, P4::None, 0);
+                }
+                SortKeySource::Rowid => {
+                    b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
+                }
+            }
             reg += 1;
         }
 
@@ -1890,6 +1897,31 @@ fn emit_where_filter(
             b.free_temp(cond_reg);
         }
     }
+}
+
+/// Check whether a column name is a rowid alias (`rowid`, `_rowid_`, or `oid`).
+fn is_rowid_alias(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == "rowid" || lower == "_rowid_" || lower == "oid"
+}
+
+/// Source for a sort key: either a table column or the implicit rowid.
+enum SortKeySource {
+    Column(usize),
+    Rowid,
+}
+
+/// Resolve a column reference to a `SortKeySource` (column index or rowid).
+fn resolve_sort_key(expr: &Expr, table: &TableSchema) -> Option<SortKeySource> {
+    if let Expr::Column(col_ref, _) = expr {
+        if let Some(idx) = table.column_index(&col_ref.column) {
+            return Some(SortKeySource::Column(idx));
+        }
+        if col_ref.table.is_none() && is_rowid_alias(&col_ref.column) {
+            return Some(SortKeySource::Rowid);
+        }
+    }
+    None
 }
 
 /// Resolve a column reference expression to its 0-based column index.

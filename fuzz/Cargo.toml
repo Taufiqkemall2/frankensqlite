@@ -1,0 +1,38 @@
+[package]
+name = "fsqlite-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+# Workspace crates under fuzz
+fsqlite-parser = { path = "../crates/fsqlite-parser" }
+fsqlite-types = { path = "../crates/fsqlite-types" }
+fsqlite-ast = { path = "../crates/fsqlite-ast" }
+fsqlite-error = { path = "../crates/fsqlite-error" }
+
+[[bin]]
+name = "fuzz_sql_parser"
+path = "fuzz_targets/fuzz_sql_parser.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_record_roundtrip"
+path = "fuzz_targets/fuzz_record_roundtrip.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_lexer"
+path = "fuzz_targets/fuzz_lexer.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_expr_parser"
+path = "fuzz_targets/fuzz_expr_parser.rs"
+doc = false

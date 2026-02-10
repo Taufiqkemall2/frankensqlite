@@ -405,20 +405,21 @@ impl<'a> Lexer<'a> {
                 ));
             }
 
-            let hex_str = String::from_utf8_lossy(hex_bytes);
+            // Work directly on raw bytes to avoid panics from
+            // string-slicing multi-byte UTF-8 sequences.
             let mut bytes = Vec::with_capacity(hex_bytes.len() / 2);
-            let mut i = 0;
-            while i < hex_str.len() {
-                match u8::from_str_radix(&hex_str[i..i + 2], 16) {
-                    Ok(b) => bytes.push(b),
-                    Err(_) => {
+            for pair in hex_bytes.chunks_exact(2) {
+                let hi = hex_digit(pair[0]);
+                let lo = hex_digit(pair[1]);
+                match (hi, lo) {
+                    (Some(h), Some(l)) => bytes.push((h << 4) | l),
+                    _ => {
                         return TokenKind::Error(format!(
                             "invalid hex in blob literal at byte {}",
                             start
                         ));
                     }
                 }
-                i += 2;
             }
             TokenKind::Blob(bytes)
         } else {
@@ -706,6 +707,17 @@ impl<'a> Lexer<'a> {
         } else {
             TokenKind::Pipe
         }
+    }
+}
+
+/// Convert an ASCII hex digit byte to its numeric value (0-15).
+/// Returns `None` for non-hex bytes.
+const fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
 }
 
