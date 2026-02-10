@@ -52,7 +52,7 @@ impl Default for FsqliteExecConfig {
     fn default() -> Self {
         Self {
             pragmas: Vec::new(),
-            concurrent_mode: false,
+            concurrent_mode: true,
             run_integrity_check: true,
         }
     }

@@ -71,7 +71,7 @@ impl Default for HarnessSettings {
             cache_size: -2000,
             page_size: 4096,
             busy_timeout_ms: 5000,
-            concurrent_mode: false,
+            concurrent_mode: true,
             run_integrity_check: true,
         }
     }

@@ -385,7 +385,7 @@ impl Connection {
             last_changes: RefCell::new(0),
             implicit_txn: RefCell::new(false),
             concurrent_txn: RefCell::new(false),
-            concurrent_mode_default: RefCell::new(false),
+            concurrent_mode_default: RefCell::new(true),
             pragma_state: RefCell::new(fsqlite_vdbe::pragma::ConnectionPragmaState::default()),
         };
         conn.load_persisted_state_if_present()?;
@@ -4535,9 +4535,9 @@ mod tests {
     // ── MVCC concurrent-mode toggle tests (bd-1w6k.2.4) ─────────────
 
     #[test]
-    fn test_concurrent_mode_default_off() {
+    fn test_concurrent_mode_default_on() {
         let conn = Connection::open(":memory:").unwrap();
-        assert!(!conn.is_concurrent_mode_default());
+        assert!(conn.is_concurrent_mode_default());
         assert!(!conn.is_concurrent_transaction());
     }
 
@@ -4622,13 +4622,14 @@ mod tests {
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);")
             .unwrap();
 
-        // Single-writer mode.
+        // Single-writer mode (explicitly disable concurrent default).
+        conn.execute("PRAGMA concurrent_mode=OFF;").unwrap();
         conn.execute("BEGIN;").unwrap();
         assert!(!conn.is_concurrent_transaction());
         conn.execute("INSERT INTO t VALUES (1, 'a');").unwrap();
         conn.execute("COMMIT;").unwrap();
 
-        // MVCC concurrent mode.
+        // MVCC concurrent mode (re-enable).
         conn.execute("PRAGMA concurrent_mode=ON;").unwrap();
         conn.execute("BEGIN;").unwrap();
         assert!(conn.is_concurrent_transaction());
@@ -4792,13 +4793,13 @@ mod tests {
     #[test]
     fn test_pragma_concurrent_mode_returns_value() {
         let conn = Connection::open(":memory:").unwrap();
-        // Query default (off).
+        // Query default (on — concurrent mode is the default).
         let rows = conn.query("PRAGMA concurrent_mode;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(0));
-        // Set on, check return.
-        let rows = conn.query("PRAGMA concurrent_mode=ON;").unwrap();
         assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(1));
+        // Set off, check return.
+        let rows = conn.query("PRAGMA concurrent_mode=OFF;").unwrap();
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(0));
     }
 }
 
