@@ -167,7 +167,7 @@ fn make_page(seed: u32) -> PageData {
 
 fn median_sample(mut samples: Vec<f64>) -> f64 {
     assert!(!samples.is_empty(), "median_sample requires non-empty samples");
-    samples.sort_by(|a, b| a.total_cmp(b));
+    samples.sort_by(f64::total_cmp);
     samples[samples.len() / 2]
 }
 
