@@ -16,4 +16,5 @@ work/
 !checksums.sha256
 !metadata/**
 !README.md
+!FIXTURES.md
 !.gitignore
