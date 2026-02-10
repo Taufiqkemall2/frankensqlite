@@ -11,7 +11,10 @@ use std::sync::{Arc, Mutex};
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
-use fsqlite_types::{CommitSeq, PageData, PageNumber, PageSize};
+use fsqlite_types::{
+    CommitSeq, DATABASE_HEADER_SIZE, DatabaseHeader, FRANKENSQLITE_SQLITE_VERSION_NUMBER, PageData,
+    PageNumber, PageSize,
+};
 use fsqlite_vfs::{Vfs, VfsFile};
 
 use crate::journal::{JournalHeader, JournalPageRecord};
@@ -209,7 +212,48 @@ where
             let _ = vfs.delete(&cx, &journal_path, true);
         }
 
-        let file_size = db_file.file_size(&cx)?;
+        let mut file_size = db_file.file_size(&cx)?;
+        if file_size == 0 {
+            // SQLite databases are never truly empty: page 1 contains the
+            // 100-byte database header followed by the sqlite_master root page.
+            //
+            // This makes newly-created databases valid for downstream layers
+            // (B-tree, schema) and avoids surprising "empty file" semantics.
+            let page_len = page_size.as_usize();
+            let mut page1 = vec![0u8; page_len];
+
+            let header = DatabaseHeader {
+                page_size,
+                page_count: 1,
+                sqlite_version: FRANKENSQLITE_SQLITE_VERSION_NUMBER,
+                ..DatabaseHeader::default()
+            };
+            let hdr_bytes = header.to_bytes().map_err(|err| {
+                FrankenError::internal(format!("failed to encode new database header: {err}"))
+            })?;
+            page1[..DATABASE_HEADER_SIZE].copy_from_slice(&hdr_bytes);
+
+            // Initialize sqlite_master root page as an empty leaf table B-tree
+            // page (type 0x0D) with zero cells.
+            let header_offset = DATABASE_HEADER_SIZE;
+            page1[header_offset] = 0x0D; // LeafTable
+
+            let content_offset_raw = if page_size.get() == 65_536 {
+                0u16 // 0 encodes 65536 for B-tree cell content area offsets.
+            } else {
+                u16::try_from(page_size.get()).map_err(|_| FrankenError::OutOfRange {
+                    what: "page size for sqlite_master header".to_owned(),
+                    value: page_size.get().to_string(),
+                })?
+            };
+            page1[header_offset + 5..header_offset + 7]
+                .copy_from_slice(&content_offset_raw.to_be_bytes());
+
+            db_file.write(&cx, &page1, 0)?;
+            db_file.sync(&cx, SyncFlags::NORMAL)?;
+            file_size = db_file.file_size(&cx)?;
+        }
+
         let page_size_u64 = page_size.as_usize() as u64;
         let db_pages = file_size
             .checked_div(page_size_u64)
@@ -678,6 +722,7 @@ mod tests {
     use crate::traits::{MvccPager, TransactionHandle, TransactionMode};
     use fsqlite_types::PageSize;
     use fsqlite_types::flags::AccessFlags;
+    use fsqlite_types::{BTreePageHeader, DatabaseHeader};
     use fsqlite_vfs::MemoryVfs;
     use std::path::PathBuf;
 
@@ -694,13 +739,38 @@ mod tests {
     fn test_open_empty_database() {
         let (pager, _) = test_pager();
         let inner = pager.inner.lock().unwrap();
-        assert_eq!(inner.db_size, 0, "bead_id={BEAD_ID} case=empty_db_size");
+        assert_eq!(inner.db_size, 1, "bead_id={BEAD_ID} case=empty_db_size");
         assert_eq!(
             inner.page_size,
             PageSize::DEFAULT,
             "bead_id={BEAD_ID} case=page_size_default"
         );
         drop(inner);
+
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let raw_page = txn.get_page(&cx, PageNumber::ONE).unwrap().into_vec();
+
+        let hdr: [u8; DATABASE_HEADER_SIZE] = raw_page[..DATABASE_HEADER_SIZE]
+            .try_into()
+            .expect("page 1 must contain database header");
+        let parsed = DatabaseHeader::from_bytes(&hdr).expect("header should parse");
+        assert_eq!(
+            parsed.page_size,
+            PageSize::DEFAULT,
+            "bead_id={BEAD_ID} case=page1_header_page_size"
+        );
+        assert_eq!(
+            parsed.page_count, 1,
+            "bead_id={BEAD_ID} case=page1_header_page_count"
+        );
+
+        let btree_hdr =
+            BTreePageHeader::parse(&raw_page, PageSize::DEFAULT, 0, true).expect("btree header");
+        assert_eq!(
+            btree_hdr.cell_count, 0,
+            "bead_id={BEAD_ID} case=sqlite_master_initially_empty"
+        );
     }
 
     #[test]

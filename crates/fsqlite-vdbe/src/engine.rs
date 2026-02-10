@@ -1259,9 +1259,8 @@ impl VdbeEngine {
                     let rowid_reg = op.p3;
                     let rowid = self.get_reg(rowid_reg).to_integer();
                     let record_val = self.get_reg(record_reg).clone();
-                    // The record is stored as a Blob containing packed SqliteValues
-                    // from MakeRecord. We decode it back.
-                    let values = decode_mem_record(&record_val);
+                    // The record is stored as a Blob in SQLite record format (MakeRecord).
+                    let values = decode_record(&record_val)?;
                     if let Some(cursor) = self.cursors.get(&cursor_id) {
                         let root = cursor.root_page;
                         if let Some(db) = self.db.as_mut() {
@@ -1301,7 +1300,7 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     let record = self.get_reg(op.p2).clone();
                     if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
-                        sorter.rows.push(decode_mem_record(&record));
+                        sorter.rows.push(decode_record(&record)?);
                     }
                     pc += 1;
                 }
@@ -1317,7 +1316,7 @@ impl VdbeEngine {
                     let differs = if let Some(sorter) = self.sorters.get(&cursor_id) {
                         if let Some(pos) = sorter.position {
                             if let Some(current) = sorter.rows.get(pos) {
-                                let probe = decode_mem_record(self.get_reg(op.p3));
+                                let probe = decode_record(self.get_reg(op.p3))?;
                                 !sorter_keys_equal(current, &probe, sorter.key_columns)
                             } else {
                                 true
@@ -1342,7 +1341,7 @@ impl VdbeEngine {
                     let value = if let Some(sorter) = self.sorters.get(&cursor_id) {
                         if let Some(pos) = sorter.position {
                             if let Some(row) = sorter.rows.get(pos) {
-                                encode_mem_record(row)
+                                SqliteValue::Blob(encode_record(row))
                             } else {
                                 SqliteValue::Null
                             }
@@ -1364,11 +1363,9 @@ impl VdbeEngine {
                     pc += 1;
                 }
 
-                // ── Record building (in-memory format) ──────────────────
+                // ── Record building (SQLite record format) ──────────────
                 Opcode::MakeRecord => {
                     // Build a record from registers p1..p1+p2-1 into register p3.
-                    // We use a simple encoding: store the SqliteValues as a
-                    // JSON-like blob that we can decode back in Insert.
                     let start = op.p1;
                     let count = op.p2;
                     let target = op.p3;
@@ -1376,7 +1373,7 @@ impl VdbeEngine {
                     for i in 0..count {
                         values.push(self.get_reg(start + i).clone());
                     }
-                    self.set_reg(target, encode_mem_record(&values));
+                    self.set_reg(target, SqliteValue::Blob(encode_record(&values)));
                     pc += 1;
                 }
 
@@ -1804,10 +1801,7 @@ impl VdbeEngine {
             .rows
             .iter()
             .map(|row| {
-                let payload = match encode_mem_record(&row.values) {
-                    SqliteValue::Blob(bytes) => bytes,
-                    _ => Vec::new(),
-                };
+                let payload = encode_record(&row.values);
                 (row.rowid, payload)
             })
             .collect();
@@ -1839,119 +1833,22 @@ impl VdbeEngine {
     }
 }
 
-// ── In-memory record encoding ───────────────────────────────────────────
+// ── SQLite record encoding ──────────────────────────────────────────────
 //
-// MakeRecord packs register values into a Blob that Insert can decode.
-// We use a simple tagged encoding:
-//   - 0x00 → Null
-//   - 0x01 + 8 bytes (i64 LE) → Integer
-//   - 0x02 + 8 bytes (f64 LE) → Float
-//   - 0x03 + 4 bytes (u32 LE, length) + N bytes → Text
-//   - 0x04 + 4 bytes (u32 LE, length) + N bytes → Blob
+// SQLite `OP_MakeRecord` produces a record in the on-disk record format
+// (header + body). Using the same format internally avoids later translation
+// when wiring VDBE cursors to the real B-tree layer.
 
-#[allow(clippy::cast_possible_truncation)]
-fn encode_mem_record(values: &[SqliteValue]) -> SqliteValue {
-    let mut buf = Vec::new();
-    for val in values {
-        match val {
-            SqliteValue::Null => buf.push(0x00),
-            SqliteValue::Integer(n) => {
-                buf.push(0x01);
-                buf.extend_from_slice(&n.to_le_bytes());
-            }
-            SqliteValue::Float(f) => {
-                buf.push(0x02);
-                buf.extend_from_slice(&f.to_le_bytes());
-            }
-            SqliteValue::Text(s) => {
-                buf.push(0x03);
-                let bytes = s.as_bytes();
-                buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                buf.extend_from_slice(bytes);
-            }
-            SqliteValue::Blob(b) => {
-                buf.push(0x04);
-                buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
-                buf.extend_from_slice(b);
-            }
-        }
-    }
-    SqliteValue::Blob(buf)
+fn encode_record(values: &[SqliteValue]) -> Vec<u8> {
+    serialize_record(values)
 }
 
-fn decode_mem_record(val: &SqliteValue) -> Vec<SqliteValue> {
+fn decode_record(val: &SqliteValue) -> Result<Vec<SqliteValue>> {
     let SqliteValue::Blob(bytes) = val else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
-    let mut result = Vec::new();
-    let mut pos = 0;
-    while pos < bytes.len() {
-        match bytes[pos] {
-            0x00 => {
-                result.push(SqliteValue::Null);
-                pos += 1;
-            }
-            0x01 => {
-                pos += 1;
-                if pos + 8 <= bytes.len() {
-                    let n = i64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap_or_default());
-                    result.push(SqliteValue::Integer(n));
-                    pos += 8;
-                } else {
-                    break;
-                }
-            }
-            0x02 => {
-                pos += 1;
-                if pos + 8 <= bytes.len() {
-                    let f = f64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap_or_default());
-                    result.push(SqliteValue::Float(f));
-                    pos += 8;
-                } else {
-                    break;
-                }
-            }
-            0x03 => {
-                pos += 1;
-                if pos + 4 <= bytes.len() {
-                    let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap_or_default())
-                        as usize;
-                    pos += 4;
-                    if pos + len <= bytes.len() {
-                        let s = String::from_utf8_lossy(&bytes[pos..pos + len]).into_owned();
-                        result.push(SqliteValue::Text(s));
-                        pos += len;
-                    } else {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            }
-            0x04 => {
-                pos += 1;
-                if pos + 4 <= bytes.len() {
-                    let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap_or_default())
-                        as usize;
-                    pos += 4;
-                    if pos + len <= bytes.len() {
-                        result.push(SqliteValue::Blob(bytes[pos..pos + len].to_vec()));
-                        pos += len;
-                    } else {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            }
-            _ => {
-                // Unknown tag: stop parsing.
-                break;
-            }
-        }
-    }
-    result
+    parse_record(bytes).ok_or_else(|| FrankenError::internal("malformed SQLite record blob"))
 }
 
 fn sorter_keys_equal(lhs: &[SqliteValue], rhs: &[SqliteValue], key_columns: usize) -> bool {
@@ -2891,7 +2788,7 @@ mod tests {
 
         let decoded: Vec<i64> = rows
             .into_iter()
-            .map(|row| decode_mem_record(&row[0])[0].to_integer())
+            .map(|row| decode_record(&row[0]).unwrap()[0].to_integer())
             .collect();
         assert_eq!(decoded, vec![10, 20, 30]);
     }
@@ -4750,7 +4647,7 @@ mod tests {
 
     #[test]
     fn test_make_record_encodes_values() {
-        // MakeRecord packs source registers into our in-memory blob format.
+        // MakeRecord packs source registers into the SQLite record format blob.
         let rows = run_program(|b| {
             let end = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
@@ -4769,7 +4666,7 @@ mod tests {
             matches!(produced_blob, Some(SqliteValue::Blob(_))),
             "MakeRecord should produce a blob"
         );
-        let decoded = decode_mem_record(&rows[0][0]);
+        let decoded = decode_record(&rows[0][0]).unwrap();
         assert_eq!(
             decoded,
             vec![SqliteValue::Integer(1), SqliteValue::Text("a".to_owned())]
