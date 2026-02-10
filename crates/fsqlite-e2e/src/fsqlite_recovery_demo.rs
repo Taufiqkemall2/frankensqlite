@@ -130,6 +130,46 @@ fn setup_wal_fixture(dir: &Path, row_count: usize) -> (std::path::PathBuf, Vec<(
     (crash_db, rows)
 }
 
+/// Create a rollback-journal database fixture for DB-corruption scenarios.
+///
+/// WAL-mode snapshots keep most changes in the WAL, so the on-disk DB file may
+/// be only 1 page when copied mid-transaction. For DB corruption scenarios we
+/// want a fully materialized `.db` with multiple pages so page-level corruption
+/// is always in-bounds.
+fn setup_db_fixture(dir: &Path, row_count: usize) -> std::path::PathBuf {
+    let db_path = dir.join("db_corruption.db");
+    let conn = rusqlite::Connection::open(&db_path).expect("open db corruption fixture");
+    conn.execute_batch(
+        "PRAGMA page_size=4096;\n\
+         PRAGMA journal_mode=DELETE;\n\
+         PRAGMA synchronous=FULL;\n\
+         CREATE TABLE demo (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);",
+    )
+    .expect("setup db corruption fixture");
+
+    for i in 0..row_count {
+        let id = i64::try_from(i + 1).expect("index fits i64");
+        let payload = format!("db-corruption-row-{id:04}");
+        conn.execute(
+            "INSERT INTO demo (id, payload) VALUES (?1, ?2)",
+            rusqlite::params![id, payload],
+        )
+        .expect("insert");
+    }
+
+    drop(conn);
+    db_path
+}
+
+fn inject_db_corruption(scenario: &CorruptionScenario, db_path: &Path) -> Result<CorruptionReport, String> {
+    let injector =
+        CorruptionInjector::new(db_path.to_path_buf()).map_err(|e| format!("injector creation: {e}"))?;
+    let pattern = scenario.pattern.to_corruption_pattern(scenario.seed, 0);
+    injector
+        .inject(&pattern)
+        .map_err(|e| format!("injection: {e}"))
+}
+
 // ── Scenario runner ─────────────────────────────────────────────────────
 
 /// Run a single corruption scenario against FrankenSQLite's recovery path.
@@ -154,6 +194,25 @@ pub fn run_scenario(scenario: &CorruptionScenario) -> FsqliteRecoveryReport {
             };
         }
     };
+
+    if scenario.target == CorruptionTarget::Database {
+        let db_path = setup_db_fixture(dir.path(), scenario.setup_row_count);
+        let corruption_report = match inject_db_corruption(scenario, &db_path) {
+            Ok(r) => r,
+            Err(e) => {
+                return FsqliteRecoveryReport {
+                    scenario_name: scenario.name,
+                    passed: false,
+                    verdict: format!("corruption injection failed: {e}"),
+                    corruption_report: None,
+                    recovery_log: None,
+                    recovery_succeeded: false,
+                    pages_recovered: 0,
+                };
+            }
+        };
+        return evaluate_db_corruption_scenario(scenario, &corruption_report);
+    }
 
     // Step 1: Setup database fixture.
     let (db_path, _rows) = setup_wal_fixture(dir.path(), scenario.setup_row_count);
@@ -284,6 +343,15 @@ fn inject_scenario_corruption(
     wal_path: &Path,
     info: &WalInfo,
 ) -> Result<CorruptionReport, String> {
+    // DB corruption scenarios must operate on real database pages.  When WAL
+    // mode is active, recent writes can live only in the WAL until checkpoint.
+    // Checkpoint before corrupting the DB file so page 2+ exists as expected.
+    if scenario.target == CorruptionTarget::Database {
+        if let Ok(conn) = rusqlite::Connection::open(db_path) {
+            let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        }
+    }
+
     let target_path = match scenario.target {
         CorruptionTarget::Database => db_path.to_path_buf(),
         CorruptionTarget::Wal => wal_path.to_path_buf(),

@@ -11,13 +11,15 @@
 //! - `corrupt` — Inject corruption into a working copy for recovery testing.
 
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
+use fsqlite_e2e::fsqlite_executor::{FsqliteExecConfig, run_oplog_fsqlite};
 use fsqlite_e2e::oplog::{self, OpLog};
 use fsqlite_e2e::report::{EngineInfo, RunRecordV1, RunRecordV1Args};
 use fsqlite_e2e::sqlite_executor::{SqliteExecConfig, run_oplog_sqlite};
@@ -357,7 +359,9 @@ fn cmd_run(argv: &[String]) -> i32 {
     let mut engine: Option<String> = None;
     let mut db: Option<String> = None;
     let mut workload: Option<String> = None;
-    let mut concurrency: u16 = 1;
+    let mut concurrency: Vec<u16> = vec![1];
+    let mut repeat: usize = 1;
+    let mut fsqlite_mvcc: bool = false;
     let mut pretty: bool = false;
     let mut output_jsonl: Option<PathBuf> = None;
 
@@ -391,14 +395,35 @@ fn cmd_run(argv: &[String]) -> i32 {
             "--concurrency" => {
                 i += 1;
                 if i >= argv.len() {
-                    eprintln!("error: --concurrency requires an integer");
+                    eprintln!("error: --concurrency requires an integer or comma-separated list");
                     return 2;
                 }
-                let Ok(n) = argv[i].parse::<u16>() else {
-                    eprintln!("error: invalid integer for --concurrency: `{}`", argv[i]);
+                match parse_u16_list(&argv[i]) {
+                    Ok(v) => concurrency = v,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return 2;
+                    }
+                }
+            }
+            "--repeat" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --repeat requires an integer");
+                    return 2;
+                }
+                let Ok(n) = argv[i].parse::<usize>() else {
+                    eprintln!("error: invalid integer for --repeat: `{}`", argv[i]);
                     return 2;
                 };
-                concurrency = n;
+                if n == 0 {
+                    eprintln!("error: --repeat must be >= 1");
+                    return 2;
+                }
+                repeat = n;
+            }
+            "--mvcc" => {
+                fsqlite_mvcc = true;
             }
             "--pretty" => {
                 pretty = true;
@@ -436,14 +461,20 @@ fn cmd_run(argv: &[String]) -> i32 {
         "sqlite3" => run_sqlite3_engine(
             db_name,
             workload_name,
-            concurrency,
+            &concurrency,
+            repeat,
             pretty,
             output_jsonl.as_deref(),
         ),
-        "fsqlite" => {
-            eprintln!("error: fsqlite engine not yet implemented (see bd-1w6k.3.3)");
-            1
-        }
+        "fsqlite" => run_fsqlite_engine(
+            db_name,
+            workload_name,
+            &concurrency,
+            repeat,
+            fsqlite_mvcc,
+            pretty,
+            output_jsonl.as_deref(),
+        ),
         other => {
             eprintln!("error: unknown engine `{other}` (expected sqlite3 or fsqlite)");
             2
@@ -511,7 +542,8 @@ fn resolve_workload(preset: &str, fixture_id: &str, concurrency: u16) -> Result<
 fn run_sqlite3_engine(
     db_name: &str,
     workload_name: &str,
-    concurrency: u16,
+    concurrency: &[u16],
+    repeat: usize,
     pretty: bool,
     output_jsonl: Option<&Path>,
 ) -> i32 {
@@ -542,15 +574,6 @@ fn run_sqlite3_engine(
         return 1;
     }
 
-    // Resolve the workload preset.
-    let oplog = match resolve_workload(workload_name, db_name, concurrency) {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return 1;
-        }
-    };
-
     let config = SqliteExecConfig::default();
     let sqlite_version = rusqlite::version().to_owned();
 
@@ -562,51 +585,90 @@ fn run_sqlite3_engine(
         }
     };
 
-    eprintln!(
-        "Running: engine=sqlite3 (v{sqlite_version}) db={db_name} \
-         workload={workload_name} concurrency={concurrency}"
-    );
-    eprintln!("  golden: {}", golden_path.display());
-    eprintln!("  working: {}", work_db.display());
-    eprintln!("  ops: {}", oplog.records.len());
+    let mut results: Vec<RunAgg> = Vec::new();
+    let mut any_error = false;
 
-    // Execute the workload.
-    let report = match run_oplog_sqlite(&work_db, &oplog, &config) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("error: execution failed: {e}");
-            return 1;
-        }
-    };
+    for &c in concurrency {
+        let mut agg = RunAgg::new(c);
+        for rep in 0..repeat {
+            // Copy golden to a fresh working directory so we don't modify the original.
+            let work_dir = match tempfile::tempdir() {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("error: failed to create temp dir: {e}");
+                    return 1;
+                }
+            };
+            let work_db = work_dir.path().join("work.db");
+            if let Err(e) = fs::copy(&golden_path, &work_db) {
+                eprintln!(
+                    "error: failed to copy {} to {}: {e}",
+                    golden_path.display(),
+                    work_db.display()
+                );
+                return 1;
+            }
 
-    let recorded_unix_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+            let oplog = match resolve_workload(workload_name, db_name, c) {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return 1;
+                }
+            };
 
-    let record = RunRecordV1::new(RunRecordV1Args {
-        recorded_unix_ms,
-        engine: EngineInfo {
-            name: "sqlite3".to_owned(),
-            sqlite_version: Some(sqlite_version),
-            fsqlite_git: None,
-        },
-        fixture_id: db_name.to_owned(),
-        golden_path: Some(golden_path.display().to_string()),
-        golden_sha256,
-        workload: workload_name.to_owned(),
-        concurrency,
-        ops_count: u64::try_from(oplog.records.len()).unwrap_or(u64::MAX),
-        report,
-    });
+            eprintln!(
+                "Running: engine=sqlite3 (v{sqlite_version}) db={db_name} workload={workload_name} \
+                 concurrency={c} rep={rep}/{repeat}"
+            );
+            eprintln!("  golden: {}", golden_path.display());
+            eprintln!("  working: {}", work_db.display());
+            eprintln!("  ops: {}", oplog.records.len());
 
-    let json = if pretty {
-        record.to_pretty_json()
-    } else {
-        record.to_jsonl_line()
-    };
+            let report = match run_oplog_sqlite(&work_db, &oplog, &config) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("error: execution failed: {e}");
+                    return 1;
+                }
+            };
+            agg.record(&report);
+            any_error |= report.error.is_some();
 
-    match json {
-        Ok(text) => {
+            let recorded_unix_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+
+            let record = RunRecordV1::new(RunRecordV1Args {
+                recorded_unix_ms,
+                engine: EngineInfo {
+                    name: "sqlite3".to_owned(),
+                    sqlite_version: Some(sqlite_version.clone()),
+                    fsqlite_git: None,
+                },
+                fixture_id: db_name.to_owned(),
+                golden_path: Some(golden_path.display().to_string()),
+                golden_sha256: golden_sha256.clone(),
+                workload: workload_name.to_owned(),
+                concurrency: c,
+                ops_count: u64::try_from(oplog.records.len()).unwrap_or(u64::MAX),
+                report,
+            });
+
+            let json = if pretty {
+                record.to_pretty_json()
+            } else {
+                record.to_jsonl_line()
+            };
+
+            let text = match json {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("error: failed to serialize report: {e}");
+                    return 1;
+                }
+            };
+
             if let Some(path) = output_jsonl {
                 if let Err(e) = append_jsonl_line(path, &text) {
                     eprintln!("error: failed to append JSONL output: {e}");
@@ -614,13 +676,148 @@ fn run_sqlite3_engine(
                 }
             }
             println!("{text}");
-            i32::from(record.report.error.is_some())
         }
-        Err(e) => {
-            eprintln!("error: failed to serialize report: {e}");
-            1
-        }
+        results.push(agg);
     }
+
+    if results.len() > 1 || repeat > 1 {
+        eprintln!("{}", format_scaling_summary("sqlite3", repeat, &results));
+    }
+
+    i32::from(any_error)
+}
+
+/// Execute a workload against FrankenSQLite and print JSON results.
+fn run_fsqlite_engine(
+    db_name: &str,
+    workload_name: &str,
+    concurrency: &[u16],
+    repeat: usize,
+    mvcc: bool,
+    pretty: bool,
+    output_jsonl: Option<&Path>,
+) -> i32 {
+    let golden_path = match resolve_golden_db(db_name) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+
+    let golden_sha256 = match sha256_file(&golden_path) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            eprintln!("warning: failed to compute golden sha256: {e}");
+            None
+        }
+    };
+
+    let config = FsqliteExecConfig {
+        concurrent_mode: mvcc,
+        ..FsqliteExecConfig::default()
+    };
+
+    let mut results: Vec<RunAgg> = Vec::new();
+    let mut any_error = false;
+
+    for &c in concurrency {
+        let mut agg = RunAgg::new(c);
+        for rep in 0..repeat {
+            let work_dir = match tempfile::tempdir() {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("error: failed to create temp dir: {e}");
+                    return 1;
+                }
+            };
+            let work_db = work_dir.path().join("work.db");
+            if let Err(e) = fs::copy(&golden_path, &work_db) {
+                eprintln!(
+                    "error: failed to copy {} to {}: {e}",
+                    golden_path.display(),
+                    work_db.display()
+                );
+                return 1;
+            }
+
+            let oplog = match resolve_workload(workload_name, db_name, c) {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return 1;
+                }
+            };
+
+            let mode = if mvcc { "mvcc" } else { "single-writer" };
+            eprintln!(
+                "Running: engine=fsqlite mode={mode} db={db_name} workload={workload_name} \
+                 concurrency={c} rep={rep}/{repeat}"
+            );
+            eprintln!("  golden: {}", golden_path.display());
+            eprintln!("  working: {}", work_db.display());
+            eprintln!("  ops: {}", oplog.records.len());
+
+            let report = match run_oplog_fsqlite(&work_db, &oplog, &config) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("error: execution failed: {e}");
+                    return 1;
+                }
+            };
+            agg.record(&report);
+            any_error |= report.error.is_some();
+
+            let recorded_unix_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+
+            let record = RunRecordV1::new(RunRecordV1Args {
+                recorded_unix_ms,
+                engine: EngineInfo {
+                    name: "fsqlite".to_owned(),
+                    sqlite_version: None,
+                    fsqlite_git: None,
+                },
+                fixture_id: db_name.to_owned(),
+                golden_path: Some(golden_path.display().to_string()),
+                golden_sha256: golden_sha256.clone(),
+                workload: workload_name.to_owned(),
+                concurrency: c,
+                ops_count: u64::try_from(oplog.records.len()).unwrap_or(u64::MAX),
+                report,
+            });
+
+            let json = if pretty {
+                record.to_pretty_json()
+            } else {
+                record.to_jsonl_line()
+            };
+
+            let text = match json {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("error: failed to serialize report: {e}");
+                    return 1;
+                }
+            };
+
+            if let Some(path) = output_jsonl {
+                if let Err(e) = append_jsonl_line(path, &text) {
+                    eprintln!("error: failed to append JSONL output: {e}");
+                    return 1;
+                }
+            }
+            println!("{text}");
+        }
+        results.push(agg);
+    }
+
+    if results.len() > 1 || repeat > 1 {
+        eprintln!("{}", format_scaling_summary("fsqlite", repeat, &results));
+    }
+
+    i32::from(any_error)
 }
 
 fn append_jsonl_line(path: &Path, line: &str) -> io::Result<()> {
@@ -637,6 +834,103 @@ fn append_jsonl_line(path: &Path, line: &str) -> io::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct RunAgg {
+    concurrency: u16,
+    wall_time_ms: Vec<u64>,
+    ops_per_sec: Vec<f64>,
+    retries: Vec<u64>,
+    aborts: Vec<u64>,
+}
+
+impl RunAgg {
+    fn new(concurrency: u16) -> Self {
+        Self {
+            concurrency,
+            wall_time_ms: Vec::new(),
+            ops_per_sec: Vec::new(),
+            retries: Vec::new(),
+            aborts: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, report: &fsqlite_e2e::report::EngineRunReport) {
+        self.wall_time_ms.push(report.wall_time_ms);
+        self.ops_per_sec.push(report.ops_per_sec);
+        self.retries.push(report.retries);
+        self.aborts.push(report.aborts);
+    }
+}
+
+fn format_scaling_summary(engine: &str, repeat: usize, results: &[RunAgg]) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "\n{}", "-".repeat(72));
+    let _ = writeln!(out, "  Scaling summary: engine={engine} repeat={repeat}");
+    let _ = writeln!(out, "{}", "-".repeat(72));
+    let _ = writeln!(
+        out,
+        "  {:>10} {:>12} {:>12} {:>10} {:>10}",
+        "Conc", "p50 ops/s", "p95 ops/s", "p50 ms", "p50 retries"
+    );
+    let _ = writeln!(out, "  {:-<72}", "");
+
+    for r in results {
+        let p50_ops = percentile_f64(&r.ops_per_sec, 50);
+        let p95_ops = percentile_f64(&r.ops_per_sec, 95);
+        let p50_ms = percentile_u64(&r.wall_time_ms, 50);
+        let p50_retries = percentile_u64(&r.retries, 50);
+        let _ = writeln!(
+            out,
+            "  {:>10} {:>12.1} {:>12.1} {:>10} {:>10}",
+            r.concurrency, p50_ops, p95_ops, p50_ms, p50_retries
+        );
+    }
+
+    let _ = writeln!(out, "{}", "-".repeat(72));
+    out
+}
+
+fn percentile_u64(data: &[u64], pct: u32) -> u64 {
+    if data.is_empty() {
+        return 0;
+    }
+    let mut sorted = data.to_vec();
+    sorted.sort_unstable();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let idx = ((f64::from(pct) / 100.0) * (sorted.len() as f64 - 1.0)).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+fn percentile_f64(data: &[f64], pct: u32) -> f64 {
+    if data.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = data.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let idx = ((f64::from(pct) / 100.0) * (sorted.len() as f64 - 1.0)).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+fn parse_u16_list(raw: &str) -> Result<Vec<u16>, String> {
+    let mut out: Vec<u16> = Vec::new();
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err(format!("invalid --concurrency list: `{raw}`"));
+        }
+        let Ok(n) = part.parse::<u16>() else {
+            return Err(format!("invalid integer in --concurrency list: `{part}`"));
+        };
+        out.push(n);
+    }
+    if out.is_empty() {
+        Err(format!("invalid --concurrency list: `{raw}`"))
+    } else {
+        Ok(out)
+    }
+}
+
 fn print_run_help() {
     let text = "\
 realdb-e2e run — Execute an OpLog workload against an engine
@@ -648,7 +942,9 @@ OPTIONS:
     --engine <ENGINE>       Engine to use: sqlite3 | fsqlite
     --db <DB_ID>            Database fixture identifier
     --workload <NAME>       OpLog preset name (e.g. commutative_inserts_disjoint_keys)
-    --concurrency <N>       Number of concurrent workers (default: 1)
+    --concurrency <N|LIST>  Number of workers, or comma-separated list (default: 1)
+    --repeat <N>            Repetitions per concurrency (default: 1)
+    --mvcc                  For fsqlite: enable MVCC concurrent_mode
     --output-jsonl <PATH>   Append a single JSONL record to PATH
     --pretty                Pretty-print JSON to stdout (default: JSONL)
     -h, --help              Show this help message
@@ -748,6 +1044,15 @@ mod tests {
     #[test]
     fn test_unknown_subcommand_exits_two() {
         assert_eq!(run_with(&["realdb-e2e", "bogus"]), 2);
+    }
+
+    #[test]
+    fn parse_u16_list_single_and_list() {
+        assert_eq!(parse_u16_list("1").unwrap(), vec![1]);
+        assert_eq!(parse_u16_list("1,2,4,8,16").unwrap(), vec![1, 2, 4, 8, 16]);
+        assert!(parse_u16_list("").is_err());
+        assert!(parse_u16_list("1,").is_err());
+        assert!(parse_u16_list("nope").is_err());
     }
 
     #[test]
