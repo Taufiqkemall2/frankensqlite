@@ -6,6 +6,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use crate::{E2eError, E2eResult};
+use fsqlite_vfs::host_fs;
 
 /// Strategy for injecting corruption into a database file.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
@@ -36,7 +37,7 @@ pub enum CorruptionStrategy {
 /// Returns `E2eError::Io` if the file cannot be read or written.
 #[allow(clippy::cast_possible_truncation)]
 pub fn inject_corruption(path: &Path, strategy: CorruptionStrategy, seed: u64) -> E2eResult<()> {
-    let mut data = std::fs::read(path)?;
+    let mut data = host_fs::read(path).map_err(|e| std::io::Error::other(e.to_string()))?;
     if data.is_empty() {
         return Err(E2eError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -73,7 +74,7 @@ pub fn inject_corruption(path: &Path, strategy: CorruptionStrategy, seed: u64) -
         }
     }
 
-    std::fs::write(path, &data)?;
+    host_fs::write(path, &data).map_err(|e| std::io::Error::other(e.to_string()))?;
     Ok(())
 }
 

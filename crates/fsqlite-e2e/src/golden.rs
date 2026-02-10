@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use std::fmt::Write as _;
 
+use fsqlite_vfs::host_fs;
 use sha2::{Digest, Sha256};
 
 use crate::{E2eError, E2eResult};
@@ -39,7 +40,7 @@ impl GoldenCopy {
     ///
     /// Returns `E2eError::Io` if the file cannot be read.
     pub fn hash_file(path: &Path) -> E2eResult<String> {
-        let bytes = std::fs::read(path)?;
+        let bytes = host_fs::read(path).map_err(|e| std::io::Error::other(e.to_string()))?;
         let mut hasher = Sha256::new();
         hasher.update(&bytes);
         let digest = hasher.finalize();

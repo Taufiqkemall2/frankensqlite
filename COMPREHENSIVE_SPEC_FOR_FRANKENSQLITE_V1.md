@@ -12311,6 +12311,20 @@ Tab completion, syntax highlighting, history.
 Conformance test runner. Runs identical SQL against FrankenSQLite and C sqlite3.
 Compares output row-by-row. Error code matching. Golden file management.
 
+**`fsqlite-e2e`** (~2,000 LOC estimated)
+End-to-end differential testing and benchmark harness. Provides golden copy
+management (SHA-256 verification), deterministic workload generation with
+seeded RNG, comparison engine running identical SQL against FrankenSQLite
+and C SQLite (via rusqlite bundled), corruption injection for resilience
+testing. Dependency rationale: depends on fsqlite, fsqlite-core (our engine),
+rusqlite (C SQLite reference), sha2 (hashing), rand (PRNG).
+Modules:
+- `lib.rs` — shared error types and re-exports
+- `golden.rs` — golden database snapshot loading and hash verification
+- `workload.rs` — deterministic workload generation framework
+- `comparison.rs` — differential comparison engine (FrankenSQLite vs C SQLite)
+- `corruption.rs` — byte/page/sector-level corruption injection
+
 ### 8.4 Dependency Edges with Rationale
 
 | From | To | Rationale |
@@ -12345,6 +12359,9 @@ Compares output row-by-row. Error code matching. Golden file management.
 | fsqlite-cli | fsqlite | Uses public API |
 | fsqlite-cli | frankentui | TUI framework |
 | fsqlite-harness | fsqlite | Uses public API for testing |
+| fsqlite-e2e | fsqlite | Uses public API for E2E differential testing |
+| fsqlite-e2e | fsqlite-core | Direct core access for workload execution |
+| fsqlite-e2e | rusqlite | C SQLite reference engine (bundled) |
 
 ### 8.5 Feature Flags
 

@@ -593,8 +593,7 @@ mod tests {
 
         assert!(
             log.records.iter().any(|r| {
-                matches!(&r.kind, OpKind::Insert { table, .. } if table == "mixed")
-                    && r.op_id > 101 // past initial seed data
+                matches!(&r.kind, OpKind::Insert { table, .. } if table == "mixed") && r.op_id > 101 // past initial seed data
             }),
             "should have write operations"
         );
