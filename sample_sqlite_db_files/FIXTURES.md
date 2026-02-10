@@ -132,46 +132,47 @@ sha256sum *.db | sort -k2 > ../checksums.sha256
 If you used `realdb-e2e corpus import`, this is done automatically (and the
 metadata is intentionally schema/PRAGMA-focused: no row contents).
 
-Create a JSON metadata file under `metadata/`:
+Metadata lives under `sample_sqlite_db_files/metadata/<db_id>.json` and follows
+the stable schema `FixtureMetadataV1` (see `crates/fsqlite-e2e/src/fixture_metadata.rs`).
+
+To (re)generate metadata for all golden DBs (deterministic JSON, best-effort
+schema summaries, derived feature flags):
 
 ```bash
-DB="sample_sqlite_db_files/golden/asupersync.db"
-ID="asupersync"
-
-# Quick metadata capture (adapt as needed):
-sqlite3 "$DB" <<'SQL'
-.mode json
-SELECT
-  'asupersync' AS name,
-  (SELECT page_size FROM pragma_page_size()) AS page_size,
-  (SELECT page_count FROM pragma_page_count()) AS page_count,
-  (SELECT freelist_count FROM pragma_freelist_count()) AS freelist_count,
-  (SELECT schema_version FROM pragma_schema_version()) AS schema_version,
-  (SELECT journal_mode FROM pragma_journal_mode()) AS journal_mode;
-SQL
+cargo run -p fsqlite-e2e --bin profile-db -- --pretty
 ```
 
-At minimum, the metadata JSON should include:
-- `name` (matches the db_id slug)
-- `file_size_bytes`
-- `page_size`, `page_count`, `freelist_count`
-- `journal_mode`, `schema_version`
-- Table list with row counts
+At minimum, each metadata JSON should include:
+- `schema_version` (metadata schema version)
+- `db_id`
+- `golden_filename`
+- `sha256_golden` + `size_bytes`
+- `sidecars_present` (e.g. `-wal`, `-shm`, `-journal`) when observed
+- `sqlite_meta.page_size` (plus other PRAGMAs as best-effort)
 
-See `metadata/README.md` for the full recommended field set.
+See `metadata/README.md` for the full recommended field set and safety rules.
 
 ### Step 6: Update the Manifest (Optional)
 
-If maintained, add an entry to `manifests/manifest.v1.json` following the schema
-in `manifests/manifest.v1.schema.json`.  Required fields:
+If maintained, `manifests/manifest.v1.json` should stay consistent with:
+- `checksums.sha256` (filenames + `sha256_golden`)
+- `metadata/*.json` (at minimum `size_bytes` + `sqlite_meta.page_size`)
+
+Preferred: generate it deterministically from `checksums.sha256` + `metadata/*.json`:
+
+```bash
+cargo run -p fsqlite-e2e --bin profile-db -- --manifest-only
+```
+
+If you need to edit it by hand, follow the schema in `manifests/manifest.v1.schema.json`.
+Required fields:
 
 ```json
 {
   "db_id": "asupersync",
   "golden_filename": "asupersync.db",
   "sha256_golden": "<64-char hex>",
-  "size_bytes": 12345678,
-  "source_path": "/dp/asupersync/.beads/beads.db"
+  "size_bytes": 12345678
 }
 ```
 
@@ -291,15 +292,16 @@ Skip a database if any of these apply:
 
 ## Tagging Taxonomy
 
-Two tag surfaces exist:
+Fixture selection and reporting use the `tags` array stored in `metadata/<db_id>.json`
+(see `FixtureMetadataV1.tags` in `crates/fsqlite-e2e/src/fixture_metadata.rs`).
 
-- `tag` (manual, stable): set via `realdb-e2e corpus import --tag <TAG>` and stored in metadata.
-- `discovery_tags` (automatic): emitted by `realdb-e2e corpus scan` via path/size heuristics.
+- `realdb-e2e corpus import --tag <TAG>` adds one stable classification tag (small allowlist).
+- The ingestion/profiling pipeline may also add derived tags (e.g. size bucket `small|medium|large`,
+  `wal`, or other feature tags) for convenience.
+- `realdb-e2e corpus scan` emits heuristic tags in its discovery JSON output; treat these as hints
+  unless your pipeline persists them into `metadata/*.json`.
 
-The manual tag is intentionally restricted to a small stable vocabulary so selection/reporting
-doesn’t drift into one-off labels.
-
-### Stable Manual Tags
+### Stable Classification Tags
 
 | Tag | When to use |
 |-----|-------------|
@@ -321,7 +323,8 @@ Discovery tags are best-effort hints. Current heuristics include:
 
 ### Notes
 
-- `journal_mode` is recorded in metadata (don’t encode it as a tag).
+- `journal_mode` is recorded in metadata (`sqlite_meta.journal_mode`). We also commonly include
+  `wal` as a derived tag for selection convenience.
 - Tag-based selection for `run/bench/corrupt` can be built on top of metadata/manifest
   (future work); today the CLI prints tags during scan/import.
 
@@ -337,7 +340,7 @@ the repo**.  The following rules apply:
 - Aggregate statistics: row counts, page counts, file size
 - PRAGMA values: page_size, journal_mode, user_version, application_id
 - Index and trigger names
-- Source path (shows project structure, not data)
+- Source path (optional; may be omitted/null for redaction safety)
 
 **Forbidden in metadata:**
 - Row contents or sample data
@@ -356,7 +359,8 @@ Before ingesting any fixture, assess PII risk:
 | `likely` | Contains emails, tokens, user content | **Do not ingest** |
 | `unknown` | Not yet assessed | Treat as `possible` until reviewed |
 
-Set `safety.pii_risk` in the manifest entry to document the assessment.
+Set `safety.pii_risk` (and `safety.secrets_risk` / `safety.allowed_for_ci`) in fixture metadata
+(via `realdb-e2e corpus import` flags) to document the assessment.
 
 ### Existing Corpus Assessment
 
