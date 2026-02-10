@@ -132,12 +132,17 @@ fn manifest_v1_exists_and_is_consistent() {
         .with_draft(jsonschema::Draft::Draft202012)
         .build(&schema_json)
         .expect("build JSON Schema validator");
-    if let Err(first) = validator.validate(&manifest_json) {
+    let validation = validator.validate(&manifest_json);
+    let ok = validation.is_ok();
+    if let Err(first) = validation {
         let mut msg = String::new();
         for err in validator.iter_errors(&manifest_json) {
             let _ = writeln!(msg, "- {err}");
         }
-        panic!("manifest.v1.json failed schema validation (first error: {first})\n{msg}");
+        assert!(
+            ok,
+            "manifest.v1.json failed schema validation (first error: {first})\n{msg}"
+        );
     }
 
     let manifest: ManifestV1 = serde_json::from_str(&manifest_raw).expect("parse manifest.v1.json");

@@ -130,6 +130,21 @@ impl Drop for PageBuf {
     }
 }
 
+impl Clone for PageBuf {
+    /// Clone produces a standalone (non-pooled) copy of the buffer contents.
+    fn clone(&self) -> Self {
+        let src = self.as_slice();
+        let (mut backing, offset) = allocate_aligned(self.page_size);
+        backing[offset..offset + self.page_size].copy_from_slice(src);
+        Self {
+            backing: Some(backing),
+            offset,
+            page_size: self.page_size,
+            pool: None,
+        }
+    }
+}
+
 impl fmt::Debug for PageBuf {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PageBuf")

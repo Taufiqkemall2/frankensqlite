@@ -928,13 +928,21 @@ impl ArcCacheInner {
             self.directory.insert(key, Location::B2(ghost_idx));
             return true;
         }
-        // Fallback: standard REPLACE.
+        // Fallback: standard REPLACE with pinned-page fallback.
         let t1_len = self.t1.len();
-        if t1_len > 0 && t1_len > self.p {
-            self.evict_lru_from_t1()
-        } else {
-            self.evict_lru_from_t2()
+        let prefer_t1 = t1_len > 0 && t1_len > self.p;
+
+        if prefer_t1 {
+            if self.evict_lru_from_t1() {
+                return true;
+            }
+            return self.evict_lru_from_t2();
         }
+
+        if self.evict_lru_from_t2() {
+            return true;
+        }
+        self.evict_lru_from_t1()
     }
 
     /// Find the first unpinned node from the head (LRU end).
@@ -3448,5 +3456,47 @@ mod tests {
             "bead_id={BEAD_ID_BD_2ZOA} case=e2e_arc_performance \
              expected>0.50 got={hit_rate:.4}"
         );
+    }
+
+    #[test]
+    fn test_evict_one_preferred_fallback() {
+        // Bug repro: evict_one_preferred should try the non-preferred list
+        // if the preferred list is fully pinned.
+        let mut cache = ArcCacheInner::new(10, 0); // unlimited bytes initially
+
+        let k1 = key(1, 0); // T2 (unpinned)
+        let k2 = key(2, 0); // T1 (pinned)
+
+        // Move k1 to T2.
+        let l = cache.request(&k1);
+        cache.admit(k1, page(k1, 4096), l);
+        cache.request(&k1); // promote to T2
+
+        // Move k2 to T1 and pin it.
+        let l = cache.request(&k2);
+        cache.admit(k2, page(k2, 4096), l);
+        cache.get(&k2).unwrap().pin();
+
+        // State: T1=[k2(pinned)], T2=[k1(unpinned)]. p=0.
+        // Rule: |T1| > p (1 > 0), so T1 is preferred for eviction.
+        // But T1 is pinned. It should fall back to T2.
+
+        // Force eviction by resizing byte limit.
+        cache.resize(10, 1); // 1 byte limit -> must evict everything possible
+
+        assert!(
+            cache.get(&k1).is_none(),
+            "k1 should be evicted from T2 because T1 was pinned"
+        );
+        assert!(
+            cache.get(&k2).is_some(),
+            "k2 must remain (pinned)"
+        );
+        assert_eq!(
+            cache.capacity_overflow_events(),
+            1,
+            "overflow only because we couldn't evict k2, but we DID evict k1"
+        );
+        cache.get(&k2).unwrap().unpin();
     }
 }

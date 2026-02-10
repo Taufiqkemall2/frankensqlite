@@ -206,7 +206,7 @@ impl PreparedStatement {
                     "prepared statement missing function registry".to_owned(),
                 ));
             };
-            execute_table_program_with_db(&self.program, None, registry, db)?
+            execute_table_program_with_db(&self.program, None, registry, db, None).0?
         } else {
             execute_program_with_postprocess(
                 &self.program,
@@ -232,7 +232,7 @@ impl PreparedStatement {
                     "prepared statement missing function registry".to_owned(),
                 ));
             };
-            execute_table_program_with_db(&self.program, Some(params), registry, db)?
+            execute_table_program_with_db(&self.program, Some(params), registry, db, None).0?
         } else {
             execute_program_with_postprocess(
                 &self.program,
@@ -1250,7 +1250,16 @@ impl Connection {
         program: &VdbeProgram,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
-        execute_table_program_with_db(program, params, &self.func_registry, &self.db)
+        // Lend the active transaction to the VDBE engine so that storage
+        // cursors route through the real pager/WAL stack (Phase 5, bd-2a3y).
+        let txn = self.active_txn.borrow_mut().take();
+        let (result, txn_back) =
+            execute_table_program_with_db(program, params, &self.func_registry, &self.db, txn);
+        // Always restore the transaction handle, even on error.
+        if let Some(txn) = txn_back {
+            *self.active_txn.borrow_mut() = Some(txn);
+        }
+        result
     }
 
     fn load_persisted_state_if_present(&self) -> Result<()> {
@@ -1731,37 +1740,50 @@ fn execute_table_program_with_db(
     params: Option<&[SqliteValue]>,
     func_registry: &Arc<FunctionRegistry>,
     db: &Rc<RefCell<MemDatabase>>,
-) -> Result<Vec<Row>> {
+    txn: Option<Box<dyn TransactionHandle>>,
+) -> (Result<Vec<Row>>, Option<Box<dyn TransactionHandle>>) {
     let mut engine = VdbeEngine::new(program.register_count());
     if let Some(params) = params {
-        validate_bound_parameters(program, params)?;
+        if let Err(e) = validate_bound_parameters(program, params) {
+            return (Err(e), txn);
+        }
         engine.set_bindings(params.to_vec());
     }
 
     engine.set_function_registry(Arc::clone(func_registry));
-    engine.enable_storage_read_cursors(true);
+
+    // Phase 5 (bd-2a3y): if a transaction handle is available, lend it to
+    // the engine so storage cursors route through the real pager/WAL stack.
+    // This also enables storage cursors automatically.
+    if let Some(txn) = txn {
+        engine.set_transaction(txn);
+    } else {
+        engine.enable_storage_read_cursors(true);
+    }
 
     // Lend the MemDatabase to the engine for the duration of execution.
     let db_value = db.replace(MemDatabase::new());
     engine.set_database(db_value);
 
-    // Always take the DB back, even if execution returns Err.
+    // Always take the DB and txn back, even if execution returns Err.
     let exec_res = engine.execute(program);
     if let Some(db_value) = engine.take_database() {
         *db.borrow_mut() = db_value;
     }
-    let outcome = exec_res?;
+    let txn_back = engine.take_transaction();
 
-    match outcome {
-        ExecOutcome::Done => Ok(engine
+    let result = match exec_res {
+        Ok(ExecOutcome::Done) => Ok(engine
             .take_results()
             .into_iter()
             .map(|values| Row { values })
             .collect()),
-        ExecOutcome::Error { code, message } => Err(FrankenError::Internal(format!(
+        Ok(ExecOutcome::Error { code, message }) => Err(FrankenError::Internal(format!(
             "VDBE halted with code {code}: {message}",
         ))),
-    }
+        Err(e) => Err(e),
+    };
+    (result, txn_back)
 }
 
 fn build_expression_postprocess(select: &SelectStatement) -> ExpressionPostprocess {

@@ -10,13 +10,17 @@
 //! and will be wired to the B-tree layer in Phase 5.
 
 use std::any::Any;
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
-use fsqlite_btree::{BtCursor, BtreeCursorOps, MemPageStore};
+use fsqlite_btree::{BtCursor, BtreeCursorOps, MemPageStore, PageReader, PageWriter, SeekResult};
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::{ErasedAggregateFunction, FunctionRegistry};
+use fsqlite_pager::TransactionHandle;
+use fsqlite_types::PageNumber;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
 use fsqlite_types::record::{parse_record, serialize_record};
@@ -200,15 +204,173 @@ impl SorterCursor {
     }
 }
 
+// ── Shared Transaction Page I/O ─────────────────────────────────────────
+//
+// Phase 5 (bd-2a3y): Adapter that lets multiple `BtCursor` instances
+// share a single pager transaction via `Rc<RefCell<…>>`.  The
+// `PageReader`/`PageWriter` impls delegate through the `RefCell` borrow
+// so that cursors can read/write pages on the real MVCC stack.
+
+/// Shared wrapper around a boxed [`TransactionHandle`] so multiple
+/// storage cursors can share one transaction.
+#[derive(Clone)]
+struct SharedTxnPageIo {
+    txn: Rc<RefCell<Box<dyn TransactionHandle>>>,
+}
+
+impl std::fmt::Debug for SharedTxnPageIo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedTxnPageIo")
+            .field("rc_count", &Rc::strong_count(&self.txn))
+            .finish()
+    }
+}
+
+impl SharedTxnPageIo {
+    fn new(txn: Box<dyn TransactionHandle>) -> Self {
+        Self {
+            txn: Rc::new(RefCell::new(txn)),
+        }
+    }
+
+    /// Unwrap back to the owned transaction handle.
+    /// Panics if other Rc clones still exist.
+    fn into_inner(self) -> Box<dyn TransactionHandle> {
+        match Rc::try_unwrap(self.txn) {
+            Ok(cell) => cell.into_inner(),
+            Err(rc) => panic!(
+                "SharedTxnPageIo: {} outstanding Rc references",
+                Rc::strong_count(&rc)
+            ),
+        }
+    }
+}
+
+impl PageReader for SharedTxnPageIo {
+    fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
+        Ok(self.txn.borrow().get_page(cx, page_no)?.into_vec())
+    }
+}
+
+impl PageWriter for SharedTxnPageIo {
+    fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
+        self.txn.borrow_mut().write_page(cx, page_no, data)
+    }
+
+    fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
+        self.txn.borrow_mut().allocate_page(cx)
+    }
+
+    fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
+        self.txn.borrow_mut().free_page(cx, page_no)
+    }
+}
+
+// ── Cursor Backend Enum ────────────────────────────────────────────────
+//
+// Allows StorageCursor to work in two modes:
+// - `Mem`: backed by MemPageStore (Phase 4 / tests)
+// - `Txn`: backed by SharedTxnPageIo (Phase 5 production path)
+
+/// Backend for a storage cursor, dispatching between in-memory and
+/// transaction-backed page I/O.
+enum CursorBackend {
+    /// In-memory page store (used by tests and Phase 4 fallback).
+    Mem(BtCursor<MemPageStore>),
+    /// Real pager transaction (Phase 5 production path, bd-2a3y).
+    Txn(BtCursor<SharedTxnPageIo>),
+}
+
+impl std::fmt::Debug for CursorBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Mem(c) => f.debug_tuple("Mem").field(c).finish(),
+            Self::Txn(c) => f.debug_tuple("Txn").field(c).finish(),
+        }
+    }
+}
+
+/// Dispatch B-tree cursor operations across both backends.
+impl CursorBackend {
+    fn first(&mut self, cx: &Cx) -> Result<bool> {
+        match self {
+            Self::Mem(c) => c.first(cx),
+            Self::Txn(c) => c.first(cx),
+        }
+    }
+
+    fn last(&mut self, cx: &Cx) -> Result<bool> {
+        match self {
+            Self::Mem(c) => c.last(cx),
+            Self::Txn(c) => c.last(cx),
+        }
+    }
+
+    fn next(&mut self, cx: &Cx) -> Result<bool> {
+        match self {
+            Self::Mem(c) => c.next(cx),
+            Self::Txn(c) => c.next(cx),
+        }
+    }
+
+    fn prev(&mut self, cx: &Cx) -> Result<bool> {
+        match self {
+            Self::Mem(c) => c.prev(cx),
+            Self::Txn(c) => c.prev(cx),
+        }
+    }
+
+    fn eof(&self) -> bool {
+        match self {
+            Self::Mem(c) => c.eof(),
+            Self::Txn(c) => c.eof(),
+        }
+    }
+
+    fn rowid(&self, cx: &Cx) -> Result<i64> {
+        match self {
+            Self::Mem(c) => c.rowid(cx),
+            Self::Txn(c) => c.rowid(cx),
+        }
+    }
+
+    fn payload(&self, cx: &Cx) -> Result<Vec<u8>> {
+        match self {
+            Self::Mem(c) => c.payload(cx),
+            Self::Txn(c) => c.payload(cx),
+        }
+    }
+
+    fn table_move_to(&mut self, cx: &Cx, rowid: i64) -> Result<SeekResult> {
+        match self {
+            Self::Mem(c) => c.table_move_to(cx, rowid),
+            Self::Txn(c) => c.table_move_to(cx, rowid),
+        }
+    }
+
+    fn table_insert(&mut self, cx: &Cx, rowid: i64, data: &[u8]) -> Result<()> {
+        match self {
+            Self::Mem(c) => c.table_insert(cx, rowid, data),
+            Self::Txn(c) => c.table_insert(cx, rowid, data),
+        }
+    }
+
+    fn delete(&mut self, cx: &Cx) -> Result<()> {
+        match self {
+            Self::Mem(c) => c.delete(cx),
+            Self::Txn(c) => c.delete(cx),
+        }
+    }
+}
+
 /// Storage-backed table cursor used by `OpenRead` and `OpenWrite`.
 ///
-/// Backed by a real [`BtCursor`] over an in-memory [`MemPageStore`] so that
-/// the VDBE exercises the same page-level navigation code path that the
-/// production pager/WAL stack will use.  When `writable` is true, `Insert`
-/// and `Delete` opcodes route through the B-tree write path.
+/// In Phase 5, `cursor` may be backed by either an in-memory [`MemPageStore`]
+/// (for tests / Phase 4 fallback) or a real pager transaction via
+/// [`SharedTxnPageIo`] (production path, bd-2a3y).
 #[derive(Debug)]
 struct StorageCursor {
-    cursor: BtCursor<MemPageStore>,
+    cursor: CursorBackend,
     cx: Cx,
     /// Whether this cursor was opened for writing (`OpenWrite`).
     writable: bool,
@@ -308,6 +470,10 @@ pub struct VdbeEngine {
     storage_cursors: HashMap<i32, StorageCursor>,
     /// Whether `OpenRead`/`OpenWrite` should route through storage-backed cursors.
     storage_cursors_enabled: bool,
+    /// Shared pager transaction for storage cursors (Phase 5, bd-2a3y).
+    /// When set, `open_storage_cursor` routes through the real pager/WAL
+    /// stack instead of building transient `MemPageStore` snapshots.
+    txn_page_io: Option<SharedTxnPageIo>,
     /// In-memory database backing cursor operations (shared with Connection).
     db: Option<MemDatabase>,
     /// Scalar/aggregate/window function registry for Function/PureFunc opcodes.
@@ -337,6 +503,7 @@ impl VdbeEngine {
             sorters: HashMap::new(),
             storage_cursors: HashMap::new(),
             storage_cursors_enabled: false,
+            txn_page_io: None,
             db: None,
             func_registry: None,
             aggregates: HashMap::new(),
@@ -361,6 +528,26 @@ impl VdbeEngine {
     /// Backwards-compatible alias for [`Self::enable_storage_cursors`].
     pub fn enable_storage_read_cursors(&mut self, enabled: bool) {
         self.enable_storage_cursors(enabled);
+    }
+
+    /// Lend a pager transaction to the engine for storage cursor I/O.
+    ///
+    /// When set, `open_storage_cursor` routes through the real pager/WAL
+    /// stack (`SharedTxnPageIo`) instead of building transient `MemPageStore`
+    /// snapshots. Also enables storage cursors automatically.
+    pub fn set_transaction(&mut self, txn: Box<dyn TransactionHandle>) {
+        self.txn_page_io = Some(SharedTxnPageIo::new(txn));
+        self.storage_cursors_enabled = true;
+    }
+
+    /// Take back the pager transaction after execution.
+    ///
+    /// All storage cursors must be dropped first (cleared during execution
+    /// cleanup). Panics if Rc references remain.
+    pub fn take_transaction(&mut self) -> Option<Box<dyn TransactionHandle>> {
+        // Drop all storage cursors first to release Rc references.
+        self.storage_cursors.clear();
+        self.txn_page_io.take().map(SharedTxnPageIo::into_inner)
     }
 
     /// Attach a function registry for `Function`/`PureFunc` opcode dispatch.
@@ -1999,17 +2186,65 @@ impl VdbeEngine {
         if !self.storage_cursors_enabled {
             return false;
         }
+
+        let Some(root_pgno) = PageNumber::new(root_page as u32) else {
+            return false;
+        };
+
+        // Phase 5 (bd-2a3y): prefer real pager transaction when available.
+        // We hydrate the B-tree from MemTable rows through the pager's
+        // transaction, so the cursor exercises the real page I/O path.
+        if let Some(ref page_io) = self.txn_page_io {
+            let cx = Cx::new();
+
+            // Initialize the root page as an empty leaf table B-tree page
+            // (type 0x0D) in the pager's write-set.
+            let mut root_data = vec![0u8; PAGE_SIZE as usize];
+            root_data[0] = 0x0D; // leaf table
+            // bytes 3-4: cell count = 0
+            // bytes 5-6: content area offset = page_size
+            #[allow(clippy::cast_possible_truncation)]
+            let content_offset = PAGE_SIZE as u16;
+            root_data[5..7].copy_from_slice(&content_offset.to_be_bytes());
+            {
+                let mut io = page_io.clone();
+                if io.write_page(&cx, root_pgno, &root_data).is_err() {
+                    return false;
+                }
+            }
+
+            let mut cursor = BtCursor::new(page_io.clone(), root_pgno, PAGE_SIZE, true);
+
+            // Hydrate from MemTable rows (dual-source during Phase 5 transition).
+            if let Some(db) = self.db.as_ref() {
+                if let Some(table) = db.get_table(root_page) {
+                    for row in &table.rows {
+                        let payload = encode_record(&row.values);
+                        if cursor.table_insert(&cx, row.rowid, &payload).is_err() {
+                            return false;
+                        }
+                    }
+                }
+            }
+
+            self.storage_cursors.insert(
+                cursor_id,
+                StorageCursor {
+                    cursor: CursorBackend::Txn(cursor),
+                    cx,
+                    writable,
+                    root_page,
+                },
+            );
+            return true;
+        }
+
+        // Fallback: build a transient B-tree snapshot from MemTable rows
+        // (Phase 4 path, used by tests without a real pager).
         let Some(db) = self.db.as_ref() else {
             return false;
         };
         let Some(table) = db.get_table(root_page) else {
-            return false;
-        };
-
-        // Build a transient B-tree snapshot from the current MemTable rows.
-        // Use the actual root page number (typically 2+) to avoid page-1's
-        // special 100-byte header offset.
-        let Some(root_pgno) = fsqlite_types::PageNumber::new(root_page as u32) else {
             return false;
         };
 
@@ -2027,7 +2262,7 @@ impl VdbeEngine {
         self.storage_cursors.insert(
             cursor_id,
             StorageCursor {
-                cursor,
+                cursor: CursorBackend::Mem(cursor),
                 cx,
                 writable,
                 root_page,
@@ -5295,5 +5530,125 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0], SqliteValue::Integer(6));
         assert_eq!(rows[1][0], SqliteValue::Integer(7));
+    }
+
+    // ── bd-2a3y: TransactionPageIo / SharedTxnPageIo integration tests ──
+
+    #[test]
+    fn test_set_transaction_enables_storage_cursors() {
+        use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
+
+        let pager = MockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+
+        let mut engine = VdbeEngine::new(8);
+        assert!(!engine.storage_cursors_enabled);
+
+        // set_transaction should auto-enable storage cursors.
+        engine.set_transaction(Box::new(txn));
+        assert!(engine.storage_cursors_enabled);
+        assert!(engine.txn_page_io.is_some());
+    }
+
+    #[test]
+    fn test_take_transaction_returns_handle() {
+        use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
+
+        let pager = MockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+
+        let mut engine = VdbeEngine::new(8);
+        engine.set_transaction(Box::new(txn));
+
+        // take_transaction should return the handle and clear cursors.
+        let recovered = engine.take_transaction();
+        assert!(recovered.is_some());
+        assert!(engine.txn_page_io.is_none());
+        assert!(engine.storage_cursors.is_empty());
+    }
+
+    #[test]
+    fn test_open_storage_cursor_prefers_txn_backend() {
+        use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
+
+        let pager = MockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+
+        let mut engine = VdbeEngine::new(8);
+        engine.set_database(db);
+        engine.set_transaction(Box::new(txn));
+
+        // open_storage_cursor should succeed using the Txn backend.
+        let opened = engine.open_storage_cursor(0, root, false);
+        assert!(opened);
+
+        // Verify the cursor exists in storage_cursors.
+        assert!(engine.storage_cursors.contains_key(&0));
+
+        // Clean up: drop cursors before taking transaction.
+        engine.storage_cursors.clear();
+        let _txn = engine.take_transaction();
+    }
+
+    #[test]
+    fn test_open_storage_cursor_falls_back_to_mem_without_txn() {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        db.get_table_mut(root)
+            .unwrap()
+            .insert(1, vec![SqliteValue::Integer(100)]);
+
+        let mut engine = VdbeEngine::new(8);
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+
+        // Without a transaction, should fall back to Mem backend.
+        let opened = engine.open_storage_cursor(0, root, false);
+        assert!(opened);
+        assert!(engine.storage_cursors.contains_key(&0));
+    }
+
+    #[test]
+    fn test_txn_cursor_open_close_lifecycle() {
+        // Verify the TransactionPageIo cursor lifecycle:
+        // set_transaction → open cursor → close cursor → take_transaction.
+        // MockTransaction doesn't produce valid B-tree pages, so we don't
+        // attempt navigation — that's tested via MemPageStore-backed tests.
+        use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
+
+        let pager = MockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        // Open a read cursor — this creates a CursorBackend::Txn.
+        b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(1), 0);
+        // Close the cursor immediately without navigation.
+        b.emit_op(Opcode::Close, 0, 0, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+        let prog = b.finish().expect("program should build");
+
+        let mut engine = VdbeEngine::new(prog.register_count());
+        engine.set_database(db);
+        engine.set_transaction(Box::new(txn));
+
+        let outcome = engine.execute(&prog).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+
+        // Verify transaction recovery after cursor lifecycle.
+        engine.storage_cursors.clear();
+        assert!(engine.take_transaction().is_some());
     }
 }

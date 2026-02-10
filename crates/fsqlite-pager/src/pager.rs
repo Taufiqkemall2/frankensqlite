@@ -18,6 +18,7 @@ use fsqlite_types::{
 use fsqlite_vfs::{Vfs, VfsFile};
 
 use crate::journal::{JournalHeader, JournalPageRecord};
+use crate::page_buf::{PageBuf, PageBufPool};
 use crate::page_cache::PageCache;
 use crate::traits::{self, JournalMode, MvccPager, TransactionHandle, TransactionMode, WalBackend};
 
@@ -36,6 +37,12 @@ struct PagerInner<F: VfsFile> {
     /// Whether a writer transaction is currently active.
     writer_active: bool,
     /// Deallocated pages available for reuse.
+    ///
+    /// TODO: This is currently an in-memory freelist. Pages freed here are
+    /// reused during the session but are NOT persisted to the database file's
+    /// freelist structure (trunk/leaf pages). This results in leaked pages
+    /// (space leak) upon restart until full persistent freelist support is
+    /// implemented (Phase 5/6).
     freelist: Vec<PageNumber>,
     /// Current journal mode (rollback journal vs WAL).
     journal_mode: JournalMode,
@@ -127,6 +134,7 @@ where
         }
         let original_db_size = inner.db_size;
         let journal_mode = inner.journal_mode;
+        let pool = inner.cache.pool().clone();
         drop(inner);
 
         Ok(SimpleTransaction {
@@ -141,6 +149,7 @@ where
             original_db_size,
             savepoint_stack: Vec::new(),
             journal_mode,
+            pool,
         })
     }
 
@@ -367,6 +376,7 @@ struct SavepointEntry {
     /// The user-supplied savepoint name.
     name: String,
     /// Snapshot of the write-set at the time the savepoint was created.
+    /// Stores raw bytes (Vec<u8>) to decouple from buffer pool handle lifetime.
     write_set_snapshot: HashMap<PageNumber, Vec<u8>>,
     /// Snapshot of freed pages at the time the savepoint was created.
     freed_pages_snapshot: Vec<PageNumber>,
@@ -377,7 +387,7 @@ pub struct SimpleTransaction<V: Vfs> {
     vfs: Arc<V>,
     journal_path: PathBuf,
     inner: Arc<Mutex<PagerInner<V::File>>>,
-    write_set: HashMap<PageNumber, Vec<u8>>,
+    write_set: HashMap<PageNumber, PageBuf>,
     freed_pages: Vec<PageNumber>,
     mode: TransactionMode,
     is_writer: bool,
@@ -387,6 +397,8 @@ pub struct SimpleTransaction<V: Vfs> {
     savepoint_stack: Vec<SavepointEntry>,
     /// Journal mode captured at transaction start.
     journal_mode: JournalMode,
+    /// Buffer pool for allocating write-set pages.
+    pool: PageBufPool,
 }
 
 impl<V: Vfs> traits::sealed::Sealed for SimpleTransaction<V> {}
@@ -403,7 +415,7 @@ where
         vfs: &Arc<V>,
         journal_path: &Path,
         inner: &mut PagerInner<V::File>,
-        write_set: &HashMap<PageNumber, Vec<u8>>,
+        write_set: &HashMap<PageNumber, PageBuf>,
         freed_pages: &mut Vec<PageNumber>,
         original_db_size: u32,
     ) -> Result<()> {
@@ -467,7 +479,7 @@ where
     fn commit_wal(
         cx: &Cx,
         inner: &mut PagerInner<V::File>,
-        write_set: &HashMap<PageNumber, Vec<u8>>,
+        write_set: &HashMap<PageNumber, PageBuf>,
         freed_pages: &mut Vec<PageNumber>,
     ) -> Result<()> {
         if !write_set.is_empty() {
@@ -544,7 +556,7 @@ where
 {
     fn get_page(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
         if let Some(data) = self.write_set.get(&page_no) {
-            return Ok(PageData::from_vec(data.clone()));
+            return Ok(PageData::from_vec(data.to_vec()));
         }
 
         let mut inner = self
@@ -559,17 +571,20 @@ where
     fn write_page(&mut self, _cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
         self.ensure_writer()?;
 
-        let page_size = {
-            let inner = self
-                .inner
-                .lock()
-                .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
-            inner.page_size.as_usize()
-        };
-        let mut owned = vec![0_u8; page_size];
-        let len = owned.len().min(data.len());
-        owned[..len].copy_from_slice(&data[..len]);
-        self.write_set.insert(page_no, owned);
+        // If we are writing to a page that was previously freed in this transaction,
+        // we must "un-free" it.
+        if let Some(pos) = self.freed_pages.iter().position(|&p| p == page_no) {
+            self.freed_pages.swap_remove(pos);
+        }
+
+        let mut buf = self.pool.acquire()?;
+        let len = buf.len().min(data.len());
+        buf[..len].copy_from_slice(&data[..len]);
+        // Zero-fill tail if needed (shouldn't happen for full page writes).
+        if len < buf.len() {
+            buf[len..].fill(0);
+        }
+        self.write_set.insert(page_no, buf);
         Ok(())
     }
 
@@ -658,6 +673,12 @@ where
                 .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
             inner.db_size = self.original_db_size;
+
+            // Reset next_page to avoid holes if we allocated pages that are now discarded.
+            // Logic matches SimplePager::open.
+            let db_size = inner.db_size;
+            inner.next_page = if db_size >= 2 { db_size + 1 } else { 2 };
+
             inner.writer_active = false;
             drop(inner);
             // Delete any partial journal file.
@@ -670,7 +691,11 @@ where
     fn savepoint(&mut self, _cx: &Cx, name: &str) -> Result<()> {
         self.savepoint_stack.push(SavepointEntry {
             name: name.to_owned(),
-            write_set_snapshot: self.write_set.clone(),
+            write_set_snapshot: self
+                .write_set
+                .iter()
+                .map(|(&k, v)| (k, v.to_vec()))
+                .collect(),
             freed_pages_snapshot: self.freed_pages.clone(),
         });
         Ok(())
@@ -695,8 +720,25 @@ where
             .rposition(|sp| sp.name == name)
             .ok_or_else(|| FrankenError::internal(format!("no savepoint named '{name}'")))?;
         // Restore write-set and freed-pages to the snapshot state.
+        // Convert Vec<u8> snapshots back to PageBuf (standalone, non-pooled).
+        let page_size = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+            inner.page_size
+        };
         let entry = &self.savepoint_stack[pos];
-        self.write_set = entry.write_set_snapshot.clone();
+        self.write_set = entry
+            .write_set_snapshot
+            .iter()
+            .map(|(&k, v)| {
+                let mut buf = PageBuf::new(page_size);
+                let len = buf.len().min(v.len());
+                buf.as_mut_slice()[..len].copy_from_slice(&v[..len]);
+                (k, buf)
+            })
+            .collect();
         self.freed_pages = entry.freed_pages_snapshot.clone();
         // Discard savepoints created after the named one, but keep
         // the named savepoint itself (it can be rolled back to again).
