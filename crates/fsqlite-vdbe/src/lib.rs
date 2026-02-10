@@ -472,7 +472,7 @@ pub mod pragma {
     use tracing::{debug, error, info, warn};
 
     /// Result of applying a PRAGMA statement.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum PragmaOutput {
         /// PRAGMA not recognized by this handler.
         Unsupported,
@@ -480,6 +480,40 @@ pub mod pragma {
         Bool(bool),
         /// PRAGMA yields an integer value.
         Int(i64),
+        /// PRAGMA yields a text value (e.g. `journal_mode`).
+        Text(String),
+    }
+
+    /// Connection-level settings controlled by PRAGMA statements.
+    ///
+    /// These mirror the standard SQLite PRAGMAs that the E2E harness needs to
+    /// set consistently across both `sqlite3` and FrankenSQLite runs.  Values
+    /// are stored here for future backend wiring (Phase 5+) and are immediately
+    /// queryable via `PRAGMA <name>`.
+    #[derive(Debug, Clone)]
+    pub struct ConnectionPragmaState {
+        /// Journal mode (`delete`, `truncate`, `persist`, `memory`, `wal`, `off`).
+        pub journal_mode: String,
+        /// Synchronous level (`OFF`, `NORMAL`, `FULL`, `EXTRA`).
+        pub synchronous: String,
+        /// Page cache size (negative = KiB, positive = pages).
+        pub cache_size: i64,
+        /// Page size in bytes (512..=65536, power of two).
+        pub page_size: u32,
+        /// Busy timeout in milliseconds for lock contention.
+        pub busy_timeout_ms: i64,
+    }
+
+    impl Default for ConnectionPragmaState {
+        fn default() -> Self {
+            Self {
+                journal_mode: "wal".to_owned(),
+                synchronous: "NORMAL".to_owned(),
+                cache_size: -2000,
+                page_size: 4096,
+                busy_timeout_ms: 5000,
+            }
+        }
     }
 
     /// Apply a PRAGMA statement to the provided connection-scoped state.
@@ -508,6 +542,165 @@ pub mod pragma {
             return apply_raptorq_repair_symbols(mgr, stmt, wal_fec_sidecar_path);
         }
         Ok(PragmaOutput::Unsupported)
+    }
+
+    /// Apply a PRAGMA to connection-level settings.
+    ///
+    /// Handles `journal_mode`, `synchronous`, `cache_size`, `page_size`,
+    /// `busy_timeout`. Returns `Unsupported` for pragmas not handled at
+    /// this layer, allowing the caller to chain with [`apply`].
+    pub fn apply_connection_pragma(
+        state: &mut ConnectionPragmaState,
+        stmt: &PragmaStatement,
+    ) -> Result<PragmaOutput> {
+        let name = &stmt.name.name;
+        if name.eq_ignore_ascii_case("journal_mode") {
+            return apply_journal_mode(state, stmt);
+        }
+        if name.eq_ignore_ascii_case("synchronous") {
+            return apply_synchronous(state, stmt);
+        }
+        if name.eq_ignore_ascii_case("cache_size") {
+            return apply_cache_size(state, stmt);
+        }
+        if name.eq_ignore_ascii_case("page_size") {
+            return apply_page_size(state, stmt);
+        }
+        if name.eq_ignore_ascii_case("busy_timeout") {
+            return apply_busy_timeout(state, stmt);
+        }
+        Ok(PragmaOutput::Unsupported)
+    }
+
+    fn apply_journal_mode(
+        state: &mut ConnectionPragmaState,
+        stmt: &PragmaStatement,
+    ) -> Result<PragmaOutput> {
+        match &stmt.value {
+            None => Ok(PragmaOutput::Text(state.journal_mode.clone())),
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let mode = parse_text_expr(expr)?;
+                let lower = mode.to_ascii_lowercase();
+                match lower.as_str() {
+                    "delete" | "truncate" | "persist" | "memory" | "wal" | "off" => {
+                        state.journal_mode.clone_from(&lower);
+                        Ok(PragmaOutput::Text(lower))
+                    }
+                    _ => Err(FrankenError::TypeMismatch {
+                        expected: "delete|truncate|persist|memory|wal|off".to_owned(),
+                        actual: mode,
+                    }),
+                }
+            }
+        }
+    }
+
+    fn apply_synchronous(
+        state: &mut ConnectionPragmaState,
+        stmt: &PragmaStatement,
+    ) -> Result<PragmaOutput> {
+        match &stmt.value {
+            None => Ok(PragmaOutput::Text(state.synchronous.clone())),
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let val = parse_synchronous_value(expr)?;
+                state.synchronous.clone_from(&val);
+                Ok(PragmaOutput::Text(val))
+            }
+        }
+    }
+
+    fn parse_synchronous_value(expr: &Expr) -> Result<String> {
+        // Accept both text names and integer codes (0=OFF, 1=NORMAL, 2=FULL, 3=EXTRA).
+        if let Expr::Literal(Literal::Integer(n), _) = expr {
+            match n {
+                0 => Ok("OFF".to_owned()),
+                1 => Ok("NORMAL".to_owned()),
+                2 => Ok("FULL".to_owned()),
+                3 => Ok("EXTRA".to_owned()),
+                _ => Err(FrankenError::OutOfRange {
+                    what: "synchronous".to_owned(),
+                    value: n.to_string(),
+                }),
+            }
+        } else {
+            let text = parse_text_expr(expr)?;
+            let upper = text.to_ascii_uppercase();
+            match upper.as_str() {
+                "OFF" | "NORMAL" | "FULL" | "EXTRA" => Ok(upper),
+                _ => Err(FrankenError::TypeMismatch {
+                    expected: "OFF|NORMAL|FULL|EXTRA|0|1|2|3".to_owned(),
+                    actual: text,
+                }),
+            }
+        }
+    }
+
+    fn apply_cache_size(
+        state: &mut ConnectionPragmaState,
+        stmt: &PragmaStatement,
+    ) -> Result<PragmaOutput> {
+        match &stmt.value {
+            None => Ok(PragmaOutput::Int(state.cache_size)),
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let val = parse_integer_expr(expr)?;
+                state.cache_size = val;
+                Ok(PragmaOutput::Int(val))
+            }
+        }
+    }
+
+    fn apply_page_size(
+        state: &mut ConnectionPragmaState,
+        stmt: &PragmaStatement,
+    ) -> Result<PragmaOutput> {
+        match &stmt.value {
+            None => Ok(PragmaOutput::Int(i64::from(state.page_size))),
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let val = parse_integer_expr(expr)?;
+                if !(512..=65536).contains(&val) || !is_power_of_two(val) {
+                    return Err(FrankenError::OutOfRange {
+                        what: "page_size".to_owned(),
+                        value: val.to_string(),
+                    });
+                }
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                {
+                    state.page_size = val as u32;
+                }
+                Ok(PragmaOutput::Int(val))
+            }
+        }
+    }
+
+    fn apply_busy_timeout(
+        state: &mut ConnectionPragmaState,
+        stmt: &PragmaStatement,
+    ) -> Result<PragmaOutput> {
+        match &stmt.value {
+            None => Ok(PragmaOutput::Int(state.busy_timeout_ms)),
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let val = parse_integer_expr(expr)?;
+                state.busy_timeout_ms = val.max(0);
+                Ok(PragmaOutput::Int(state.busy_timeout_ms))
+            }
+        }
+    }
+
+    fn is_power_of_two(n: i64) -> bool {
+        n > 0 && (n & (n - 1)) == 0
+    }
+
+    /// Extract a text value from a PRAGMA assignment expression.
+    fn parse_text_expr(expr: &Expr) -> Result<String> {
+        match expr {
+            Expr::Literal(Literal::String(s), _) => Ok(s.clone()),
+            Expr::Column(col, _) => Ok(col.column.clone()),
+            Expr::Literal(Literal::Integer(n), _) => Ok(n.to_string()),
+            other => Err(FrankenError::TypeMismatch {
+                expected: "text or identifier".to_owned(),
+                actual: format!("{other:?}"),
+            }),
+        }
     }
 
     fn apply_serializable(

@@ -38,6 +38,10 @@ pub struct SqliteExecConfig {
 
     /// Maximum backoff cap.
     pub busy_backoff_max: Duration,
+
+    /// Run `PRAGMA integrity_check` after the workload completes and populate
+    /// [`CorrectnessReport::integrity_check_ok`].  Defaults to `true`.
+    pub run_integrity_check: bool,
 }
 
 impl Default for SqliteExecConfig {
@@ -54,6 +58,7 @@ impl Default for SqliteExecConfig {
             max_busy_retries: 10_000,
             busy_backoff: Duration::from_millis(1),
             busy_backoff_max: Duration::from_millis(250),
+            run_integrity_check: true,
         }
     }
 }
@@ -76,6 +81,7 @@ struct WorkerStats {
 ///
 /// Returns an error only for setup failures (e.g. cannot open DB). Per-worker
 /// execution failures are returned in the [`EngineRunReport::error`] field.
+#[allow(clippy::too_many_lines)]
 pub fn run_oplog_sqlite(
     db_path: &Path,
     oplog: &OpLog,
@@ -178,6 +184,12 @@ pub fn run_oplog_sqlite(
         0.0
     };
 
+    let integrity_check_ok = if config.run_integrity_check {
+        Some(run_integrity_check_sqlite(db_path))
+    } else {
+        None
+    };
+
     Ok(EngineRunReport {
         wall_time_ms: wall_ms,
         ops_total,
@@ -188,7 +200,7 @@ pub fn run_oplog_sqlite(
             raw_sha256_match: None,
             dump_match: None,
             canonical_sha256_match: None,
-            integrity_check_ok: None,
+            integrity_check_ok,
             raw_sha256: None,
             canonical_sha256: None,
             logical_sha256: None,
@@ -197,6 +209,23 @@ pub fn run_oplog_sqlite(
         latency_ms: None,
         error,
     })
+}
+
+/// Run `PRAGMA integrity_check` on the database at `db_path`.
+///
+/// Opens a fresh connection, checkpoints the WAL, then executes the pragma.
+/// Returns `true` if the only result row is the string `"ok"`.
+/// Returns `false` on any integrity error or if the connection/query fails.
+pub fn run_integrity_check_sqlite(db_path: &Path) -> bool {
+    let Ok(conn) = Connection::open(db_path) else {
+        return false;
+    };
+    // Checkpoint WAL before checking so the integrity check covers all data.
+    let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+
+    let result: Result<String, _> =
+        conn.pragma_query_value(None, "integrity_check", |row| row.get(0));
+    matches!(result, Ok(ref msg) if msg == "ok")
 }
 
 fn run_worker(
@@ -602,5 +631,55 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM t0", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 100);
+    }
+
+    #[test]
+    fn integrity_check_populates_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("integrity.db");
+        Connection::open(&db_path).unwrap();
+
+        let oplog = preset_commutative_inserts_disjoint_keys("test-fixture", 99, 1, 10);
+        let report = run_oplog_sqlite(&db_path, &oplog, &SqliteExecConfig::default()).unwrap();
+
+        assert_eq!(
+            report.correctness.integrity_check_ok,
+            Some(true),
+            "healthy database should pass integrity_check"
+        );
+    }
+
+    #[test]
+    fn integrity_check_disabled_leaves_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("no_ic.db");
+        Connection::open(&db_path).unwrap();
+
+        let oplog = preset_commutative_inserts_disjoint_keys("test-fixture", 7, 1, 5);
+        let config = SqliteExecConfig {
+            run_integrity_check: false,
+            ..SqliteExecConfig::default()
+        };
+        let report = run_oplog_sqlite(&db_path, &oplog, &config).unwrap();
+
+        assert_eq!(
+            report.correctness.integrity_check_ok, None,
+            "integrity_check_ok should be None when disabled"
+        );
+    }
+
+    #[test]
+    fn run_integrity_check_on_healthy_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("healthy.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES(1);")
+            .unwrap();
+        drop(conn);
+
+        assert!(
+            run_integrity_check_sqlite(&db_path),
+            "healthy database should pass"
+        );
     }
 }

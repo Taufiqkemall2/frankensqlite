@@ -22,6 +22,14 @@ jobs:
       - name: Create artifacts directory
         run: mkdir -p artifacts
 
+      - name: Golden corpus immutability guardrail
+        run: |
+          echo "=== Golden corpus checksums.sha256 guardrail ==="
+          # Verify checksums.sha256 exists and is well-formed (Rust test)
+          cargo test -p fsqlite-e2e --test golden_integrity -- checksums_sha256 --nocapture
+          # If golden .db files are present, verify their hashes match
+          cargo test -p fsqlite-e2e --test golden_integrity -- golden_checksum_file_matches_actual_hashes --nocapture
+
       - name: Run Phase 1-3 verification gates
         run: |
           cargo run -p fsqlite-harness --bin phase_1_3_gate_runner -- artifacts/phase_1_3_gate_report.json \

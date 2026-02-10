@@ -19,7 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use fsqlite_e2e::oplog::{self, OpLog};
-use fsqlite_e2e::report::EngineRunReport;
+use fsqlite_e2e::report::{EngineInfo, RunRecordV1, RunRecordV1Args};
 use fsqlite_e2e::sqlite_executor::{SqliteExecConfig, run_oplog_sqlite};
 
 fn main() {
@@ -358,6 +358,8 @@ fn cmd_run(argv: &[String]) -> i32 {
     let mut db: Option<String> = None;
     let mut workload: Option<String> = None;
     let mut concurrency: u16 = 1;
+    let mut pretty: bool = false;
+    let mut output_jsonl: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < argv.len() {
@@ -398,6 +400,17 @@ fn cmd_run(argv: &[String]) -> i32 {
                 };
                 concurrency = n;
             }
+            "--pretty" => {
+                pretty = true;
+            }
+            "--output-jsonl" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --output-jsonl requires a path");
+                    return 2;
+                }
+                output_jsonl = Some(PathBuf::from(argv[i].clone()));
+            }
             other => {
                 eprintln!("error: unknown option `{other}`");
                 return 2;
@@ -420,7 +433,13 @@ fn cmd_run(argv: &[String]) -> i32 {
     };
 
     match engine_str {
-        "sqlite3" => run_sqlite3_engine(db_name, workload_name, concurrency),
+        "sqlite3" => run_sqlite3_engine(
+            db_name,
+            workload_name,
+            concurrency,
+            pretty,
+            output_jsonl.as_deref(),
+        ),
         "fsqlite" => {
             eprintln!("error: fsqlite engine not yet implemented (see bd-1w6k.3.3)");
             1
@@ -489,7 +508,13 @@ fn resolve_workload(preset: &str, fixture_id: &str, concurrency: u16) -> Result<
 }
 
 /// Execute a workload against C SQLite via rusqlite and print JSON results.
-fn run_sqlite3_engine(db_name: &str, workload_name: &str, concurrency: u16) -> i32 {
+fn run_sqlite3_engine(
+    db_name: &str,
+    workload_name: &str,
+    concurrency: u16,
+    pretty: bool,
+    output_jsonl: Option<&Path>,
+) -> i32 {
     // Resolve golden DB path.
     let golden_path = match resolve_golden_db(db_name) {
         Ok(p) => p,
@@ -529,6 +554,14 @@ fn run_sqlite3_engine(db_name: &str, workload_name: &str, concurrency: u16) -> i
     let config = SqliteExecConfig::default();
     let sqlite_version = rusqlite::version().to_owned();
 
+    let golden_sha256 = match sha256_file(&golden_path) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            eprintln!("warning: failed to compute golden sha256: {e}");
+            None
+        }
+    };
+
     eprintln!(
         "Running: engine=sqlite3 (v{sqlite_version}) db={db_name} \
          workload={workload_name} concurrency={concurrency}"
@@ -546,25 +579,42 @@ fn run_sqlite3_engine(db_name: &str, workload_name: &str, concurrency: u16) -> i
         }
     };
 
-    // Build JSON output.
-    let output = RunOutput {
-        engine: "sqlite3".to_owned(),
-        sqlite_version,
-        db: db_name.to_owned(),
-        golden_path: golden_path.display().to_string(),
+    let recorded_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+
+    let record = RunRecordV1::new(RunRecordV1Args {
+        recorded_unix_ms,
+        engine: EngineInfo {
+            name: "sqlite3".to_owned(),
+            sqlite_version: Some(sqlite_version),
+            fsqlite_git: None,
+        },
+        fixture_id: db_name.to_owned(),
+        golden_path: Some(golden_path.display().to_string()),
+        golden_sha256,
         workload: workload_name.to_owned(),
         concurrency,
-        ops_count: oplog.records.len(),
+        ops_count: u64::try_from(oplog.records.len()).unwrap_or(u64::MAX),
         report,
-        timestamp_unix_ms: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+    });
+
+    let json = if pretty {
+        record.to_pretty_json()
+    } else {
+        record.to_jsonl_line()
     };
 
-    match serde_json::to_string_pretty(&output) {
-        Ok(json) => {
-            println!("{json}");
-            i32::from(output.report.error.is_some())
+    match json {
+        Ok(text) => {
+            if let Some(path) = output_jsonl {
+                if let Err(e) = append_jsonl_line(path, &text) {
+                    eprintln!("error: failed to append JSONL output: {e}");
+                    return 1;
+                }
+            }
+            println!("{text}");
+            i32::from(record.report.error.is_some())
         }
         Err(e) => {
             eprintln!("error: failed to serialize report: {e}");
@@ -573,18 +623,18 @@ fn run_sqlite3_engine(db_name: &str, workload_name: &str, concurrency: u16) -> i
     }
 }
 
-/// JSON output structure for a single run invocation.
-#[derive(serde::Serialize)]
-struct RunOutput {
-    engine: String,
-    sqlite_version: String,
-    db: String,
-    golden_path: String,
-    workload: String,
-    concurrency: u16,
-    ops_count: usize,
-    report: EngineRunReport,
-    timestamp_unix_ms: u64,
+fn append_jsonl_line(path: &Path, line: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(f, "{line}")?;
+    Ok(())
 }
 
 fn print_run_help() {
@@ -599,6 +649,8 @@ OPTIONS:
     --db <DB_ID>            Database fixture identifier
     --workload <NAME>       OpLog preset name (e.g. commutative_inserts_disjoint_keys)
     --concurrency <N>       Number of concurrent workers (default: 1)
+    --output-jsonl <PATH>   Append a single JSONL record to PATH
+    --pretty                Pretty-print JSON to stdout (default: JSONL)
     -h, --help              Show this help message
 ";
     let _ = io::stdout().write_all(text.as_bytes());

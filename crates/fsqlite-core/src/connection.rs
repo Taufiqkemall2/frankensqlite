@@ -248,6 +248,9 @@ pub struct Connection {
     /// Connection-level flag: when set, plain `BEGIN` is promoted to
     /// `BEGIN CONCURRENT`.  Controlled by `PRAGMA fsqlite.concurrent_mode`.
     concurrent_mode_default: RefCell<bool>,
+    /// Connection-scoped PRAGMA state used by the E2E harness for fairness knobs
+    /// (journal_mode, synchronous, cache_size, page_size).
+    pragma_state: RefCell<fsqlite_vdbe::pragma::ConnectionPragmaState>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -286,6 +289,7 @@ impl Connection {
             implicit_txn: RefCell::new(false),
             concurrent_txn: RefCell::new(false),
             concurrent_mode_default: RefCell::new(false),
+            pragma_state: RefCell::new(fsqlite_vdbe::pragma::ConnectionPragmaState::default()),
         };
         conn.load_persisted_state_if_present()?;
         Ok(conn)
@@ -478,10 +482,7 @@ impl Connection {
                 self.execute_release(name)?;
                 Ok(Vec::new())
             }
-            Statement::Pragma(ref pragma) => {
-                self.execute_pragma(pragma)?;
-                Ok(Vec::new())
-            }
+            Statement::Pragma(ref pragma) => self.execute_pragma(pragma),
             _ => Err(FrankenError::NotImplemented(
                 "only SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, transaction control, and PRAGMA are supported".to_owned(),
             )),
@@ -740,7 +741,31 @@ impl Connection {
     ///   Enables or disables MVCC concurrent-writer mode for subsequent
     ///   transactions on this connection. When enabled, plain `BEGIN` is
     ///   automatically promoted to `BEGIN CONCURRENT`.
-    fn execute_pragma(&self, pragma: &fsqlite_ast::PragmaStatement) -> Result<()> {
+    fn execute_pragma(&self, pragma: &fsqlite_ast::PragmaStatement) -> Result<Vec<Row>> {
+        // First try connection-level knobs (journal_mode, synchronous, etc.).
+        {
+            let mut state = self.pragma_state.borrow_mut();
+            match fsqlite_vdbe::pragma::apply_connection_pragma(&mut state, pragma)? {
+                fsqlite_vdbe::pragma::PragmaOutput::Text(s) => {
+                    return Ok(vec![Row {
+                        values: vec![SqliteValue::Text(s)],
+                    }]);
+                }
+                fsqlite_vdbe::pragma::PragmaOutput::Int(n) => {
+                    return Ok(vec![Row {
+                        values: vec![SqliteValue::Integer(n)],
+                    }]);
+                }
+                fsqlite_vdbe::pragma::PragmaOutput::Bool(b) => {
+                    return Ok(vec![Row {
+                        values: vec![SqliteValue::Integer(i64::from(b))],
+                    }]);
+                }
+                fsqlite_vdbe::pragma::PragmaOutput::Unsupported => {}
+            }
+        }
+
+        // fsqlite-specific: concurrent_mode toggle.
         let name = pragma.name.name.to_lowercase();
         let schema = pragma.name.schema.as_ref().map(|s| s.to_lowercase());
         let full_name = if let Some(ref s) = schema {
@@ -754,11 +779,18 @@ impl Connection {
                 if let Some(ref val) = pragma.value {
                     let enabled = parse_pragma_bool(val)?;
                     *self.concurrent_mode_default.borrow_mut() = enabled;
+                    Ok(vec![Row {
+                        values: vec![SqliteValue::Integer(i64::from(enabled))],
+                    }])
+                } else {
+                    let enabled = *self.concurrent_mode_default.borrow();
+                    Ok(vec![Row {
+                        values: vec![SqliteValue::Integer(i64::from(enabled))],
+                    }])
                 }
-                Ok(())
             }
             // Unrecognised pragmas are silently ignored (SQLite compatibility).
-            _ => Ok(()),
+            _ => Ok(Vec::new()),
         }
     }
 

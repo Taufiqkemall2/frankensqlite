@@ -4,3 +4,6 @@
 # multiple languages. UBS is a source scanner and produces high-noise findings
 # when run on these documents.
 COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md
+
+# Agent-specific build output dirs (large; non-source).
+target_*

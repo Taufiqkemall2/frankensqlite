@@ -214,3 +214,105 @@ fn golden_checksum_file_matches_actual_hashes() {
 
     eprintln!("OK: {} golden files match checksums.sha256", files.len());
 }
+
+// ─── Always-run guardrails (no golden files needed) ────────────────────
+
+/// Resolve the checksums file relative to the workspace root.
+fn checksums_path() -> PathBuf {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("workspace root")
+        .join("sample_sqlite_db_files/checksums.sha256")
+}
+
+/// Validate that `checksums.sha256` exists, is non-empty, and every line
+/// follows the `<64-hex-char-sha256>  <filename.db>` format.
+///
+/// This test runs unconditionally (does NOT require golden `.db` files)
+/// so it works in CI where the large binaries are gitignored.
+#[test]
+fn checksums_sha256_is_well_formed() {
+    let path = checksums_path();
+    assert!(
+        path.exists(),
+        "checksums.sha256 must exist at {path:?} (tracked in git)"
+    );
+
+    let content = std::fs::read_to_string(&path).expect("failed to read checksums.sha256");
+    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert!(
+        !lines.is_empty(),
+        "checksums.sha256 must contain at least one entry"
+    );
+
+    for (i, line) in lines.iter().enumerate() {
+        let parts: Vec<&str> = line.splitn(2, "  ").collect();
+        assert_eq!(
+            parts.len(),
+            2,
+            "line {}: malformed checksum line (expected '<hash>  <filename>'): {line}",
+            i + 1
+        );
+
+        let hash = parts[0];
+        assert_eq!(
+            hash.len(),
+            64,
+            "line {}: SHA-256 hash must be 64 hex characters, got {} chars: {hash}",
+            i + 1,
+            hash.len()
+        );
+        assert!(
+            hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "line {}: hash contains non-hex characters: {hash}",
+            i + 1
+        );
+
+        let filename = parts[1];
+        assert!(
+            std::path::Path::new(filename)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("db")),
+            "line {}: filename must end with .db: {filename}",
+            i + 1
+        );
+    }
+
+    eprintln!(
+        "OK: checksums.sha256 is well-formed ({} entries)",
+        lines.len()
+    );
+}
+
+/// Verify that no two entries in `checksums.sha256` reference the same filename.
+#[test]
+fn checksums_sha256_no_duplicate_filenames() {
+    let path = checksums_path();
+    if !path.exists() {
+        eprintln!("SKIP: checksums.sha256 not found");
+        return;
+    }
+
+    let content = std::fs::read_to_string(&path).expect("failed to read checksums.sha256");
+    let mut seen = std::collections::HashSet::new();
+    let mut duplicates = Vec::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((_, filename)) = line.split_once("  ") {
+            if !seen.insert(filename.to_owned()) {
+                duplicates.push(filename.to_owned());
+            }
+        }
+    }
+
+    assert!(
+        duplicates.is_empty(),
+        "duplicate filenames in checksums.sha256: {duplicates:?}"
+    );
+}

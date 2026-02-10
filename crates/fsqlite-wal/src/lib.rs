@@ -39,13 +39,14 @@ pub use wal::WalFile;
 pub use wal_fec::{
     DEFAULT_RAPTORQ_REPAIR_SYMBOLS, MAX_RAPTORQ_REPAIR_SYMBOLS, WAL_FEC_GROUP_META_MAGIC,
     WAL_FEC_GROUP_META_VERSION, WalFecDecodeProof, WalFecGroupId, WalFecGroupMeta,
-    WalFecGroupMetaInit, WalFecGroupRecord, WalFecRecoveredGroup, WalFecRecoveryFallbackReason,
-    WalFecRecoveryOutcome, WalFecRepairPipeline, WalFecRepairPipelineConfig,
-    WalFecRepairPipelineStats, WalFecRepairWorkItem, WalFecScanResult, WalFrameCandidate,
-    append_wal_fec_group, build_source_page_hashes, ensure_wal_with_fec_sidecar,
+    WalFecGroupMetaInit, WalFecGroupRecord, WalFecRecoveredGroup, WalFecRecoveryConfig,
+    WalFecRecoveryFallbackReason, WalFecRecoveryLog, WalFecRecoveryOutcome, WalFecRepairPipeline,
+    WalFecRepairPipelineConfig, WalFecRepairPipelineStats, WalFecRepairWorkItem, WalFecScanResult,
+    WalFrameCandidate, append_wal_fec_group, build_source_page_hashes, ensure_wal_with_fec_sidecar,
     find_wal_fec_group, generate_wal_fec_repair_symbols, identify_damaged_commit_group,
     persist_wal_fec_raptorq_repair_symbols, read_wal_fec_raptorq_repair_symbols,
-    recover_wal_fec_group_with_decoder, scan_wal_fec, wal_fec_path_for_wal,
+    recover_wal_fec_group_with_config, recover_wal_fec_group_with_decoder,
+    recovery_log_from_outcome, scan_wal_fec, wal_fec_path_for_wal,
 };
 pub use wal_index::{
     WAL_CKPT_INFO_BYTES, WAL_CKPT_LOCK, WAL_INDEX_HASH_MASK, WAL_INDEX_HASH_MULTIPLIER,

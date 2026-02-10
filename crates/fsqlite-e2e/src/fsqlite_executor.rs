@@ -22,10 +22,11 @@ use fsqlite_types::value::SqliteValue;
 
 use crate::oplog::{ExpectedResult, OpKind, OpLog, OpRecord};
 use crate::report::{CorrectnessReport, EngineRunReport};
+use crate::sqlite_executor;
 use crate::{E2eError, E2eResult};
 
 /// Execution configuration for the FrankenSQLite OpLog executor.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct FsqliteExecConfig {
     /// PRAGMA statements executed once on the connection before running.
     ///
@@ -42,6 +43,19 @@ pub struct FsqliteExecConfig {
     /// - `SQLITE_BUSY` — page lock contention; retry the transaction.
     /// - `SQLITE_BUSY_SNAPSHOT` — first-committer-wins conflict; retry.
     pub concurrent_mode: bool,
+    /// Run `PRAGMA integrity_check` after the workload completes and populate
+    /// [`CorrectnessReport::integrity_check_ok`]. Defaults to `true`.
+    pub run_integrity_check: bool,
+}
+
+impl Default for FsqliteExecConfig {
+    fn default() -> Self {
+        Self {
+            pragmas: Vec::new(),
+            concurrent_mode: false,
+            run_integrity_check: true,
+        }
+    }
 }
 
 /// Run an OpLog against FrankenSQLite.
@@ -73,8 +87,8 @@ pub fn run_oplog_fsqlite(
     // Apply concurrent-mode PRAGMA before user pragmas so the user can
     // override it if needed.
     if config.concurrent_mode {
-        conn.execute("PRAGMA concurrent_mode=ON;")
-            .map_err(|e| E2eError::Fsqlite(format!("PRAGMA concurrent_mode=ON: {e}")))?;
+        conn.execute("PRAGMA fsqlite.concurrent_mode=ON;")
+            .map_err(|e| E2eError::Fsqlite(format!("PRAGMA fsqlite.concurrent_mode=ON: {e}")))?;
     }
 
     for pragma in &config.pragmas {
@@ -88,12 +102,22 @@ pub fn run_oplog_fsqlite(
     let (ops_ok, ops_err, first_error) = replay_all(&conn, oplog, setup_len, &per_worker);
     let wall = started.elapsed();
 
+    let integrity_check_ok = if config.run_integrity_check && db_path != Path::new(":memory:") {
+        // Best-effort verification: validate the resulting DB file with
+        // libsqlite via rusqlite. This does not require FrankenSQLite to
+        // implement `PRAGMA integrity_check` itself.
+        Some(sqlite_executor::run_integrity_check_sqlite(db_path))
+    } else {
+        None
+    };
+
     Ok(build_report(
         wall,
         ops_ok,
         ops_err,
         first_error,
         config.concurrent_mode,
+        integrity_check_ok,
     ))
 }
 
@@ -176,6 +200,7 @@ fn build_report(
     ops_err: u64,
     first_error: Option<String>,
     concurrent_mode: bool,
+    integrity_check_ok: Option<bool>,
 ) -> EngineRunReport {
     let wall_ms = wall.as_millis() as u64;
     let ops_total = ops_ok + ops_err;
@@ -210,7 +235,7 @@ fn build_report(
             raw_sha256_match: None,
             dump_match: None,
             canonical_sha256_match: None,
-            integrity_check_ok: None,
+            integrity_check_ok,
             raw_sha256: None,
             canonical_sha256: None,
             logical_sha256: None,
@@ -487,6 +512,56 @@ mod tests {
     fn escape_ident_handles_quotes() {
         assert_eq!(escape_ident("normal"), "normal");
         assert_eq!(escape_ident(r#"has"quote"#), r#"has""quote"#);
+    }
+
+    #[test]
+    fn integrity_check_skipped_for_memory_db() {
+        let oplog = preset_commutative_inserts_disjoint_keys("test-fixture", 1, 1, 5);
+        let report =
+            run_oplog_fsqlite(Path::new(":memory:"), &oplog, &FsqliteExecConfig::default())
+                .unwrap();
+
+        // :memory: databases have no file to validate, so integrity_check_ok
+        // should be None even when run_integrity_check is true (the default).
+        assert!(
+            report.correctness.integrity_check_ok.is_none(),
+            "expected None for :memory: db, got {:?}",
+            report.correctness.integrity_check_ok
+        );
+    }
+
+    #[test]
+    fn integrity_check_disabled_leaves_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("check-disabled.db");
+
+        let oplog = preset_commutative_inserts_disjoint_keys("test-fixture", 7, 1, 5);
+        let config = FsqliteExecConfig {
+            run_integrity_check: false,
+            ..FsqliteExecConfig::default()
+        };
+        let report = run_oplog_fsqlite(&db_path, &oplog, &config).unwrap();
+
+        assert!(
+            report.correctness.integrity_check_ok.is_none(),
+            "expected None when disabled, got {:?}",
+            report.correctness.integrity_check_ok
+        );
+    }
+
+    #[test]
+    fn integrity_check_populates_report_for_file_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("integrity.db");
+
+        let oplog = preset_commutative_inserts_disjoint_keys("test-fixture", 7, 1, 5);
+        let report = run_oplog_fsqlite(&db_path, &oplog, &FsqliteExecConfig::default()).unwrap();
+
+        // For a file-based DB, integrity_check should be populated.
+        assert!(
+            report.correctness.integrity_check_ok.is_some(),
+            "expected Some for file-based db"
+        );
     }
 
     #[test]
