@@ -2693,4 +2693,49 @@ mod tests {
     fn test_arc_cache_scan_resistance() {
         test_scan_resistance();
     }
+
+    // Canonical §6 acceptance-test identifiers.
+
+    #[test]
+    fn test_arc_hit_t1_promote_to_t2() {
+        test_request_t1_to_t2_promotion();
+    }
+
+    #[test]
+    fn test_arc_ghost_hit_b1_increases_p() {
+        test_request_b1_ghost_increases_p();
+    }
+
+    #[test]
+    fn test_arc_ghost_hit_b2_decreases_p() {
+        test_request_b2_ghost_decreases_p();
+    }
+
+    #[test]
+    fn test_replace_all_pinned_overflow() {
+        test_replace_overflow_safety_valve();
+        test_pinned_page_eviction_overflow();
+    }
+
+    #[test]
+    fn test_mvcc_keying_exact_match_ghosts() {
+        test_ghost_hit_exact_match();
+        test_ghost_miss_different_version();
+    }
+
+    #[test]
+    fn test_version_coalescing_drops_superseded() {
+        test_version_coalesce_removes_superseded();
+    }
+
+    #[test]
+    fn test_eviction_never_appends_wal() {
+        test_eviction_never_writes_wal();
+        test_eviction_no_io();
+    }
+
+    #[test]
+    fn test_e2e_arc_scan_then_hotset() {
+        test_scan_resistance();
+    }
 }
