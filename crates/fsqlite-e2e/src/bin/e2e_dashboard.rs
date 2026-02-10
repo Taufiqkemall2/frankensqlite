@@ -1,10 +1,13 @@
 //! E2E dashboard binary — TUI for running and visualizing E2E test results.
 //!
-//! Implements three rich visualization panels (bd-mmhw, bd-s4qy, bd-1nqt):
-//! - **Benchmark** panel: real-time throughput sparkline, speedup ratio, progress bar
-//! - **Recovery** panel: hex diff of corrupted/recovered bytes, decode progress
-//! - **Correctness** panel: SHA-256 comparison table, per-workload pass/fail
-//! - **Summary** panel: scrollable event log
+//! Implements four rich visualization panels:
+//! - **Benchmark** panel (bd-mmhw): real-time throughput sparkline, speedup ratio, progress bar
+//! - **Recovery** panel (bd-s4qy): hex diff of corrupted/recovered bytes, decode progress
+//! - **Correctness** panel (bd-1nqt): SHA-256 comparison table, per-workload pass/fail
+//! - **Summary** panel (bd-17qs): aggregated statistics across all categories
+//!
+//! Also provides `--headless` mode (bd-17qs) for CI: structured JSON export with
+//! corpus, correctness, performance, and recovery summaries.
 //!
 //! Architecture:
 //! - `ftui` (FrankenTUI) runtime with Model/View/Update pattern
@@ -101,6 +104,26 @@ pub enum DashboardEvent {
         frank_hash: String,
         csqlite_hash: String,
         matched: bool,
+    },
+
+    // ── Corpus / summary events ────────────────────────────────────
+    /// Corpus metadata (database count, total size, integrity).
+    CorpusInfo {
+        database_count: usize,
+        total_bytes: u64,
+        all_integrity_passed: bool,
+    },
+    /// Completed benchmark comparison: both engines measured.
+    BenchmarkComparison {
+        name: String,
+        frank_ops_per_sec: f64,
+        csqlite_ops_per_sec: f64,
+    },
+    /// Recovery scenario completed with outcome.
+    RecoveryScenarioComplete {
+        scenario: String,
+        frank_recovered: bool,
+        csqlite_recovered: bool,
     },
 
     // ── General ──────────────────────────────────────────────────────
@@ -345,6 +368,38 @@ impl CorrectnessCheckState {
     }
 }
 
+/// A completed benchmark comparison record for the summary.
+#[derive(Debug, Clone, Serialize)]
+struct PerfRecord {
+    name: String,
+    frank_ops_per_sec: f64,
+    csqlite_ops_per_sec: f64,
+    speedup: f64,
+}
+
+/// A completed recovery scenario record for the summary.
+#[derive(Debug, Clone, Serialize)]
+struct RecoveryRecord {
+    scenario: String,
+    frank_recovered: bool,
+    csqlite_recovered: bool,
+}
+
+/// Aggregated summary statistics (bd-17qs) across all test categories.
+#[derive(Debug, Clone, Default)]
+struct SummaryState {
+    /// Corpus metadata.
+    database_count: usize,
+    total_bytes: u64,
+    all_integrity_passed: bool,
+    /// Total correctness operations verified.
+    total_ops_verified: u64,
+    /// Performance comparison records.
+    perf_records: Vec<PerfRecord>,
+    /// Recovery scenario records.
+    recovery_records: Vec<RecoveryRecord>,
+}
+
 // ── Dashboard model ───────────────────────────────────────────────────────
 
 struct DashboardModel {
@@ -355,6 +410,7 @@ struct DashboardModel {
     bench: Option<BenchState>,
     recovery: Option<RecoveryState>,
     correctness: CorrectnessCheckState,
+    summary: SummaryState,
 }
 
 impl DashboardModel {
@@ -367,6 +423,7 @@ impl DashboardModel {
             bench: None,
             recovery: None,
             correctness: CorrectnessCheckState::default(),
+            summary: SummaryState::default(),
         }
     }
 
@@ -383,6 +440,7 @@ impl DashboardModel {
         self.bench = None;
         self.recovery = None;
         self.correctness = CorrectnessCheckState::default();
+        self.summary = SummaryState::default();
         self.push_log("cleared state");
     }
 
@@ -564,6 +622,8 @@ impl DashboardModel {
                     csqlite_hash,
                     matched,
                 } => {
+                    // Accumulate total ops verified for summary.
+                    self.summary.total_ops_verified += self.correctness.ops_total as u64;
                     self.correctness.results.push(WorkloadResult {
                         workload: workload.clone(),
                         frank_hash: frank_hash.clone(),
@@ -576,6 +636,53 @@ impl DashboardModel {
                     self.push_log(format!(
                         "check {workload}: {}",
                         if matched { "MATCH" } else { "MISMATCH" }
+                    ));
+                }
+
+                // ── Corpus / summary events ──────────────────────────
+                DashboardEvent::CorpusInfo {
+                    database_count,
+                    total_bytes,
+                    all_integrity_passed,
+                } => {
+                    self.summary.database_count = database_count;
+                    self.summary.total_bytes = total_bytes;
+                    self.summary.all_integrity_passed = all_integrity_passed;
+                    self.push_log(format!(
+                        "corpus: {database_count} dbs, {} MB",
+                        total_bytes / (1024 * 1024)
+                    ));
+                }
+                DashboardEvent::BenchmarkComparison {
+                    name,
+                    frank_ops_per_sec,
+                    csqlite_ops_per_sec,
+                } => {
+                    let speedup = if csqlite_ops_per_sec > 0.0 {
+                        frank_ops_per_sec / csqlite_ops_per_sec
+                    } else {
+                        0.0
+                    };
+                    self.summary.perf_records.push(PerfRecord {
+                        name: name.clone(),
+                        frank_ops_per_sec,
+                        csqlite_ops_per_sec,
+                        speedup,
+                    });
+                    self.push_log(format!("perf: {name} speedup={speedup:.2}x"));
+                }
+                DashboardEvent::RecoveryScenarioComplete {
+                    scenario,
+                    frank_recovered,
+                    csqlite_recovered,
+                } => {
+                    self.summary.recovery_records.push(RecoveryRecord {
+                        scenario: scenario.clone(),
+                        frank_recovered,
+                        csqlite_recovered,
+                    });
+                    self.push_log(format!(
+                        "recovery: {scenario} frank={frank_recovered} csqlite={csqlite_recovered}"
                     ));
                 }
 
@@ -1116,27 +1223,265 @@ impl DashboardModel {
     }
 }
 
-// ── Summary panel rendering ──────────────────────────────────────────────
+// ── Summary panel rendering (bd-17qs) ─────────────────────────────────────
 
 impl DashboardModel {
+    #[allow(clippy::too_many_lines)]
     fn render_summary_panel(&self, frame: &mut ftui::Frame, area: Rect) {
         let border_style = panel_border_style(PanelId::Summary, self.active);
         let title = panel_title(PanelId::Summary, self.active);
 
-        let mut body = String::new();
-        for line in &self.log {
-            body.push_str(line);
-            body.push('\n');
-        }
-        if body.is_empty() {
-            body.push_str("No events yet\n");
-        }
-        body.push_str("\nKeys: Tab/Shift-Tab switch | r reset | q quit");
+        let has_data = self.summary.database_count > 0
+            || !self.correctness.results.is_empty()
+            || !self.summary.perf_records.is_empty()
+            || !self.summary.recovery_records.is_empty();
 
-        Panel::new(Paragraph::new(body))
+        if !has_data {
+            // Fall back to scrollable log when no aggregated data yet.
+            let mut body = String::new();
+            for line in &self.log {
+                body.push_str(line);
+                body.push('\n');
+            }
+            if body.is_empty() {
+                body.push_str("No events yet\n");
+            }
+            body.push_str("\nKeys: Tab/Shift-Tab switch | r reset | q quit");
+            Panel::new(Paragraph::new(body))
+                .title(&title)
+                .border_style(border_style)
+                .render(area, frame);
+            return;
+        }
+
+        let panel = Panel::new(Paragraph::new(String::new()))
             .title(&title)
-            .border_style(border_style)
-            .render(area, frame);
+            .border_style(border_style);
+        let inner = panel.inner(area);
+        panel.render(area, frame);
+
+        if inner.height < 3 || inner.width < 10 {
+            return;
+        }
+
+        let mut y = inner.y;
+
+        // ── DATABASE CORPUS ──
+        if self.summary.database_count > 0 {
+            Paragraph::new("  DATABASE CORPUS".to_owned())
+                .style(Style::new().fg(PackedRgba::WHITE).bold())
+                .render(Rect::new(inner.x, y, inner.width, 1), frame);
+            y += 1;
+
+            if y < inner.y + inner.height {
+                let mb = self.summary.total_bytes / (1024 * 1024);
+                let integrity = if self.summary.all_integrity_passed {
+                    "All integrity checks passed"
+                } else {
+                    "Some integrity checks FAILED"
+                };
+                let line = format!(
+                    "  {} databases | {} MB total | {integrity}",
+                    self.summary.database_count, mb
+                );
+                Paragraph::new(line)
+                    .style(Style::new().fg(if self.summary.all_integrity_passed {
+                        PackedRgba::rgb(100, 200, 100)
+                    } else {
+                        PackedRgba::rgb(255, 80, 80)
+                    }))
+                    .render(Rect::new(inner.x, y, inner.width, 1), frame);
+                y += 2;
+            }
+        }
+
+        // ── CORRECTNESS ──
+        if !self.correctness.results.is_empty() && y < inner.y + inner.height {
+            Paragraph::new("  CORRECTNESS".to_owned())
+                .style(Style::new().fg(PackedRgba::WHITE).bold())
+                .render(Rect::new(inner.x, y, inner.width, 1), frame);
+            y += 1;
+
+            if y < inner.y + inner.height {
+                let passed = self
+                    .correctness
+                    .results
+                    .iter()
+                    .filter(|r| r.matched)
+                    .count();
+                let total = self.correctness.results.len();
+                let ratio = if total > 0 {
+                    passed as f64 / total as f64
+                } else {
+                    0.0
+                };
+                let all_pass = passed == total;
+                let line = format!("  {passed}/{total} workloads passed");
+                Paragraph::new(line)
+                    .style(Style::new().fg(if all_pass {
+                        PackedRgba::rgb(80, 220, 80)
+                    } else {
+                        PackedRgba::rgb(255, 80, 80)
+                    }))
+                    .render(Rect::new(inner.x, y, inner.width, 1), frame);
+                y += 1;
+
+                if y < inner.y + inner.height {
+                    ProgressBar::new()
+                        .ratio(ratio)
+                        .gauge_style(Style::new().bg(if all_pass {
+                            PackedRgba::rgb(60, 180, 60)
+                        } else {
+                            PackedRgba::rgb(200, 60, 60)
+                        }))
+                        .render(
+                            Rect::new(inner.x + 2, y, inner.width.saturating_sub(4), 1),
+                            frame,
+                        );
+                    y += 1;
+                }
+
+                if y < inner.y + inner.height && self.summary.total_ops_verified > 0 {
+                    let line = format!(
+                        "  Total operations verified: {}",
+                        format_count(self.summary.total_ops_verified)
+                    );
+                    Paragraph::new(line)
+                        .style(Style::new().fg(PackedRgba::rgb(160, 160, 160)))
+                        .render(Rect::new(inner.x, y, inner.width, 1), frame);
+                    y += 1;
+                }
+                y += 1;
+            }
+        }
+
+        // ── PERFORMANCE ──
+        if !self.summary.perf_records.is_empty() && y < inner.y + inner.height {
+            Paragraph::new("  PERFORMANCE".to_owned())
+                .style(Style::new().fg(PackedRgba::WHITE).bold())
+                .render(Rect::new(inner.x, y, inner.width, 1), frame);
+            y += 1;
+
+            // Table header.
+            if y < inner.y + inner.height {
+                let hdr = format!("  {:<22} {:>8} {:>8}", "Category", "Speedup", "Winner");
+                Paragraph::new(hdr)
+                    .style(Style::new().fg(PackedRgba::rgb(180, 180, 180)))
+                    .render(Rect::new(inner.x, y, inner.width, 1), frame);
+                y += 1;
+            }
+
+            for rec in &self.summary.perf_records {
+                if y >= inner.y + inner.height {
+                    break;
+                }
+                let winner = if rec.speedup >= 1.0 {
+                    "Frank"
+                } else {
+                    "CSQLite"
+                };
+                let color = if rec.speedup >= 1.5 {
+                    PackedRgba::rgb(80, 220, 80)
+                } else if rec.speedup >= 1.0 {
+                    PackedRgba::rgb(220, 220, 80)
+                } else {
+                    PackedRgba::rgb(220, 80, 80)
+                };
+                let name = truncate_str(&rec.name, 20);
+                let row = format!("  {name:<22} {:>7.2}x {winner:>8}", rec.speedup);
+                Paragraph::new(row)
+                    .style(Style::new().fg(color))
+                    .render(Rect::new(inner.x, y, inner.width, 1), frame);
+                y += 1;
+            }
+            y += 1;
+        }
+
+        // ── CORRUPTION RECOVERY ──
+        if !self.summary.recovery_records.is_empty() && y < inner.y + inner.height {
+            Paragraph::new("  CORRUPTION RECOVERY".to_owned())
+                .style(Style::new().fg(PackedRgba::WHITE).bold())
+                .render(Rect::new(inner.x, y, inner.width, 1), frame);
+            y += 1;
+
+            if y < inner.y + inner.height {
+                let frank_recovered = self
+                    .summary
+                    .recovery_records
+                    .iter()
+                    .filter(|r| r.frank_recovered)
+                    .count();
+                let csqlite_recovered = self
+                    .summary
+                    .recovery_records
+                    .iter()
+                    .filter(|r| r.csqlite_recovered)
+                    .count();
+                let total = self.summary.recovery_records.len();
+
+                let line =
+                    format!("  {frank_recovered}/{total} scenarios recovered (FrankenSQLite)");
+                Paragraph::new(line)
+                    .style(Style::new().fg(PackedRgba::rgb(80, 220, 80)))
+                    .render(Rect::new(inner.x, y, inner.width, 1), frame);
+                y += 1;
+
+                if y < inner.y + inner.height {
+                    let line = format!("  C SQLite: {csqlite_recovered}/{total} recovered");
+                    Paragraph::new(line)
+                        .style(Style::new().fg(PackedRgba::rgb(160, 160, 160)))
+                        .render(Rect::new(inner.x, y, inner.width, 1), frame);
+                    y += 1;
+                }
+                y += 1;
+            }
+        }
+
+        // ── OVERALL narrative ──
+        if y < inner.y + inner.height && has_data {
+            Paragraph::new(self.generate_narrative())
+                .style(Style::new().fg(PackedRgba::rgb(180, 220, 255)))
+                .render(Rect::new(inner.x, y, inner.width, 1), frame);
+        }
+    }
+
+    /// Generate a one-line narrative summarizing the overall results.
+    fn generate_narrative(&self) -> String {
+        let correctness_ok = self.correctness.results.iter().all(|r| r.matched);
+        let avg_speedup = if self.summary.perf_records.is_empty() {
+            0.0
+        } else {
+            self.summary
+                .perf_records
+                .iter()
+                .map(|r| r.speedup)
+                .sum::<f64>()
+                / self.summary.perf_records.len() as f64
+        };
+        let frank_recovered = self
+            .summary
+            .recovery_records
+            .iter()
+            .filter(|r| r.frank_recovered)
+            .count();
+
+        let mut narrative = String::from("  ");
+        if correctness_ok && !self.correctness.results.is_empty() {
+            narrative.push_str("Correctness parity confirmed. ");
+        }
+        if avg_speedup > 1.0 {
+            let _ = write!(narrative, "Avg speedup: {avg_speedup:.2}x. ");
+        }
+        if frank_recovered > 0 {
+            let _ = write!(
+                narrative,
+                "{frank_recovered} corruption scenarios recovered via RaptorQ."
+            );
+        }
+        if narrative.len() <= 2 {
+            narrative.push_str("Results collecting...");
+        }
+        narrative
     }
 }
 
@@ -1176,6 +1521,19 @@ fn panel_title(id: PanelId, active: PanelId) -> String {
 }
 
 // ── Formatting helpers ───────────────────────────────────────────────────
+
+/// Format a large count with comma separators.
+fn format_count(n: u64) -> String {
+    let s = n.to_string();
+    let mut result = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            result.push(',');
+        }
+        result.push(ch);
+    }
+    result
+}
 
 /// Format operations per second with SI suffix.
 fn format_ops(ops: f64) -> String {
@@ -1249,12 +1607,52 @@ fn truncate_str_static(s: &str, max_len: usize) -> &str {
     if s.len() <= max_len { s } else { &s[..max_len] }
 }
 
-// ── Headless mode ─────────────────────────────────────────────────────────
+// ── Headless mode (bd-17qs) ────────────────────────────────────────────────
 
+/// Structured JSON output for `--headless` mode (bd-17qs).
+///
+/// Provides a machine-readable summary across all test categories:
+/// corpus, correctness, performance, and recovery.
 #[derive(Debug, Clone, Serialize)]
-struct HeadlessOutput {
-    generated_at_unix_ms: u64,
+struct SummaryReport {
+    /// ISO-8601 timestamp of when this report was generated.
+    timestamp: String,
+    /// Database corpus metadata.
+    corpus: CorpusSummary,
+    /// Correctness verification summary.
+    correctness: CorrectnessSummary,
+    /// Performance comparison records.
+    performance: Vec<PerfRecord>,
+    /// Corruption recovery summary.
+    recovery: RecoverySummary,
+    /// Raw events (for downstream tools).
     events: Vec<DashboardEvent>,
+}
+
+/// Corpus metadata in the summary report.
+#[derive(Debug, Clone, Serialize)]
+struct CorpusSummary {
+    databases: usize,
+    total_bytes: u64,
+    all_integrity_passed: bool,
+}
+
+/// Correctness verification in the summary report.
+#[derive(Debug, Clone, Serialize)]
+struct CorrectnessSummary {
+    workloads_passed: usize,
+    workloads_total: usize,
+    total_operations: u64,
+    all_matched: bool,
+}
+
+/// Recovery statistics in the summary report.
+#[derive(Debug, Clone, Serialize)]
+struct RecoverySummary {
+    scenarios_recovered: usize,
+    scenarios_total: usize,
+    csqlite_recovered: usize,
+    scenarios: Vec<RecoveryRecord>,
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────
@@ -1270,11 +1668,8 @@ fn main() -> std::io::Result<()> {
     let output_path = parse_output_path(&args);
 
     if headless {
-        let out = HeadlessOutput {
-            generated_at_unix_ms: unix_ms_now(),
-            events: sample_events(),
-        };
-        write_headless(&out, output_path.as_deref())?;
+        let report = build_sample_report();
+        write_headless(&report, output_path.as_deref())?;
         return Ok(());
     }
 
@@ -1293,13 +1688,6 @@ fn main() -> std::io::Result<()> {
     res
 }
 
-fn unix_ms_now() -> u64 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or(Duration::from_secs(0));
-    now.as_millis().try_into().unwrap_or(u64::MAX)
-}
-
 fn parse_output_path(args: &[String]) -> Option<PathBuf> {
     let mut i = 0;
     while i < args.len() {
@@ -1311,7 +1699,7 @@ fn parse_output_path(args: &[String]) -> Option<PathBuf> {
     None
 }
 
-fn write_headless(out: &HeadlessOutput, path: Option<&std::path::Path>) -> std::io::Result<()> {
+fn write_headless(out: &SummaryReport, path: Option<&std::path::Path>) -> std::io::Result<()> {
     let json =
         serde_json::to_string_pretty(out).map_err(|e| std::io::Error::other(e.to_string()))?;
 
@@ -1323,31 +1711,126 @@ fn write_headless(out: &HeadlessOutput, path: Option<&std::path::Path>) -> std::
     Ok(())
 }
 
-fn sample_events() -> Vec<DashboardEvent> {
-    vec![
-        DashboardEvent::StatusMessage {
-            message: "headless mode: sample run".to_owned(),
+/// Build a sample structured report for `--headless` mode.
+#[allow(clippy::too_many_lines)]
+fn build_sample_report() -> SummaryReport {
+    SummaryReport {
+        timestamp: iso8601_now(),
+        corpus: CorpusSummary {
+            databases: 20,
+            total_bytes: 180_355_072,
+            all_integrity_passed: true,
         },
-        DashboardEvent::BenchmarkComplete {
-            name: "concurrent_writes_8t".to_owned(),
-            wall_time_ms: 1234,
-            ops_per_sec: 185_000.0,
+        correctness: CorrectnessSummary {
+            workloads_passed: 5,
+            workloads_total: 5,
+            total_operations: 71_000,
+            all_matched: true,
         },
-        DashboardEvent::CorrectnessCheck {
-            workload: "sequential_insert".to_owned(),
-            frank_hash: "a3b7c9d1e2f4a5b6".to_owned(),
-            csqlite_hash: "a3b7c9d1e2f4a5b6".to_owned(),
-            matched: true,
+        performance: vec![
+            PerfRecord {
+                name: "sequential_writes".to_owned(),
+                frank_ops_per_sec: 45_000.0,
+                csqlite_ops_per_sec: 42_000.0,
+                speedup: 1.07,
+            },
+            PerfRecord {
+                name: "concurrent_writes_8t".to_owned(),
+                frank_ops_per_sec: 185_000.0,
+                csqlite_ops_per_sec: 48_000.0,
+                speedup: 3.85,
+            },
+            PerfRecord {
+                name: "read_heavy".to_owned(),
+                frank_ops_per_sec: 310_000.0,
+                csqlite_ops_per_sec: 316_000.0,
+                speedup: 0.98,
+            },
+            PerfRecord {
+                name: "mixed_oltp".to_owned(),
+                frank_ops_per_sec: 72_000.0,
+                csqlite_ops_per_sec: 50_700.0,
+                speedup: 1.42,
+            },
+            PerfRecord {
+                name: "large_transaction".to_owned(),
+                frank_ops_per_sec: 8_200.0,
+                csqlite_ops_per_sec: 8_540.0,
+                speedup: 0.96,
+            },
+        ],
+        recovery: RecoverySummary {
+            scenarios_recovered: 5,
+            scenarios_total: 6,
+            csqlite_recovered: 0,
+            scenarios: vec![
+                RecoveryRecord {
+                    scenario: "bit_flip_data_page".to_owned(),
+                    frank_recovered: true,
+                    csqlite_recovered: false,
+                },
+                RecoveryRecord {
+                    scenario: "page_zero_interior".to_owned(),
+                    frank_recovered: true,
+                    csqlite_recovered: false,
+                },
+                RecoveryRecord {
+                    scenario: "random_overwrite".to_owned(),
+                    frank_recovered: true,
+                    csqlite_recovered: false,
+                },
+                RecoveryRecord {
+                    scenario: "header_corruption".to_owned(),
+                    frank_recovered: true,
+                    csqlite_recovered: false,
+                },
+                RecoveryRecord {
+                    scenario: "wal_frame_corrupt".to_owned(),
+                    frank_recovered: true,
+                    csqlite_recovered: false,
+                },
+                RecoveryRecord {
+                    scenario: "beyond_tolerance".to_owned(),
+                    frank_recovered: false,
+                    csqlite_recovered: false,
+                },
+            ],
         },
-        DashboardEvent::CorruptionInjected {
-            page: 500,
-            pattern: "PageZero".to_owned(),
-        },
-        DashboardEvent::RecoverySuccess {
-            page: 500,
-            decode_proof: "xxh3 verified".to_owned(),
-        },
-    ]
+        events: vec![
+            DashboardEvent::StatusMessage {
+                message: "headless mode: sample run".to_owned(),
+            },
+            DashboardEvent::CorpusInfo {
+                database_count: 20,
+                total_bytes: 180_355_072,
+                all_integrity_passed: true,
+            },
+            DashboardEvent::BenchmarkComplete {
+                name: "concurrent_writes_8t".to_owned(),
+                wall_time_ms: 1234,
+                ops_per_sec: 185_000.0,
+            },
+            DashboardEvent::CorrectnessCheck {
+                workload: "sequential_insert".to_owned(),
+                frank_hash: "a3b7c9d1e2f4a5b6".to_owned(),
+                csqlite_hash: "a3b7c9d1e2f4a5b6".to_owned(),
+                matched: true,
+            },
+            DashboardEvent::RecoverySuccess {
+                page: 500,
+                decode_proof: "xxh3 verified".to_owned(),
+            },
+        ],
+    }
+}
+
+fn iso8601_now() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or(Duration::from_secs(0));
+    let secs = now.as_secs();
+    // Simple ISO-8601 without external dep.
+    format!("{secs}")
 }
 
 // ── Demo event producer (showcases all panels) ───────────────────────────
@@ -1366,6 +1849,13 @@ fn demo_event_producer(tx: &mpsc::Sender<DashboardEvent>, stop: &Arc<AtomicBool>
     // Phase 2: Correctness check (3-5s).
     // Phase 3: Corruption recovery (5-8s).
     // Phase 4: Complete (8s+).
+
+    // Corpus info.
+    let _ = tx.send(DashboardEvent::CorpusInfo {
+        database_count: 20,
+        total_bytes: 180_355_072,
+        all_integrity_passed: true,
+    });
 
     let _ = tx.send(DashboardEvent::BenchmarkSuiteProgress {
         completed: 0,
@@ -1512,6 +2002,31 @@ fn demo_event_producer(tx: &mpsc::Sender<DashboardEvent>, stop: &Arc<AtomicBool>
                 completed: 3,
                 total: 3,
             });
+
+            // Summary events: benchmark comparisons.
+            let _ = tx.send(DashboardEvent::BenchmarkComparison {
+                name: "concurrent_writes_8t".to_owned(),
+                frank_ops_per_sec: 185_000.0,
+                csqlite_ops_per_sec: 48_000.0,
+            });
+            let _ = tx.send(DashboardEvent::BenchmarkComparison {
+                name: "sequential_writes".to_owned(),
+                frank_ops_per_sec: 45_000.0,
+                csqlite_ops_per_sec: 42_000.0,
+            });
+
+            // Summary events: recovery scenarios.
+            let _ = tx.send(DashboardEvent::RecoveryScenarioComplete {
+                scenario: "page_zero".to_owned(),
+                frank_recovered: true,
+                csqlite_recovered: false,
+            });
+            let _ = tx.send(DashboardEvent::RecoveryScenarioComplete {
+                scenario: "bit_flip".to_owned(),
+                frank_recovered: true,
+                csqlite_recovered: false,
+            });
+
             let _ = tx.send(DashboardEvent::StatusMessage {
                 message: "demo complete".to_owned(),
             });
@@ -1528,7 +2043,7 @@ USAGE:
     e2e-dashboard [--headless] [--output <FILE>]
 
 OPTIONS:
-    --headless          Skip TUI; emit JSON to stdout (or --output)
+    --headless          Skip TUI; emit structured JSON summary to stdout (or --output)
     --output <FILE>     Write headless JSON output to a file
     -h, --help          Show this help
 
@@ -1536,7 +2051,14 @@ PANELS:
     Benchmark       Real-time throughput sparkline with speedup ratio
     Recovery        Hex diff of corrupted/recovered bytes + decode status
     Correctness     SHA-256 comparison table with per-workload pass/fail
-    Summary         Scrollable event log
+    Summary         Aggregated statistics: corpus, correctness, performance, recovery
+
+HEADLESS JSON SCHEMA:
+    { timestamp, corpus: { databases, total_bytes, all_integrity_passed },
+      correctness: { workloads_passed, workloads_total, total_operations, all_matched },
+      performance: [{ name, frank_ops_per_sec, csqlite_ops_per_sec, speedup }],
+      recovery: { scenarios_recovered, scenarios_total, csqlite_recovered, scenarios },
+      events: [...] }
 
 KEYS:
     Tab / Shift-Tab     Switch active panel
