@@ -32,6 +32,10 @@ struct IssueRecord {
     #[serde(default)]
     description: String,
     #[serde(default)]
+    acceptance_criteria: String,
+    #[serde(default)]
+    notes: String,
+    #[serde(default)]
     comments: Vec<IssueComment>,
 }
 
@@ -43,7 +47,15 @@ impl IssueRecord {
     }
 
     fn full_text(&self) -> String {
-        let mut text = self.description.clone();
+        let mut text = String::new();
+        for part in [&self.description, &self.acceptance_criteria, &self.notes] {
+            if !part.trim().is_empty() {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(part);
+            }
+        }
         for comment in &self.comments {
             if !comment.text.is_empty() {
                 if !text.is_empty() {
@@ -224,6 +236,8 @@ fn section_mapping_issue(section: u8) -> Option<&'static str> {
 
 fn has_acceptance_criteria(text: &str) -> bool {
     contains_ci(text, "acceptance criteria")
+        || contains_ci(text, "## acceptance")
+        || contains_ci(text, "done when")
 }
 
 fn has_test_plan_reference(text: &str) -> bool {

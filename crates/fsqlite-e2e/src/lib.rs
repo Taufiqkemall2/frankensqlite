@@ -17,6 +17,7 @@ pub mod corruption_scenarios;
 pub mod corruption_walkthrough;
 pub mod executor;
 pub mod fairness;
+pub mod fixture_metadata;
 pub mod fsqlite_executor;
 pub mod fsqlite_recovery_demo;
 pub mod golden;

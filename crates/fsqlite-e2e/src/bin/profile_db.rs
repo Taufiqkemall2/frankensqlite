@@ -15,6 +15,12 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
+
+use fsqlite_e2e::fixture_metadata::{
+    ColumnProfileV1, FIXTURE_METADATA_SCHEMA_VERSION_V1, FixtureFeaturesV1, FixtureMetadataV1,
+    FixtureSafetyV1, RiskLevel, SqliteMetaV1, TableProfileV1, normalize_tags, size_bucket_tag,
+};
 
 fn main() {
     let exit_code = run_cli(std::env::args_os());
@@ -135,13 +141,37 @@ where
             let mut fail_count = 0u32;
 
             for db_path in &db_files {
-                let db_name = db_path
+                let db_stem = db_path
                     .file_stem()
                     .unwrap_or_default()
                     .to_string_lossy()
                     .into_owned();
 
-                match profile_database(db_path) {
+                let db_id = match validate_db_id(&db_stem) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        eprintln!("FAIL  {db_stem}: invalid db_id: {e}");
+                        fail_count += 1;
+                        continue;
+                    }
+                };
+
+                let Some(golden_filename) = db_path.file_name().and_then(|n| n.to_str()) else {
+                    eprintln!("FAIL  {db_id}: invalid golden filename");
+                    fail_count += 1;
+                    continue;
+                };
+
+                let sha256_golden = match sha256_file(db_path) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        eprintln!("FAIL  {db_id}: sha256 error: {e}");
+                        fail_count += 1;
+                        continue;
+                    }
+                };
+
+                match profile_database(db_path, &db_id, golden_filename, &sha256_golden) {
                     Ok(profile) => {
                         let json_result = if pretty {
                             serde_json::to_string_pretty(&profile)
@@ -150,26 +180,26 @@ where
                         };
                         match json_result {
                             Ok(json) => {
-                                let out_path = output_dir.join(format!("{db_name}.json"));
+                                let out_path = output_dir.join(format!("{db_id}.json"));
                                 match std::fs::write(&out_path, json.as_bytes()) {
                                     Ok(()) => {
-                                        println!("  OK  {db_name} -> {}", out_path.display());
+                                        println!("  OK  {db_id} -> {}", out_path.display());
                                         success_count += 1;
                                     }
                                     Err(e) => {
-                                        eprintln!("FAIL  {db_name}: write error: {e}");
+                                        eprintln!("FAIL  {db_id}: write error: {e}");
                                         fail_count += 1;
                                     }
                                 }
                             }
                             Err(e) => {
-                                eprintln!("FAIL  {db_name}: JSON serialization error: {e}");
+                                eprintln!("FAIL  {db_id}: JSON serialization error: {e}");
                                 fail_count += 1;
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("FAIL  {db_name}: {e}");
+                        eprintln!("FAIL  {db_id}: {e}");
                         fail_count += 1;
                     }
                 }
@@ -236,43 +266,8 @@ EXAMPLES:
 }
 
 // ── Data structures ──────────────────────────────────────────────────────
-
-/// Full profile of a single SQLite database.
-#[derive(Debug, Serialize)]
-struct DbProfile {
-    name: String,
-    file_size_bytes: u64,
-    page_size: u32,
-    page_count: u32,
-    freelist_count: u32,
-    schema_version: u32,
-    journal_mode: String,
-    user_version: u32,
-    application_id: u32,
-    tables: Vec<TableProfile>,
-    indices: Vec<String>,
-    triggers: Vec<String>,
-    views: Vec<String>,
-}
-
-/// Profile of a single table within a database.
-#[derive(Debug, Serialize)]
-struct TableProfile {
-    name: String,
-    row_count: u64,
-    columns: Vec<ColumnProfile>,
-}
-
-/// Profile of a single column within a table.
-#[derive(Debug, Serialize)]
-struct ColumnProfile {
-    name: String,
-    #[serde(rename = "type")]
-    col_type: String,
-    primary_key: bool,
-    not_null: bool,
-    default_value: Option<String>,
-}
+//
+// Fixture metadata is emitted using `fsqlite_e2e::fixture_metadata::FixtureMetadataV1`.
 
 // ── Manifest (v1) ─────────────────────────────────────────────────────────
 
@@ -288,11 +283,11 @@ struct ManifestEntryV1 {
     golden_filename: String,
     sha256_golden: String,
     size_bytes: u64,
-    sqlite_meta: SqliteMetaV1,
+    sqlite_meta: ManifestSqliteMetaV1,
 }
 
 #[derive(Debug, Serialize)]
-struct SqliteMetaV1 {
+struct ManifestSqliteMetaV1 {
     page_size: u32,
     journal_mode: Option<String>,
     user_version: Option<u32>,
@@ -345,7 +340,7 @@ fn build_manifest_v1(checksums_path: &Path, metadata_dir: &Path) -> Result<Manif
             golden_filename: golden_filename.to_owned(),
             sha256_golden: sha256_golden.to_owned(),
             size_bytes,
-            sqlite_meta: SqliteMetaV1 {
+            sqlite_meta: ManifestSqliteMetaV1 {
                 page_size,
                 journal_mode,
                 user_version,
@@ -444,38 +439,15 @@ fn read_metadata_minimal(
 ) -> Result<(u64, u32, Option<String>, Option<u32>, Option<u32>), String> {
     let content = std::fs::read_to_string(meta_path)
         .map_err(|e| format!("cannot read metadata {}: {e}", meta_path.display()))?;
-    let v: serde_json::Value =
-        serde_json::from_str(&content).map_err(|e| format!("metadata JSON parse failed: {e}"))?;
-
-    let size_bytes = v
-        .get("file_size_bytes")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| format!("metadata missing file_size_bytes: {}", meta_path.display()))?;
-    let page_size = v
-        .get("page_size")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|n| u32::try_from(n).ok())
-        .ok_or_else(|| format!("metadata missing page_size: {}", meta_path.display()))?;
-
-    let journal_mode = v
-        .get("journal_mode")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned);
-    let user_version = v
-        .get("user_version")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|n| u32::try_from(n).ok());
-    let application_id = v
-        .get("application_id")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|n| u32::try_from(n).ok());
+    let meta: FixtureMetadataV1 = serde_json::from_str(&content)
+        .map_err(|e| format!("metadata JSON parse failed (expected v1): {e}"))?;
 
     Ok((
-        size_bytes,
-        page_size,
-        journal_mode,
-        user_version,
-        application_id,
+        meta.size_bytes,
+        meta.sqlite_meta.page_size,
+        Some(meta.sqlite_meta.journal_mode),
+        Some(meta.sqlite_meta.user_version),
+        Some(meta.sqlite_meta.application_id),
     ))
 }
 
@@ -509,17 +481,91 @@ fn collect_db_files(golden_dir: &Path, single_db: Option<&str>) -> Result<Vec<Pa
     Ok(files)
 }
 
-#[allow(clippy::cast_possible_truncation)]
-fn profile_database(db_path: &Path) -> Result<DbProfile, String> {
-    let name = db_path
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned();
+fn quote_ident(name: &str) -> String {
+    let escaped = name.replace('"', "\"\"");
+    format!("\"{escaped}\"")
+}
 
-    let file_size_bytes = std::fs::metadata(db_path)
+fn detect_sidecars(db_path: &Path) -> Vec<String> {
+    const SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
+    let mut present = Vec::new();
+
+    for suffix in SIDECARS {
+        let mut os = db_path.as_os_str().to_os_string();
+        os.push(suffix);
+        let path = PathBuf::from(os);
+        if path.exists() {
+            present.push(suffix.to_owned());
+        }
+    }
+
+    present
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    use std::fmt::Write as _;
+
+    let data = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(&data);
+    let digest = hasher.finalize();
+
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    Ok(hex)
+}
+
+fn sqlite_master_sql_contains(conn: &Connection, needle_lower: &str) -> Result<bool, String> {
+    let pattern = format!("%{needle_lower}%");
+    let mut stmt = conn
+        .prepare(
+            "SELECT 1 FROM sqlite_master \
+             WHERE sql IS NOT NULL AND lower(sql) LIKE ?1 \
+             LIMIT 1",
+        )
+        .map_err(|e| format!("sqlite_master sql prepare: {e}"))?;
+    let mut rows = stmt
+        .query([pattern])
+        .map_err(|e| format!("sqlite_master sql query: {e}"))?;
+    Ok(rows
+        .next()
+        .map_err(|e| format!("sqlite_master sql next: {e}"))?
+        .is_some())
+}
+
+fn has_foreign_keys(conn: &Connection, tables: &[TableProfileV1]) -> Result<bool, String> {
+    for t in tables {
+        let sql = format!("PRAGMA foreign_key_list({})", quote_ident(&t.name));
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("PRAGMA foreign_key_list({}) prepare: {e}", t.name))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| format!("PRAGMA foreign_key_list({}) query: {e}", t.name))?;
+        if rows
+            .next()
+            .map_err(|e| format!("PRAGMA foreign_key_list({}) next: {e}", t.name))?
+            .is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn profile_database(
+    db_path: &Path,
+    db_id: &str,
+    golden_filename: &str,
+    sha256_golden: &str,
+) -> Result<FixtureMetadataV1, String> {
+    let size_bytes = std::fs::metadata(db_path)
         .map_err(|e| format!("cannot stat file: {e}"))?
         .len();
+    let sidecars_present = detect_sidecars(db_path);
 
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn =
@@ -529,25 +575,102 @@ fn profile_database(db_path: &Path) -> Result<DbProfile, String> {
     let page_count = pragma_u32(&conn, "page_count")?;
     let freelist_count = pragma_u32(&conn, "freelist_count")?;
     let schema_version = pragma_u32(&conn, "schema_version")?;
+    let encoding = pragma_string(&conn, "encoding")?;
     let user_version = pragma_u32(&conn, "user_version")?;
     let application_id = pragma_u32(&conn, "application_id")?;
     let journal_mode = pragma_string(&conn, "journal_mode")?;
+    let auto_vacuum = pragma_u32(&conn, "auto_vacuum")?;
 
     let tables = query_tables(&conn)?;
     let indices = query_names(&conn, "index")?;
     let triggers = query_names(&conn, "trigger")?;
     let views = query_names(&conn, "view")?;
 
-    Ok(DbProfile {
-        name,
-        file_size_bytes,
-        page_size,
-        page_count,
-        freelist_count,
-        schema_version,
-        journal_mode,
-        user_version,
-        application_id,
+    let has_fts = sqlite_master_sql_contains(&conn, "using fts")?;
+    let has_rtree = sqlite_master_sql_contains(&conn, "using rtree")?;
+    let has_foreign_keys = has_foreign_keys(&conn, &tables)?;
+
+    let features = FixtureFeaturesV1 {
+        has_wal_sidecars_observed: sidecars_present
+            .iter()
+            .any(|s| s == "-wal" || s == "-shm"),
+        has_fts,
+        has_rtree,
+        has_triggers: !triggers.is_empty(),
+        has_views: !views.is_empty(),
+        has_foreign_keys,
+    };
+
+    let norm_id = db_id.replace('_', "-");
+    let mut tags: Vec<String> = Vec::new();
+    for stable in fsqlite_harness::fixture_discovery::STABLE_CORPUS_TAGS {
+        if *stable == "misc" {
+            continue;
+        }
+        if norm_id.contains(stable) {
+            tags.push((*stable).to_owned());
+        }
+    }
+    if tags.is_empty() {
+        tags.push("misc".to_owned());
+    }
+
+    tags.push(size_bucket_tag(size_bytes).to_owned());
+    if journal_mode.eq_ignore_ascii_case("wal") {
+        tags.push("wal".to_owned());
+    }
+    if features.has_fts {
+        tags.push("fts".to_owned());
+    }
+    if features.has_rtree {
+        tags.push("rtree".to_owned());
+    }
+    if indices.len() > 20 {
+        tags.push("many-indexes".to_owned());
+    }
+    if tables.len() > 20 {
+        tags.push("many-tables".to_owned());
+    }
+
+    let pii_risk = if tags.iter().any(|t| {
+        matches!(
+            t.as_str(),
+            "asupersync" | "frankentui" | "flywheel" | "frankensqlite" | "agent-mail" | "beads"
+        )
+    }) {
+        RiskLevel::Unlikely
+    } else {
+        RiskLevel::Unknown
+    };
+    let secrets_risk = pii_risk;
+    let allowed_for_ci = pii_risk == RiskLevel::Unlikely && secrets_risk == RiskLevel::Unlikely;
+
+    Ok(FixtureMetadataV1 {
+        schema_version: FIXTURE_METADATA_SCHEMA_VERSION_V1,
+        db_id: db_id.to_owned(),
+        source_path: None,
+        golden_filename: golden_filename.to_owned(),
+        sha256_golden: sha256_golden.to_owned(),
+        size_bytes,
+        sidecars_present,
+        sqlite_meta: SqliteMetaV1 {
+            page_size,
+            page_count,
+            freelist_count,
+            schema_version,
+            encoding,
+            user_version,
+            application_id,
+            journal_mode,
+            auto_vacuum,
+        },
+        features,
+        tags: normalize_tags(tags),
+        safety: FixtureSafetyV1 {
+            pii_risk,
+            secrets_risk,
+            allowed_for_ci,
+        },
         tables,
         indices,
         triggers,
@@ -582,7 +705,7 @@ fn query_names(conn: &Connection, obj_type: &str) -> Result<Vec<String>, String>
     Ok(names)
 }
 
-fn query_tables(conn: &Connection) -> Result<Vec<TableProfile>, String> {
+fn query_tables(conn: &Connection) -> Result<Vec<TableProfileV1>, String> {
     let table_names = {
         let sql = "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name";
         let mut stmt = conn.prepare(sql).map_err(|e| format!("prepare: {e}"))?;
@@ -601,7 +724,7 @@ fn query_tables(conn: &Connection) -> Result<Vec<TableProfile>, String> {
     for tname in &table_names {
         let columns = query_columns(conn, tname)?;
         let row_count = query_row_count(conn, tname)?;
-        tables.push(TableProfile {
+        tables.push(TableProfileV1 {
             name: tname.clone(),
             row_count,
             columns,
@@ -610,7 +733,7 @@ fn query_tables(conn: &Connection) -> Result<Vec<TableProfile>, String> {
     Ok(tables)
 }
 
-fn query_columns(conn: &Connection, table_name: &str) -> Result<Vec<ColumnProfile>, String> {
+fn query_columns(conn: &Connection, table_name: &str) -> Result<Vec<ColumnProfileV1>, String> {
     // table_info returns: cid, name, type, notnull, dflt_value, pk
     let sql = format!("PRAGMA table_info('{table_name}')");
     let mut stmt = conn
@@ -618,7 +741,7 @@ fn query_columns(conn: &Connection, table_name: &str) -> Result<Vec<ColumnProfil
         .map_err(|e| format!("prepare table_info: {e}"))?;
     let rows = stmt
         .query_map([], |row| {
-            Ok(ColumnProfile {
+            Ok(ColumnProfileV1 {
                 name: row.get::<_, String>(1)?,
                 col_type: row.get::<_, String>(2)?,
                 not_null: row.get::<_, bool>(3)?,
@@ -651,6 +774,21 @@ mod tests {
     fn run_with(args: &[&str]) -> i32 {
         let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
         run_cli(os_args)
+    }
+
+    fn profile_for_test(db_path: &Path) -> FixtureMetadataV1 {
+        let stem = db_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("test db path must have UTF-8 stem");
+        let db_id = validate_db_id(stem).expect("db_id must be valid in tests");
+        let golden_filename = db_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("test db path must have UTF-8 filename");
+        let sha256_golden = sha256_file(db_path).expect("sha256 must be computed for test db");
+        profile_database(db_path, &db_id, golden_filename, &sha256_golden)
+            .expect("profile_database must succeed for test db")
     }
 
     #[test]
@@ -694,10 +832,12 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let profile = profile_database(&db_path).unwrap();
-        assert_eq!(profile.name, "test");
-        assert!(profile.page_size > 0);
-        assert!(profile.page_count > 0);
+        let profile = profile_for_test(&db_path);
+        assert_eq!(profile.db_id, "test");
+        assert_eq!(profile.golden_filename, "test.db");
+        assert!(profile.size_bytes > 0);
+        assert!(profile.sqlite_meta.page_size > 0);
+        assert!(profile.sqlite_meta.page_count > 0);
         assert_eq!(profile.tables.len(), 1);
         assert_eq!(profile.tables[0].name, "items");
         assert_eq!(profile.tables[0].row_count, 2);
@@ -720,12 +860,12 @@ mod tests {
             .unwrap();
         drop(conn);
 
-        let profile = profile_database(&db_path).unwrap();
+        let profile = profile_for_test(&db_path);
         let json = serde_json::to_string_pretty(&profile).unwrap();
 
         // Round-trip: deserialize back into a generic value.
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["name"], "json_test");
+        assert_eq!(parsed["db_id"], "json_test");
         assert_eq!(parsed["tables"][0]["name"], "t1");
         assert_eq!(parsed["tables"][0]["columns"].as_array().unwrap().len(), 2);
     }
@@ -756,7 +896,8 @@ mod tests {
 
         let content = std::fs::read_to_string(&out_path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(parsed["name"], "sample");
+        assert_eq!(parsed["db_id"], "sample");
+        assert_eq!(parsed["golden_filename"], "sample.db");
     }
 
     #[test]
@@ -765,7 +906,7 @@ mod tests {
         let meta = tempfile::tempdir().unwrap();
 
         // Create two databases.
-        for name in &["a.db", "b.db"] {
+        for name in &["aa.db", "bb.db"] {
             let db_path = golden.path().join(name);
             let conn = Connection::open(&db_path).unwrap();
             conn.execute_batch("CREATE TABLE t (id INTEGER);").unwrap();
@@ -779,13 +920,13 @@ mod tests {
             "--output-dir",
             meta.path().to_str().unwrap(),
             "--db",
-            "a.db",
+            "aa.db",
         ]);
         assert_eq!(exit_code, 0);
 
         // Only a.json should exist.
-        assert!(meta.path().join("a.json").exists());
-        assert!(!meta.path().join("b.json").exists());
+        assert!(meta.path().join("aa.json").exists());
+        assert!(!meta.path().join("bb.json").exists());
     }
 
     #[test]
@@ -809,13 +950,49 @@ mod tests {
         let checksums = meta.path().join("checksums.sha256");
         let manifest = meta.path().join("manifest.v1.json");
 
-        // Minimal metadata file matching existing corpus fields.
+        // Minimal metadata file matching the stable corpus metadata schema.
         let meta_path = meta.path().join("alpha.json");
-        std::fs::write(
-            &meta_path,
-            r#"{"name":"alpha","file_size_bytes":123,"page_size":4096,"journal_mode":"wal","user_version":0,"application_id":0}"#,
-        )
-        .unwrap();
+        let meta_record = FixtureMetadataV1 {
+            schema_version: FIXTURE_METADATA_SCHEMA_VERSION_V1,
+            db_id: "alpha".to_owned(),
+            source_path: None,
+            golden_filename: "alpha.db".to_owned(),
+            sha256_golden: "00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff"
+                .to_owned(),
+            size_bytes: 123,
+            sidecars_present: Vec::new(),
+            sqlite_meta: SqliteMetaV1 {
+                page_size: 4096,
+                page_count: 1,
+                freelist_count: 0,
+                schema_version: 1,
+                encoding: "UTF-8".to_owned(),
+                user_version: 0,
+                application_id: 0,
+                journal_mode: "wal".to_owned(),
+                auto_vacuum: 0,
+            },
+            features: FixtureFeaturesV1 {
+                has_wal_sidecars_observed: false,
+                has_fts: false,
+                has_rtree: false,
+                has_triggers: false,
+                has_views: false,
+                has_foreign_keys: false,
+            },
+            tags: normalize_tags([String::from("misc"), String::from("small")]),
+            safety: FixtureSafetyV1 {
+                pii_risk: RiskLevel::Unlikely,
+                secrets_risk: RiskLevel::Unlikely,
+                allowed_for_ci: true,
+            },
+            tables: Vec::new(),
+            indices: Vec::new(),
+            triggers: Vec::new(),
+            views: Vec::new(),
+        };
+        let meta_json = serde_json::to_string_pretty(&meta_record).unwrap();
+        std::fs::write(&meta_path, meta_json.as_bytes()).unwrap();
 
         std::fs::write(
             &checksums,
@@ -862,11 +1039,11 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let profile = profile_database(&db_path).unwrap();
-        assert_eq!(profile.page_size, 8192);
+        let profile = profile_for_test(&db_path);
+        assert_eq!(profile.sqlite_meta.page_size, 8192);
         // freelist_count is always non-negative (u32), just verify it's accessible.
-        let _ = profile.freelist_count;
-        assert!(profile.schema_version > 0);
+        let _ = profile.sqlite_meta.freelist_count;
+        assert!(profile.sqlite_meta.schema_version > 0);
     }
 
     #[test]
@@ -886,7 +1063,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let profile = profile_database(&db_path).unwrap();
+        let profile = profile_for_test(&db_path);
         assert_eq!(profile.tables.len(), 1);
         let t = &profile.tables[0];
         assert_eq!(t.row_count, 1);

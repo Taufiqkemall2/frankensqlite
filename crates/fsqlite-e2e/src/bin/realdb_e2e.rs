@@ -25,7 +25,7 @@ use serde::Serialize;
 use fsqlite_e2e::benchmark::{BenchmarkConfig, BenchmarkMeta, BenchmarkSummary, run_benchmark};
 use fsqlite_e2e::corruption::{CorruptionStrategy, inject_corruption};
 use fsqlite_e2e::fixture_metadata::{
-    FIXTURE_METADATA_SCHEMA_VERSION_V1, ColumnProfileV1, FixtureFeaturesV1, FixtureMetadataV1,
+    ColumnProfileV1, FIXTURE_METADATA_SCHEMA_VERSION_V1, FixtureFeaturesV1, FixtureMetadataV1,
     FixtureSafetyV1, RiskLevel, SqliteMetaV1, TableProfileV1, normalize_tags, size_bucket_tag,
 };
 use fsqlite_e2e::fsqlite_executor::{FsqliteExecConfig, run_oplog_fsqlite};
@@ -2113,9 +2113,7 @@ fn profile_database_for_metadata(
     let has_rtree = sqlite_master_sql_contains(&conn, "using rtree")?;
     let has_foreign_keys = has_foreign_keys(&conn, &tables)?;
 
-    let has_wal_sidecars_observed = sidecars_present
-        .iter()
-        .any(|s| s == "-wal" || s == "-shm");
+    let has_wal_sidecars_observed = sidecars_present.iter().any(|s| s == "-wal" || s == "-shm");
 
     let features = FixtureFeaturesV1 {
         has_wal_sidecars_observed,
@@ -3088,6 +3086,10 @@ mod tests {
             src.to_str().unwrap(),
             "--id",
             "test_import",
+            "--pii-risk",
+            "unlikely",
+            "--secrets-risk",
+            "unlikely",
             "--golden-dir",
             golden.to_str().unwrap(),
             "--metadata-dir",
@@ -3114,9 +3116,18 @@ mod tests {
         assert!(meta_path.exists(), "metadata JSON must be created");
         let meta_json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
-        assert_eq!(meta_json["name"], "test_import");
-        assert!(meta_json["page_size"].as_u64().unwrap() > 0);
-        assert!(meta_json["file_size_bytes"].as_u64().unwrap() > 0);
+        assert_eq!(
+            meta_json["schema_version"].as_u64().unwrap(),
+            u64::from(FIXTURE_METADATA_SCHEMA_VERSION_V1)
+        );
+        assert_eq!(meta_json["db_id"], "test_import");
+        assert_eq!(meta_json["golden_filename"], "test_import.db");
+        assert_eq!(meta_json["safety"]["pii_risk"], "unlikely");
+        assert_eq!(meta_json["safety"]["secrets_risk"], "unlikely");
+        assert_eq!(meta_json["safety"]["allowed_for_ci"], true);
+
+        assert!(meta_json["sqlite_meta"]["page_size"].as_u64().unwrap() > 0);
+        assert!(meta_json["size_bytes"].as_u64().unwrap() > 0);
         assert_eq!(meta_json["tables"][0]["name"], "widgets");
         assert_eq!(meta_json["tables"][0]["row_count"], 2);
 
@@ -3125,6 +3136,7 @@ mod tests {
 
         // Checksums hash must match the actual golden file.
         let actual_hash = sha256_file(&golden_db).unwrap();
+        assert_eq!(meta_json["sha256_golden"], actual_hash);
         assert!(
             checksums_content.contains(&actual_hash),
             "checksums hash must match actual file"
