@@ -32,11 +32,29 @@ snapshots from live WAL-mode databases.
 
 ### Tagging Taxonomy
 
-`realdb-e2e corpus scan` emits heuristic discovery tags (project name, `beads`, size buckets).
+`realdb-e2e corpus scan` emits heuristic tags (project name, `beads`, size buckets) in its
+JSON discovery output.
 
-`realdb-e2e corpus import --tag <TAG>` stores a single stable classification tag in metadata:
+`realdb-e2e corpus import --tag <TAG>` sets a stable *classification* tag (from a small
+allowlist) and stores it in the fixture metadata.
 
 - `asupersync`, `frankentui`, `flywheel`, `frankensqlite`, `agent-mail`, `beads`, `misc`
+
+Additional derived tags (e.g. `small|medium|large`, `wal`) may also be present in the
+metadata `tags` array; these are normalized (lowercase), sorted, and de-duplicated.
+
+### Safety / CI Eligibility
+
+Fixture metadata is git-tracked, so it must not leak secrets/PII.
+
+`realdb-e2e corpus import` records a conservative safety classification:
+
+- `--pii-risk unknown|unlikely|possible|likely`
+- `--secrets-risk unknown|unlikely|possible|likely`
+- `--allow-for-ci` (or leave false)
+
+These fields are stored in `metadata/*.json` under `safety.{pii_risk,secrets_risk,allowed_for_ci}`.
+For redaction safety, `source_path` may be omitted (`null`) in committed metadata.
 
 ### Concrete Examples
 
