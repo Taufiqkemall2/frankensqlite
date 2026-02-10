@@ -1,0 +1,1104 @@
+{
+  "schema_version": 1,
+  "db_id": "eidetic_memory",
+  "source_path": "/dp/older_projects/eidetic_engine_agent/eidetic_memory.db",
+  "golden_filename": "eidetic_memory.db",
+  "sha256_golden": "4f50e7195e739fe28e12918c3423bc71436fa2b0003f6a6bb96be9c9ac1e5e8e",
+  "size_bytes": 15175680,
+  "sidecars_present": [
+    "-wal",
+    "-shm"
+  ],
+  "sqlite_meta": {
+    "page_size": 4096,
+    "page_count": 3705,
+    "freelist_count": 1,
+    "schema_version": 1,
+    "encoding": "UTF-8",
+    "user_version": 0,
+    "application_id": 0,
+    "journal_mode": "wal",
+    "auto_vacuum": 0
+  },
+  "features": {
+    "has_wal_sidecars_observed": true,
+    "has_fts": true,
+    "has_rtree": false,
+    "has_triggers": true,
+    "has_views": true,
+    "has_foreign_keys": true
+  },
+  "tags": [
+    "fts",
+    "large",
+    "many-indexes",
+    "misc",
+    "page-size-4096",
+    "wal"
+  ],
+  "safety": {
+    "pii_risk": "unknown",
+    "secrets_risk": "unknown",
+    "allowed_for_ci": false
+  },
+  "tables": [
+    {
+      "name": "audit_log",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "actor",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "action",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "target_type",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "target_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "meta_json",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "audit_logs",
+      "row_count": 29,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "event_type",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "user_id",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "workflow_id",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "memory_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "action",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "details",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "ip_address",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "user_agent",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "correlation_id",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "data_governance_policies",
+      "row_count": 8,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "memory_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "workflow_id",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "classification",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "residency",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "retention_policy",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "retention_days",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "legal_hold",
+          "type": "BOOLEAN",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "pii_detected",
+          "type": "BOOLEAN",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "pii_types",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "updated_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "embeddings",
+      "row_count": 21,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "memory_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "model",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "dims",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "vector",
+          "type": "BLOB",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "segment_type",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "'FULL'"
+        }
+      ]
+    },
+    {
+      "name": "idempotency_keys",
+      "row_count": 154,
+      "columns": [
+        {
+          "name": "key",
+          "type": "VARCHAR",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "idempotency_records",
+      "row_count": 1,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "idempotency_key",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "tool_name",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "request_hash",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "response_data",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "error_message",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "expires_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "request_count",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "last_accessed_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "memories",
+      "row_count": 34606,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "content",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "memory_type",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "level",
+          "type": "VARCHAR(10)",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "importance",
+          "type": "FLOAT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "confidence",
+          "type": "FLOAT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "tags_json",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "meta_json",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "updated_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "schema_name",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "schema_version",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "event_time",
+          "type": "TIMESTAMP",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "valid_from",
+          "type": "TIMESTAMP",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "valid_to",
+          "type": "TIMESTAMP",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "utility_score",
+          "type": "REAL",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "0.0"
+        },
+        {
+          "name": "reuse_count",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "0"
+        },
+        {
+          "name": "affect_valence",
+          "type": "REAL",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "memories_fts",
+      "row_count": 34606,
+      "columns": [
+        {
+          "name": "content",
+          "type": "",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "memory_type",
+          "type": "",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "level",
+          "type": "",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "memories_fts_config",
+      "row_count": 1,
+      "columns": [
+        {
+          "name": "k",
+          "type": "",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "v",
+          "type": "",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "memories_fts_data",
+      "row_count": 259,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "block",
+          "type": "BLOB",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "memories_fts_docsize",
+      "row_count": 34605,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "sz",
+          "type": "BLOB",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "memories_fts_idx",
+      "row_count": 116,
+      "columns": [
+        {
+          "name": "segid",
+          "type": "",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "term",
+          "type": "",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "pgno",
+          "type": "",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "memory_links",
+      "row_count": 15527,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "src_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "dst_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "relation",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "weight",
+          "type": "REAL",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "1.0"
+        },
+        {
+          "name": "flags",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "0"
+        }
+      ]
+    },
+    {
+      "name": "memory_tags",
+      "row_count": 1295,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "memory_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "tag",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "operation_log",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "idempotency_key",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "tool",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "status",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "code",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "request_json",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "response_json",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "operation_logs",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "operation_id",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "tool_name",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "operation_type",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "request_data",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "response_data",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "status",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "error_message",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "correlation_id",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "duration_ms",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "pack_records",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "VARCHAR",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "run_id",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "goal",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "token_budget",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "plan_json",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "retrieval_policies",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "policy_id",
+          "type": "VARCHAR",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "weights_json",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "notes",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "workflow_acls",
+      "row_count": 1,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "workflow_id",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "user_id",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "access_level",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "granted_by",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "granted_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "expires_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "acl_metadata",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    }
+  ],
+  "indices": [
+    "idx_memories_meta_source",
+    "idx_memories_meta_type",
+    "idx_memories_tags_first",
+    "idx_operation_log_idemp",
+    "idx_operation_log_tool",
+    "idx_operation_logs_corr",
+    "idx_operation_logs_tool_name",
+    "ix_audit_log_action",
+    "ix_audit_log_actor",
+    "ix_audit_log_created_at",
+    "ix_audit_log_target_id",
+    "ix_audit_log_target_type",
+    "ix_audit_logs_correlation_id",
+    "ix_audit_logs_event_type",
+    "ix_audit_logs_memory_id",
+    "ix_audit_logs_user_id",
+    "ix_audit_logs_workflow_id",
+    "ix_data_governance_policies_memory_id",
+    "ix_data_governance_policies_workflow_id",
+    "ix_embeddings_created_at",
+    "ix_embeddings_memory_id",
+    "ix_embeddings_model",
+    "ix_idempotency_keys_created_at",
+    "ix_idempotency_records_idempotency_key",
+    "ix_memories_content",
+    "ix_memories_created_at",
+    "ix_memories_level",
+    "ix_memories_memory_type",
+    "ix_memories_updated_at",
+    "ix_memory_links_created_at",
+    "ix_memory_links_dst_id",
+    "ix_memory_links_relation",
+    "ix_memory_links_src_id",
+    "ix_memory_tags_memory_id",
+    "ix_memory_tags_tag",
+    "ix_operation_log_created_at",
+    "ix_operation_log_idempotency_key",
+    "ix_operation_log_status",
+    "ix_operation_log_tool",
+    "ix_operation_logs_correlation_id",
+    "ix_operation_logs_operation_id",
+    "ix_pack_records_created_at",
+    "ix_pack_records_run_id",
+    "ix_retrieval_policies_created_at",
+    "ix_workflow_acls_user_id",
+    "ix_workflow_acls_workflow_id",
+    "uq_embeddings_mem_model",
+    "uq_embeddings_mem_model_seg"
+  ],
+  "triggers": [
+    "memories_ad",
+    "memories_ai",
+    "memories_au",
+    "trg_mem_tags_ins",
+    "trg_mem_tags_up",
+    "trg_memlinks_rel_ins",
+    "trg_memlinks_rel_up"
+  ],
+  "views": [
+    "memories_meta"
+  ]
+}

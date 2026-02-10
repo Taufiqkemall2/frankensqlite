@@ -85,9 +85,18 @@ impl<F: VfsFile> PagerInner<F> {
             let len = cached.len().min(data.len());
             cached[..len].copy_from_slice(&data[..len]);
         } else {
-            let fresh = self.cache.insert_fresh(page_no)?;
-            let len = fresh.len().min(data.len());
-            fresh[..len].copy_from_slice(&data[..len]);
+            // Cache population is best-effort: if the bounded buffer pool is
+            // temporarily exhausted by an in-flight transaction write-set, we
+            // still want commits to succeed (the authoritative copy is written
+            // to the backing VFS file below).
+            match self.cache.insert_fresh(page_no) {
+                Ok(fresh) => {
+                    let len = fresh.len().min(data.len());
+                    fresh[..len].copy_from_slice(&data[..len]);
+                }
+                Err(FrankenError::OutOfMemory) => {}
+                Err(err) => return Err(err),
+            }
         }
 
         let page_size = self.page_size.as_usize();
@@ -720,25 +729,21 @@ where
             .rposition(|sp| sp.name == name)
             .ok_or_else(|| FrankenError::internal(format!("no savepoint named '{name}'")))?;
         // Restore write-set and freed-pages to the snapshot state.
-        // Convert Vec<u8> snapshots back to PageBuf (standalone, non-pooled).
-        let page_size = {
-            let inner = self
-                .inner
-                .lock()
-                .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
-            inner.page_size
-        };
+        // Convert Vec<u8> snapshots back to PageBuf (allocated from pool).
         let entry = &self.savepoint_stack[pos];
         self.write_set = entry
             .write_set_snapshot
             .iter()
-            .map(|(&k, v)| {
-                let mut buf = PageBuf::new(page_size);
+            .map(|(&k, v)| -> Result<(PageNumber, PageBuf)> {
+                let mut buf = self.pool.acquire()?;
                 let len = buf.len().min(v.len());
                 buf.as_mut_slice()[..len].copy_from_slice(&v[..len]);
-                (k, buf)
+                if len < buf.len() {
+                    buf[len..].fill(0);
+                }
+                Ok((k, buf))
             })
-            .collect();
+            .collect::<Result<HashMap<_, _>>>()?;
         self.freed_pages = entry.freed_pages_snapshot.clone();
         // Discard savepoints created after the named one, but keep
         // the named savepoint itself (it can be rolled back to again).

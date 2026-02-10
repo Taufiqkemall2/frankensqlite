@@ -2107,7 +2107,7 @@ mod tests {
 
         let outcome = cache
             .request_async(k, || -> Result<CachedPage, &'static str> {
-                panic!("hit path must not call loader");
+                unreachable!("hit path must not call loader");
             })
             .expect("hit path should not fail");
         assert_eq!(
@@ -2127,7 +2127,7 @@ mod tests {
             let panic_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                 let _ = cache_leader.request_async(k, || -> Result<CachedPage, &'static str> {
                     thread::sleep(Duration::from_millis(75));
-                    panic!("forced loader panic for cancellation path");
+                    unreachable!("forced loader panic for cancellation path");
                 });
             }));
             panic_result.is_err()
@@ -2141,7 +2141,7 @@ mod tests {
         let waiter = thread::spawn(move || {
             cache_waiter
                 .request_async(k, || -> Result<CachedPage, &'static str> {
-                    panic!("waiter loader must not execute while placeholder is active");
+                    unreachable!("waiter loader must not execute while placeholder is active");
                 })
                 .expect("waiter should observe peer outcome")
         });
@@ -3488,10 +3488,7 @@ mod tests {
             cache.get(&k1).is_none(),
             "k1 should be evicted from T2 because T1 was pinned"
         );
-        assert!(
-            cache.get(&k2).is_some(),
-            "k2 must remain (pinned)"
-        );
+        assert!(cache.get(&k2).is_some(), "k2 must remain (pinned)");
         assert_eq!(
             cache.capacity_overflow_events(),
             1,

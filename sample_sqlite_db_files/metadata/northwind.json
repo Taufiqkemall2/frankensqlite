@@ -1,0 +1,755 @@
+{
+  "schema_version": 1,
+  "db_id": "northwind",
+  "source_path": "/dp/ultimate_mcp_server/examples/sample/northwind.db",
+  "golden_filename": "northwind.db",
+  "sha256_golden": "ffddd65dbd69c0b6ebfd282dce94150cdd6ba4e0dd5dc42983e5cca2adad9f45",
+  "size_bytes": 24702976,
+  "sidecars_present": [],
+  "sqlite_meta": {
+    "page_size": 4096,
+    "page_count": 6031,
+    "freelist_count": 0,
+    "schema_version": 1,
+    "encoding": "UTF-8",
+    "user_version": 0,
+    "application_id": 0,
+    "journal_mode": "delete",
+    "auto_vacuum": 0
+  },
+  "features": {
+    "has_wal_sidecars_observed": false,
+    "has_fts": false,
+    "has_rtree": false,
+    "has_triggers": false,
+    "has_views": true,
+    "has_foreign_keys": true
+  },
+  "tags": [
+    "large",
+    "misc",
+    "page-size-4096"
+  ],
+  "safety": {
+    "pii_risk": "unknown",
+    "secrets_risk": "unknown",
+    "allowed_for_ci": false
+  },
+  "tables": [
+    {
+      "name": "Categories",
+      "row_count": 8,
+      "columns": [
+        {
+          "name": "CategoryID",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "CategoryName",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "Description",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "Picture",
+          "type": "BLOB",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "CustomerCustomerDemo",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "CustomerID",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "CustomerTypeID",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "CustomerDemographics",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "CustomerTypeID",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "CustomerDesc",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "Customers",
+      "row_count": 93,
+      "columns": [
+        {
+          "name": "CustomerID",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "CompanyName",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "ContactName",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "ContactTitle",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "Address",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "City",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "Region",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "PostalCode",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "Country",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "Phone",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "Fax",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "EmployeeTerritories",
+      "row_count": 49,
+      "columns": [
+        {
+          "name": "EmployeeID",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "TerritoryID",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "Employees",
+      "row_count": 9,
+      "columns": [
+        {
+          "name": "EmployeeID",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "LastName",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "FirstName",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "Title",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "TitleOfCourtesy",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "BirthDate",
+          "type": "DATE",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "HireDate",
+          "type": "DATE",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "Address",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "City",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "Region",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "PostalCode",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "Country",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "HomePhone",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "Extension",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "Photo",
+          "type": "BLOB",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "Notes",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "ReportsTo",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "PhotoPath",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "Order Details",
+      "row_count": 609283,
+      "columns": [
+        {
+          "name": "OrderID",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "ProductID",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "UnitPrice",
+          "type": "NUMERIC",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "0"
+        },
+        {
+          "name": "Quantity",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "1"
+        },
+        {
+          "name": "Discount",
+          "type": "REAL",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "0"
+        }
+      ]
+    },
+    {
+      "name": "Orders",
+      "row_count": 16282,
+      "columns": [
+        {
+          "name": "OrderID",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "CustomerID",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "EmployeeID",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "OrderDate",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "RequiredDate",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "ShippedDate",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "ShipVia",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "Freight",
+          "type": "NUMERIC",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": "0"
+        },
+        {
+          "name": "ShipName",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "ShipAddress",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "ShipCity",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "ShipRegion",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "ShipPostalCode",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "ShipCountry",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "Products",
+      "row_count": 77,
+      "columns": [
+        {
+          "name": "ProductID",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "ProductName",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "SupplierID",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "CategoryID",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "QuantityPerUnit",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "UnitPrice",
+          "type": "NUMERIC",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": "0"
+        },
+        {
+          "name": "UnitsInStock",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": "0"
+        },
+        {
+          "name": "UnitsOnOrder",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": "0"
+        },
+        {
+          "name": "ReorderLevel",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": "0"
+        },
+        {
+          "name": "Discontinued",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "'0'"
+        }
+      ]
+    },
+    {
+      "name": "Regions",
+      "row_count": 4,
+      "columns": [
+        {
+          "name": "RegionID",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "RegionDescription",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "Shippers",
+      "row_count": 3,
+      "columns": [
+        {
+          "name": "ShipperID",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "CompanyName",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "Phone",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "Suppliers",
+      "row_count": 29,
+      "columns": [
+        {
+          "name": "SupplierID",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "CompanyName",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "ContactName",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "ContactTitle",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "Address",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "City",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "Region",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "PostalCode",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "Country",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "Phone",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "Fax",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "HomePage",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "Territories",
+      "row_count": 53,
+      "columns": [
+        {
+          "name": "TerritoryID",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "TerritoryDescription",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "RegionID",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    }
+  ],
+  "indices": [],
+  "triggers": [],
+  "views": [
+    "Alphabetical list of products",
+    "Category Sales for 1997",
+    "Current Product List",
+    "Customer and Suppliers by City",
+    "Invoices",
+    "Order Details Extended",
+    "Order Subtotals",
+    "Orders Qry",
+    "Product Sales for 1997",
+    "ProductDetails_V",
+    "Products Above Average Price",
+    "Products by Category",
+    "Quarterly Orders",
+    "Sales Totals by Amount",
+    "Sales by Category",
+    "Summary of Sales by Quarter",
+    "Summary of Sales by Year"
+  ]
+}
