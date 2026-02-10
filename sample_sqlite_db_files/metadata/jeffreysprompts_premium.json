@@ -1,13 +1,44 @@
 {
-  "name": "jeffreysprompts_premium",
-  "file_size_bytes": 8364032,
-  "page_size": 4096,
-  "page_count": 2042,
-  "freelist_count": 0,
   "schema_version": 1,
-  "journal_mode": "wal",
-  "user_version": 0,
-  "application_id": 0,
+  "db_id": "jeffreysprompts_premium",
+  "source_path": null,
+  "golden_filename": "jeffreysprompts_premium.db",
+  "sha256_golden": "bfe77a7b8b4694548b2edb6f1e532b5f086a0d6015a9b73f7e3ec6b37e29553c",
+  "size_bytes": 8364032,
+  "sidecars_present": [
+    "-wal",
+    "-shm"
+  ],
+  "sqlite_meta": {
+    "page_size": 4096,
+    "page_count": 2042,
+    "freelist_count": 0,
+    "schema_version": 1,
+    "encoding": "UTF-8",
+    "user_version": 0,
+    "application_id": 0,
+    "journal_mode": "wal",
+    "auto_vacuum": 0
+  },
+  "features": {
+    "has_wal_sidecars_observed": true,
+    "has_fts": false,
+    "has_rtree": false,
+    "has_triggers": false,
+    "has_views": true,
+    "has_foreign_keys": true
+  },
+  "tags": [
+    "large",
+    "many-indexes",
+    "misc",
+    "wal"
+  ],
+  "safety": {
+    "pii_risk": "unknown",
+    "secrets_risk": "unknown",
+    "allowed_for_ci": false
+  },
   "tables": [
     {
       "name": "blocked_issues_cache",

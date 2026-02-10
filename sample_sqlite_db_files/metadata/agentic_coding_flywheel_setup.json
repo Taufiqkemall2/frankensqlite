@@ -1,13 +1,44 @@
 {
-  "name": "agentic_coding_flywheel_setup",
-  "file_size_bytes": 7966720,
-  "page_size": 4096,
-  "page_count": 1945,
-  "freelist_count": 1,
   "schema_version": 1,
-  "journal_mode": "wal",
-  "user_version": 0,
-  "application_id": 0,
+  "db_id": "agentic_coding_flywheel_setup",
+  "source_path": null,
+  "golden_filename": "agentic_coding_flywheel_setup.db",
+  "sha256_golden": "6bef9ced8217337f7bf7196d1f3d8035752c67ec32c4952abc09ad6a0235c037",
+  "size_bytes": 7966720,
+  "sidecars_present": [
+    "-wal",
+    "-shm"
+  ],
+  "sqlite_meta": {
+    "page_size": 4096,
+    "page_count": 1945,
+    "freelist_count": 1,
+    "schema_version": 1,
+    "encoding": "UTF-8",
+    "user_version": 0,
+    "application_id": 0,
+    "journal_mode": "wal",
+    "auto_vacuum": 0
+  },
+  "features": {
+    "has_wal_sidecars_observed": true,
+    "has_fts": false,
+    "has_rtree": false,
+    "has_triggers": false,
+    "has_views": true,
+    "has_foreign_keys": true
+  },
+  "tags": [
+    "flywheel",
+    "large",
+    "many-indexes",
+    "wal"
+  ],
+  "safety": {
+    "pii_risk": "unlikely",
+    "secrets_risk": "unlikely",
+    "allowed_for_ci": true
+  },
   "tables": [
     {
       "name": "blocked_issues_cache",

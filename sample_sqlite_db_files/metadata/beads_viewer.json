@@ -1,13 +1,44 @@
 {
-  "name": "beads_viewer",
-  "file_size_bytes": 6565888,
-  "page_size": 4096,
-  "page_count": 1603,
-  "freelist_count": 2,
   "schema_version": 1,
-  "journal_mode": "wal",
-  "user_version": 0,
-  "application_id": 0,
+  "db_id": "beads_viewer",
+  "source_path": null,
+  "golden_filename": "beads_viewer.db",
+  "sha256_golden": "e80d29ccb19a796cda8caf4ac1c87c3f5df2a60f0735bc934b1da86a05f91835",
+  "size_bytes": 6565888,
+  "sidecars_present": [
+    "-wal",
+    "-shm"
+  ],
+  "sqlite_meta": {
+    "page_size": 4096,
+    "page_count": 1603,
+    "freelist_count": 2,
+    "schema_version": 1,
+    "encoding": "UTF-8",
+    "user_version": 0,
+    "application_id": 0,
+    "journal_mode": "wal",
+    "auto_vacuum": 0
+  },
+  "features": {
+    "has_wal_sidecars_observed": true,
+    "has_fts": false,
+    "has_rtree": false,
+    "has_triggers": false,
+    "has_views": true,
+    "has_foreign_keys": true
+  },
+  "tags": [
+    "beads",
+    "large",
+    "many-indexes",
+    "wal"
+  ],
+  "safety": {
+    "pii_risk": "unlikely",
+    "secrets_risk": "unlikely",
+    "allowed_for_ci": true
+  },
   "tables": [
     {
       "name": "blocked_issues_cache",

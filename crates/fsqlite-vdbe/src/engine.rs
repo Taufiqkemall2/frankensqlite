@@ -200,15 +200,20 @@ impl SorterCursor {
     }
 }
 
-/// Storage-backed table cursor used by read scans (`OpenRead`).
+/// Storage-backed table cursor used by `OpenRead` and `OpenWrite`.
 ///
 /// Backed by a real [`BtCursor`] over an in-memory [`MemPageStore`] so that
 /// the VDBE exercises the same page-level navigation code path that the
-/// production pager/WAL stack will use.
+/// production pager/WAL stack will use.  When `writable` is true, `Insert`
+/// and `Delete` opcodes route through the B-tree write path.
 #[derive(Debug)]
 struct StorageCursor {
     cursor: BtCursor<MemPageStore>,
     cx: Cx,
+    /// Whether this cursor was opened for writing (`OpenWrite`).
+    writable: bool,
+    /// Root page number (MemDatabase key), used for MemDatabase sync.
+    root_page: i32,
 }
 
 /// Shared in-memory database backing the VDBE engine's cursor operations.
@@ -299,10 +304,10 @@ pub struct VdbeEngine {
     cursors: HashMap<i32, MemCursor>,
     /// Open sorter cursors keyed by cursor number.
     sorters: HashMap<i32, SorterCursor>,
-    /// Open storage-backed read cursors keyed by cursor number.
+    /// Open storage-backed cursors keyed by cursor number (read and write).
     storage_cursors: HashMap<i32, StorageCursor>,
-    /// Whether `OpenRead` should route through storage-backed cursors.
-    storage_read_cursors_enabled: bool,
+    /// Whether `OpenRead`/`OpenWrite` should route through storage-backed cursors.
+    storage_cursors_enabled: bool,
     /// In-memory database backing cursor operations (shared with Connection).
     db: Option<MemDatabase>,
     /// Scalar/aggregate/window function registry for Function/PureFunc opcodes.
@@ -331,7 +336,7 @@ impl VdbeEngine {
             cursors: HashMap::new(),
             sorters: HashMap::new(),
             storage_cursors: HashMap::new(),
-            storage_read_cursors_enabled: false,
+            storage_cursors_enabled: false,
             db: None,
             func_registry: None,
             aggregates: HashMap::new(),
@@ -348,9 +353,14 @@ impl VdbeEngine {
         self.db.take()
     }
 
-    /// Enable/disable storage-backed cursor execution for `OpenRead` scans.
+    /// Enable/disable storage-backed cursor execution for `OpenRead`/`OpenWrite`.
+    pub fn enable_storage_cursors(&mut self, enabled: bool) {
+        self.storage_cursors_enabled = enabled;
+    }
+
+    /// Backwards-compatible alias for [`Self::enable_storage_cursors`].
     pub fn enable_storage_read_cursors(&mut self, enabled: bool) {
-        self.storage_read_cursors_enabled = enabled;
+        self.enable_storage_cursors(enabled);
     }
 
     /// Attach a function registry for `Function`/`PureFunc` opcode dispatch.
@@ -867,7 +877,7 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     let root_page = op.p2;
                     let writable = op.opcode == Opcode::OpenWrite;
-                    if !writable && self.open_storage_cursor(cursor_id, root_page) {
+                    if self.open_storage_cursor(cursor_id, root_page, writable) {
                         self.cursors.remove(&cursor_id);
                     } else {
                         self.storage_cursors.remove(&cursor_id);
@@ -1281,14 +1291,22 @@ impl VdbeEngine {
                     }
                 }
 
-                // ── Insert / Delete / NewRowid (in-memory) ──────────────
+                // ── Insert / Delete / NewRowid ──────────────────────────
                 Opcode::NewRowid => {
                     // Allocate a new rowid for cursor p1, store in register p2.
                     let cursor_id = op.p1;
                     let target = op.p2;
-                    let rowid = if let Some(cursor) = self.cursors.get(&cursor_id) {
+                    // Check storage cursor first, falling back to MemCursor.
+                    // Rowid is always allocated from MemTable's counter so
+                    // both the B-tree and MemDatabase stay in sync.
+                    let root = self
+                        .storage_cursors
+                        .get(&cursor_id)
+                        .map(|sc| sc.root_page)
+                        .or_else(|| self.cursors.get(&cursor_id).map(|c| c.root_page));
+                    let rowid = if let Some(root) = root {
                         if let Some(db) = self.db.as_mut() {
-                            if let Some(table) = db.get_table_mut(cursor.root_page) {
+                            if let Some(table) = db.get_table_mut(root) {
                                 table.alloc_rowid()
                             } else {
                                 1
@@ -1311,10 +1329,27 @@ impl VdbeEngine {
                     let rowid_reg = op.p3;
                     let rowid = self.get_reg(rowid_reg).to_integer();
                     let record_val = self.get_reg(record_reg).clone();
-                    // The record is stored as a Blob in SQLite record format (MakeRecord).
+                    // Phase 5: route through B-tree if a writable storage
+                    // cursor is active for this cursor id.
+                    let storage_root = if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
+                        if sc.writable {
+                            let blob = record_blob_bytes(&record_val);
+                            // UPSERT: delete existing row before insert.
+                            if sc.cursor.table_move_to(&sc.cx, rowid)?.is_found() {
+                                sc.cursor.delete(&sc.cx)?;
+                            }
+                            sc.cursor.table_insert(&sc.cx, rowid, &blob)?;
+                        }
+                        Some(sc.root_page)
+                    } else {
+                        None
+                    };
+                    // Sync to MemDatabase (dual-write during Phase 5 transition,
+                    // or pure in-memory path for Phase 4 cursors).
                     let values = decode_record(&record_val)?;
-                    if let Some(cursor) = self.cursors.get(&cursor_id) {
-                        let root = cursor.root_page;
+                    let root =
+                        storage_root.or_else(|| self.cursors.get(&cursor_id).map(|c| c.root_page));
+                    if let Some(root) = root {
                         if let Some(db) = self.db.as_mut() {
                             if let Some(table) = db.get_table_mut(root) {
                                 table.insert(rowid, values);
@@ -1326,11 +1361,32 @@ impl VdbeEngine {
 
                 Opcode::Delete => {
                     // Delete the row at the current cursor position.
-                    // Cursor position is left unchanged; the DELETE codegen
-                    // uses reverse iteration (Last/Prev) so removing a row
-                    // does not shift indices of unvisited (earlier) rows.
                     let cursor_id = op.p1;
-                    if let Some(cursor) = self.cursors.get(&cursor_id) {
+                    // Phase 5: route through B-tree if a writable storage
+                    // cursor is active.
+                    let storage_delete = if let Some(sc) = self.storage_cursors.get_mut(&cursor_id)
+                    {
+                        if sc.writable && !sc.cursor.eof() {
+                            let rowid = sc.cursor.rowid(&sc.cx)?;
+                            sc.cursor.delete(&sc.cx)?;
+                            Some((sc.root_page, rowid))
+                        } else {
+                            Some((sc.root_page, 0)) // has cursor but no-op
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some((root, rowid)) = storage_delete {
+                        // Sync deletion to MemDatabase (dual-write).
+                        if rowid != 0 {
+                            if let Some(db) = self.db.as_mut() {
+                                if let Some(table) = db.get_table_mut(root) {
+                                    table.delete_by_rowid(rowid);
+                                }
+                            }
+                        }
+                    } else if let Some(cursor) = self.cursors.get(&cursor_id) {
+                        // Pure in-memory path (Phase 4).
                         if let Some(pos) = cursor.position {
                             let root = cursor.root_page;
                             if let Some(db) = self.db.as_mut() {
@@ -1938,9 +1994,9 @@ impl VdbeEngine {
     }
 
     #[allow(clippy::cast_sign_loss)]
-    fn open_storage_cursor(&mut self, cursor_id: i32, root_page: i32) -> bool {
+    fn open_storage_cursor(&mut self, cursor_id: i32, root_page: i32, writable: bool) -> bool {
         const PAGE_SIZE: u32 = 4096;
-        if !self.storage_read_cursors_enabled {
+        if !self.storage_cursors_enabled {
             return false;
         }
         let Some(db) = self.db.as_ref() else {
@@ -1968,8 +2024,15 @@ impl VdbeEngine {
             }
         }
 
-        self.storage_cursors
-            .insert(cursor_id, StorageCursor { cursor, cx });
+        self.storage_cursors.insert(
+            cursor_id,
+            StorageCursor {
+                cursor,
+                cx,
+                writable,
+                root_page,
+            },
+        );
         true
     }
 
@@ -2004,6 +2067,14 @@ impl VdbeEngine {
 
 fn encode_record(values: &[SqliteValue]) -> Vec<u8> {
     serialize_record(values)
+}
+
+/// Extract the raw bytes from a record blob value (output of `MakeRecord`).
+fn record_blob_bytes(val: &SqliteValue) -> Vec<u8> {
+    match val {
+        SqliteValue::Blob(bytes) => bytes.clone(),
+        _ => Vec::new(),
+    }
 }
 
 fn decode_record(val: &SqliteValue) -> Result<Vec<SqliteValue>> {
@@ -5051,5 +5122,178 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0], vec![SqliteValue::Integer(42)]);
+    }
+
+    // ── bd-3iw8 / bd-25c6: Storage cursor WRITE path tests ────────────
+
+    /// Build and execute a write program with storage cursors enabled.
+    /// Returns both the result rows and the final MemDatabase state.
+    fn run_write_with_storage_cursors(
+        db: MemDatabase,
+        build: impl FnOnce(&mut ProgramBuilder),
+    ) -> (Vec<Vec<SqliteValue>>, MemDatabase) {
+        let mut b = ProgramBuilder::new();
+        build(&mut b);
+        let prog = b.finish().expect("program should build");
+        let mut engine = VdbeEngine::new(prog.register_count());
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        let outcome = engine.execute(&prog).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+        let results = engine.take_results();
+        let db = engine.take_database().expect("database should exist");
+        (results, db)
+    }
+
+    #[test]
+    fn test_openwrite_uses_storage_cursor_backend() {
+        // Verify OpenWrite routes through StorageCursor when enabled.
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).unwrap();
+        table.insert(1, vec![SqliteValue::Integer(100)]);
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let prog = b.finish().expect("program should build");
+        let mut engine = VdbeEngine::new(prog.register_count());
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        let outcome = engine.execute(&prog).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+        // Verify the cursor was opened as a storage cursor, not a MemCursor.
+        assert!(
+            engine.storage_cursors.contains_key(&0),
+            "OpenWrite should route through StorageCursor"
+        );
+        assert!(!engine.cursors.contains_key(&0));
+        // Verify it's marked writable.
+        assert!(engine.storage_cursors[&0].writable);
+    }
+
+    #[test]
+    fn test_insert_via_storage_cursor_write_path() {
+        // Insert a row through the B-tree write path and verify it's readable
+        // via the storage cursor AND synced to MemDatabase.
+        let mut db = MemDatabase::new();
+        let root = db.create_table(2);
+
+        let (_rows, final_db) = run_write_with_storage_cursors(db, |b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            // OpenWrite cursor 0 on root page.
+            b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(2), 0);
+
+            // NewRowid → r1.
+            b.emit_op(Opcode::NewRowid, 0, 1, 0, P4::None, 0);
+
+            // Build record: r2=42, r3="hello" → MakeRecord → r4.
+            b.emit_op(Opcode::Integer, 42, 2, 0, P4::None, 0);
+            b.emit_op(Opcode::String8, 0, 3, 0, P4::Str("hello".to_owned()), 0);
+            b.emit_op(Opcode::MakeRecord, 2, 2, 4, P4::None, 0);
+
+            // Insert(cursor=0, record=r4, rowid=r1).
+            b.emit_op(Opcode::Insert, 0, 4, 1, P4::None, 0);
+
+            // Now read it back: close write cursor, open read cursor.
+            b.emit_op(Opcode::Close, 0, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(2), 0);
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+
+            let body = b.current_addr();
+            b.emit_op(Opcode::Column, 0, 0, 5, P4::None, 0);
+            b.emit_op(Opcode::Column, 0, 1, 6, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 5, 2, 0, P4::None, 0);
+            let next_target =
+                i32::try_from(body).expect("program counter should fit into i32 for tests");
+            b.emit_op(Opcode::Next, 0, next_target, 0, P4::None, 0);
+
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        // MemDatabase should have the row (dual-write sync).
+        let table = final_db.get_table(root).expect("table should exist");
+        assert_eq!(table.rows.len(), 1);
+        assert_eq!(table.rows[0].rowid, 1);
+        assert_eq!(table.rows[0].values[0], SqliteValue::Integer(42));
+        assert_eq!(
+            table.rows[0].values[1],
+            SqliteValue::Text("hello".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_delete_via_storage_cursor_write_path() {
+        // Insert a row into MemDatabase, open a writable StorageCursor,
+        // position on it, delete it, verify MemDatabase is synced.
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).unwrap();
+        table.insert(1, vec![SqliteValue::Integer(10)]);
+        table.insert(2, vec![SqliteValue::Integer(20)]);
+        table.insert(3, vec![SqliteValue::Integer(30)]);
+
+        let (_, final_db) = run_write_with_storage_cursors(db, |b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            // Open writable cursor.
+            b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+
+            // Seek to rowid=2 (register 1). Jump to end if not found.
+            b.emit_op(Opcode::Integer, 2, 1, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SeekRowid, 0, 1, end, P4::None, 0);
+
+            // Delete the current row.
+            b.emit_op(Opcode::Delete, 0, 0, 0, P4::None, 0);
+
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        // MemDatabase should have only rows 1 and 3 remaining.
+        let table = final_db.get_table(root).expect("table should exist");
+        assert_eq!(table.rows.len(), 2);
+        let rowids: Vec<i64> = table.rows.iter().map(|r| r.rowid).collect();
+        assert!(rowids.contains(&1));
+        assert!(rowids.contains(&3));
+        assert!(!rowids.contains(&2));
+    }
+
+    #[test]
+    fn test_newrowid_with_storage_cursor_allocates_correctly() {
+        // Verify NewRowid allocates sequential rowids when using storage cursors.
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).unwrap();
+        table.insert(5, vec![SqliteValue::Integer(50)]);
+
+        let (rows, _) = run_write_with_storage_cursors(db, |b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+
+            // Allocate two new rowids and output them.
+            b.emit_op(Opcode::NewRowid, 0, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::NewRowid, 0, 2, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 2, 1, 0, P4::None, 0);
+
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        // The table had rowid 5 → next_rowid should be 6, then 7.
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], SqliteValue::Integer(6));
+        assert_eq!(rows[1][0], SqliteValue::Integer(7));
     }
 }

@@ -1,13 +1,44 @@
 {
-  "name": "brenner_bot",
-  "file_size_bytes": 8740864,
-  "page_size": 4096,
-  "page_count": 2134,
-  "freelist_count": 27,
   "schema_version": 1,
-  "journal_mode": "wal",
-  "user_version": 0,
-  "application_id": 0,
+  "db_id": "brenner_bot",
+  "source_path": null,
+  "golden_filename": "brenner_bot.db",
+  "sha256_golden": "83608b0c169dc42af87f742f3fb53f822bd395b676901f6754614fe795f8d771",
+  "size_bytes": 8740864,
+  "sidecars_present": [
+    "-wal",
+    "-shm"
+  ],
+  "sqlite_meta": {
+    "page_size": 4096,
+    "page_count": 2134,
+    "freelist_count": 27,
+    "schema_version": 1,
+    "encoding": "UTF-8",
+    "user_version": 0,
+    "application_id": 0,
+    "journal_mode": "wal",
+    "auto_vacuum": 0
+  },
+  "features": {
+    "has_wal_sidecars_observed": true,
+    "has_fts": false,
+    "has_rtree": false,
+    "has_triggers": false,
+    "has_views": true,
+    "has_foreign_keys": true
+  },
+  "tags": [
+    "large",
+    "many-indexes",
+    "misc",
+    "wal"
+  ],
+  "safety": {
+    "pii_risk": "unknown",
+    "secrets_risk": "unknown",
+    "allowed_for_ci": false
+  },
   "tables": [
     {
       "name": "blocked_issues_cache",

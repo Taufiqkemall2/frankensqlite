@@ -408,18 +408,18 @@ fn manifest_v1_matches_checksums_and_metadata() {
         let meta_json: serde_json::Value =
             serde_json::from_str(&meta_text).expect("metadata must be valid JSON");
 
-        let meta_size = meta_json["file_size_bytes"]
+        let meta_size = meta_json["size_bytes"]
             .as_u64()
-            .expect("metadata.file_size_bytes must be u64");
+            .expect("metadata.size_bytes must be u64");
         assert_eq!(
             size_bytes, meta_size,
             "manifest size_bytes mismatch for {db_id}"
         );
 
-        let meta_page_size = meta_json["page_size"]
+        let meta_page_size = meta_json["sqlite_meta"]["page_size"]
             .as_u64()
             .and_then(|n| u32::try_from(n).ok())
-            .expect("metadata.page_size must be u32");
+            .expect("metadata.sqlite_meta.page_size must be u32");
         let manifest_page_size = entry["sqlite_meta"]["page_size"]
             .as_u64()
             .and_then(|n| u32::try_from(n).ok())

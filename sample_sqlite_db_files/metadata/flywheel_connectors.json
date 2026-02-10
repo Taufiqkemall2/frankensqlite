@@ -1,13 +1,44 @@
 {
-  "name": "flywheel_connectors",
-  "file_size_bytes": 17813504,
-  "page_size": 4096,
-  "page_count": 4349,
-  "freelist_count": 54,
   "schema_version": 1,
-  "journal_mode": "wal",
-  "user_version": 0,
-  "application_id": 0,
+  "db_id": "flywheel_connectors",
+  "source_path": null,
+  "golden_filename": "flywheel_connectors.db",
+  "sha256_golden": "931a8e00ee2c38352041112d099ed422bba944c10949e5445b22558a1149d974",
+  "size_bytes": 17813504,
+  "sidecars_present": [
+    "-wal",
+    "-shm"
+  ],
+  "sqlite_meta": {
+    "page_size": 4096,
+    "page_count": 4349,
+    "freelist_count": 54,
+    "schema_version": 1,
+    "encoding": "UTF-8",
+    "user_version": 0,
+    "application_id": 0,
+    "journal_mode": "wal",
+    "auto_vacuum": 0
+  },
+  "features": {
+    "has_wal_sidecars_observed": true,
+    "has_fts": false,
+    "has_rtree": false,
+    "has_triggers": false,
+    "has_views": true,
+    "has_foreign_keys": true
+  },
+  "tags": [
+    "flywheel",
+    "large",
+    "many-indexes",
+    "wal"
+  ],
+  "safety": {
+    "pii_risk": "unlikely",
+    "secrets_risk": "unlikely",
+    "allowed_for_ci": true
+  },
   "tables": [
     {
       "name": "blocked_issues_cache",

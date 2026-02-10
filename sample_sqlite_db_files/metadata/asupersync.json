@@ -1,13 +1,44 @@
 {
-  "name": "asupersync",
-  "file_size_bytes": 12427264,
-  "page_size": 4096,
-  "page_count": 3034,
-  "freelist_count": 246,
   "schema_version": 1,
-  "journal_mode": "wal",
-  "user_version": 0,
-  "application_id": 0,
+  "db_id": "asupersync",
+  "source_path": null,
+  "golden_filename": "asupersync.db",
+  "sha256_golden": "8e91ff61cbbf4c63c68009e6dee7de0ac63f8e601d9555db3a4afbcb7f85acd0",
+  "size_bytes": 12427264,
+  "sidecars_present": [
+    "-wal",
+    "-shm"
+  ],
+  "sqlite_meta": {
+    "page_size": 4096,
+    "page_count": 3034,
+    "freelist_count": 246,
+    "schema_version": 1,
+    "encoding": "UTF-8",
+    "user_version": 0,
+    "application_id": 0,
+    "journal_mode": "wal",
+    "auto_vacuum": 0
+  },
+  "features": {
+    "has_wal_sidecars_observed": true,
+    "has_fts": false,
+    "has_rtree": false,
+    "has_triggers": false,
+    "has_views": true,
+    "has_foreign_keys": true
+  },
+  "tags": [
+    "asupersync",
+    "large",
+    "many-indexes",
+    "wal"
+  ],
+  "safety": {
+    "pii_risk": "unlikely",
+    "secrets_risk": "unlikely",
+    "allowed_for_ci": true
+  },
   "tables": [
     {
       "name": "blocked_issues_cache",

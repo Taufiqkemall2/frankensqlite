@@ -1,13 +1,44 @@
 {
-  "name": "coding_agent_session_search",
-  "file_size_bytes": 8044544,
-  "page_size": 4096,
-  "page_count": 1964,
-  "freelist_count": 0,
   "schema_version": 1,
-  "journal_mode": "wal",
-  "user_version": 0,
-  "application_id": 0,
+  "db_id": "coding_agent_session_search",
+  "source_path": null,
+  "golden_filename": "coding_agent_session_search.db",
+  "sha256_golden": "418628dd11d06b0d11fc1597e84a1bdcc4165a0f668640ad118321dce095e974",
+  "size_bytes": 8044544,
+  "sidecars_present": [
+    "-wal",
+    "-shm"
+  ],
+  "sqlite_meta": {
+    "page_size": 4096,
+    "page_count": 1964,
+    "freelist_count": 0,
+    "schema_version": 1,
+    "encoding": "UTF-8",
+    "user_version": 0,
+    "application_id": 0,
+    "journal_mode": "wal",
+    "auto_vacuum": 0
+  },
+  "features": {
+    "has_wal_sidecars_observed": true,
+    "has_fts": false,
+    "has_rtree": false,
+    "has_triggers": false,
+    "has_views": true,
+    "has_foreign_keys": true
+  },
+  "tags": [
+    "large",
+    "many-indexes",
+    "misc",
+    "wal"
+  ],
+  "safety": {
+    "pii_risk": "unknown",
+    "secrets_risk": "unknown",
+    "allowed_for_ci": false
+  },
   "tables": [
     {
       "name": "blocked_issues_cache",

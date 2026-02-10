@@ -591,9 +591,7 @@ fn profile_database(
     let has_foreign_keys = has_foreign_keys(&conn, &tables)?;
 
     let features = FixtureFeaturesV1 {
-        has_wal_sidecars_observed: sidecars_present
-            .iter()
-            .any(|s| s == "-wal" || s == "-shm"),
+        has_wal_sidecars_observed: sidecars_present.iter().any(|s| s == "-wal" || s == "-shm"),
         has_fts,
         has_rtree,
         has_triggers: !triggers.is_empty(),

@@ -4,6 +4,7 @@
 //! be present (they are git-ignored). It only reads git-tracked artifacts.
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -72,6 +73,10 @@ fn corpus_path(relative: &str) -> PathBuf {
     workspace_root().join(relative)
 }
 
+fn manifest_schema_path() -> PathBuf {
+    corpus_path("sample_sqlite_db_files/manifests/manifest.v1.schema.json")
+}
+
 fn is_db_id_first(b: u8) -> bool {
     matches!(b, b'a'..=b'z' | b'0'..=b'9')
 }
@@ -109,6 +114,32 @@ fn manifest_v1_exists_and_is_consistent() {
     );
 
     let manifest_raw = std::fs::read_to_string(&manifest_path).expect("read manifest.v1.json");
+
+    // Validate against the tracked JSON Schema (Draft 2020-12).
+    let schema_path = manifest_schema_path();
+    assert!(
+        schema_path.exists(),
+        "manifest schema must exist at {}",
+        schema_path.display()
+    );
+    let schema_raw = std::fs::read_to_string(&schema_path).expect("read manifest.v1.schema.json");
+    let schema_json: serde_json::Value =
+        serde_json::from_str(&schema_raw).expect("parse manifest.v1.schema.json");
+    let manifest_json: serde_json::Value =
+        serde_json::from_str(&manifest_raw).expect("parse manifest.v1.json as raw JSON");
+
+    let validator = jsonschema::options()
+        .with_draft(jsonschema::Draft::Draft202012)
+        .build(&schema_json)
+        .expect("build JSON Schema validator");
+    if let Err(first) = validator.validate(&manifest_json) {
+        let mut msg = String::new();
+        for err in validator.iter_errors(&manifest_json) {
+            let _ = writeln!(msg, "- {err}");
+        }
+        panic!("manifest.v1.json failed schema validation (first error: {first})\n{msg}");
+    }
+
     let manifest: ManifestV1 = serde_json::from_str(&manifest_raw).expect("parse manifest.v1.json");
 
     assert_eq!(manifest.manifest_version, 1, "manifest_version must be 1");

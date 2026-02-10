@@ -44,6 +44,7 @@ pub struct FixtureSafetyV1 {
 }
 
 /// Feature flags derived from schema inspection.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FixtureFeaturesV1 {
     pub has_wal_sidecars_observed: bool,

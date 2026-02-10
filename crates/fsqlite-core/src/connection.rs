@@ -1,13 +1,15 @@
-//! SQL connection API for the Phase 4 query pipeline.
+//! SQL connection API with Phase 5 pager/WAL/B-tree storage wiring.
 //!
 //! Supports expression-only SELECT statements as well as table-backed DML:
-//! CREATE TABLE, INSERT, SELECT (with FROM), UPDATE, and DELETE. All table
-//! storage uses the in-memory `MemDatabase` backend until the B-tree layer
-//! is wired in Phase 5.
+//! CREATE TABLE, INSERT, SELECT (with FROM), UPDATE, and DELETE. Table
+//! storage currently uses the in-memory `MemDatabase` backend for execution,
+//! while a [`PagerBackend`] is initialized alongside for future Phase 5
+//! sub-tasks (bd-1dqg, bd-25c6) that will wire the transaction lifecycle
+//! and cursor paths through the real storage stack.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -18,7 +20,11 @@ use fsqlite_ast::{
 };
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::FunctionRegistry;
+use fsqlite_pager::SimplePager;
+use fsqlite_pager::traits::{MvccPager, TransactionHandle, TransactionMode};
 use fsqlite_parser::Parser;
+use fsqlite_types::PageSize;
+use fsqlite_types::cx::Cx;
 use fsqlite_types::opcode::{Opcode, P4};
 use fsqlite_types::value::SqliteValue;
 use fsqlite_vdbe::codegen::{
@@ -27,6 +33,80 @@ use fsqlite_vdbe::codegen::{
 };
 use fsqlite_vdbe::engine::{ExecOutcome, MemDatabase, VdbeEngine};
 use fsqlite_vdbe::{ProgramBuilder, VdbeProgram};
+use fsqlite_vfs::MemoryVfs;
+#[cfg(unix)]
+use fsqlite_vfs::UnixVfs;
+
+// ---------------------------------------------------------------------------
+// Phase 5: Pager backend abstraction (bd-3iw8)
+// ---------------------------------------------------------------------------
+
+/// Pager backend that dispatches across VFS implementations.
+///
+/// Wraps [`SimplePager`] for both in-memory (`:memory:`) and on-disk
+/// (Unix filesystem) connections without making [`Connection`] generic.
+///
+/// # Future sub-tasks
+///
+/// - **bd-1dqg**: Wire `begin()` / `commit()` / `rollback()` through the
+///   pager transaction lifecycle.
+/// - **bd-25c6**: Wire `OpenWrite` opcode through `StorageCursor` to the
+///   B-tree write path using [`TransactionPageIo`].
+#[allow(dead_code)] // Fields used by upcoming sub-tasks bd-1dqg and bd-25c6
+pub enum PagerBackend {
+    /// In-memory VFS backend (`:memory:` databases).
+    Memory(Arc<SimplePager<MemoryVfs>>),
+    /// Unix filesystem VFS backend (file-backed databases).
+    #[cfg(unix)]
+    Unix(Arc<SimplePager<UnixVfs>>),
+}
+
+impl std::fmt::Debug for PagerBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Memory(_) => f.write_str("PagerBackend::Memory"),
+            #[cfg(unix)]
+            Self::Unix(_) => f.write_str("PagerBackend::Unix"),
+        }
+    }
+}
+
+impl PagerBackend {
+    /// Open a pager for the given path.
+    ///
+    /// Uses [`MemoryVfs`] for `:memory:` and [`UnixVfs`] for file paths.
+    fn open(path: &str) -> Result<Self> {
+        if path == ":memory:" {
+            let vfs = MemoryVfs::new();
+            let db_path = PathBuf::from("/:memory:");
+            let pager = SimplePager::open(vfs, &db_path, PageSize::DEFAULT)?;
+            Ok(Self::Memory(Arc::new(pager)))
+        } else {
+            #[cfg(unix)]
+            {
+                let vfs = UnixVfs::new();
+                let db_path = PathBuf::from(path);
+                let pager = SimplePager::open(vfs, &db_path, PageSize::DEFAULT)?;
+                Ok(Self::Unix(Arc::new(pager)))
+            }
+            #[cfg(not(unix))]
+            {
+                Err(FrankenError::NotImplemented(
+                    "file-backed pager not available on this platform".to_owned(),
+                ))
+            }
+        }
+    }
+
+    /// Begin a new transaction.
+    fn begin(&self, cx: &Cx, mode: TransactionMode) -> Result<Box<dyn TransactionHandle>> {
+        match self {
+            Self::Memory(p) => Ok(Box::new(p.begin(cx, mode)?)),
+            #[cfg(unix)]
+            Self::Unix(p) => Ok(Box::new(p.begin(cx, mode)?)),
+        }
+    }
+}
 
 /// Build a [`FunctionRegistry`] populated with all built-in scalar,
 /// aggregate, datetime, and math functions.
@@ -219,7 +299,16 @@ struct SavepointEntry {
 pub struct Connection {
     path: String,
     /// In-memory table storage (shared with the VDBE engine during execution).
+    /// Will be gradually replaced by pager-backed storage in Phase 5 sub-tasks.
     db: Rc<RefCell<MemDatabase>>,
+    /// Phase 5 pager backend (bd-3iw8). Initialized for all connections;
+    /// sub-tasks bd-1dqg (transaction lifecycle) and bd-25c6 (write path)
+    /// will wire this into the execution pipeline.
+    #[allow(dead_code)] // Used by upcoming sub-tasks
+    pager: PagerBackend,
+    /// Active transaction handle (Phase 5/bd-1dqg).
+    /// Stores the pager transaction state during BEGIN/COMMIT/ROLLBACK.
+    active_txn: RefCell<Option<Box<dyn TransactionHandle>>>,
     /// Schema registry: table metadata used by the code generator.
     schema: RefCell<Vec<TableSchema>>,
     /// Scalar/aggregate/window function registry shared with the VDBE engine.
@@ -275,9 +364,17 @@ impl Connection {
             });
         }
         let persist_path = (path != ":memory:").then(|| path.clone());
+
+        // Phase 5 (bd-3iw8): initialize the pager backend alongside
+        // the MemDatabase. Sub-tasks bd-1dqg and bd-25c6 will wire
+        // transaction lifecycle and cursor paths through this pager.
+        let pager = PagerBackend::open(&path)?;
+
         let conn = Self {
             path,
             db: Rc::new(RefCell::new(MemDatabase::new())),
+            pager,
+            active_txn: RefCell::new(None),
             schema: RefCell::new(Vec::new()),
             func_registry: default_function_registry(),
             in_transaction: RefCell::new(false),
@@ -639,6 +736,21 @@ impl Connection {
             None => *self.concurrent_mode_default.borrow(),
         };
 
+        // Map AST mode to Pager mode.
+        let pager_mode = match begin.mode {
+            Some(fsqlite_ast::TransactionMode::Immediate) => TransactionMode::Immediate,
+            Some(fsqlite_ast::TransactionMode::Exclusive) => TransactionMode::Exclusive,
+            // Concurrent is deferred-start in Pager V1.
+            Some(
+                fsqlite_ast::TransactionMode::Deferred | fsqlite_ast::TransactionMode::Concurrent,
+            )
+            | None => TransactionMode::Deferred,
+        };
+
+        let cx = Cx::new();
+        let txn = self.pager.begin(&cx, pager_mode)?;
+        *self.active_txn.borrow_mut() = Some(txn);
+
         *self.txn_snapshot.borrow_mut() = Some(self.snapshot());
         *self.in_transaction.borrow_mut() = true;
         *self.concurrent_txn.borrow_mut() = is_concurrent;
@@ -652,6 +764,20 @@ impl Connection {
                 "cannot commit - no transaction is active".to_owned(),
             ));
         }
+
+        let cx = Cx::new();
+        // Attempt commit without consuming the handle (retriable on BUSY).
+        // We use a scope to limit the mutable borrow of active_txn.
+        {
+            let mut txn_guard = self.active_txn.borrow_mut();
+            if let Some(txn) = txn_guard.as_mut() {
+                txn.commit(&cx)?;
+            }
+        }
+
+        // Commit succeeded; now consume and drop the handle.
+        *self.active_txn.borrow_mut() = None;
+
         // Discard rollback snapshot and savepoints — changes are committed.
         *self.txn_snapshot.borrow_mut() = None;
         self.savepoints.borrow_mut().clear();
@@ -663,9 +789,14 @@ impl Connection {
 
     /// Handle ROLLBACK [TO SAVEPOINT name].
     fn execute_rollback(&self, rb: &fsqlite_ast::RollbackStatement) -> Result<()> {
+        let cx = Cx::new();
         if let Some(ref sp_name) = rb.to_savepoint {
             // ROLLBACK TO SAVEPOINT: restore to the named savepoint's snapshot
             // but keep the savepoint (don't pop it).
+            if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
+                txn.rollback_to_savepoint(&cx, sp_name)?;
+            }
+
             let savepoints = self.savepoints.borrow();
             let entry = savepoints
                 .iter()
@@ -682,6 +813,11 @@ impl Connection {
                     "cannot rollback - no transaction is active".to_owned(),
                 ));
             }
+
+            if let Some(mut txn) = self.active_txn.borrow_mut().take() {
+                txn.rollback(&cx)?;
+            }
+
             let snap = self.txn_snapshot.borrow().clone();
             if let Some(snap) = &snap {
                 self.restore_snapshot(snap);
@@ -698,12 +834,21 @@ impl Connection {
     /// Handle SAVEPOINT name.
     #[allow(clippy::unnecessary_wraps)] // will return errors once pager is wired
     fn execute_savepoint(&self, name: &str) -> Result<()> {
+        let cx = Cx::new();
         // If no explicit transaction, implicitly begin one.
         if !*self.in_transaction.borrow() {
+            let txn = self.pager.begin(&cx, TransactionMode::Deferred)?;
+            *self.active_txn.borrow_mut() = Some(txn);
+
             *self.txn_snapshot.borrow_mut() = Some(self.snapshot());
             *self.in_transaction.borrow_mut() = true;
             *self.implicit_txn.borrow_mut() = true;
         }
+
+        if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
+            txn.savepoint(&cx, name)?;
+        }
+
         self.savepoints.borrow_mut().push(SavepointEntry {
             name: name.to_owned(),
             snapshot: self.snapshot(),
@@ -713,6 +858,11 @@ impl Connection {
 
     /// Handle RELEASE \[SAVEPOINT\] name.
     fn execute_release(&self, name: &str) -> Result<()> {
+        let cx = Cx::new();
+        if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
+            txn.release_savepoint(&cx, name)?;
+        }
+
         let mut savepoints = self.savepoints.borrow_mut();
         let idx = savepoints
             .iter()
@@ -725,6 +875,10 @@ impl Connection {
             drop(savepoints);
             // Implicit transaction via savepoint: commit on final release.
             // (If the user did explicit BEGIN, they still need COMMIT.)
+            if let Some(mut txn) = self.active_txn.borrow_mut().take() {
+                txn.commit(&cx)?;
+            }
+
             *self.txn_snapshot.borrow_mut() = None;
             *self.in_transaction.borrow_mut() = false;
             *self.implicit_txn.borrow_mut() = false;
@@ -4614,5 +4768,201 @@ mod tests {
         // Set on, check return.
         let rows = conn.query("PRAGMA concurrent_mode=ON;").unwrap();
         assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(1));
+    }
+}
+
+#[cfg(test)]
+mod transaction_lifecycle_tests {
+    use super::*;
+
+    fn new_conn() -> Connection {
+        Connection::open(":memory:").unwrap()
+    }
+
+    #[test]
+    fn test_lifecycle_begin_commit() {
+        let conn = new_conn();
+        assert!(!conn.in_transaction());
+
+        conn.execute("BEGIN").unwrap();
+        assert!(conn.in_transaction());
+        assert!(conn.active_txn.borrow().is_some());
+
+        conn.execute("COMMIT").unwrap();
+        assert!(!conn.in_transaction());
+        assert!(conn.active_txn.borrow().is_none());
+    }
+
+    #[test]
+    fn test_lifecycle_begin_rollback() {
+        let conn = new_conn();
+        conn.execute("BEGIN").unwrap();
+        assert!(conn.in_transaction());
+
+        conn.execute("ROLLBACK").unwrap();
+        assert!(!conn.in_transaction());
+        assert!(conn.active_txn.borrow().is_none());
+    }
+
+    #[test]
+    fn test_lifecycle_nested_begin_fails() {
+        let conn = new_conn();
+        conn.execute("BEGIN").unwrap();
+        let result = conn.execute("BEGIN");
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "internal error: cannot start a transaction within a transaction"
+        );
+    }
+
+    #[test]
+    fn test_lifecycle_commit_no_txn_fails() {
+        let conn = new_conn();
+        let result = conn.execute("COMMIT");
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "internal error: cannot commit - no transaction is active"
+        );
+    }
+
+    #[test]
+    fn test_lifecycle_rollback_no_txn_fails() {
+        let conn = new_conn();
+        let result = conn.execute("ROLLBACK");
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "internal error: cannot rollback - no transaction is active"
+        );
+    }
+
+    #[test]
+    fn test_lifecycle_savepoint_implicit_txn() {
+        let conn = new_conn();
+        assert!(!conn.in_transaction());
+
+        // SAVEPOINT should start a transaction implicitly (deferred).
+        conn.execute("SAVEPOINT sp1").unwrap();
+        assert!(conn.in_transaction());
+        assert!(conn.active_txn.borrow().is_some());
+
+        // RELEASE should commit it.
+        conn.execute("RELEASE sp1").unwrap();
+        assert!(!conn.in_transaction());
+        assert!(conn.active_txn.borrow().is_none());
+    }
+
+    #[test]
+    fn test_lifecycle_rollback_to_savepoint() {
+        let conn = new_conn();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("SAVEPOINT sp1").unwrap();
+
+        // This should invoke rollback_to_savepoint on the txn
+        conn.execute("ROLLBACK TO sp1").unwrap();
+
+        // Transaction should still be active
+        assert!(conn.in_transaction());
+
+        conn.execute("COMMIT").unwrap();
+        assert!(!conn.in_transaction());
+    }
+
+    // -----------------------------------------------------------------------
+    // File-backed persistence tests (bd-1dqg acceptance criteria)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_persist_begin_insert_commit_visible_to_new_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_str = db_path.to_str().unwrap();
+
+        // First connection: create, insert, commit.
+        {
+            let conn = Connection::open(db_str).unwrap();
+            conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+            conn.execute("BEGIN").unwrap();
+            conn.execute("INSERT INTO t VALUES (42)").unwrap();
+            conn.execute("COMMIT").unwrap();
+        }
+
+        // Second connection: data must be visible.
+        {
+            let conn = Connection::open(db_str).unwrap();
+            let rows = conn.query("SELECT x FROM t").unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].get(0).unwrap(),
+                &fsqlite_types::value::SqliteValue::Integer(42)
+            );
+        }
+    }
+
+    #[test]
+    fn test_persist_begin_insert_rollback_no_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_str = db_path.to_str().unwrap();
+
+        // Create the table (outside any explicit transaction).
+        {
+            let conn = Connection::open(db_str).unwrap();
+            conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+        }
+
+        // Begin, insert, then rollback.
+        {
+            let conn = Connection::open(db_str).unwrap();
+            conn.execute("BEGIN").unwrap();
+            conn.execute("INSERT INTO t VALUES (99)").unwrap();
+            conn.execute("ROLLBACK").unwrap();
+
+            // Within the same connection, data should be gone.
+            let rows = conn.query("SELECT x FROM t").unwrap();
+            assert!(rows.is_empty(), "rollback should discard INSERT");
+        }
+
+        // Re-open: data should still be gone.
+        {
+            let conn = Connection::open(db_str).unwrap();
+            let rows = conn.query("SELECT x FROM t").unwrap();
+            assert!(rows.is_empty(), "rolled-back data must not persist to disk");
+        }
+    }
+
+    #[test]
+    fn test_persist_multiple_commits_accumulate() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_str = db_path.to_str().unwrap();
+
+        {
+            let conn = Connection::open(db_str).unwrap();
+            conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+            conn.execute("BEGIN").unwrap();
+            conn.execute("INSERT INTO t VALUES (1)").unwrap();
+            conn.execute("COMMIT").unwrap();
+
+            conn.execute("BEGIN").unwrap();
+            conn.execute("INSERT INTO t VALUES (2)").unwrap();
+            conn.execute("COMMIT").unwrap();
+        }
+
+        {
+            let conn = Connection::open(db_str).unwrap();
+            let rows = conn.query("SELECT x FROM t ORDER BY x").unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(
+                rows[0].get(0).unwrap(),
+                &fsqlite_types::value::SqliteValue::Integer(1)
+            );
+            assert_eq!(
+                rows[1].get(0).unwrap(),
+                &fsqlite_types::value::SqliteValue::Integer(2)
+            );
+        }
     }
 }
