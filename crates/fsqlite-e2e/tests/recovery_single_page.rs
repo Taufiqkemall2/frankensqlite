@@ -326,6 +326,10 @@ fn test_decode_proof_artifact_emitted() {
     let (_, result) = attempt_page_repair(target, &meta, &read_fn, &syms).expect("repair");
 
     // Verify DecodeProof fields are present and correct.
+    assert!(
+        matches!(result, RepairResult::Repaired { .. }),
+        "expected Repaired result, got {result:?}"
+    );
     if let RepairResult::Repaired { pgno, symbols_used } = result {
         assert_eq!(pgno, target);
         assert!(symbols_used > 0, "must use at least one symbol");
@@ -339,8 +343,6 @@ fn test_decode_proof_artifact_emitted() {
             "DecodeProof: pgno={pgno}, symbols_used={symbols_used}, K={}, R={}",
             meta.group_size, meta.r_repair
         );
-    } else {
-        panic!("expected Repaired result, got {result:?}");
     }
 }
 
@@ -639,17 +641,18 @@ fn test_multi_page_cross_group_independent_recovery() {
         let read_fn = |pgno: u32| -> Vec<u8> { read_page(&corrupt_snapshot, pgno, ps) };
         let result = attempt_page_repair(target_pgno, &meta, &read_fn, &syms);
 
-        match result {
-            Ok((recovered, RepairResult::Repaired { pgno, .. })) => {
-                assert_eq!(pgno, target_pgno);
-                assert_eq!(
-                    recovered, original_page,
-                    "page {target_pgno}: recovered data must match original"
-                );
-                write_page(&mut corrupt_db, target_pgno, ps, &recovered);
-                repaired_count += 1;
-            }
-            other => panic!("page {target_pgno}: expected Repaired, got {other:?}"),
+        assert!(
+            matches!(&result, Ok((_, RepairResult::Repaired { .. }))),
+            "page {target_pgno}: expected Repaired, got {result:?}"
+        );
+        if let Ok((recovered, RepairResult::Repaired { pgno, .. })) = result {
+            assert_eq!(pgno, target_pgno);
+            assert_eq!(
+                recovered, original_page,
+                "page {target_pgno}: recovered data must match original"
+            );
+            write_page(&mut corrupt_db, target_pgno, ps, &recovered);
+            repaired_count += 1;
         }
     }
 

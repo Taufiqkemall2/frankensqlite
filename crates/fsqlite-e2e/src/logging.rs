@@ -212,7 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn test_logging_json_format() {
+    fn test_logging_json_format() -> Result<(), Box<dyn std::error::Error>> {
         let tmp = tempfile::TempDir::new().unwrap();
         let log_path = tmp.path().join("test.log.jsonl");
         let (subscriber, _) = scoped_json_subscriber(&log_path);
@@ -226,13 +226,18 @@ mod tests {
             if line.trim().is_empty() {
                 continue;
             }
-            let parsed: serde_json::Value = serde_json::from_str(line)
-                .unwrap_or_else(|e| panic!("invalid JSON in log: {e}\nline: {line}"));
+            let parsed: serde_json::Value = serde_json::from_str(line).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid JSON in log: {e}\nline: {line}"),
+                )
+            })?;
             assert!(
                 parsed.get("level").is_some(),
                 "log event missing 'level' field: {parsed}"
             );
         }
+        Ok(())
     }
 
     #[test]

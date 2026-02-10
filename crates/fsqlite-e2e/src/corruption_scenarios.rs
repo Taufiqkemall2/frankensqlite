@@ -459,12 +459,10 @@ mod tests {
 
         // WalAllFrames
         let pat = ScenarioCorruptionPattern::WalAllFrames;
-        if let CorruptionPattern::WalFrameCorrupt { frame_numbers, .. } =
-            pat.to_corruption_pattern(99, 5)
-        {
+        let cp = pat.to_corruption_pattern(99, 5);
+        assert!(matches!(cp, CorruptionPattern::WalFrameCorrupt { .. }));
+        if let CorruptionPattern::WalFrameCorrupt { frame_numbers, .. } = cp {
             assert_eq!(frame_numbers, vec![0, 1, 2, 3, 4]);
-        } else {
-            panic!("expected WalFrameCorrupt");
         }
 
         // DbHeaderZero

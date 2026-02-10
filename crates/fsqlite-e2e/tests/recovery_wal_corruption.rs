@@ -342,8 +342,12 @@ fn test_wal_fec_intact_fast_path() {
         .collect();
 
     // Decoder should NOT be called (fast path).
+    let decode_called = std::sync::atomic::AtomicBool::new(false);
     let decoder = |_meta: &WalFecGroupMeta, _available: &[(u32, Vec<u8>)]| {
-        panic!("decoder should not be called for intact WAL");
+        decode_called.store(true, std::sync::atomic::Ordering::Relaxed);
+        Err(fsqlite_error::FrankenError::Internal(
+            "decoder called unexpectedly for intact WAL".to_owned(),
+        ))
     };
 
     let outcome = recover_wal_fec_group_with_decoder(
@@ -359,6 +363,10 @@ fn test_wal_fec_intact_fast_path() {
     assert!(
         matches!(outcome, WalFecRecoveryOutcome::Recovered(_)),
         "intact WAL must take fast path"
+    );
+    assert!(
+        !decode_called.load(std::sync::atomic::Ordering::Relaxed),
+        "decoder should not be called for intact WAL"
     );
 
     if let WalFecRecoveryOutcome::Recovered(recovered) = outcome {
@@ -412,8 +420,12 @@ fn test_wal_fec_salt_mismatch_rejection() {
         })
         .collect();
 
+    let decode_called = std::sync::atomic::AtomicBool::new(false);
     let decoder = |_meta: &WalFecGroupMeta, _available: &[(u32, Vec<u8>)]| {
-        panic!("decoder should not be called with wrong salts");
+        decode_called.store(true, std::sync::atomic::Ordering::Relaxed);
+        Err(fsqlite_error::FrankenError::Internal(
+            "decoder called unexpectedly with wrong salts".to_owned(),
+        ))
     };
 
     let outcome = recover_wal_fec_group_with_decoder(
@@ -426,15 +438,18 @@ fn test_wal_fec_salt_mismatch_rejection() {
     )
     .expect("recovery should return outcome, not error");
 
-    match outcome {
-        WalFecRecoveryOutcome::TruncateBeforeGroup { decode_proof, .. } => {
-            eprintln!(
-                "OK: WAL-FEC salt mismatch correctly rejected: {:?}",
-                decode_proof.fallback_reason
-            );
-        }
-        WalFecRecoveryOutcome::Recovered(_) => {
-            panic!("recovery should NOT succeed with wrong salts");
-        }
+    assert!(
+        matches!(outcome, WalFecRecoveryOutcome::TruncateBeforeGroup { .. }),
+        "expected truncation on wrong salts, got {outcome:?}"
+    );
+    assert!(
+        !decode_called.load(std::sync::atomic::Ordering::Relaxed),
+        "decoder should not be called with wrong salts"
+    );
+    if let WalFecRecoveryOutcome::TruncateBeforeGroup { decode_proof, .. } = outcome {
+        eprintln!(
+            "OK: WAL-FEC salt mismatch correctly rejected: {:?}",
+            decode_proof.fallback_reason
+        );
     }
 }

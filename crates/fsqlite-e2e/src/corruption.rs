@@ -487,7 +487,7 @@ pub enum CorruptionStrategy {
     RandomBitFlip { count: usize },
     /// Zero out a range of bytes at the given offset.
     ZeroRange { offset: usize, length: usize },
-    /// Corrupt an entire page (4096-byte aligned).
+    /// Corrupt an entire page (4096-byte aligned, 1-indexed page number).
     PageCorrupt { page_number: u32 },
 }
 
@@ -525,12 +525,35 @@ pub fn inject_corruption(path: &Path, strategy: CorruptionStrategy, seed: u64) -
         }
         CorruptionStrategy::PageCorrupt { page_number } => {
             let page_size = 4096usize;
-            let start = page_number as usize * page_size;
-            let end = (start + page_size).min(data.len());
-            if start < data.len() {
-                for byte in &mut data[start..end] {
-                    *byte = rng.r#gen();
-                }
+
+            let Some(page_index) = page_number.checked_sub(1) else {
+                return Err(E2eError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "page_number must be >= 1",
+                )));
+            };
+
+            let Some(start) = (page_index as usize).checked_mul(page_size) else {
+                return Err(E2eError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "page offset overflow",
+                )));
+            };
+            let Some(end) = start.checked_add(page_size) else {
+                return Err(E2eError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "page end overflow",
+                )));
+            };
+            if end > data.len() {
+                return Err(E2eError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("page {page_number} beyond file end"),
+                )));
+            }
+
+            for byte in &mut data[start..end] {
+                *byte = rng.r#gen();
             }
         }
     }
