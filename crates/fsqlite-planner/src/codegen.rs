@@ -824,10 +824,33 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32) {
             Literal::Integer(n) => {
                 b.emit_op(Opcode::Integer, *n as i32, reg, 0, P4::None, 0);
             }
+            Literal::Float(f) => {
+                b.emit_op(Opcode::Real, 0, reg, 0, P4::Real(*f), 0);
+            }
             Literal::String(s) => {
                 b.emit_op(Opcode::String8, 0, reg, 0, P4::Str(s.clone()), 0);
             }
-            _ => {
+            Literal::Blob(bytes) => {
+                b.emit_op(
+                    Opcode::Blob,
+                    bytes.len() as i32,
+                    reg,
+                    0,
+                    P4::Blob(bytes.clone()),
+                    0,
+                );
+            }
+            Literal::Null => {
+                b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+            }
+            Literal::True => {
+                b.emit_op(Opcode::Integer, 1, reg, 0, P4::None, 0);
+            }
+            Literal::False => {
+                b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
+            }
+            Literal::CurrentTime | Literal::CurrentDate | Literal::CurrentTimestamp => {
+                // Placeholder: emit NULL for now (datetime functions handle these).
                 b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
             }
         },
@@ -852,7 +875,7 @@ mod tests {
     use super::*;
     use fsqlite_ast::{
         Assignment, AssignmentTarget, BinaryOp as AstBinaryOp, ColumnRef, DeleteStatement,
-        Distinctness, Expr, FromClause, InsertSource, InsertStatement, PlaceholderType,
+        Distinctness, Expr, FromClause, InsertSource, InsertStatement, Literal, PlaceholderType,
         QualifiedName, QualifiedTableRef, ResultColumn, SelectBody, SelectCore, SelectStatement,
         Span, TableOrSubquery, UpdateStatement,
     };
@@ -995,6 +1018,95 @@ mod tests {
             }
         }
         true
+    }
+
+    #[test]
+    fn test_emit_expr_literals() {
+        let mut b = ProgramBuilder::new();
+
+        let reg_real = b.alloc_reg();
+        emit_expr(
+            &mut b,
+            &Expr::Literal(Literal::Float(3.25), Span::ZERO),
+            reg_real,
+        );
+
+        let reg_blob = b.alloc_reg();
+        emit_expr(
+            &mut b,
+            &Expr::Literal(Literal::Blob(vec![0, 1, 2, 3]), Span::ZERO),
+            reg_blob,
+        );
+
+        let reg_null = b.alloc_reg();
+        emit_expr(&mut b, &Expr::Literal(Literal::Null, Span::ZERO), reg_null);
+
+        let reg_true = b.alloc_reg();
+        emit_expr(&mut b, &Expr::Literal(Literal::True, Span::ZERO), reg_true);
+
+        let reg_false = b.alloc_reg();
+        emit_expr(
+            &mut b,
+            &Expr::Literal(Literal::False, Span::ZERO),
+            reg_false,
+        );
+
+        let reg_current_time = b.alloc_reg();
+        emit_expr(
+            &mut b,
+            &Expr::Literal(Literal::CurrentTime, Span::ZERO),
+            reg_current_time,
+        );
+
+        let reg_current_date = b.alloc_reg();
+        emit_expr(
+            &mut b,
+            &Expr::Literal(Literal::CurrentDate, Span::ZERO),
+            reg_current_date,
+        );
+
+        let reg_current_timestamp = b.alloc_reg();
+        emit_expr(
+            &mut b,
+            &Expr::Literal(Literal::CurrentTimestamp, Span::ZERO),
+            reg_current_timestamp,
+        );
+
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+        assert_eq!(ops.len(), 8);
+
+        assert_eq!(ops[0].opcode, Opcode::Real);
+        assert_eq!(ops[0].p2, reg_real);
+        assert_eq!(ops[0].p4, P4::Real(3.25));
+
+        assert_eq!(ops[1].opcode, Opcode::Blob);
+        assert_eq!(ops[1].p1, 4);
+        assert_eq!(ops[1].p2, reg_blob);
+        assert_eq!(ops[1].p4, P4::Blob(vec![0, 1, 2, 3]));
+
+        assert_eq!(ops[2].opcode, Opcode::Null);
+        assert_eq!(ops[2].p2, reg_null);
+        assert_eq!(ops[2].p4, P4::None);
+
+        assert_eq!(ops[3].opcode, Opcode::Integer);
+        assert_eq!(ops[3].p1, 1);
+        assert_eq!(ops[3].p2, reg_true);
+        assert_eq!(ops[3].p4, P4::None);
+
+        assert_eq!(ops[4].opcode, Opcode::Integer);
+        assert_eq!(ops[4].p1, 0);
+        assert_eq!(ops[4].p2, reg_false);
+        assert_eq!(ops[4].p4, P4::None);
+
+        assert_eq!(ops[5].opcode, Opcode::Null);
+        assert_eq!(ops[5].p2, reg_current_time);
+
+        assert_eq!(ops[6].opcode, Opcode::Null);
+        assert_eq!(ops[6].p2, reg_current_date);
+
+        assert_eq!(ops[7].opcode, Opcode::Null);
+        assert_eq!(ops[7].p2, reg_current_timestamp);
     }
 
     // === Test 1: SELECT by rowid ===

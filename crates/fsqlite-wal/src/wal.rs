@@ -48,9 +48,10 @@ impl<F: VfsFile> WalFile<F> {
     }
 
     /// Byte offset of frame `index` (0-based) within the WAL file.
+    #[allow(clippy::cast_possible_truncation)]
     fn frame_offset(&self, index: usize) -> u64 {
-        let offset = WAL_HEADER_SIZE + index * self.frame_size();
-        u64::try_from(offset).expect("WAL frame offset must fit in u64")
+        // Compute in u64 to prevent usize overflow on 32-bit targets.
+        WAL_HEADER_SIZE as u64 + index as u64 * self.frame_size() as u64
     }
 
     /// Number of valid frames in the WAL.
@@ -170,8 +171,9 @@ impl<F: VfsFile> WalFile<F> {
         let mut frame_buf = vec![0u8; frame_size];
 
         for frame_index in 0..max_frames {
-            let offset = WAL_HEADER_SIZE + frame_index * frame_size;
-            let file_offset = u64::try_from(offset).expect("frame offset fits u64");
+            // Compute in u64 to prevent usize overflow on 32-bit targets.
+            #[allow(clippy::cast_possible_truncation)]
+            let file_offset = WAL_HEADER_SIZE as u64 + frame_index as u64 * frame_size as u64;
             let bytes_read = file.read(cx, &mut frame_buf, file_offset)?;
             if bytes_read < frame_size {
                 break; // truncated frame
