@@ -325,15 +325,11 @@ fn mixed_dml_logical_state_hash() {
     assert!(!hash.frank_sha256.is_empty(), "FrankenSQLite hash empty");
     assert!(!hash.csqlite_sha256.is_empty(), "C SQLite hash empty");
 
-    // TODO: assert!(hash.matched) once FrankenSQLite rowid ordering matches
-    // C SQLite for `SELECT * FROM <table> ORDER BY 1` on the in-memory backend.
-    if !hash.matched {
-        eprintln!(
-            "NOTE: logical state hash mismatch (known rowid ordering divergence):\n  \
-             frank={}\n  csqlite={}",
-            hash.frank_sha256, hash.csqlite_sha256
-        );
-    }
+    assert!(
+        hash.matched,
+        "logical state hash mismatch:\n  frank={}\n  csqlite={}",
+        hash.frank_sha256, hash.csqlite_sha256
+    );
 }
 
 #[test]
