@@ -1067,7 +1067,10 @@ fn file_size_and_mtime(path: &Path) -> (Option<u64>, Option<u64>) {
     let Ok(meta) = fs::metadata(path) else {
         return (None, None);
     };
-    (Some(meta.len()), system_time_to_unix_ms(meta.modified().ok()))
+    (
+        Some(meta.len()),
+        system_time_to_unix_ms(meta.modified().ok()),
+    )
 }
 
 fn system_time_to_unix_ms(st: Option<SystemTime>) -> Option<u64> {
