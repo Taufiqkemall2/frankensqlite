@@ -66,9 +66,13 @@ pub struct DiscoveryConfig {
     /// Only include files matching these extensions (empty = all
     /// SQLite-header-valid files).
     pub extensions: Vec<String>,
+    /// Minimum file size to consider (bytes). Files smaller than this are skipped.
+    pub min_file_size: u64,
     /// Maximum file size to consider (bytes). Files larger than this are
     /// skipped to keep discovery fast.
     pub max_file_size: u64,
+    /// If true, return only SQLite-header-valid files.
+    pub header_only: bool,
 }
 
 impl Default for DiscoveryConfig {
@@ -80,6 +84,9 @@ impl Default for DiscoveryConfig {
                 "node_modules".to_owned(),
                 ".git".to_owned(),
                 "target".to_owned(),
+                ".ruff_cache".to_owned(),
+                ".pytest_cache".to_owned(),
+                ".mypy_cache".to_owned(),
                 "__pycache__".to_owned(),
                 ".cache".to_owned(),
                 ".venv".to_owned(),
@@ -89,7 +96,9 @@ impl Default for DiscoveryConfig {
                 "build".to_owned(),
             ],
             extensions: vec!["db".to_owned(), "sqlite".to_owned(), "sqlite3".to_owned()],
+            min_file_size: 0,
             max_file_size: 512 * 1024 * 1024, // 512 MiB
+            header_only: false,
         }
     }
 }
@@ -101,10 +110,14 @@ impl Default for DiscoveryConfig {
 pub struct Candidate {
     /// Absolute path to the file.
     pub path: PathBuf,
+    /// Stable inferred fixture id candidate (stem heuristic, sanitized).
+    pub db_id: String,
     /// File size in bytes.
     pub size_bytes: u64,
     /// Whether the first 16 bytes match the SQLite magic header.
     pub header_ok: bool,
+    /// Sidecar suffixes present at scan time (e.g. `-wal`, `-shm`, `-journal`).
+    pub sidecars_present: Vec<String>,
     /// Classification tags derived from path heuristics.
     pub tags: Vec<String>,
 }
@@ -167,11 +180,14 @@ fn walk_dir(dir: &Path, depth: usize, config: &DiscoveryConfig, out: &mut Vec<Ca
         if meta.is_dir() {
             let dir_name = entry.file_name();
             let name = dir_name.to_string_lossy();
-            if config.denylist.iter().any(|d| d == name.as_ref()) {
+            if is_denylisted_dir(&name, &config.denylist) {
                 continue;
             }
             walk_dir(&path, depth + 1, config, out);
         } else if meta.is_file() {
+            if meta.len() < config.min_file_size {
+                continue;
+            }
             if meta.len() > config.max_file_size {
                 continue;
             }
@@ -186,11 +202,19 @@ fn walk_dir(dir: &Path, depth: usize, config: &DiscoveryConfig, out: &mut Vec<Ca
             }
 
             let header_ok = check_sqlite_header(&path);
-            let tags = classify_path(&path);
+            if config.header_only && !header_ok {
+                continue;
+            }
+
+            let sidecars_present = detect_sidecars(&path);
+            let db_id = infer_db_id(&path);
+            let tags = classify_path(&path, meta.len());
             out.push(Candidate {
                 path,
+                db_id,
                 size_bytes: meta.len(),
                 header_ok,
+                sidecars_present,
                 tags,
             });
         }
@@ -215,8 +239,68 @@ fn push_tag(tags: &mut Vec<String>, tag: &str) {
     }
 }
 
+fn is_denylisted_dir(name: &str, denylist: &[String]) -> bool {
+    // Exact matches from the configured denylist.
+    if denylist.iter().any(|d| d == name) {
+        return true;
+    }
+
+    // Common prefixes: this repo (and many /dp roots) contain `target_*` dirs.
+    if name.starts_with("target") {
+        return true;
+    }
+
+    false
+}
+
+fn sanitize_db_id(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        let c = ch.to_ascii_lowercase();
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    let trimmed = out.trim_matches('_').to_owned();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn infer_db_id(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    sanitize_db_id(stem).unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn detect_sidecars(db_path: &Path) -> Vec<String> {
+    const SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
+    let mut present = Vec::new();
+
+    for suffix in SIDECARS {
+        let mut os = db_path.as_os_str().to_os_string();
+        os.push(suffix);
+        let path = PathBuf::from(os);
+        if path.exists() {
+            present.push(suffix.to_owned());
+        }
+    }
+
+    present
+}
+
 /// Classify a file path into tags based on heuristics.
-fn classify_path(path: &Path) -> Vec<String> {
+fn classify_path(path: &Path, size_bytes: u64) -> Vec<String> {
     let s = path.to_string_lossy().to_lowercase();
     let mut tags = Vec::new();
 
@@ -257,16 +341,17 @@ fn classify_path(path: &Path) -> Vec<String> {
         push_tag(&mut tags, "test");
     }
 
-    // Size classification from file name patterns.
-    let size_hint = path.metadata().map_or(0, |m| m.len());
-    if size_hint < 64 * 1024 {
+    // Size bucket tag.
+    if size_bytes < 64 * 1024 {
         push_tag(&mut tags, "small");
-    } else if size_hint < 4 * 1024 * 1024 {
+    } else if size_bytes < 4 * 1024 * 1024 {
         push_tag(&mut tags, "medium");
     } else {
         push_tag(&mut tags, "large");
     }
 
+    tags.sort();
+    tags.dedup();
     tags
 }
 
@@ -316,13 +401,13 @@ mod tests {
 
     #[test]
     fn test_classify_path_beads() {
-        let tags = classify_path(Path::new("/dp/myproject/.beads/beads.db"));
+        let tags = classify_path(Path::new("/dp/myproject/.beads/beads.db"), 0);
         assert!(tags.contains(&"beads".to_owned()));
     }
 
     #[test]
     fn test_classify_path_cache() {
-        let tags = classify_path(Path::new("/tmp/some_cache.db"));
+        let tags = classify_path(Path::new("/tmp/some_cache.db"), 0);
         assert!(tags.contains(&"cache".to_owned()));
     }
 
@@ -368,6 +453,8 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(results[0].header_ok);
         assert_eq!(results[0].size_bytes, 100);
+        assert_eq!(results[0].db_id, "found");
+        assert!(results[0].sidecars_present.is_empty());
     }
 
     #[test]
@@ -398,6 +485,72 @@ mod tests {
         };
         let results2 = discover_sqlite_files(&config2).unwrap();
         assert_eq!(results2.len(), 1);
+    }
+
+    #[test]
+    fn test_header_only_filters_bad_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.db");
+        let bad = dir.path().join("bad.db");
+
+        let mut f = fs::File::create(&good).unwrap();
+        f.write_all(SQLITE_MAGIC).unwrap();
+        f.write_all(&[0u8; 84]).unwrap();
+        drop(f);
+
+        fs::write(&bad, b"not sqlite").unwrap();
+
+        let config = DiscoveryConfig {
+            roots: vec![dir.path().to_owned()],
+            max_depth: 1,
+            header_only: true,
+            ..DiscoveryConfig::default()
+        };
+        let results = discover_sqlite_files(&config).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].header_ok);
+        assert_eq!(results[0].db_id, "good");
+    }
+
+    #[test]
+    fn test_min_file_size_respected() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("tiny.db");
+        let mut f = fs::File::create(&db_path).unwrap();
+        f.write_all(SQLITE_MAGIC).unwrap();
+        f.write_all(&[0u8; 84]).unwrap(); // 100 bytes.
+        drop(f);
+
+        let config = DiscoveryConfig {
+            roots: vec![dir.path().to_owned()],
+            max_depth: 1,
+            min_file_size: 200,
+            ..DiscoveryConfig::default()
+        };
+        let results = discover_sqlite_files(&config).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_sidecar_detection_reports_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("withwal.db");
+        let mut f = fs::File::create(&db_path).unwrap();
+        f.write_all(SQLITE_MAGIC).unwrap();
+        f.write_all(&[0u8; 84]).unwrap();
+        drop(f);
+
+        let wal = dir.path().join("withwal.db-wal");
+        fs::write(&wal, b"wal").unwrap();
+
+        let config = DiscoveryConfig {
+            roots: vec![dir.path().to_owned()],
+            max_depth: 1,
+            ..DiscoveryConfig::default()
+        };
+        let results = discover_sqlite_files(&config).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].sidecars_present.contains(&"-wal".to_owned()));
     }
 
     #[test]
