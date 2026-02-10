@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::{Command, Output};
 
+use fsqlite_btree::cursor::{BtCursor, TransactionPageIo};
+use fsqlite_btree::{BtreeCursorOps, SeekResult};
 use fsqlite_pager::{
     Argon2Params, DATABASE_ID_SIZE, DatabaseId, ENCRYPTION_RESERVED_BYTES, EncryptError,
     JournalHeader, JournalPageRecord, KEY_SIZE, KeyManager, MvccPager, NONCE_SIZE, PageEncryptor,
@@ -379,6 +381,90 @@ fn test_persistence_create_close_reopen() -> Result<(), String> {
             "bead_id={BEAD_ID} case=persistence_create_close_reopen_mismatch first={} last={}",
             observed.as_ref().first().copied().unwrap_or_default(),
             observed.as_ref().last().copied().unwrap_or_default()
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_btree_cursor_insert_reopen_roundtrip() -> Result<(), String> {
+    let cx = test_cx();
+    let vfs = MemoryVfs::new();
+    let path = PathBuf::from("/bd_bca_1_btree_cursor_roundtrip.db");
+    let usable_size = PageSize::DEFAULT.usable(0);
+
+    let root_page = {
+        let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT)
+            .map_err(|error| format!("open_pager_for_write_failed error={error}"))?;
+        let mut txn = pager
+            .begin(&cx, TransactionMode::Immediate)
+            .map_err(|error| format!("begin_writer_failed error={error}"))?;
+
+        let root_page = txn
+            .allocate_page(&cx)
+            .map_err(|error| format!("allocate_root_page_failed error={error}"))?;
+
+        let mut root = vec![0_u8; PageSize::DEFAULT.as_usize()];
+        root[0] = 0x0D; // LeafTable
+        root[3..5].copy_from_slice(&0u16.to_be_bytes()); // cell_count = 0
+        let content_start = u16::try_from(PageSize::DEFAULT.get()).map_err(|_| {
+            format!(
+                "content_start_u16_overflow page_size={}",
+                PageSize::DEFAULT.get()
+            )
+        })?;
+        root[5..7].copy_from_slice(&content_start.to_be_bytes()); // cell content at end of page
+
+        txn.write_page(&cx, root_page, &root)
+            .map_err(|error| format!("write_root_page_failed error={error}"))?;
+
+        {
+            let mut cursor = BtCursor::new(
+                TransactionPageIo::new(&mut txn),
+                root_page,
+                usable_size,
+                true,
+            );
+            cursor
+                .table_insert(&cx, 1, b"hello")
+                .map_err(|error| format!("btree_insert_failed error={error}"))?;
+        }
+
+        txn.commit(&cx)
+            .map_err(|error| format!("commit_failed error={error}"))?;
+        root_page
+    };
+
+    let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT)
+        .map_err(|error| format!("open_pager_for_read_failed error={error}"))?;
+    let mut txn = pager
+        .begin(&cx, TransactionMode::ReadOnly)
+        .map_err(|error| format!("begin_reader_failed error={error}"))?;
+
+    let mut cursor = BtCursor::new(
+        TransactionPageIo::new(&mut txn),
+        root_page,
+        usable_size,
+        true,
+    );
+    let seek = cursor
+        .table_move_to(&cx, 1)
+        .map_err(|error| format!("btree_seek_failed error={error}"))?;
+    if seek != SeekResult::Found {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=btree_seek_not_found root_page={}",
+            root_page.get()
+        ));
+    }
+
+    let payload = cursor
+        .payload(&cx)
+        .map_err(|error| format!("btree_payload_failed error={error}"))?;
+    if payload.as_slice() != b"hello" {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=btree_payload_mismatch len={}",
+            payload.len()
         ));
     }
 
