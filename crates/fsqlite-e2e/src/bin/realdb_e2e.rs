@@ -142,12 +142,17 @@ ACTIONS:
     verify      Verify all golden copies match their checksums entries
 
 SCAN OPTIONS:
-    --root <DIR>        Root directory to scan (default: /dp)
-    --max-depth <N>     Maximum traversal depth (default: 6)
-    --max-file-size-mib <N>
-                        Skip files larger than N MiB during discovery (default: 512).
-                        Use 0 to disable the size cap (not recommended).
-    --header-only       Only show files with valid SQLite magic header
+    --root <DIR>            Root directory to scan (default: /dp)
+    --max-depth <N>         Maximum traversal depth (default: 6)
+    --min-bytes <N>         Skip files smaller than N bytes (default: 0)
+    --max-bytes <N>         Skip files larger than N bytes (default: 536870912).
+                            Use 0 to disable the size cap (not recommended).
+    --max-file-size-mib <N> Alias for --max-bytes, expressed in MiB (default: 512).
+                            Use 0 to disable the size cap (not recommended).
+    --header-only           Only include files with valid SQLite magic header
+                            (alias: --require-header-ok)
+    --require-header-ok     Alias for --header-only
+    --json                  Emit machine-readable JSON describing candidates
 
 IMPORT OPTIONS:
     --db <PATH|NAME>        Source database path (preferred) or discovery filename/stem
@@ -186,11 +191,39 @@ VERIFY OPTIONS:
     let _ = io::stdout().write_all(text.as_bytes());
 }
 
+#[derive(Debug, Serialize)]
+struct CorpusScanReportV1 {
+    /// Stable contract identifier for scan output.
+    schema_version: String,
+    candidates: Vec<CorpusScanCandidateV1>,
+}
+
+#[derive(Debug, Serialize)]
+struct CorpusScanCandidateV1 {
+    /// Absolute path to the discovered file.
+    path: String,
+    /// Discovered filename (basename).
+    file_name: String,
+    /// Inferred id candidate (sanitized stem).
+    db_id: String,
+    /// File size in bytes.
+    size_bytes: u64,
+    /// Whether the file begins with the SQLite header magic bytes.
+    header_ok: bool,
+    /// Sidecar suffixes present (`-wal`, `-shm`, `-journal`).
+    sidecars_present: Vec<String>,
+    /// Tags inferred from path heuristics (sorted, deduped).
+    tags: Vec<String>,
+}
+
+#[allow(clippy::too_many_lines)]
 fn cmd_corpus_scan(argv: &[String]) -> i32 {
-    let mut root = "/dp".to_owned();
+    let mut root = PathBuf::from("/dp");
     let mut max_depth: usize = 6;
-    let mut max_file_size_mib: u64 = 512;
+    let mut min_bytes: u64 = 0;
+    let mut max_bytes: u64 = 512 * 1024 * 1024;
     let mut header_only = false;
+    let mut json = false;
 
     let mut i = 0;
     while i < argv.len() {
@@ -201,7 +234,7 @@ fn cmd_corpus_scan(argv: &[String]) -> i32 {
                     eprintln!("error: --root requires a directory argument");
                     return 2;
                 }
-                root.clone_from(&argv[i]);
+                root = PathBuf::from(&argv[i]);
             }
             "--max-depth" => {
                 i += 1;
@@ -214,6 +247,30 @@ fn cmd_corpus_scan(argv: &[String]) -> i32 {
                     return 2;
                 };
                 max_depth = n;
+            }
+            "--min-bytes" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --min-bytes requires an integer argument");
+                    return 2;
+                }
+                let Ok(n) = argv[i].parse::<u64>() else {
+                    eprintln!("error: invalid integer for --min-bytes: `{}`", argv[i]);
+                    return 2;
+                };
+                min_bytes = n;
+            }
+            "--max-bytes" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --max-bytes requires an integer argument");
+                    return 2;
+                }
+                let Ok(n) = argv[i].parse::<u64>() else {
+                    eprintln!("error: invalid integer for --max-bytes: `{}`", argv[i]);
+                    return 2;
+                };
+                max_bytes = if n == 0 { u64::MAX } else { n };
             }
             "--max-file-size-mib" => {
                 i += 1;
@@ -228,9 +285,16 @@ fn cmd_corpus_scan(argv: &[String]) -> i32 {
                     );
                     return 2;
                 };
-                max_file_size_mib = n;
+                max_bytes = match mib_to_bytes(n) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return 2;
+                    }
+                };
             }
-            "--header-only" => header_only = true,
+            "--header-only" | "--require-header-ok" => header_only = true,
+            "--json" => json = true,
             "-h" | "--help" => {
                 print_corpus_help();
                 return 0;
@@ -243,32 +307,65 @@ fn cmd_corpus_scan(argv: &[String]) -> i32 {
         i += 1;
     }
 
-    let max_file_size = match mib_to_bytes(max_file_size_mib) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return 2;
-        }
-    };
-
     let mut config = fsqlite_harness::fixture_discovery::DiscoveryConfig {
-        roots: vec![root.into()],
+        roots: vec![root],
         max_depth,
+        min_file_size: min_bytes,
+        header_only,
         ..fsqlite_harness::fixture_discovery::DiscoveryConfig::default()
     };
-    config.max_file_size = max_file_size;
+    config.max_file_size = max_bytes;
 
     match fsqlite_harness::fixture_discovery::discover_sqlite_files(&config) {
         Ok(candidates) => {
-            let filtered: Vec<_> = if header_only {
-                candidates.into_iter().filter(|c| c.header_ok).collect()
-            } else {
-                candidates
-            };
+            if json {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                let report = CorpusScanReportV1 {
+                    schema_version: "corpus_scan_v1".to_owned(),
+                    candidates: candidates
+                        .iter()
+                        .map(|c| {
+                            let abs = if c.path.is_absolute() {
+                                c.path.clone()
+                            } else {
+                                cwd.join(&c.path)
+                            };
+                            CorpusScanCandidateV1 {
+                                path: abs.to_string_lossy().into_owned(),
+                                file_name: c
+                                    .path
+                                    .file_name()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or_default()
+                                    .to_owned(),
+                                db_id: c.db_id.clone(),
+                                size_bytes: c.size_bytes,
+                                header_ok: c.header_ok,
+                                sidecars_present: c.sidecars_present.clone(),
+                                tags: c.tags.clone(),
+                            }
+                        })
+                        .collect(),
+                };
 
-            println!("Found {} candidate(s):", filtered.len());
-            for c in &filtered {
-                println!("  {c}");
+                match serde_json::to_string_pretty(&report) {
+                    Ok(text) => println!("{text}"),
+                    Err(e) => {
+                        eprintln!("error: failed to serialize scan report as JSON: {e}");
+                        return 2;
+                    }
+                }
+            } else {
+                println!("Found {} candidate(s):", candidates.len());
+                for c in &candidates {
+                    let mut line = String::new();
+                    let _ = write!(&mut line, "  {c}");
+                    if !c.sidecars_present.is_empty() {
+                        let _ = write!(&mut line, "\tsidecars={}", c.sidecars_present.join(","));
+                    }
+                    let _ = write!(&mut line, "\tdb_id={}", c.db_id);
+                    println!("{line}");
+                }
             }
             0
         }
@@ -3033,6 +3130,47 @@ mod tests {
                 "scan",
                 "--root",
                 dir.path().to_str().unwrap(),
+            ]),
+            0
+        );
+    }
+
+    #[test]
+    fn test_corpus_scan_json_and_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("not_sqlite.db"), b"nope").unwrap();
+
+        assert_eq!(
+            run_with(&[
+                "realdb-e2e",
+                "corpus",
+                "scan",
+                "--root",
+                dir.path().to_str().unwrap(),
+                "--json",
+            ]),
+            0
+        );
+        assert_eq!(
+            run_with(&[
+                "realdb-e2e",
+                "corpus",
+                "scan",
+                "--root",
+                dir.path().to_str().unwrap(),
+                "--require-header-ok",
+            ]),
+            0
+        );
+        assert_eq!(
+            run_with(&[
+                "realdb-e2e",
+                "corpus",
+                "scan",
+                "--root",
+                dir.path().to_str().unwrap(),
+                "--min-bytes",
+                "9999999",
             ]),
             0
         );
