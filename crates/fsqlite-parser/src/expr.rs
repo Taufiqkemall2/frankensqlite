@@ -23,7 +23,7 @@ use fsqlite_ast::{
     SelectStatement, Span, TableOrSubquery, TypeName, UnaryOp, WindowSpec,
 };
 
-use crate::parser::{ParseError, Parser};
+use crate::parser::{ParseError, Parser, is_nonreserved_kw, kw_to_str};
 use crate::token::{Token, TokenKind};
 
 // Binding powers: higher = tighter binding.
@@ -308,6 +308,14 @@ impl Parser {
             // ── Keywords usable as function names ───────────────────────
             TokenKind::KwReplace if matches!(self.peek_kind(), TokenKind::LeftParen) => {
                 self.parse_function_call("replace".to_owned(), tok.span)
+            }
+
+            // ── Non-reserved keywords usable as identifiers ─────────────
+            // In SQL, non-reserved keywords (like KEY, MATCH, FIRST, etc.)
+            // can be used as column names without quoting.
+            k if is_nonreserved_kw(k) => {
+                let name = kw_to_str(k);
+                self.parse_ident_expr(name, tok.span)
             }
 
             _ => Err(ParseError::at(

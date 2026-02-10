@@ -1842,7 +1842,7 @@ impl Parser {
 // Keyword classification helper
 // ---------------------------------------------------------------------------
 
-fn is_nonreserved_kw(k: &TokenKind) -> bool {
+pub(crate) fn is_nonreserved_kw(k: &TokenKind) -> bool {
     matches!(
         k,
         TokenKind::KwAbort
@@ -7119,5 +7119,87 @@ mod tests {
                 prop_assert_eq!(rendered1, rendered2, "{}", msg);
             }
         }
+    }
+
+    // ── bd-1702 repro tests ─────────────────────────────────────────────
+    // Reserved-word column names in CREATE TABLE (quoted and unquoted).
+
+    #[test]
+    fn create_table_quoted_reserved_word_key() {
+        // Double-quoted "key" should parse as identifier, not KwKey.
+        parse_ok(r#"CREATE TABLE "meta" ("key" TEXT, "val" TEXT);"#);
+    }
+
+    #[test]
+    fn create_table_unquoted_key_column() {
+        // KEY is a non-reserved keyword — should work unquoted.
+        parse_ok("CREATE TABLE meta (key TEXT, val TEXT);");
+    }
+
+    #[test]
+    fn create_table_quoted_order_column() {
+        // ORDER is reserved — must work when double-quoted.
+        parse_ok(r#"CREATE TABLE t ("order" INTEGER);"#);
+    }
+
+    #[test]
+    fn create_table_quoted_select_column() {
+        // SELECT is reserved — must work when double-quoted.
+        parse_ok(r#"CREATE TABLE t ("select" TEXT);"#);
+    }
+
+    #[test]
+    fn select_with_reserved_word_column_key() {
+        // SELECT using "key" as column name — unquoted.
+        parse_ok("SELECT key FROM meta;");
+    }
+
+    #[test]
+    fn select_with_reserved_word_column_value() {
+        // SELECT using "value" — check if it's a keyword.
+        parse_ok("SELECT value FROM meta;");
+    }
+
+    #[test]
+    fn select_with_reserved_word_column_order() {
+        // ORDER is reserved — quoted should work.
+        parse_ok(r#"SELECT "order" FROM t;"#);
+    }
+
+    #[test]
+    fn where_clause_with_reserved_word_column() {
+        // WHERE referencing a reserved-word column.
+        parse_ok("UPDATE meta SET val = '2.0' WHERE key = 'version';");
+    }
+
+    #[test]
+    fn update_set_reserved_word_column() {
+        // SET reserved-word column.
+        parse_ok(r#"UPDATE meta SET "key" = 'newkey' WHERE "key" = 'oldkey';"#);
+    }
+
+    #[test]
+    fn delete_where_reserved_word_column() {
+        parse_ok("DELETE FROM meta WHERE key = 'version';");
+    }
+
+    #[test]
+    fn persistence_dump_with_reserved_word_columns() {
+        // Simulates the exact SQL that build_create_table_sql generates
+        // for a table that was originally created with reserved-word columns.
+        let sql = concat!(
+            r#"CREATE TABLE "meta" ("key" TEXT, "value" TEXT);"#,
+            "\n",
+            r#"INSERT INTO "meta" VALUES ('version', '1.0');"#,
+            "\n",
+            r#"INSERT INTO "meta" VALUES ('author', 'test');"#,
+        );
+        let mut p = Parser::from_sql(sql);
+        let (stmts, errs) = p.parse_all();
+        assert!(
+            errs.is_empty(),
+            "persistence dump with reserved-word columns should parse cleanly: {errs:?}"
+        );
+        assert_eq!(stmts.len(), 3);
     }
 }

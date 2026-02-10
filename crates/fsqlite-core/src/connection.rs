@@ -1899,6 +1899,7 @@ mod tests {
     use fsqlite_error::FrankenError;
     use fsqlite_types::opcode::{Opcode, P4};
     use fsqlite_types::value::SqliteValue;
+    use fsqlite_vdbe::engine::{ExecOutcome, VdbeEngine};
 
     fn row_values(row: &Row) -> Vec<SqliteValue> {
         row.values().to_vec()
@@ -3055,8 +3056,9 @@ mod tests {
         conn.execute("CREATE TABLE t (bl BLOB);").unwrap();
 
         let stmt = super::parse_single_statement("INSERT INTO t VALUES (X'DEADBEEF');").unwrap();
-        let Statement::Insert(insert) = stmt else {
-            panic!("expected INSERT statement");
+        let insert = match stmt {
+            Statement::Insert(insert) => insert,
+            other => panic!("expected INSERT statement, got {other:?}"),
         };
 
         let program = conn.compile_table_insert(&insert).unwrap();
@@ -3073,6 +3075,77 @@ mod tests {
             }
             other => panic!("expected P4::Blob, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_blob_literal_roundtrips_through_mem_and_storage_cursors() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (bl BLOB);").unwrap();
+        conn.execute("INSERT INTO t VALUES (X'DEADBEEF');").unwrap();
+
+        let stmt = super::parse_single_statement("SELECT bl FROM t;").unwrap();
+        let select = match stmt {
+            Statement::Select(select) => select,
+            other => panic!("expected SELECT statement, got {other:?}"),
+        };
+        let program = conn.compile_table_select(&select).unwrap();
+
+        // Execute once with mem cursors (storage cursors disabled).
+        let db_mem = conn.db.borrow().clone();
+        let mut engine = VdbeEngine::new(program.register_count());
+        engine.set_database(db_mem);
+        let outcome = engine.execute(&program).unwrap();
+        assert_eq!(outcome, ExecOutcome::Done);
+        let mem_rows = engine.take_results();
+
+        // Execute once with storage-backed read cursors enabled.
+        let db_storage = conn.db.borrow().clone();
+        let mut engine = VdbeEngine::new(program.register_count());
+        engine.enable_storage_read_cursors(true);
+        engine.set_database(db_storage);
+        let outcome = engine.execute(&program).unwrap();
+        assert_eq!(outcome, ExecOutcome::Done);
+        let storage_rows = engine.take_results();
+
+        let expected = vec![SqliteValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF])];
+        assert_eq!(mem_rows, vec![expected.clone()]);
+        assert_eq!(storage_rows, vec![expected]);
+    }
+
+    #[test]
+    fn test_blob_literal_multi_column_in_memory() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (i INTEGER, r REAL, tx TEXT, bl BLOB, n INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (42, 3.14, 'it''s a test', X'DEADBEEF', NULL);")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT i, r, tx, bl, n FROM t;")
+            .expect("multi-column SELECT should execute");
+        assert_eq!(rows.len(), 1);
+        let expected = vec![
+            SqliteValue::Integer(42),
+            SqliteValue::Float(314.0 / 100.0),
+            SqliteValue::Text("it's a test".to_owned()),
+            SqliteValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+            SqliteValue::Null,
+        ];
+        assert_eq!(row_values(&rows[0]), expected,);
+
+        // Persistence dump path uses SELECT *; ensure it preserves blob bytes.
+        let rows = conn.query("SELECT * FROM t;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Integer(42),
+                SqliteValue::Float(314.0 / 100.0),
+                SqliteValue::Text("it's a test".to_owned()),
+                SqliteValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+                SqliteValue::Null,
+            ],
+        );
     }
 
     #[test]
@@ -3229,6 +3302,91 @@ mod tests {
                 vec![
                     SqliteValue::Integer(1),
                     SqliteValue::Text("widget".to_owned())
+                ],
+            );
+        }
+    }
+
+    // ── bd-1s7a: E2E storage cursor acceptance tests ───────────────────
+
+    #[test]
+    fn test_reopen_then_select_reads_persisted_rows_via_storage_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("storage_path.db");
+        let path_str = path.to_str().unwrap();
+
+        {
+            let conn = Connection::open(path_str).unwrap();
+            conn.execute("CREATE TABLE items (id INTEGER, name TEXT, qty INTEGER);")
+                .unwrap();
+            conn.execute("INSERT INTO items VALUES (1, 'apple', 10);")
+                .unwrap();
+            conn.execute("INSERT INTO items VALUES (2, 'banana', 20);")
+                .unwrap();
+            conn.execute("INSERT INTO items VALUES (3, 'cherry', 30);")
+                .unwrap();
+        }
+
+        {
+            let conn = Connection::open(path_str).unwrap();
+            let rows = conn.query("SELECT id, name, qty FROM items;").unwrap();
+            assert_eq!(rows.len(), 3, "all 3 rows must survive close/reopen");
+            assert_eq!(
+                row_values(&rows[0]),
+                vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("apple".to_owned()),
+                    SqliteValue::Integer(10),
+                ],
+            );
+            assert_eq!(
+                row_values(&rows[2]),
+                vec![
+                    SqliteValue::Integer(3),
+                    SqliteValue::Text("cherry".to_owned()),
+                    SqliteValue::Integer(30),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn test_e2e_sql_pipeline_storage_backed_select_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("e2e.db");
+        let path_str = path.to_str().unwrap();
+
+        {
+            let conn = Connection::open(path_str).unwrap();
+            conn.execute("CREATE TABLE log (seq INTEGER, msg TEXT);")
+                .unwrap();
+            conn.execute("INSERT INTO log VALUES (1, 'first');")
+                .unwrap();
+            conn.execute("INSERT INTO log VALUES (2, 'second');")
+                .unwrap();
+            conn.execute("INSERT INTO log VALUES (3, 'third');")
+                .unwrap();
+            conn.execute("UPDATE log SET msg = 'updated' WHERE seq = 2;")
+                .unwrap();
+            conn.execute("DELETE FROM log WHERE seq = 3;").unwrap();
+        }
+
+        {
+            let conn = Connection::open(path_str).unwrap();
+            let rows = conn.query("SELECT seq, msg FROM log;").unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(
+                row_values(&rows[0]),
+                vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("first".to_owned())
+                ],
+            );
+            assert_eq!(
+                row_values(&rows[1]),
+                vec![
+                    SqliteValue::Integer(2),
+                    SqliteValue::Text("updated".to_owned()),
                 ],
             );
         }

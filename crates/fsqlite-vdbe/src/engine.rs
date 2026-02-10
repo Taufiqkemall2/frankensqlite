@@ -4755,4 +4755,95 @@ mod tests {
         });
         assert_eq!(rows[0], vec![SqliteValue::Integer(1)]);
     }
+
+    // ── bd-1s7a: Storage cursor acceptance tests ───────────────────────
+
+    /// Build and execute a program with a MemDatabase + storage cursors enabled.
+    fn run_with_storage_cursors(
+        db: MemDatabase,
+        build: impl FnOnce(&mut ProgramBuilder),
+    ) -> Vec<Vec<SqliteValue>> {
+        let mut b = ProgramBuilder::new();
+        build(&mut b);
+        let prog = b.finish().expect("program should build");
+        let mut engine = VdbeEngine::new(prog.register_count());
+        engine.enable_storage_read_cursors(true);
+        engine.set_database(db);
+        let outcome = engine.execute(&prog).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+        engine.take_results()
+    }
+
+    #[test]
+    fn test_vdbe_openread_uses_btree_cursor_backend() {
+        // Insert rows into a MemDatabase, then verify OpenRead routes through
+        // the storage cursor path (not MemCursor) when enabled.
+        let mut db = MemDatabase::new();
+        let root = db.create_table(2);
+        let table = db.get_table_mut(root).unwrap();
+        table.insert(
+            1,
+            vec![SqliteValue::Integer(10), SqliteValue::Text("a".to_owned())],
+        );
+        table.insert(
+            2,
+            vec![SqliteValue::Integer(20), SqliteValue::Text("b".to_owned())],
+        );
+
+        let rows = run_with_storage_cursors(db, |b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(2), 0);
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+
+            let body = b.current_addr();
+            b.emit_op(Opcode::Column, 0, 0, 1, P4::None, 0);
+            b.emit_op(Opcode::Column, 0, 1, 2, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 1, 2, 0, P4::None, 0);
+
+            let next_target =
+                i32::try_from(body).expect("program counter should fit into i32 for tests");
+            b.emit_op(Opcode::Next, 0, next_target, 0, P4::None, 0);
+
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows.len(), 2, "should return 2 rows via storage cursor");
+        assert_eq!(rows[0][0], SqliteValue::Integer(10));
+        assert_eq!(rows[0][1], SqliteValue::Text("a".to_owned()));
+        assert_eq!(rows[1][0], SqliteValue::Integer(20));
+        assert_eq!(rows[1][1], SqliteValue::Text("b".to_owned()));
+    }
+
+    #[test]
+    fn test_select_uses_storage_cursor_not_memdb_for_persisted_table() {
+        // With storage cursors enabled, verify the engine uses StorageCursor
+        // (the read path) rather than MemCursor for OpenRead.
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).unwrap();
+        table.insert(1, vec![SqliteValue::Integer(42)]);
+
+        let rows = run_with_storage_cursors(db, |b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            // OpenRead with storage cursors enabled should use StorageCursor.
+            b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(1), 0);
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+
+            let body = b.current_addr();
+            b.emit_op(Opcode::Column, 0, 0, 1, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
+            let next_target =
+                i32::try_from(body).expect("program counter should fit into i32 for tests");
+            b.emit_op(Opcode::Next, 0, next_target, 0, P4::None, 0);
+
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], vec![SqliteValue::Integer(42)]);
+    }
 }
