@@ -161,9 +161,12 @@ fn setup_db_fixture(dir: &Path, row_count: usize) -> std::path::PathBuf {
     db_path
 }
 
-fn inject_db_corruption(scenario: &CorruptionScenario, db_path: &Path) -> Result<CorruptionReport, String> {
-    let injector =
-        CorruptionInjector::new(db_path.to_path_buf()).map_err(|e| format!("injector creation: {e}"))?;
+fn inject_db_corruption(
+    scenario: &CorruptionScenario,
+    db_path: &Path,
+) -> Result<CorruptionReport, String> {
+    let injector = CorruptionInjector::new(db_path.to_path_buf())
+        .map_err(|e| format!("injector creation: {e}"))?;
     let pattern = scenario.pattern.to_corruption_pattern(scenario.seed, 0);
     injector
         .inject(&pattern)

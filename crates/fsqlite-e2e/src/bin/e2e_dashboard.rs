@@ -1,11 +1,18 @@
 //! E2E dashboard binary — TUI for running and visualizing E2E test results.
 //!
-//! This is the initial scaffold for bd-3ppz:
-//! - `ftui` (FrankenTUI) runtime for terminal lifecycle + event loop
-//! - mpsc channel to feed background progress into the UI
+//! Implements three rich visualization panels (bd-mmhw, bd-s4qy, bd-1nqt):
+//! - **Benchmark** panel: real-time throughput sparkline, speedup ratio, progress bar
+//! - **Recovery** panel: hex diff of corrupted/recovered bytes, decode progress
+//! - **Correctness** panel: SHA-256 comparison table, per-workload pass/fail
+//! - **Summary** panel: scrollable event log
+//!
+//! Architecture:
+//! - `ftui` (FrankenTUI) runtime with Model/View/Update pattern
+//! - mpsc channel feeds background progress into the UI
 //! - `--headless` mode for CI / non-terminal environments
 
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -17,48 +24,91 @@ use ftui::core::geometry::Rect;
 use ftui::widgets::Widget;
 use ftui::widgets::panel::Panel;
 use ftui::widgets::paragraph::Paragraph;
+use ftui::widgets::progress::ProgressBar;
+use ftui::widgets::sparkline::Sparkline;
 use ftui::{App, Cmd, Event, KeyCode, KeyEventKind, Model, PackedRgba, ScreenMode, Style};
 
+// ── Dashboard events (contract between background worker and TUI) ────────
+
+/// Events sent from background threads to the dashboard UI via mpsc channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum DashboardEvent {
+    // ── Benchmark events ─────────────────────────────────────────────
+    /// Periodic throughput update for FrankenSQLite.
     BenchmarkProgress {
         name: String,
         ops_per_sec: f64,
         elapsed_ms: u64,
     },
+    /// Periodic throughput update for C SQLite baseline.
+    BenchmarkCsqliteProgress {
+        name: String,
+        ops_per_sec: f64,
+        elapsed_ms: u64,
+    },
+    /// A single benchmark run completed.
     BenchmarkComplete {
         name: String,
         wall_time_ms: u64,
         ops_per_sec: f64,
     },
-    CorruptionInjected {
-        page: u32,
-        pattern: String,
+    /// Overall benchmark suite progress.
+    BenchmarkSuiteProgress { completed: usize, total: usize },
+
+    // ── Corruption recovery events ───────────────────────────────────
+    /// Corruption was injected into a page.
+    CorruptionInjected { page: u32, pattern: String },
+    /// Hex dump of original bytes before corruption (first N bytes).
+    CorruptionHexData {
+        original_bytes: Vec<u8>,
+        corrupted_bytes: Vec<u8>,
+        page_offset: u64,
     },
+    /// RaptorQ recovery phase update.
     RecoveryAttempt {
         group: u32,
         symbols_available: u32,
         needed: u32,
     },
-    RecoverySuccess {
-        page: u32,
-        decode_proof: String,
+    /// Recovery decode phase progress.
+    RecoveryPhaseUpdate {
+        phase: String,
+        symbols_resolved: u32,
     },
-    RecoveryFailure {
-        page: u32,
-        reason: String,
+    /// Recovery succeeded with hex proof.
+    RecoverySuccess { page: u32, decode_proof: String },
+    /// Recovered bytes for hex comparison.
+    RecoveryHexData { recovered_bytes: Vec<u8> },
+    /// Recovery failed.
+    RecoveryFailure { page: u32, reason: String },
+    /// C SQLite integrity check result after corruption.
+    CsqliteIntegrityResult { passed: bool, message: String },
+
+    // ── Correctness verification events ──────────────────────────────
+    /// A new correctness workload is starting.
+    CorrectnessWorkloadStart { workload: String, total_ops: usize },
+    /// Progress within a correctness workload.
+    CorrectnessOpProgress {
+        workload: String,
+        ops_done: usize,
+        total_ops: usize,
+        current_sql: String,
     },
+    /// A correctness workload completed with hash comparison.
     CorrectnessCheck {
         workload: String,
         frank_hash: String,
         csqlite_hash: String,
         matched: bool,
     },
-    StatusMessage {
-        message: String,
-    },
+
+    // ── General ──────────────────────────────────────────────────────
+    /// Freeform status message for the log.
+    StatusMessage { message: String },
 }
+
+// ── Panel navigation ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PanelId {
@@ -97,6 +147,8 @@ impl PanelId {
     }
 }
 
+// ── Messages ──────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone)]
 enum Msg {
     Tick,
@@ -127,21 +179,173 @@ impl From<Event> for Msg {
     }
 }
 
+// ── State types ───────────────────────────────────────────────────────────
+
+/// Maximum throughput history samples for the sparkline.
+const MAX_SPARKLINE_SAMPLES: usize = 60;
+
+/// Maximum hex dump display bytes per panel.
+const HEX_DISPLAY_BYTES: usize = 64;
+
+/// Maximum recent SQL lines in correctness log.
+const MAX_RECENT_SQL: usize = 5;
+
+/// Benchmark panel state: throughput history, comparison, suite progress.
 #[derive(Debug, Clone)]
 struct BenchState {
     name: String,
     ops_per_sec: f64,
     elapsed_ms: u64,
     done: bool,
+    /// FrankenSQLite throughput history for sparkline.
+    frank_history: VecDeque<f64>,
+    /// C SQLite throughput history for sparkline.
+    csqlite_history: VecDeque<f64>,
+    /// Latest C SQLite throughput for speedup calculation.
+    csqlite_ops_per_sec: Option<f64>,
+    /// Suite-level progress.
+    suite_completed: usize,
+    suite_total: usize,
 }
 
-#[derive(Debug, Clone)]
-struct CorrectnessState {
-    workload: String,
-    matched: bool,
-    frank_sha256: String,
-    csqlite_sha256: String,
+impl BenchState {
+    fn new(name: String, ops_per_sec: f64, elapsed_ms: u64) -> Self {
+        let mut frank_history = VecDeque::with_capacity(MAX_SPARKLINE_SAMPLES);
+        frank_history.push_back(ops_per_sec);
+        Self {
+            name,
+            ops_per_sec,
+            elapsed_ms,
+            done: false,
+            frank_history,
+            csqlite_history: VecDeque::with_capacity(MAX_SPARKLINE_SAMPLES),
+            csqlite_ops_per_sec: None,
+            suite_completed: 0,
+            suite_total: 0,
+        }
+    }
+
+    fn push_frank_sample(&mut self, ops: f64) {
+        if self.frank_history.len() >= MAX_SPARKLINE_SAMPLES {
+            self.frank_history.pop_front();
+        }
+        self.frank_history.push_back(ops);
+    }
+
+    fn push_csqlite_sample(&mut self, ops: f64) {
+        if self.csqlite_history.len() >= MAX_SPARKLINE_SAMPLES {
+            self.csqlite_history.pop_front();
+        }
+        self.csqlite_history.push_back(ops);
+    }
 }
+
+/// Recovery panel state: corruption hex data, recovery progress, outcome.
+#[derive(Debug, Clone)]
+struct RecoveryState {
+    /// Corrupted page number.
+    page: u32,
+    /// Corruption pattern description.
+    pattern: String,
+    /// Original bytes before corruption (first N bytes).
+    original_bytes: Vec<u8>,
+    /// Corrupted bytes (first N bytes).
+    corrupted_bytes: Vec<u8>,
+    /// Recovered bytes after RaptorQ decode (first N bytes).
+    recovered_bytes: Vec<u8>,
+    /// Page file offset.
+    page_offset: u64,
+    /// RaptorQ group being decoded.
+    recovery_group: Option<u32>,
+    /// Available symbols for decode.
+    symbols_available: u32,
+    /// Required symbols for decode.
+    symbols_needed: u32,
+    /// Current decode phase description.
+    current_phase: String,
+    /// Symbols resolved so far in current phase.
+    phase_symbols_resolved: u32,
+    /// Whether recovery succeeded.
+    succeeded: Option<bool>,
+    /// Decode proof / reason string.
+    verdict: String,
+    /// C SQLite integrity check outcome.
+    csqlite_integrity_passed: Option<bool>,
+    csqlite_integrity_message: String,
+    /// Step-by-step log.
+    steps: Vec<String>,
+}
+
+impl RecoveryState {
+    fn new(page: u32, pattern: &str) -> Self {
+        let steps = vec![format!("Corruption injected: page {page} ({pattern})")];
+        Self {
+            page,
+            pattern: pattern.to_owned(),
+            original_bytes: Vec::new(),
+            corrupted_bytes: Vec::new(),
+            recovered_bytes: Vec::new(),
+            page_offset: u64::from(page.saturating_sub(1)) * 4096,
+            recovery_group: None,
+            symbols_available: 0,
+            symbols_needed: 0,
+            current_phase: String::new(),
+            phase_symbols_resolved: 0,
+            succeeded: None,
+            verdict: String::new(),
+            csqlite_integrity_passed: None,
+            csqlite_integrity_message: String::new(),
+            steps,
+        }
+    }
+}
+
+/// A single correctness workload result.
+#[derive(Debug, Clone)]
+struct WorkloadResult {
+    workload: String,
+    frank_hash: String,
+    csqlite_hash: String,
+    matched: bool,
+}
+
+/// Correctness panel state: multiple workload results, progress, recent SQL.
+#[derive(Debug, Clone)]
+struct CorrectnessCheckState {
+    /// Completed workload results.
+    results: Vec<WorkloadResult>,
+    /// Currently running workload name.
+    current_workload: Option<String>,
+    /// Operations completed in current workload.
+    ops_done: usize,
+    /// Total operations in current workload.
+    ops_total: usize,
+    /// Recent SQL statements executed.
+    recent_sql: VecDeque<String>,
+}
+
+impl Default for CorrectnessCheckState {
+    fn default() -> Self {
+        Self {
+            results: Vec::new(),
+            current_workload: None,
+            ops_done: 0,
+            ops_total: 0,
+            recent_sql: VecDeque::with_capacity(MAX_RECENT_SQL),
+        }
+    }
+}
+
+impl CorrectnessCheckState {
+    fn push_sql(&mut self, sql: String) {
+        if self.recent_sql.len() >= MAX_RECENT_SQL {
+            self.recent_sql.pop_front();
+        }
+        self.recent_sql.push_back(sql);
+    }
+}
+
+// ── Dashboard model ───────────────────────────────────────────────────────
 
 struct DashboardModel {
     active: PanelId,
@@ -149,8 +353,8 @@ struct DashboardModel {
     stop: Arc<AtomicBool>,
     log: VecDeque<String>,
     bench: Option<BenchState>,
-    recovery: Option<String>,
-    correctness: Option<CorrectnessState>,
+    recovery: Option<RecoveryState>,
+    correctness: CorrectnessCheckState,
 }
 
 impl DashboardModel {
@@ -162,7 +366,7 @@ impl DashboardModel {
             log: VecDeque::new(),
             bench: None,
             recovery: None,
-            correctness: None,
+            correctness: CorrectnessCheckState::default(),
         }
     }
 
@@ -178,26 +382,49 @@ impl DashboardModel {
         self.log.clear();
         self.bench = None;
         self.recovery = None;
-        self.correctness = None;
+        self.correctness = CorrectnessCheckState::default();
         self.push_log("cleared state");
     }
 
+    #[allow(clippy::too_many_lines)]
     fn drain_events(&mut self) {
         while let Ok(ev) = self.rx.try_recv() {
             match ev {
+                // ── Benchmark events ─────────────────────────────────
                 DashboardEvent::BenchmarkProgress {
                     name,
                     ops_per_sec,
                     elapsed_ms,
                 } => {
-                    self.bench = Some(BenchState {
-                        name: name.clone(),
-                        ops_per_sec,
-                        elapsed_ms,
-                        done: false,
-                    });
+                    if let Some(ref mut b) = self.bench {
+                        b.name.clone_from(&name);
+                        b.ops_per_sec = ops_per_sec;
+                        b.elapsed_ms = elapsed_ms;
+                        b.done = false;
+                        b.push_frank_sample(ops_per_sec);
+                    } else {
+                        self.bench = Some(BenchState::new(name.clone(), ops_per_sec, elapsed_ms));
+                    }
                     self.push_log(format!(
-                        "bench {name}: {ops_per_sec:.1} ops/s @ {elapsed_ms}ms"
+                        "bench {name}: {ops_per_sec:.0} ops/s @ {elapsed_ms}ms"
+                    ));
+                }
+                DashboardEvent::BenchmarkCsqliteProgress {
+                    name,
+                    ops_per_sec,
+                    elapsed_ms,
+                } => {
+                    if let Some(ref mut b) = self.bench {
+                        b.csqlite_ops_per_sec = Some(ops_per_sec);
+                        b.push_csqlite_sample(ops_per_sec);
+                    } else {
+                        let mut state = BenchState::new(name.clone(), 0.0, elapsed_ms);
+                        state.csqlite_ops_per_sec = Some(ops_per_sec);
+                        state.push_csqlite_sample(ops_per_sec);
+                        self.bench = Some(state);
+                    }
+                    self.push_log(format!(
+                        "bench {name} (csqlite): {ops_per_sec:.0} ops/s @ {elapsed_ms}ms"
                     ));
                 }
                 DashboardEvent::BenchmarkComplete {
@@ -205,42 +432,131 @@ impl DashboardModel {
                     wall_time_ms,
                     ops_per_sec,
                 } => {
-                    self.bench = Some(BenchState {
-                        name: name.clone(),
-                        ops_per_sec,
-                        elapsed_ms: wall_time_ms,
-                        done: true,
-                    });
+                    if let Some(ref mut b) = self.bench {
+                        b.name.clone_from(&name);
+                        b.ops_per_sec = ops_per_sec;
+                        b.elapsed_ms = wall_time_ms;
+                        b.done = true;
+                        b.push_frank_sample(ops_per_sec);
+                    } else {
+                        let mut state = BenchState::new(name.clone(), ops_per_sec, wall_time_ms);
+                        state.done = true;
+                        self.bench = Some(state);
+                    }
                     self.push_log(format!(
-                        "bench {name}: DONE {ops_per_sec:.1} ops/s ({wall_time_ms}ms)"
+                        "bench {name}: DONE {ops_per_sec:.0} ops/s ({wall_time_ms}ms)"
                     ));
                 }
+                DashboardEvent::BenchmarkSuiteProgress { completed, total } => {
+                    if let Some(ref mut b) = self.bench {
+                        b.suite_completed = completed;
+                        b.suite_total = total;
+                    }
+                    self.push_log(format!("suite: {completed}/{total}"));
+                }
+
+                // ── Recovery events ──────────────────────────────────
                 DashboardEvent::CorruptionInjected { page, pattern } => {
-                    self.recovery = Some(format!(
-                        "corruption injected: page={page} pattern={pattern}"
-                    ));
+                    self.recovery = Some(RecoveryState::new(page, &pattern));
                     self.push_log(format!("corrupt: page={page} ({pattern})"));
+                }
+                DashboardEvent::CorruptionHexData {
+                    original_bytes,
+                    corrupted_bytes,
+                    page_offset,
+                } => {
+                    if let Some(ref mut r) = self.recovery {
+                        r.original_bytes = original_bytes;
+                        r.corrupted_bytes = corrupted_bytes;
+                        r.page_offset = page_offset;
+                        r.steps.push("Hex data captured".to_owned());
+                    }
                 }
                 DashboardEvent::RecoveryAttempt {
                     group,
                     symbols_available,
                     needed,
                 } => {
-                    self.recovery = Some(format!(
-                        "recovery attempt: group={group} symbols={symbols_available}/{needed}"
-                    ));
+                    if let Some(ref mut r) = self.recovery {
+                        r.recovery_group = Some(group);
+                        r.symbols_available = symbols_available;
+                        r.symbols_needed = needed;
+                        r.steps.push(format!(
+                            "Recovery: group={group} symbols={symbols_available}/{needed}"
+                        ));
+                    }
                     self.push_log(format!(
                         "recover: group={group} symbols={symbols_available}/{needed}"
                     ));
                 }
+                DashboardEvent::RecoveryPhaseUpdate {
+                    phase,
+                    symbols_resolved,
+                } => {
+                    if let Some(ref mut r) = self.recovery {
+                        r.current_phase.clone_from(&phase);
+                        r.phase_symbols_resolved = symbols_resolved;
+                        r.steps.push(format!(
+                            "Phase {phase}: {symbols_resolved} symbols resolved"
+                        ));
+                    }
+                }
                 DashboardEvent::RecoverySuccess { page, decode_proof } => {
-                    self.recovery =
-                        Some(format!("recovery succeeded: page={page}\n{decode_proof}"));
+                    if let Some(ref mut r) = self.recovery {
+                        r.succeeded = Some(true);
+                        r.verdict.clone_from(&decode_proof);
+                        r.steps.push(format!("Page {page} RECOVERED"));
+                    }
                     self.push_log(format!("recover: OK page={page}"));
                 }
+                DashboardEvent::RecoveryHexData { recovered_bytes } => {
+                    if let Some(ref mut r) = self.recovery {
+                        r.recovered_bytes = recovered_bytes;
+                    }
+                }
                 DashboardEvent::RecoveryFailure { page, reason } => {
-                    self.recovery = Some(format!("recovery failed: page={page} reason={reason}"));
+                    if let Some(ref mut r) = self.recovery {
+                        r.succeeded = Some(false);
+                        r.verdict.clone_from(&reason);
+                        r.steps.push(format!("FAILED: page={page} ({reason})"));
+                    }
                     self.push_log(format!("recover: FAIL page={page} ({reason})"));
+                }
+                DashboardEvent::CsqliteIntegrityResult { passed, message } => {
+                    if let Some(ref mut r) = self.recovery {
+                        r.csqlite_integrity_passed = Some(passed);
+                        r.csqlite_integrity_message.clone_from(&message);
+                        r.steps.push(format!(
+                            "C SQLite: {}",
+                            if passed {
+                                "integrity OK"
+                            } else {
+                                "INTEGRITY FAILED"
+                            }
+                        ));
+                    }
+                }
+
+                // ── Correctness events ───────────────────────────────
+                DashboardEvent::CorrectnessWorkloadStart {
+                    workload,
+                    total_ops,
+                } => {
+                    self.correctness.current_workload = Some(workload.clone());
+                    self.correctness.ops_done = 0;
+                    self.correctness.ops_total = total_ops;
+                    self.correctness.recent_sql.clear();
+                    self.push_log(format!("correctness: start {workload} ({total_ops} ops)"));
+                }
+                DashboardEvent::CorrectnessOpProgress {
+                    workload: _,
+                    ops_done,
+                    total_ops,
+                    current_sql,
+                } => {
+                    self.correctness.ops_done = ops_done;
+                    self.correctness.ops_total = total_ops;
+                    self.correctness.push_sql(current_sql);
                 }
                 DashboardEvent::CorrectnessCheck {
                     workload,
@@ -248,17 +564,22 @@ impl DashboardModel {
                     csqlite_hash,
                     matched,
                 } => {
-                    self.correctness = Some(CorrectnessState {
+                    self.correctness.results.push(WorkloadResult {
                         workload: workload.clone(),
+                        frank_hash: frank_hash.clone(),
+                        csqlite_hash: csqlite_hash.clone(),
                         matched,
-                        frank_sha256: frank_hash.clone(),
-                        csqlite_sha256: csqlite_hash.clone(),
                     });
+                    self.correctness.current_workload = None;
+                    self.correctness.ops_done = 0;
+                    self.correctness.ops_total = 0;
                     self.push_log(format!(
                         "check {workload}: {}",
                         if matched { "MATCH" } else { "MISMATCH" }
                     ));
                 }
+
+                // ── General ──────────────────────────────────────────
                 DashboardEvent::StatusMessage { message } => {
                     self.push_log(format!("status: {message}"));
                 }
@@ -266,6 +587,8 @@ impl DashboardModel {
         }
     }
 }
+
+// ── Model implementation ──────────────────────────────────────────────────
 
 impl Model for DashboardModel {
     type Message = Msg;
@@ -302,84 +625,522 @@ impl Model for DashboardModel {
     fn view(&self, frame: &mut ftui::Frame) {
         let (a, b, c, d) = split_quadrants(frame.width(), frame.height());
 
-        render_panel(
-            frame,
-            PanelId::Benchmark,
-            a,
-            self.active,
-            &self.render_benchmark(),
-        );
-        render_panel(
-            frame,
-            PanelId::Recovery,
-            b,
-            self.active,
-            &self.render_recovery(),
-        );
-        render_panel(
-            frame,
-            PanelId::Correctness,
-            c,
-            self.active,
-            &self.render_correctness(),
-        );
-        render_panel(
-            frame,
-            PanelId::Summary,
-            d,
-            self.active,
-            &self.render_summary(),
-        );
+        self.render_benchmark_panel(frame, a);
+        self.render_recovery_panel(frame, b);
+        self.render_correctness_panel(frame, c);
+        self.render_summary_panel(frame, d);
     }
 }
+
+// ── Benchmark panel rendering (bd-mmhw) ──────────────────────────────────
 
 impl DashboardModel {
-    fn render_benchmark(&self) -> String {
+    #[allow(clippy::too_many_lines)]
+    fn render_benchmark_panel(&self, frame: &mut ftui::Frame, area: Rect) {
+        let border_style = panel_border_style(PanelId::Benchmark, self.active);
+        let title = panel_title(PanelId::Benchmark, self.active);
+
         let Some(ref b) = self.bench else {
-            return "waiting for benchmark events...\n\nkeys: tab / shift-tab switch panel | r reset | q quit"
-                .to_owned();
+            Panel::new(Paragraph::new(
+                "Waiting for benchmark events...\n\n\
+                 Keys: Tab/Shift-Tab switch panel | r reset | q quit"
+                    .to_owned(),
+            ))
+            .title(&title)
+            .border_style(border_style)
+            .render(area, frame);
+            return;
         };
 
-        let status = if b.done { "DONE" } else { "RUN" };
-        format!(
-            "name: {}\nstatus: {}\nops_per_sec: {:.2}\nelapsed_ms: {}\n\nkeys: tab / shift-tab | r reset | q quit",
-            b.name, status, b.ops_per_sec, b.elapsed_ms
-        )
-    }
+        // Compute inner area for custom layout.
+        let panel = Panel::new(Paragraph::new(String::new()))
+            .title(&title)
+            .border_style(border_style);
+        let inner = panel.inner(area);
+        panel.render(area, frame);
 
-    fn render_recovery(&self) -> String {
-        self.recovery.clone().unwrap_or_else(|| {
-            "waiting for recovery events...\n\nkeys: tab / shift-tab | r reset | q quit".to_owned()
-        })
-    }
-
-    fn render_correctness(&self) -> String {
-        let Some(ref c) = self.correctness else {
-            return "waiting for correctness events...\n\nkeys: tab / shift-tab | r reset | q quit"
-                .to_owned();
-        };
-        format!(
-            "workload: {}\nmatch: {}\nfrank_sha256: {}\ncsqlite_sha256: {}\n\nkeys: tab / shift-tab | r reset | q quit",
-            c.workload,
-            if c.matched { "YES" } else { "NO" },
-            c.frank_sha256,
-            c.csqlite_sha256
-        )
-    }
-
-    fn render_summary(&self) -> String {
-        let mut out = String::new();
-        for line in &self.log {
-            out.push_str(line);
-            out.push('\n');
+        if inner.height < 3 || inner.width < 10 {
+            return;
         }
-        if out.is_empty() {
-            out.push_str("no events yet\n");
+
+        let mut y = inner.y;
+
+        // Status line.
+        let status = if b.done { "DONE" } else { "RUNNING" };
+        let status_line = format!("  {}: {} [{status}]", b.name, format_ops(b.ops_per_sec));
+        Paragraph::new(status_line)
+            .style(Style::new().fg(if b.done {
+                PackedRgba::rgb(100, 220, 100)
+            } else {
+                PackedRgba::rgb(100, 180, 255)
+            }))
+            .render(Rect::new(inner.x, y, inner.width, 1), frame);
+        y += 1;
+
+        // Speedup ratio.
+        if let Some(csqlite_ops) = b.csqlite_ops_per_sec {
+            let speedup = if csqlite_ops > 0.0 {
+                b.ops_per_sec / csqlite_ops
+            } else {
+                0.0
+            };
+            let speedup_line = format!(
+                "  FrankenSQLite: {}  |  C SQLite: {}  |  Speedup: {speedup:.2}x",
+                format_ops(b.ops_per_sec),
+                format_ops(csqlite_ops)
+            );
+            let color = if speedup >= 2.0 {
+                PackedRgba::rgb(80, 220, 80)
+            } else if speedup >= 1.0 {
+                PackedRgba::rgb(220, 220, 80)
+            } else {
+                PackedRgba::rgb(220, 80, 80)
+            };
+            Paragraph::new(speedup_line)
+                .style(Style::new().fg(color))
+                .render(Rect::new(inner.x, y, inner.width, 1), frame);
+            y += 1;
         }
-        out.push_str("\nkeys: tab / shift-tab | r reset | q quit");
-        out
+
+        // Sparkline: FrankenSQLite throughput.
+        if y < inner.y + inner.height && !b.frank_history.is_empty() {
+            y += 1; // blank line
+            let label = "  Throughput (FrankenSQLite):";
+            Paragraph::new(label.to_owned())
+                .style(Style::new().fg(PackedRgba::rgb(100, 220, 100)))
+                .render(Rect::new(inner.x, y, inner.width, 1), frame);
+            y += 1;
+
+            if y < inner.y + inner.height {
+                let data: Vec<f64> = b.frank_history.iter().copied().collect();
+                let spark_width = inner
+                    .width
+                    .saturating_sub(2)
+                    .min(u16::try_from(data.len()).unwrap_or(u16::MAX));
+                let visible = &data[data.len().saturating_sub(spark_width as usize)..];
+                Sparkline::new(visible)
+                    .style(Style::new().fg(PackedRgba::rgb(80, 220, 80)))
+                    .render(Rect::new(inner.x + 2, y, spark_width, 1), frame);
+                y += 1;
+            }
+        }
+
+        // Sparkline: C SQLite throughput (if available).
+        if y < inner.y + inner.height && !b.csqlite_history.is_empty() {
+            let label = "  Throughput (C SQLite):";
+            Paragraph::new(label.to_owned())
+                .style(Style::new().fg(PackedRgba::rgb(220, 180, 60)))
+                .render(Rect::new(inner.x, y, inner.width, 1), frame);
+            y += 1;
+
+            if y < inner.y + inner.height {
+                let data: Vec<f64> = b.csqlite_history.iter().copied().collect();
+                let spark_width = inner
+                    .width
+                    .saturating_sub(2)
+                    .min(u16::try_from(data.len()).unwrap_or(u16::MAX));
+                let visible = &data[data.len().saturating_sub(spark_width as usize)..];
+                Sparkline::new(visible)
+                    .style(Style::new().fg(PackedRgba::rgb(220, 180, 60)))
+                    .render(Rect::new(inner.x + 2, y, spark_width, 1), frame);
+                y += 1;
+            }
+        }
+
+        // Suite progress bar.
+        if y + 1 < inner.y + inner.height && b.suite_total > 0 {
+            y += 1;
+            let ratio = if b.suite_total > 0 {
+                b.suite_completed as f64 / b.suite_total as f64
+            } else {
+                0.0
+            };
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let pct = (ratio * 100.0) as u32;
+            let label = format!("  Suite: {}/{} ({pct}%)", b.suite_completed, b.suite_total);
+            Paragraph::new(label)
+                .style(Style::new().fg(PackedRgba::WHITE))
+                .render(Rect::new(inner.x, y, inner.width, 1), frame);
+            y += 1;
+
+            if y < inner.y + inner.height {
+                ProgressBar::new()
+                    .ratio(ratio)
+                    .gauge_style(Style::new().bg(PackedRgba::rgb(60, 120, 200)))
+                    .render(
+                        Rect::new(inner.x + 2, y, inner.width.saturating_sub(4), 1),
+                        frame,
+                    );
+            }
+        }
     }
 }
+
+// ── Recovery panel rendering (bd-s4qy) ───────────────────────────────────
+
+impl DashboardModel {
+    #[allow(clippy::too_many_lines)]
+    fn render_recovery_panel(&self, frame: &mut ftui::Frame, area: Rect) {
+        let border_style = panel_border_style(PanelId::Recovery, self.active);
+        let title = panel_title(PanelId::Recovery, self.active);
+
+        let Some(ref r) = self.recovery else {
+            Panel::new(Paragraph::new(
+                "Waiting for recovery events...\n\n\
+                 Keys: Tab/Shift-Tab switch panel | r reset | q quit"
+                    .to_owned(),
+            ))
+            .title(&title)
+            .border_style(border_style)
+            .render(area, frame);
+            return;
+        };
+
+        let panel = Panel::new(Paragraph::new(String::new()))
+            .title(&title)
+            .border_style(border_style);
+        let inner = panel.inner(area);
+        panel.render(area, frame);
+
+        if inner.height < 3 || inner.width < 10 {
+            return;
+        }
+
+        let mut y = inner.y;
+
+        // Header: page info.
+        let header = format!(
+            "  Page {} (offset {:#X}): {}",
+            r.page, r.page_offset, r.pattern
+        );
+        Paragraph::new(header)
+            .style(Style::new().fg(PackedRgba::rgb(255, 180, 80)))
+            .render(Rect::new(inner.x, y, inner.width, 1), frame);
+        y += 1;
+
+        // Hex diff: original vs corrupted.
+        if !r.original_bytes.is_empty() && !r.corrupted_bytes.is_empty() {
+            y += 1;
+            let hex_lines_available =
+                ((inner.y + inner.height).saturating_sub(y).saturating_sub(8)) / 2;
+            let bytes_per_line: usize = 8;
+            let max_lines = (hex_lines_available as usize).min(HEX_DISPLAY_BYTES / bytes_per_line);
+
+            // Original bytes.
+            Paragraph::new("  Original:".to_owned())
+                .style(Style::new().fg(PackedRgba::rgb(160, 160, 160)))
+                .render(Rect::new(inner.x, y, inner.width, 1), frame);
+            y += 1;
+
+            for line_idx in 0..max_lines {
+                if y >= inner.y + inner.height {
+                    break;
+                }
+                let start = line_idx * bytes_per_line;
+                let hex = format_hex_line(&r.original_bytes, start, bytes_per_line);
+                Paragraph::new(format!("  {hex}"))
+                    .style(Style::new().fg(PackedRgba::rgb(100, 200, 100)))
+                    .render(Rect::new(inner.x, y, inner.width, 1), frame);
+                y += 1;
+            }
+
+            // Corrupted bytes.
+            if y < inner.y + inner.height {
+                Paragraph::new("  Corrupted:".to_owned())
+                    .style(Style::new().fg(PackedRgba::rgb(160, 160, 160)))
+                    .render(Rect::new(inner.x, y, inner.width, 1), frame);
+                y += 1;
+
+                for line_idx in 0..max_lines {
+                    if y >= inner.y + inner.height {
+                        break;
+                    }
+                    let start = line_idx * bytes_per_line;
+                    let hex = format_hex_line_diff(
+                        &r.corrupted_bytes,
+                        &r.original_bytes,
+                        start,
+                        bytes_per_line,
+                    );
+                    Paragraph::new(format!("  {hex}"))
+                        .style(Style::new().fg(PackedRgba::rgb(255, 80, 80)))
+                        .render(Rect::new(inner.x, y, inner.width, 1), frame);
+                    y += 1;
+                }
+            }
+        }
+
+        // Recovery status.
+        if y < inner.y + inner.height {
+            y += 1;
+            Paragraph::new("  Recovery Status:".to_owned())
+                .style(Style::new().fg(PackedRgba::WHITE).bold())
+                .render(Rect::new(inner.x, y, inner.width, 1), frame);
+            y += 1;
+        }
+
+        // Symbol availability progress.
+        if r.symbols_needed > 0 && y < inner.y + inner.height {
+            let ratio = if r.symbols_needed > 0 {
+                f64::from(r.symbols_available) / f64::from(r.symbols_needed)
+            } else {
+                0.0
+            };
+            let decodable = if r.symbols_available >= r.symbols_needed {
+                "DECODABLE"
+            } else {
+                "INSUFFICIENT"
+            };
+            let sym_line = format!(
+                "  Symbols: {}/{} ({decodable})",
+                r.symbols_available, r.symbols_needed
+            );
+            Paragraph::new(sym_line)
+                .style(Style::new().fg(if r.symbols_available >= r.symbols_needed {
+                    PackedRgba::rgb(80, 220, 80)
+                } else {
+                    PackedRgba::rgb(255, 180, 80)
+                }))
+                .render(Rect::new(inner.x, y, inner.width, 1), frame);
+            y += 1;
+
+            if y < inner.y + inner.height {
+                ProgressBar::new()
+                    .ratio(ratio.min(1.0))
+                    .gauge_style(Style::new().bg(PackedRgba::rgb(60, 180, 120)))
+                    .render(
+                        Rect::new(inner.x + 2, y, inner.width.saturating_sub(4), 1),
+                        frame,
+                    );
+                y += 1;
+            }
+        }
+
+        // Phase progress.
+        if !r.current_phase.is_empty() && y < inner.y + inner.height {
+            let phase_line = format!(
+                "  Phase: {} ({} resolved)",
+                r.current_phase, r.phase_symbols_resolved
+            );
+            Paragraph::new(phase_line)
+                .style(Style::new().fg(PackedRgba::rgb(180, 180, 255)))
+                .render(Rect::new(inner.x, y, inner.width, 1), frame);
+            y += 1;
+        }
+
+        // Verdict.
+        if let Some(succeeded) = r.succeeded {
+            if y < inner.y + inner.height {
+                let (icon, color) = if succeeded {
+                    ("RECOVERED", PackedRgba::rgb(80, 255, 80))
+                } else {
+                    ("FAILED", PackedRgba::rgb(255, 80, 80))
+                };
+                let verdict_line = format!("  FrankenSQLite: {icon}");
+                Paragraph::new(verdict_line)
+                    .style(Style::new().fg(color).bold())
+                    .render(Rect::new(inner.x, y, inner.width, 1), frame);
+                y += 1;
+            }
+        }
+
+        // C SQLite integrity result.
+        if let Some(passed) = r.csqlite_integrity_passed {
+            if y < inner.y + inner.height {
+                let (icon, color) = if passed {
+                    ("integrity OK", PackedRgba::rgb(160, 160, 160))
+                } else {
+                    ("INTEGRITY FAILED", PackedRgba::rgb(255, 80, 80))
+                };
+                let line = format!("  C SQLite: {icon}");
+                Paragraph::new(line)
+                    .style(Style::new().fg(color))
+                    .render(Rect::new(inner.x, y, inner.width, 1), frame);
+            }
+        }
+    }
+}
+
+// ── Correctness panel rendering (bd-1nqt) ────────────────────────────────
+
+impl DashboardModel {
+    #[allow(clippy::too_many_lines)]
+    fn render_correctness_panel(&self, frame: &mut ftui::Frame, area: Rect) {
+        let border_style = panel_border_style(PanelId::Correctness, self.active);
+        let title = panel_title(PanelId::Correctness, self.active);
+        let c = &self.correctness;
+
+        if c.results.is_empty() && c.current_workload.is_none() {
+            Panel::new(Paragraph::new(
+                "Waiting for correctness events...\n\n\
+                 Keys: Tab/Shift-Tab switch panel | r reset | q quit"
+                    .to_owned(),
+            ))
+            .title(&title)
+            .border_style(border_style)
+            .render(area, frame);
+            return;
+        }
+
+        let panel = Panel::new(Paragraph::new(String::new()))
+            .title(&title)
+            .border_style(border_style);
+        let inner = panel.inner(area);
+        panel.render(area, frame);
+
+        if inner.height < 3 || inner.width < 10 {
+            return;
+        }
+
+        let mut y = inner.y;
+
+        // Current workload progress.
+        if let Some(ref wl) = c.current_workload {
+            let progress_line = format!("  Workload: {wl}");
+            Paragraph::new(progress_line)
+                .style(Style::new().fg(PackedRgba::rgb(100, 180, 255)))
+                .render(Rect::new(inner.x, y, inner.width, 1), frame);
+            y += 1;
+
+            if c.ops_total > 0 && y < inner.y + inner.height {
+                let ratio = c.ops_done as f64 / c.ops_total as f64;
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let pct = (ratio * 100.0) as u32;
+                let ops_line = format!("  Progress: {}/{} ({pct}%)", c.ops_done, c.ops_total);
+                Paragraph::new(ops_line)
+                    .style(Style::new().fg(PackedRgba::WHITE))
+                    .render(Rect::new(inner.x, y, inner.width, 1), frame);
+                y += 1;
+
+                if y < inner.y + inner.height {
+                    ProgressBar::new()
+                        .ratio(ratio)
+                        .gauge_style(Style::new().bg(PackedRgba::rgb(60, 120, 200)))
+                        .render(
+                            Rect::new(inner.x + 2, y, inner.width.saturating_sub(4), 1),
+                            frame,
+                        );
+                    y += 1;
+                }
+            }
+            y += 1;
+        }
+
+        // Results table header.
+        if y < inner.y + inner.height {
+            let hdr = format!(
+                "  {:<20} {:<10} {:<10} {}",
+                "Workload", "Frank", "CSQLite", "Result"
+            );
+            Paragraph::new(hdr)
+                .style(Style::new().fg(PackedRgba::WHITE).bold())
+                .render(Rect::new(inner.x, y, inner.width, 1), frame);
+            y += 1;
+        }
+
+        // Separator.
+        if y < inner.y + inner.height {
+            let sep: String = "-".repeat(inner.width.saturating_sub(2) as usize);
+            Paragraph::new(format!("  {sep}"))
+                .style(Style::new().fg(PackedRgba::rgb(80, 80, 80)))
+                .render(Rect::new(inner.x, y, inner.width, 1), frame);
+            y += 1;
+        }
+
+        // Result rows.
+        for result in &c.results {
+            if y >= inner.y + inner.height {
+                break;
+            }
+            let frank_short = truncate_hash(&result.frank_hash, 8);
+            let csqlite_short = truncate_hash(&result.csqlite_hash, 8);
+            let (icon, color) = if result.matched {
+                ("MATCH", PackedRgba::rgb(80, 220, 80))
+            } else {
+                ("MISMATCH", PackedRgba::rgb(255, 80, 80))
+            };
+            let wl_name = truncate_str(&result.workload, 18);
+            let row = format!("  {wl_name:<20} {frank_short:<10} {csqlite_short:<10} {icon}");
+            Paragraph::new(row)
+                .style(Style::new().fg(color))
+                .render(Rect::new(inner.x, y, inner.width, 1), frame);
+            y += 1;
+        }
+
+        // Currently running workload placeholder row.
+        if c.current_workload.is_some() && y < inner.y + inner.height {
+            let wl_name = c
+                .current_workload
+                .as_deref()
+                .map_or("...", |w| truncate_str_static(w, 18));
+            let row = format!("  {wl_name:<20} {:<10} {:<10} ...", "running", "running");
+            Paragraph::new(row)
+                .style(Style::new().fg(PackedRgba::rgb(180, 180, 180)))
+                .render(Rect::new(inner.x, y, inner.width, 1), frame);
+            y += 1;
+        }
+
+        // Recent SQL log.
+        if !c.recent_sql.is_empty() && y + 1 < inner.y + inner.height {
+            y += 1;
+            Paragraph::new("  Recent SQL:".to_owned())
+                .style(Style::new().fg(PackedRgba::rgb(160, 160, 160)))
+                .render(Rect::new(inner.x, y, inner.width, 1), frame);
+            y += 1;
+
+            for sql in &c.recent_sql {
+                if y >= inner.y + inner.height {
+                    break;
+                }
+                let truncated = truncate_str(sql, (inner.width.saturating_sub(4)) as usize);
+                Paragraph::new(format!("  {truncated}"))
+                    .style(Style::new().fg(PackedRgba::rgb(120, 120, 120)))
+                    .render(Rect::new(inner.x, y, inner.width, 1), frame);
+                y += 1;
+            }
+        }
+
+        // Overall summary.
+        if y < inner.y + inner.height && !c.results.is_empty() {
+            y += 1;
+            let passed = c.results.iter().filter(|r| r.matched).count();
+            let running = i32::from(c.current_workload.is_some());
+            let summary = format!(
+                "  Overall: {passed}/{} passed, {running} running",
+                c.results.len()
+            );
+            Paragraph::new(summary)
+                .style(Style::new().fg(PackedRgba::WHITE))
+                .render(Rect::new(inner.x, y, inner.width, 1), frame);
+        }
+    }
+}
+
+// ── Summary panel rendering ──────────────────────────────────────────────
+
+impl DashboardModel {
+    fn render_summary_panel(&self, frame: &mut ftui::Frame, area: Rect) {
+        let border_style = panel_border_style(PanelId::Summary, self.active);
+        let title = panel_title(PanelId::Summary, self.active);
+
+        let mut body = String::new();
+        for line in &self.log {
+            body.push_str(line);
+            body.push('\n');
+        }
+        if body.is_empty() {
+            body.push_str("No events yet\n");
+        }
+        body.push_str("\nKeys: Tab/Shift-Tab switch | r reset | q quit");
+
+        Panel::new(Paragraph::new(body))
+            .title(&title)
+            .border_style(border_style)
+            .render(area, frame);
+    }
+}
+
+// ── Layout + styling helpers ─────────────────────────────────────────────
 
 fn split_quadrants(width: u16, height: u16) -> (Rect, Rect, Rect, Rect) {
     let mid_x = width / 2;
@@ -398,30 +1159,105 @@ fn split_quadrants(width: u16, height: u16) -> (Rect, Rect, Rect, Rect) {
     (a, b, c, d)
 }
 
-fn render_panel(frame: &mut ftui::Frame, id: PanelId, area: Rect, active: PanelId, body: &str) {
-    let (border, title) = if id == active {
-        (
-            Style::default().fg(PackedRgba::rgb(255, 255, 0)),
-            format!("{} [active]", id.title()),
-        )
+fn panel_border_style(id: PanelId, active: PanelId) -> Style {
+    if id == active {
+        Style::default().fg(PackedRgba::rgb(255, 255, 0))
     } else {
-        (
-            Style::default().fg(PackedRgba::rgb(128, 128, 128)),
-            id.title().to_owned(),
-        )
-    };
-
-    Panel::new(Paragraph::new(body.to_owned()))
-        .title(&title)
-        .border_style(border)
-        .render(area, frame);
+        Style::default().fg(PackedRgba::rgb(80, 80, 80))
+    }
 }
+
+fn panel_title(id: PanelId, active: PanelId) -> String {
+    if id == active {
+        format!("{} [active]", id.title())
+    } else {
+        id.title().to_owned()
+    }
+}
+
+// ── Formatting helpers ───────────────────────────────────────────────────
+
+/// Format operations per second with SI suffix.
+fn format_ops(ops: f64) -> String {
+    if ops >= 1_000_000.0 {
+        format!("{:.1}M ops/s", ops / 1_000_000.0)
+    } else if ops >= 1_000.0 {
+        format!("{:.1}K ops/s", ops / 1_000.0)
+    } else {
+        format!("{ops:.0} ops/s")
+    }
+}
+
+/// Format a hex line from a byte slice.
+fn format_hex_line(bytes: &[u8], start: usize, count: usize) -> String {
+    let end = (start + count).min(bytes.len());
+    if start >= bytes.len() {
+        return String::new();
+    }
+    let mut hex = String::with_capacity(count * 3);
+    for (i, &b) in bytes[start..end].iter().enumerate() {
+        if i > 0 {
+            hex.push(' ');
+        }
+        let _ = write!(hex, "{b:02X}");
+    }
+    hex
+}
+
+/// Format a hex line highlighting bytes that differ from reference.
+fn format_hex_line_diff(bytes: &[u8], reference: &[u8], start: usize, count: usize) -> String {
+    let end = (start + count).min(bytes.len());
+    if start >= bytes.len() {
+        return String::new();
+    }
+    let mut hex = String::with_capacity(count * 3);
+    for (i, &b) in bytes[start..end].iter().enumerate() {
+        if i > 0 {
+            hex.push(' ');
+        }
+        let ref_byte = reference.get(start + i).copied().unwrap_or(0);
+        if b == ref_byte {
+            let _ = write!(hex, "{b:02X}");
+        } else {
+            // Mark differing bytes with brackets.
+            let _ = write!(hex, "[{b:02X}]");
+        }
+    }
+    hex
+}
+
+/// Truncate a hash string to `max_len` characters.
+fn truncate_hash(hash: &str, max_len: usize) -> String {
+    if hash.len() <= max_len {
+        hash.to_owned()
+    } else {
+        format!("{}...", &hash[..max_len.saturating_sub(3)])
+    }
+}
+
+/// Truncate a string reference to `max_len` characters.
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_owned()
+    } else {
+        format!("{}...", &s[..max_len.saturating_sub(3)])
+    }
+}
+
+/// Truncate returning a static-like reference (returns owned for simplicity).
+fn truncate_str_static(s: &str, max_len: usize) -> &str {
+    if s.len() <= max_len { s } else { &s[..max_len] }
+}
+
+// ── Headless mode ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
 struct HeadlessOutput {
     generated_at_unix_ms: u64,
     events: Vec<DashboardEvent>,
 }
+
+// ── Main ──────────────────────────────────────────────────────────────────
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -493,19 +1329,30 @@ fn sample_events() -> Vec<DashboardEvent> {
             message: "headless mode: sample run".to_owned(),
         },
         DashboardEvent::BenchmarkComplete {
-            name: "commutative_inserts_disjoint_keys".to_owned(),
+            name: "concurrent_writes_8t".to_owned(),
             wall_time_ms: 1234,
-            ops_per_sec: 9876.0,
+            ops_per_sec: 185_000.0,
         },
         DashboardEvent::CorrectnessCheck {
-            workload: "commutative_inserts_disjoint_keys".to_owned(),
-            frank_hash: "aaa".to_owned(),
-            csqlite_hash: "aaa".to_owned(),
+            workload: "sequential_insert".to_owned(),
+            frank_hash: "a3b7c9d1e2f4a5b6".to_owned(),
+            csqlite_hash: "a3b7c9d1e2f4a5b6".to_owned(),
             matched: true,
+        },
+        DashboardEvent::CorruptionInjected {
+            page: 500,
+            pattern: "PageZero".to_owned(),
+        },
+        DashboardEvent::RecoverySuccess {
+            page: 500,
+            decode_proof: "xxh3 verified".to_owned(),
         },
     ]
 }
 
+// ── Demo event producer (showcases all panels) ───────────────────────────
+
+#[allow(clippy::too_many_lines)]
 fn demo_event_producer(tx: &mpsc::Sender<DashboardEvent>, stop: &Arc<AtomicBool>) {
     let _ = tx.send(DashboardEvent::StatusMessage {
         message: "dashboard online (demo event source)".to_owned(),
@@ -513,49 +1360,163 @@ fn demo_event_producer(tx: &mpsc::Sender<DashboardEvent>, stop: &Arc<AtomicBool>
 
     let started = Instant::now();
     let mut last_emit = Instant::now();
-    let mut ops: f64 = 0.0;
+    let mut tick: u64 = 0;
+
+    // Phase 1: Benchmark progress (0-3s).
+    // Phase 2: Correctness check (3-5s).
+    // Phase 3: Corruption recovery (5-8s).
+    // Phase 4: Complete (8s+).
+
+    let _ = tx.send(DashboardEvent::BenchmarkSuiteProgress {
+        completed: 0,
+        total: 3,
+    });
+
+    // Start correctness workload.
+    let _ = tx.send(DashboardEvent::CorrectnessWorkloadStart {
+        workload: "Sequential INSERT".to_owned(),
+        total_ops: 10000,
+    });
 
     while !stop.load(Ordering::Relaxed) {
-        if last_emit.elapsed() >= Duration::from_millis(250) {
-            last_emit = Instant::now();
-            ops += 1000.0;
-            let elapsed_ms: u64 = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+        if last_emit.elapsed() < Duration::from_millis(200) {
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+
+        last_emit = Instant::now();
+        tick += 1;
+        let elapsed_ms: u64 = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+
+        // Phase 1: Streaming benchmark throughput.
+        if (0..4_000).contains(&elapsed_ms) {
+            let tick_f = tick as f64;
+            let frank_ops = tick_f.mul_add(8_000.0, 50_000.0);
+            let csqlite_ops = tick_f.mul_add(1_200.0, 12_000.0);
+
             let _ = tx.send(DashboardEvent::BenchmarkProgress {
-                name: "demo".to_owned(),
-                ops_per_sec: ops,
+                name: "concurrent_writes_8t".to_owned(),
+                ops_per_sec: frank_ops,
+                elapsed_ms,
+            });
+            let _ = tx.send(DashboardEvent::BenchmarkCsqliteProgress {
+                name: "concurrent_writes_8t".to_owned(),
+                ops_per_sec: csqlite_ops,
                 elapsed_ms,
             });
 
-            if elapsed_ms > 3_000 {
-                let _ = tx.send(DashboardEvent::BenchmarkComplete {
-                    name: "demo".to_owned(),
-                    wall_time_ms: elapsed_ms,
-                    ops_per_sec: ops,
-                });
-                let _ = tx.send(DashboardEvent::CorrectnessCheck {
-                    workload: "demo".to_owned(),
-                    frank_hash: "deadbeef".to_owned(),
-                    csqlite_hash: "deadbeef".to_owned(),
-                    matched: true,
-                });
-                let _ = tx.send(DashboardEvent::CorruptionInjected {
-                    page: 1,
-                    pattern: "bit_flip".to_owned(),
-                });
-                let _ = tx.send(DashboardEvent::RecoveryAttempt {
-                    group: 0,
-                    symbols_available: 64,
-                    needed: 64,
-                });
-                let _ = tx.send(DashboardEvent::RecoverySuccess {
-                    page: 1,
-                    decode_proof: "decode_succeeded=true".to_owned(),
-                });
-                break;
-            }
+            // Correctness op progress.
+            #[allow(clippy::cast_possible_truncation)]
+            let ops_done = ((tick * 600) as usize).min(10000);
+            let sql_samples = [
+                "INSERT INTO test VALUES (421, 'data-421')",
+                "UPDATE test SET value=82.3 WHERE id=421",
+                "DELETE FROM test WHERE id < 10",
+                "SELECT COUNT(*) FROM test",
+                "INSERT INTO test VALUES (999, 'final')",
+            ];
+            let _ = tx.send(DashboardEvent::CorrectnessOpProgress {
+                workload: "Sequential INSERT".to_owned(),
+                ops_done,
+                total_ops: 10000,
+                #[allow(clippy::cast_possible_truncation)]
+                current_sql: sql_samples[(tick as usize) % sql_samples.len()].to_owned(),
+            });
         }
 
-        std::thread::sleep(Duration::from_millis(10));
+        // Phase 2: Benchmark done + correctness results.
+        if (4_000..4_500).contains(&elapsed_ms) && tick % 5 == 0 {
+            let _ = tx.send(DashboardEvent::BenchmarkComplete {
+                name: "concurrent_writes_8t".to_owned(),
+                wall_time_ms: elapsed_ms,
+                ops_per_sec: 185_000.0,
+            });
+            let _ = tx.send(DashboardEvent::BenchmarkSuiteProgress {
+                completed: 1,
+                total: 3,
+            });
+
+            let _ = tx.send(DashboardEvent::CorrectnessCheck {
+                workload: "Sequential INSERT".to_owned(),
+                frank_hash: "a3b7c9d1e2f4a5b6c7d8e9f0a1b2c3d4".to_owned(),
+                csqlite_hash: "a3b7c9d1e2f4a5b6c7d8e9f0a1b2c3d4".to_owned(),
+                matched: true,
+            });
+
+            let _ = tx.send(DashboardEvent::CorrectnessWorkloadStart {
+                workload: "Mixed DML".to_owned(),
+                total_ops: 20000,
+            });
+        }
+
+        // Phase 3: Corruption + recovery demo.
+        if (5_000..5_500).contains(&elapsed_ms) && tick % 5 == 0 {
+            let _ = tx.send(DashboardEvent::CorruptionInjected {
+                page: 500,
+                pattern: "PageZero".to_owned(),
+            });
+            // Simulated hex data.
+            let original: Vec<u8> = (0..64).map(|i| 0x0D_u8.wrapping_add(i)).collect();
+            let corrupted: Vec<u8> = vec![0u8; 64];
+            let _ = tx.send(DashboardEvent::CorruptionHexData {
+                original_bytes: original,
+                corrupted_bytes: corrupted,
+                page_offset: 0x1F_4000,
+            });
+        }
+
+        if (6_000..6_500).contains(&elapsed_ms) && tick % 5 == 0 {
+            let _ = tx.send(DashboardEvent::RecoveryAttempt {
+                group: 7,
+                symbols_available: 67,
+                needed: 64,
+            });
+            let _ = tx.send(DashboardEvent::RecoveryPhaseUpdate {
+                phase: "peeling".to_owned(),
+                symbols_resolved: 61,
+            });
+        }
+
+        if (7_000..7_500).contains(&elapsed_ms) && tick % 5 == 0 {
+            let _ = tx.send(DashboardEvent::RecoveryPhaseUpdate {
+                phase: "Gaussian".to_owned(),
+                symbols_resolved: 64,
+            });
+
+            let recovered: Vec<u8> = (0..64).map(|i| 0x0D_u8.wrapping_add(i)).collect();
+            let _ = tx.send(DashboardEvent::RecoveryHexData {
+                recovered_bytes: recovered,
+            });
+
+            let _ = tx.send(DashboardEvent::RecoverySuccess {
+                page: 500,
+                decode_proof: "xxh3 verified — page matches original".to_owned(),
+            });
+
+            let _ = tx.send(DashboardEvent::CsqliteIntegrityResult {
+                passed: false,
+                message: "PRAGMA integrity_check failed — data lost".to_owned(),
+            });
+
+            // Second correctness result.
+            let _ = tx.send(DashboardEvent::CorrectnessCheck {
+                workload: "Mixed DML".to_owned(),
+                frank_hash: "e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0".to_owned(),
+                csqlite_hash: "e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0".to_owned(),
+                matched: true,
+            });
+        }
+
+        if elapsed_ms >= 9_000 {
+            let _ = tx.send(DashboardEvent::BenchmarkSuiteProgress {
+                completed: 3,
+                total: 3,
+            });
+            let _ = tx.send(DashboardEvent::StatusMessage {
+                message: "demo complete".to_owned(),
+            });
+            break;
+        }
     }
 }
 
@@ -570,6 +1531,17 @@ OPTIONS:
     --headless          Skip TUI; emit JSON to stdout (or --output)
     --output <FILE>     Write headless JSON output to a file
     -h, --help          Show this help
+
+PANELS:
+    Benchmark       Real-time throughput sparkline with speedup ratio
+    Recovery        Hex diff of corrupted/recovered bytes + decode status
+    Correctness     SHA-256 comparison table with per-workload pass/fail
+    Summary         Scrollable event log
+
+KEYS:
+    Tab / Shift-Tab     Switch active panel
+    r                   Reset all state
+    q                   Quit
 ";
     print!("{text}");
 }

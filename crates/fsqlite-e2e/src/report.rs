@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::methodology::{EnvironmentMeta, MethodologyMeta};
+
 /// JSON schema version for the E2E report format.
 ///
 /// This is a human-readable version string intended for `report.json` consumers.
@@ -41,16 +43,27 @@ FrankenSQLite RealDB E2E equality tiers (best-effort):\n\
 pub struct E2eReport {
     pub schema_version: String,
     pub run: RunInfo,
+    /// Benchmark methodology that governs how measurements were taken.
+    pub methodology: MethodologyMeta,
+    /// Environment snapshot captured at benchmark time for reproducibility.
+    pub environment: EnvironmentMeta,
     pub fixture: FixtureInfo,
     pub workload: WorkloadInfo,
     pub cases: Vec<CaseReport>,
 }
 
 impl E2eReport {
-    pub fn new(run: RunInfo, fixture: FixtureInfo, workload: WorkloadInfo) -> Self {
+    pub fn new(
+        run: RunInfo,
+        fixture: FixtureInfo,
+        workload: WorkloadInfo,
+        environment: EnvironmentMeta,
+    ) -> Self {
         Self {
             schema_version: REPORT_SCHEMA_V1.to_owned(),
             run,
+            methodology: MethodologyMeta::current(),
+            environment,
             fixture,
             workload,
             cases: Vec::new(),
@@ -66,6 +79,10 @@ pub struct RunRecordV1 {
     pub schema_version: String,
     /// Milliseconds since Unix epoch, captured when the record is written.
     pub recorded_unix_ms: u64,
+    /// Benchmark methodology that governs how measurements were taken.
+    pub methodology: MethodologyMeta,
+    /// Environment snapshot captured at benchmark time for reproducibility.
+    pub environment: EnvironmentMeta,
     pub engine: EngineInfo,
     pub fixture_id: String,
     pub golden_path: Option<String>,
@@ -81,6 +98,7 @@ pub struct RunRecordV1 {
 #[derive(Debug, Clone)]
 pub struct RunRecordV1Args {
     pub recorded_unix_ms: u64,
+    pub environment: EnvironmentMeta,
     pub engine: EngineInfo,
     pub fixture_id: String,
     pub golden_path: Option<String>,
@@ -97,6 +115,8 @@ impl RunRecordV1 {
         Self {
             schema_version: RUN_RECORD_SCHEMA_V1.to_owned(),
             recorded_unix_ms: args.recorded_unix_ms,
+            methodology: MethodologyMeta::current(),
+            environment: args.environment,
             engine: args.engine,
             fixture_id: args.fixture_id,
             golden_path: args.golden_path,
@@ -423,6 +443,7 @@ mod tests {
 
         let record = RunRecordV1::new(RunRecordV1Args {
             recorded_unix_ms: 1_700_000_000_000,
+            environment: crate::methodology::EnvironmentMeta::capture("test"),
             engine: EngineInfo {
                 name: "sqlite3".to_owned(),
                 sqlite_version: Some("3.45.1".to_owned()),
@@ -440,6 +461,8 @@ mod tests {
         let line = record.to_jsonl_line().unwrap();
         let parsed: RunRecordV1 = serde_json::from_str(&line).unwrap();
         assert_eq!(parsed.schema_version, RUN_RECORD_SCHEMA_V1);
+        assert_eq!(parsed.methodology.version, "fsqlite-e2e.methodology.v1");
+        assert!(!parsed.environment.arch.is_empty());
         assert_eq!(parsed.engine.name, "sqlite3");
         assert_eq!(parsed.concurrency, 4);
         assert_eq!(parsed.ops_count, 10);

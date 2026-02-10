@@ -6,20 +6,27 @@
 //! - **Differential comparison**: running identical SQL against FrankenSQLite and C SQLite
 //! - **Corruption injection**: byte/page/sector-level corruption for recovery testing
 
+pub mod bench_summary;
+pub mod benchmark;
 pub mod canonicalize;
 pub mod comparison;
 pub mod corruption;
 pub mod corruption_demo_sqlite;
 pub mod corruption_scenarios;
 pub mod executor;
+pub mod fairness;
 pub mod fsqlite_executor;
 pub mod fsqlite_recovery_demo;
 pub mod golden;
+pub mod logging;
+pub mod methodology;
 pub mod oplog;
 pub mod recovery_demo;
 pub mod report;
 pub mod run_workspace;
+pub mod smoke;
 pub mod sqlite_executor;
+pub mod validation;
 pub mod workload;
 
 /// Determinism and durability knobs that the harness sets consistently

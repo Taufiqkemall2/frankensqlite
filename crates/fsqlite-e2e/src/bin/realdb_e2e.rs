@@ -20,6 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use fsqlite_e2e::fsqlite_executor::{FsqliteExecConfig, run_oplog_fsqlite};
+use fsqlite_e2e::methodology::EnvironmentMeta;
 use fsqlite_e2e::oplog::{self, OpLog};
 use fsqlite_e2e::report::{EngineInfo, RunRecordV1, RunRecordV1Args};
 use fsqlite_e2e::sqlite_executor::{SqliteExecConfig, run_oplog_sqlite};
@@ -350,6 +351,7 @@ fn sha256_file(path: &Path) -> Result<String, String> {
 
 // ── run ─────────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_lines)]
 fn cmd_run(argv: &[String]) -> i32 {
     if argv.iter().any(|a| a == "-h" || a == "--help") {
         print_run_help();
@@ -539,6 +541,7 @@ fn resolve_workload(preset: &str, fixture_id: &str, concurrency: u16) -> Result<
 }
 
 /// Execute a workload against C SQLite via rusqlite and print JSON results.
+#[allow(clippy::too_many_lines)]
 fn run_sqlite3_engine(
     db_name: &str,
     workload_name: &str,
@@ -641,6 +644,7 @@ fn run_sqlite3_engine(
 
             let record = RunRecordV1::new(RunRecordV1Args {
                 recorded_unix_ms,
+                environment: EnvironmentMeta::capture("release"),
                 engine: EngineInfo {
                     name: "sqlite3".to_owned(),
                     sqlite_version: Some(sqlite_version.clone()),
@@ -688,6 +692,7 @@ fn run_sqlite3_engine(
 }
 
 /// Execute a workload against FrankenSQLite and print JSON results.
+#[allow(clippy::too_many_lines)]
 fn run_fsqlite_engine(
     db_name: &str,
     workload_name: &str,
@@ -774,6 +779,7 @@ fn run_fsqlite_engine(
 
             let record = RunRecordV1::new(RunRecordV1Args {
                 recorded_unix_ms,
+                environment: EnvironmentMeta::capture("release"),
                 engine: EngineInfo {
                     name: "fsqlite".to_owned(),
                     sqlite_version: None,
