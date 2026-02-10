@@ -19,10 +19,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
+use rusqlite::{Connection, OpenFlags};
+use serde::Serialize;
+
+use fsqlite_e2e::benchmark::{BenchmarkConfig, BenchmarkMeta, BenchmarkSummary, run_benchmark};
+use fsqlite_e2e::corruption::{CorruptionStrategy, inject_corruption};
 use fsqlite_e2e::fsqlite_executor::{FsqliteExecConfig, run_oplog_fsqlite};
 use fsqlite_e2e::methodology::EnvironmentMeta;
 use fsqlite_e2e::oplog::{self, OpLog};
 use fsqlite_e2e::report::{EngineInfo, RunRecordV1, RunRecordV1Args};
+use fsqlite_e2e::report_render::render_benchmark_summaries_markdown;
+use fsqlite_e2e::run_workspace::{WorkspaceConfig, create_workspace};
 use fsqlite_e2e::sqlite_executor::{SqliteExecConfig, run_oplog_sqlite};
 
 fn main() {
@@ -136,8 +143,21 @@ SCAN OPTIONS:
     --header-only       Only show files with valid SQLite magic header
 
 IMPORT OPTIONS:
-    --db <NAME>         Source database path or discovery name
-    --tag <LABEL>       Classification tag (beads, sample, test, etc.)
+    --db <PATH|NAME>        Source database path (preferred) or discovery filename/stem
+    --id <DB_ID>            Override destination fixture id (default: sanitized stem)
+    --tag <LABEL>           Classification tag (stored in metadata)
+    --golden-dir <DIR>      Destination golden directory
+                            (default: sample_sqlite_db_files/golden)
+    --metadata-dir <DIR>    Destination metadata directory
+                            (default: sample_sqlite_db_files/metadata)
+    --checksums <PATH>      Checksums file to update
+                            (default: sample_sqlite_db_files/checksums.sha256)
+    --root <DIR>            Discovery root (only used when resolving NAME)
+                            (default: /dp)
+    --max-depth <N>         Discovery max-depth (only used when resolving NAME)
+                            (default: 6)
+    --allow-bad-header      Allow importing files failing SQLite magic header check
+    --no-metadata           Skip metadata generation
 
 VERIFY OPTIONS:
     --checksums <PATH>  Path to checksums file (default: sample_sqlite_db_files/checksums.sha256)
@@ -214,7 +234,265 @@ fn cmd_corpus_scan(argv: &[String]) -> i32 {
 }
 
 fn cmd_corpus_import(_argv: &[String]) -> i32 {
-    println!("corpus import: not yet implemented (see bd-3jrn)");
+    if _argv.is_empty() || _argv.iter().any(|a| a == "-h" || a == "--help") {
+        print_corpus_help();
+        return if _argv.is_empty() { 2 } else { 0 };
+    }
+
+    let mut db_arg: Option<String> = None;
+    let mut id_override: Option<String> = None;
+    let mut tag: Option<String> = None;
+    let mut golden_dir = PathBuf::from(DEFAULT_GOLDEN_DIR);
+    let mut metadata_dir = PathBuf::from(DEFAULT_METADATA_DIR);
+    let mut checksums_path = PathBuf::from(DEFAULT_CHECKSUMS_PATH);
+    let mut root = PathBuf::from("/dp");
+    let mut max_depth: usize = 6;
+    let mut allow_bad_header = false;
+    let mut write_metadata = true;
+
+    let mut i = 0;
+    while i < _argv.len() {
+        match _argv[i].as_str() {
+            "--db" => {
+                i += 1;
+                if i >= _argv.len() {
+                    eprintln!("error: --db requires a path or discovery name");
+                    return 2;
+                }
+                db_arg = Some(_argv[i].clone());
+            }
+            "--id" => {
+                i += 1;
+                if i >= _argv.len() {
+                    eprintln!("error: --id requires a fixture identifier");
+                    return 2;
+                }
+                id_override = Some(_argv[i].clone());
+            }
+            "--tag" => {
+                i += 1;
+                if i >= _argv.len() {
+                    eprintln!("error: --tag requires a label");
+                    return 2;
+                }
+                tag = Some(_argv[i].clone());
+            }
+            "--golden-dir" => {
+                i += 1;
+                if i >= _argv.len() {
+                    eprintln!("error: --golden-dir requires a directory path");
+                    return 2;
+                }
+                golden_dir = PathBuf::from(&_argv[i]);
+            }
+            "--metadata-dir" => {
+                i += 1;
+                if i >= _argv.len() {
+                    eprintln!("error: --metadata-dir requires a directory path");
+                    return 2;
+                }
+                metadata_dir = PathBuf::from(&_argv[i]);
+            }
+            "--checksums" => {
+                i += 1;
+                if i >= _argv.len() {
+                    eprintln!("error: --checksums requires a file path");
+                    return 2;
+                }
+                checksums_path = PathBuf::from(&_argv[i]);
+            }
+            "--root" => {
+                i += 1;
+                if i >= _argv.len() {
+                    eprintln!("error: --root requires a directory path");
+                    return 2;
+                }
+                root = PathBuf::from(&_argv[i]);
+            }
+            "--max-depth" => {
+                i += 1;
+                if i >= _argv.len() {
+                    eprintln!("error: --max-depth requires an integer");
+                    return 2;
+                }
+                let Ok(n) = _argv[i].parse::<usize>() else {
+                    eprintln!("error: invalid integer for --max-depth: `{}`", _argv[i]);
+                    return 2;
+                };
+                max_depth = n;
+            }
+            "--allow-bad-header" => allow_bad_header = true,
+            "--no-metadata" => write_metadata = false,
+            other => {
+                eprintln!("error: unknown option `{other}`");
+                return 2;
+            }
+        }
+        i += 1;
+    }
+
+    let Some(db_arg) = db_arg.as_deref() else {
+        eprintln!("error: --db is required");
+        return 2;
+    };
+
+    // Resolve source DB path. Prefer literal paths; otherwise do a bounded discovery scan.
+    let (source_path, source_tags, header_ok) = match resolve_source_db(db_arg, &root, max_depth) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+
+    if !allow_bad_header && !header_ok {
+        eprintln!(
+            "error: source does not look like a SQLite database (bad magic header): {}",
+            source_path.display()
+        );
+        return 1;
+    }
+
+    // Determine destination fixture id.
+    let raw_id = id_override.as_deref().unwrap_or_else(|| {
+        source_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("fixture")
+    });
+    let fixture_id = match sanitize_db_id(raw_id) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("error: invalid fixture id `{raw_id}`: {e}");
+            return 2;
+        }
+    };
+
+    if let Err(e) = fs::create_dir_all(&golden_dir) {
+        eprintln!("error: failed to create golden dir {}: {e}", golden_dir.display());
+        return 1;
+    }
+
+    let dest_db = golden_dir.join(format!("{fixture_id}.db"));
+
+    // Compute source hash for idempotency / checksums update.
+    let source_sha = match sha256_file(&source_path) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("error: cannot hash source db {}: {e}", source_path.display());
+            return 1;
+        }
+    };
+
+    if dest_db.exists() {
+        let dest_sha = match sha256_file(&dest_db) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("error: cannot hash existing golden db {}: {e}", dest_db.display());
+                return 1;
+            }
+        };
+        if dest_sha != source_sha {
+            eprintln!("error: destination already exists with different contents:");
+            eprintln!("  dest: {}", dest_db.display());
+            eprintln!("  dest sha256:   {dest_sha}");
+            eprintln!("  source sha256: {source_sha}");
+            eprintln!("hint: pass --id <new_id> (e.g. {fixture_id}_{}).", &source_sha[..8]);
+            return 1;
+        }
+        println!("Already imported: {} (sha256 match)", dest_db.display());
+    } else if let Err(e) = fs::copy(&source_path, &dest_db) {
+        eprintln!(
+            "error: failed to copy {} to {}: {e}",
+            source_path.display(),
+            dest_db.display()
+        );
+        return 1;
+    }
+
+    // Copy known sidecars if present (WAL/SHM/journal).
+    let copied_sidecars = match copy_sidecars(&source_path, &dest_db) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: sidecar copy failed: {e}");
+            return 1;
+        }
+    };
+
+    // Best-effort: mark golden copies read-only.
+    if let Err(e) = set_read_only(&dest_db) {
+        eprintln!("warning: failed to mark read-only {}: {e}", dest_db.display());
+    }
+    for s in &copied_sidecars {
+        if let Err(e) = set_read_only(s) {
+            eprintln!("warning: failed to mark read-only {}: {e}", s.display());
+        }
+    }
+
+    // Update checksums file (DB only, not sidecars).
+    let dest_sha = match sha256_file(&dest_db) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("error: cannot hash golden db {}: {e}", dest_db.display());
+            return 1;
+        }
+    };
+    if let Err(e) = upsert_checksum(&checksums_path, &dest_db, &dest_sha) {
+        eprintln!("error: failed to update checksums: {e}");
+        return 1;
+    }
+
+    // Generate/update metadata JSON unless disabled.
+    if write_metadata {
+        if let Err(e) = fs::create_dir_all(&metadata_dir) {
+            eprintln!(
+                "error: failed to create metadata dir {}: {e}",
+                metadata_dir.display()
+            );
+            return 1;
+        }
+
+        match profile_database_for_metadata(&dest_db, &fixture_id, tag.as_deref(), &source_tags) {
+            Ok(profile) => {
+                let out_path = metadata_dir.join(format!("{fixture_id}.json"));
+                match serde_json::to_string_pretty(&profile) {
+                    Ok(json) => {
+                        if let Err(e) = fs::write(&out_path, json.as_bytes()) {
+                            eprintln!("error: failed to write metadata {}: {e}", out_path.display());
+                            return 1;
+                        }
+                        println!("Wrote metadata: {}", out_path.display());
+                    }
+                    Err(e) => {
+                        eprintln!("error: failed to serialize metadata: {e}");
+                        return 1;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("error: failed to profile imported DB: {e}");
+                return 1;
+            }
+        }
+    }
+
+    // Final summary.
+    println!("Imported fixture:");
+    println!("  id: {fixture_id}");
+    println!("  source: {}", source_path.display());
+    println!("  golden: {}", dest_db.display());
+    println!("  sha256: {dest_sha}");
+    if let Some(tag) = tag.as_deref() {
+        println!("  tag: {tag}");
+    }
+    if !source_tags.is_empty() {
+        println!("  tags: {}", source_tags.join(", "));
+    }
+    println!("  sidecars: {}", copied_sidecars.len());
+    for s in copied_sidecars {
+        println!("    - {}", s.file_name().and_then(|n| n.to_str()).unwrap_or(""));
+    }
+
     0
 }
 
@@ -223,6 +501,12 @@ const DEFAULT_CHECKSUMS_PATH: &str = "sample_sqlite_db_files/checksums.sha256";
 
 /// Default directory containing golden database copies.
 const DEFAULT_GOLDEN_DIR: &str = "sample_sqlite_db_files/golden";
+
+/// Default directory containing per-fixture metadata JSON.
+const DEFAULT_METADATA_DIR: &str = "sample_sqlite_db_files/metadata";
+
+/// Default base directory for per-run working copies.
+const DEFAULT_WORKING_DIR: &str = "sample_sqlite_db_files/working";
 
 fn cmd_corpus_verify(argv: &[String]) -> i32 {
     let mut checksums_path = PathBuf::from(DEFAULT_CHECKSUMS_PATH);
@@ -966,8 +1250,292 @@ fn cmd_bench(argv: &[String]) -> i32 {
         return 0;
     }
 
-    println!("bench: args={argv:?} (not yet implemented — see bd-312d)");
-    0
+    let mut golden_dir = PathBuf::from(DEFAULT_GOLDEN_DIR);
+    let mut fixture_ids: Vec<String> = Vec::new();
+    let mut presets: Vec<String> = Vec::new();
+    let mut concurrency: Vec<u16> = vec![1, 2, 4, 8];
+    let mut engine = "both".to_owned(); // sqlite3|fsqlite|both
+    let mut mvcc = false;
+    let defaults = BenchmarkConfig::default();
+    let mut warmup_iterations = defaults.warmup_iterations;
+    let mut min_iterations = defaults.min_iterations;
+    let mut measurement_time_secs = defaults.measurement_time_secs;
+    let mut output_jsonl: Option<PathBuf> = None;
+    let mut output_md: Option<PathBuf> = None;
+    let mut pretty = false;
+
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--golden-dir" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --golden-dir requires a directory path");
+                    return 2;
+                }
+                golden_dir = PathBuf::from(&argv[i]);
+            }
+            "--db" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --db requires a fixture id or comma-separated list");
+                    return 2;
+                }
+                for part in argv[i].split(',') {
+                    let part = part.trim();
+                    if !part.is_empty() {
+                        fixture_ids.push(part.to_owned());
+                    }
+                }
+            }
+            "--preset" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --preset requires a preset name or comma-separated list");
+                    return 2;
+                }
+                for part in argv[i].split(',') {
+                    let part = part.trim();
+                    if !part.is_empty() {
+                        presets.push(part.to_owned());
+                    }
+                }
+            }
+            "--concurrency" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --concurrency requires an integer or comma-separated list");
+                    return 2;
+                }
+                match parse_u16_list(&argv[i]) {
+                    Ok(v) => concurrency = v,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return 2;
+                    }
+                }
+            }
+            "--engine" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --engine requires sqlite3|fsqlite|both");
+                    return 2;
+                }
+                engine = argv[i].clone();
+            }
+            "--mvcc" => mvcc = true,
+            "--warmup" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --warmup requires an integer");
+                    return 2;
+                }
+                let Ok(n) = argv[i].parse::<u32>() else {
+                    eprintln!("error: invalid integer for --warmup: `{}`", argv[i]);
+                    return 2;
+                };
+                warmup_iterations = n;
+            }
+            "--min-iters" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --min-iters requires an integer");
+                    return 2;
+                }
+                let Ok(n) = argv[i].parse::<u32>() else {
+                    eprintln!("error: invalid integer for --min-iters: `{}`", argv[i]);
+                    return 2;
+                };
+                min_iterations = n;
+            }
+            "--time-secs" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --time-secs requires an integer");
+                    return 2;
+                }
+                let Ok(n) = argv[i].parse::<u64>() else {
+                    eprintln!("error: invalid integer for --time-secs: `{}`", argv[i]);
+                    return 2;
+                };
+                measurement_time_secs = n;
+            }
+            "--output-jsonl" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --output-jsonl requires a path");
+                    return 2;
+                }
+                output_jsonl = Some(PathBuf::from(&argv[i]));
+            }
+            "--output-md" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --output-md requires a path");
+                    return 2;
+                }
+                output_md = Some(PathBuf::from(&argv[i]));
+            }
+            "--pretty" => pretty = true,
+            other => {
+                eprintln!("error: unknown option `{other}`");
+                return 2;
+            }
+        }
+        i += 1;
+    }
+
+    if presets.is_empty() || presets.iter().any(|p| p == "all") {
+        presets = vec![
+            "commutative_inserts_disjoint_keys".to_owned(),
+            "hot_page_contention".to_owned(),
+            "mixed_read_write".to_owned(),
+        ];
+    }
+
+    if fixture_ids.is_empty() {
+        match discover_golden_fixture_ids(&golden_dir) {
+            Ok(ids) => fixture_ids = ids,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 1;
+            }
+        }
+    }
+
+    let bench_cfg = BenchmarkConfig {
+        warmup_iterations,
+        min_iterations,
+        measurement_time_secs,
+    };
+
+    let cargo_profile = cargo_profile_name();
+    let mut summaries: Vec<BenchmarkSummary> = Vec::new();
+    let mut any_iteration_error = false;
+
+    for fixture_id in &fixture_ids {
+        let golden_path = match resolve_golden_db_in(&golden_dir, fixture_id) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 1;
+            }
+        };
+
+        for preset in &presets {
+            for &c in &concurrency {
+                let engines: Vec<(&str, bool)> = match engine.as_str() {
+                    "sqlite3" => vec![("sqlite3", false)],
+                    "fsqlite" => vec![("fsqlite", mvcc)],
+                    "both" => vec![("sqlite3", false), ("fsqlite", mvcc)],
+                    other => {
+                        eprintln!("error: unknown --engine `{other}` (expected sqlite3|fsqlite|both)");
+                        return 2;
+                    }
+                };
+
+                for (engine_name, fsqlite_mvcc) in engines {
+                    let engine_label = if engine_name == "fsqlite" && fsqlite_mvcc {
+                        "fsqlite_mvcc"
+                    } else {
+                        engine_name
+                    };
+
+                    let meta = BenchmarkMeta {
+                        engine: engine_label.to_owned(),
+                        workload: preset.to_owned(),
+                        fixture_id: fixture_id.to_owned(),
+                        concurrency: c,
+                        cargo_profile: cargo_profile.to_owned(),
+                    };
+
+                    let sqlite_cfg = SqliteExecConfig {
+                        run_integrity_check: false,
+                        ..SqliteExecConfig::default()
+                    };
+                    let fsqlite_cfg = FsqliteExecConfig {
+                        concurrent_mode: fsqlite_mvcc,
+                        run_integrity_check: false,
+                        ..FsqliteExecConfig::default()
+                    };
+
+                    let summary = run_benchmark(&bench_cfg, &meta, |global_idx| {
+                        let _ = global_idx; // currently unused, but kept for future run-id tagging.
+                        let td = tempfile::tempdir()
+                            .map_err(|e| format!("failed to create temp dir: {e}"))?;
+                        let work_db = td.path().join("work.db");
+                        copy_db_with_sidecars(&golden_path, &work_db)?;
+
+                        let oplog = resolve_workload(preset, fixture_id, c)?;
+
+                        if engine_name == "sqlite3" {
+                            run_oplog_sqlite(&work_db, &oplog, &sqlite_cfg)
+                                .map_err(|e| format!("{e}"))
+                        } else {
+                            run_oplog_fsqlite(&work_db, &oplog, &fsqlite_cfg)
+                                .map_err(|e| format!("{e}"))
+                        }
+                    });
+
+                    any_iteration_error |= summary.iterations.iter().any(|it| it.error.is_some());
+
+                    let line = if pretty {
+                        summary
+                            .to_pretty_json()
+                            .map_err(|e| format!("serialize benchmark: {e}"))
+                    } else {
+                        summary
+                            .to_jsonl()
+                            .map_err(|e| format!("serialize benchmark: {e}"))
+                    };
+
+                    let text = match line {
+                        Ok(t) => t,
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            return 1;
+                        }
+                    };
+
+                    if let Some(ref path) = output_jsonl {
+                        let compact = match summary.to_jsonl() {
+                            Ok(t) => t,
+                            Err(e) => {
+                                eprintln!("error: failed to serialize benchmark for JSONL output: {e}");
+                                return 1;
+                            }
+                        };
+                        if let Err(e) = append_jsonl_line(path, &compact) {
+                            eprintln!("error: failed to append JSONL output: {e}");
+                            return 1;
+                        }
+                    }
+
+                    println!("{text}");
+                    summaries.push(summary);
+                }
+            }
+        }
+    }
+
+    if let Some(path) = output_md.as_deref() {
+        let md = render_benchmark_summaries_markdown(&summaries);
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    eprintln!("error: failed to create output directory {}: {e}", parent.display());
+                    return 1;
+                }
+            }
+        }
+        if let Err(e) = fs::write(path, md.as_bytes()) {
+            eprintln!("error: failed to write markdown report {}: {e}", path.display());
+            return 1;
+        }
+        eprintln!("Wrote markdown report: {}", path.display());
+    }
+
+    i32::from(any_iteration_error)
 }
 
 fn print_bench_help() {
@@ -978,11 +1546,18 @@ USAGE:
     realdb-e2e bench [OPTIONS]
 
 OPTIONS:
-    --db <DB_ID>            Database fixture (default: all golden copies)
-    --preset <NAME>         Workload preset (default: all)
-    --warmup <N>            Warmup iterations (default: 3)
-    --repeat <N>            Measurement iterations (default: 10)
-    --output <PATH>         Path for report.json output
+    --golden-dir <DIR>      Golden directory (default: sample_sqlite_db_files/golden)
+    --db <DB_ID>            Database fixture id, or comma-separated list (default: all)
+    --preset <NAME>         Workload preset, or comma-separated list (default: all)
+    --concurrency <N|LIST>  Concurrency levels (default: 1,2,4,8)
+    --engine <NAME>         sqlite3 | fsqlite | both (default: both)
+    --mvcc                  For fsqlite: enable MVCC concurrent_mode
+    --warmup <N>            Warmup iterations discarded (default: methodology default)
+    --min-iters <N>         Minimum measurement iterations (default: methodology default)
+    --time-secs <N>         Measurement time floor in seconds (default: methodology default)
+    --output-jsonl <PATH>   Append compact JSONL BenchmarkSummary records to PATH
+    --output-md <PATH>      Write a Markdown report to PATH (rendered from summaries)
+    --pretty                Pretty-print JSON to stdout (default: JSONL)
     -h, --help              Show this help message
 ";
     let _ = io::stdout().write_all(text.as_bytes());
@@ -996,8 +1571,255 @@ fn cmd_corrupt(argv: &[String]) -> i32 {
         return 0;
     }
 
-    println!("corrupt: args={argv:?} (not yet implemented — see bd-1w6k.7.2)");
-    0
+    let mut golden_dir = PathBuf::from(DEFAULT_GOLDEN_DIR);
+    let mut working_base = PathBuf::from(DEFAULT_WORKING_DIR);
+
+    let mut db: Option<String> = None;
+    let mut strategy: Option<String> = None;
+    let mut seed: u64 = 0;
+    let mut count: usize = 1;
+    let mut offset: Option<usize> = None;
+    let mut length: Option<usize> = None;
+    let mut page: Option<u32> = None;
+    let mut json = false;
+
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--golden-dir" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --golden-dir requires a directory path");
+                    return 2;
+                }
+                golden_dir = PathBuf::from(&argv[i]);
+            }
+            "--working-base" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --working-base requires a directory path");
+                    return 2;
+                }
+                working_base = PathBuf::from(&argv[i]);
+            }
+            "--db" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --db requires a fixture id");
+                    return 2;
+                }
+                db = Some(argv[i].clone());
+            }
+            "--strategy" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --strategy requires bitflip|zero|page");
+                    return 2;
+                }
+                strategy = Some(argv[i].clone());
+            }
+            "--seed" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --seed requires an integer");
+                    return 2;
+                }
+                let Ok(n) = argv[i].parse::<u64>() else {
+                    eprintln!("error: invalid integer for --seed: `{}`", argv[i]);
+                    return 2;
+                };
+                seed = n;
+            }
+            "--count" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --count requires an integer");
+                    return 2;
+                }
+                let Ok(n) = argv[i].parse::<usize>() else {
+                    eprintln!("error: invalid integer for --count: `{}`", argv[i]);
+                    return 2;
+                };
+                count = n;
+            }
+            "--offset" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --offset requires an integer");
+                    return 2;
+                }
+                let Ok(n) = argv[i].parse::<usize>() else {
+                    eprintln!("error: invalid integer for --offset: `{}`", argv[i]);
+                    return 2;
+                };
+                offset = Some(n);
+            }
+            "--length" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --length requires an integer");
+                    return 2;
+                }
+                let Ok(n) = argv[i].parse::<usize>() else {
+                    eprintln!("error: invalid integer for --length: `{}`", argv[i]);
+                    return 2;
+                };
+                length = Some(n);
+            }
+            "--page" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --page requires an integer");
+                    return 2;
+                }
+                let Ok(n) = argv[i].parse::<u32>() else {
+                    eprintln!("error: invalid integer for --page: `{}`", argv[i]);
+                    return 2;
+                };
+                page = Some(n);
+            }
+            "--json" => json = true,
+            other => {
+                eprintln!("error: unknown option `{other}`");
+                return 2;
+            }
+        }
+        i += 1;
+    }
+
+    let Some(db_id) = db.as_deref() else {
+        eprintln!("error: --db is required");
+        return 2;
+    };
+    let Some(strategy) = strategy.as_deref() else {
+        eprintln!("error: --strategy is required");
+        return 2;
+    };
+
+    // Validate the golden fixture exists up front.
+    let golden_path = match resolve_golden_db_in(&golden_dir, db_id) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+    let _ = golden_path; // only used for existence validation here.
+
+    // Create a working workspace containing the selected golden DB.
+    let project_root = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: failed to get current dir: {e}");
+            return 1;
+        }
+    };
+    let ws_cfg = WorkspaceConfig {
+        golden_dir,
+        working_base,
+    };
+
+    let ws = match create_workspace(&ws_cfg, &[db_id]) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("error: failed to create workspace: {e}");
+            return 1;
+        }
+    };
+    let Some(db) = ws.databases.first() else {
+        eprintln!("error: workspace contains no databases");
+        return 1;
+    };
+
+    let work_db = db.db_path.clone();
+    let before = match sha256_file(&work_db) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("error: cannot hash working db {}: {e}", work_db.display());
+            return 1;
+        }
+    };
+
+    let (strategy_desc, strat) = match strategy {
+        "bitflip" => (
+            format!("bitflip(count={count}, seed={seed})"),
+            CorruptionStrategy::RandomBitFlip { count },
+        ),
+        "zero" => {
+            let Some(off) = offset else {
+                eprintln!("error: zero strategy requires --offset");
+                return 2;
+            };
+            let Some(len) = length else {
+                eprintln!("error: zero strategy requires --length");
+                return 2;
+            };
+            (
+                format!("zero(offset={off}, length={len})"),
+                CorruptionStrategy::ZeroRange {
+                    offset: off,
+                    length: len,
+                },
+            )
+        }
+        "page" => {
+            let Some(pg) = page else {
+                eprintln!("error: page strategy requires --page");
+                return 2;
+            };
+            (
+                format!("page(page_number={pg}, seed={seed})"),
+                CorruptionStrategy::PageCorrupt { page_number: pg },
+            )
+        }
+        other => {
+            eprintln!("error: unknown strategy `{other}` (expected bitflip|zero|page)");
+            return 2;
+        }
+    };
+
+    if let Err(e) = inject_corruption(&work_db, strat, seed) {
+        eprintln!("error: corruption injection failed: {e}");
+        return 1;
+    }
+
+    let after = match sha256_file(&work_db) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("error: cannot hash corrupted db {}: {e}", work_db.display());
+            return 1;
+        }
+    };
+
+    let report = CorruptReport {
+        fixture_id: db_id.to_owned(),
+        strategy: strategy_desc,
+        workspace_dir: ws.run_dir.display().to_string(),
+        db_path: work_db.display().to_string(),
+        sha256_before: before,
+        sha256_after: after,
+    };
+
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => println!("{text}"),
+            Err(e) => {
+                eprintln!("error: failed to serialize report: {e}");
+                return 1;
+            }
+        }
+    } else {
+        println!("Corruption injected:");
+        println!("  fixture: {}", report.fixture_id);
+        println!("  strategy: {}", report.strategy);
+        println!("  workspace: {}", report.workspace_dir);
+        println!("  db: {}", report.db_path);
+        println!("  sha256(before): {}", report.sha256_before);
+        println!("  sha256(after):  {}", report.sha256_after);
+    }
+
+    // Ensure the corruption actually changed bytes (sanity).
+    i32::from(report.sha256_before == report.sha256_after)
 }
 
 fn print_corrupt_help() {
@@ -1013,16 +1835,475 @@ STRATEGIES:
     page                Corrupt an entire page (--page N)
 
 OPTIONS:
-    --db <DB_ID>            Database fixture to corrupt (uses working/ copy)
+    --golden-dir <DIR>      Golden directory (default: sample_sqlite_db_files/golden)
+    --working-base <DIR>    Base directory for working copies
+                            (default: sample_sqlite_db_files/working)
+    --db <DB_ID>            Database fixture to corrupt (copied from golden/)
     --strategy <STRATEGY>   Corruption strategy (bitflip|zero|page)
     --seed <N>              RNG seed for deterministic corruption (default: 0)
     --count <N>             Number of bits to flip (bitflip strategy)
     --offset <N>            Byte offset (zero strategy)
     --length <N>            Byte count (zero strategy)
     --page <N>              Page number to corrupt (page strategy)
+    --json                  Output a structured JSON report
     -h, --help              Show this help message
 ";
     let _ = io::stdout().write_all(text.as_bytes());
+}
+
+// ── Types: corpus import metadata + corrupt report ─────────────────────
+
+#[derive(Debug, Serialize)]
+struct CorruptReport {
+    fixture_id: String,
+    strategy: String,
+    workspace_dir: String,
+    db_path: String,
+    sha256_before: String,
+    sha256_after: String,
+}
+
+/// Profile of a single SQLite database for metadata JSON.
+#[derive(Debug, Serialize)]
+struct DbProfile {
+    name: String,
+    source_path: Option<String>,
+    tag: Option<String>,
+    discovery_tags: Vec<String>,
+    file_size_bytes: u64,
+    page_size: u32,
+    page_count: u32,
+    freelist_count: u32,
+    schema_version: u32,
+    journal_mode: String,
+    user_version: u32,
+    application_id: u32,
+    tables: Vec<TableProfile>,
+    indices: Vec<String>,
+    triggers: Vec<String>,
+    views: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct TableProfile {
+    name: String,
+    row_count: u64,
+    columns: Vec<ColumnProfile>,
+}
+
+#[derive(Debug, Serialize)]
+struct ColumnProfile {
+    name: String,
+    #[serde(rename = "type")]
+    col_type: String,
+    primary_key: bool,
+    not_null: bool,
+    default_value: Option<String>,
+}
+
+fn profile_database_for_metadata(
+    db_path: &Path,
+    fixture_id: &str,
+    tag: Option<&str>,
+    discovery_tags: &[String],
+) -> Result<DbProfile, String> {
+    let meta = fs::metadata(db_path)
+        .map_err(|e| format!("cannot stat {}: {e}", db_path.display()))?;
+
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("cannot open {}: {e}", db_path.display()))?;
+
+    let page_size: u32 = conn
+        .query_row("PRAGMA page_size", [], |r| r.get(0))
+        .map_err(|e| format!("PRAGMA page_size: {e}"))?;
+    let page_count: u32 = conn
+        .query_row("PRAGMA page_count", [], |r| r.get(0))
+        .map_err(|e| format!("PRAGMA page_count: {e}"))?;
+    let freelist_count: u32 = conn
+        .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+        .map_err(|e| format!("PRAGMA freelist_count: {e}"))?;
+    let schema_version: u32 = conn
+        .query_row("PRAGMA schema_version", [], |r| r.get(0))
+        .map_err(|e| format!("PRAGMA schema_version: {e}"))?;
+    let journal_mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .map_err(|e| format!("PRAGMA journal_mode: {e}"))?;
+    let user_version: u32 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .map_err(|e| format!("PRAGMA user_version: {e}"))?;
+    let application_id: u32 = conn
+        .query_row("PRAGMA application_id", [], |r| r.get(0))
+        .map_err(|e| format!("PRAGMA application_id: {e}"))?;
+
+    let tables = collect_tables(&conn)?;
+    let indices = collect_names(&conn, "index")?;
+    let triggers = collect_names(&conn, "trigger")?;
+    let views = collect_names(&conn, "view")?;
+
+    Ok(DbProfile {
+        name: fixture_id.to_owned(),
+        source_path: None,
+        tag: tag.map(str::to_owned),
+        discovery_tags: discovery_tags.to_vec(),
+        file_size_bytes: meta.len(),
+        page_size,
+        page_count,
+        freelist_count,
+        schema_version,
+        journal_mode,
+        user_version,
+        application_id,
+        tables,
+        indices,
+        triggers,
+        views,
+    })
+}
+
+fn collect_names(conn: &Connection, ty: &str) -> Result<Vec<String>, String> {
+    let sql = format!(
+        "SELECT name FROM sqlite_master WHERE type='{ty}' ORDER BY name"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("sqlite_master({ty}) prepare: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|e| format!("sqlite_master({ty}) query: {e}"))?;
+    let mut out: Vec<String> = Vec::new();
+    for r in rows {
+        if let Ok(name) = r {
+            out.push(name);
+        }
+    }
+    Ok(out)
+}
+
+fn collect_tables(conn: &Connection) -> Result<Vec<TableProfile>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT name FROM sqlite_master \
+             WHERE type='table' AND name NOT LIKE 'sqlite_%' \
+             ORDER BY name",
+        )
+        .map_err(|e| format!("sqlite_master(table) prepare: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|e| format!("sqlite_master(table) query: {e}"))?;
+
+    let mut out: Vec<TableProfile> = Vec::new();
+    for row in rows {
+        let Ok(table) = row else { continue };
+        let cols = collect_table_columns(conn, &table)?;
+        let row_count = count_rows(conn, &table)?;
+        out.push(TableProfile {
+            name: table,
+            row_count,
+            columns: cols,
+        });
+    }
+    Ok(out)
+}
+
+fn collect_table_columns(conn: &Connection, table: &str) -> Result<Vec<ColumnProfile>, String> {
+    let sql = format!("PRAGMA table_info({})", quote_ident(table));
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("PRAGMA table_info({table}) prepare: {e}"))?;
+
+    let mut cols = Vec::new();
+    let mut rows = stmt
+        .query([])
+        .map_err(|e| format!("PRAGMA table_info({table}) query: {e}"))?;
+
+    while let Some(r) = rows
+        .next()
+        .map_err(|e| format!("PRAGMA table_info({table}) next: {e}"))?
+    {
+        let name: String = r.get(1).map_err(|e| format!("col.name: {e}"))?;
+        let col_type: String = r.get(2).map_err(|e| format!("col.type: {e}"))?;
+        let not_null: bool = r.get::<_, i32>(3).map(|v| v != 0).unwrap_or(false);
+        let default_value: Option<String> = r.get(4).ok();
+        let primary_key: bool = r.get::<_, i32>(5).map(|v| v != 0).unwrap_or(false);
+        cols.push(ColumnProfile {
+            name,
+            col_type,
+            primary_key,
+            not_null,
+            default_value,
+        });
+    }
+
+    Ok(cols)
+}
+
+fn count_rows(conn: &Connection, table: &str) -> Result<u64, String> {
+    let sql = format!("SELECT count(*) FROM {}", quote_ident(table));
+    conn.query_row(&sql, [], |r| r.get::<_, u64>(0))
+        .map_err(|e| format!("count_rows({table}): {e}"))
+}
+
+fn quote_ident(name: &str) -> String {
+    let escaped = name.replace('"', "\"\"");
+    format!("\"{escaped}\"")
+}
+
+fn cargo_profile_name() -> &'static str {
+    if cfg!(debug_assertions) {
+        "dev"
+    } else {
+        "release"
+    }
+}
+
+fn sanitize_db_id(raw: &str) -> Result<String, &'static str> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err("empty");
+    }
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        let c = ch.to_ascii_lowercase();
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+        } else if c == '-' || c == '_' || c == '.' {
+            out.push('_');
+        } else {
+            out.push('_');
+        }
+    }
+    // Trim underscores.
+    let trimmed = out.trim_matches('_').to_owned();
+    if trimmed.is_empty() {
+        Err("no usable characters after sanitization")
+    } else {
+        Ok(trimmed)
+    }
+}
+
+fn resolve_source_db(
+    db_arg: &str,
+    root: &Path,
+    max_depth: usize,
+) -> Result<(PathBuf, Vec<String>, bool), String> {
+    let as_path = PathBuf::from(db_arg);
+    if as_path.exists() {
+        let header_ok = sqlite_magic_header_ok(&as_path)
+            .map_err(|e| format!("header check failed: {e}"))?;
+        return Ok((as_path, Vec::new(), header_ok));
+    }
+
+    let config = fsqlite_harness::fixture_discovery::DiscoveryConfig {
+        roots: vec![root.to_path_buf()],
+        max_depth,
+        ..fsqlite_harness::fixture_discovery::DiscoveryConfig::default()
+    };
+
+    let candidates = fsqlite_harness::fixture_discovery::discover_sqlite_files(&config)
+        .map_err(|e| format!("discovery scan failed: {e}"))?;
+
+    let mut matches = Vec::new();
+    for c in candidates {
+        let filename = c
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        let stem = c
+            .path
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+
+        if filename == db_arg || stem == db_arg {
+            matches.push(c);
+        }
+    }
+
+    if matches.is_empty() {
+        return Err(format!(
+            "cannot resolve `{db_arg}`. Provide a literal path, or run `realdb-e2e corpus scan` and pass an exact filename/stem."
+        ));
+    }
+    if matches.len() > 1 {
+        eprintln!("error: `{db_arg}` is ambiguous; matches:");
+        for m in &matches {
+            eprintln!("  {m}");
+        }
+        return Err("ambiguous discovery name".to_owned());
+    }
+
+    let chosen = matches.remove(0);
+    Ok((chosen.path, chosen.tags, chosen.header_ok))
+}
+
+fn sqlite_magic_header_ok(path: &Path) -> io::Result<bool> {
+    use std::io::Read as _;
+    const MAGIC: &[u8; 16] = b"SQLite format 3\0";
+    let mut f = std::fs::File::open(path)?;
+    let mut buf = [0u8; 16];
+    if f.read_exact(&mut buf).is_err() {
+        return Ok(false);
+    }
+    Ok(&buf == MAGIC)
+}
+
+fn copy_sidecars(src_db: &Path, dest_db: &Path) -> Result<Vec<PathBuf>, String> {
+    const SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
+    let mut copied = Vec::new();
+
+    for suffix in SIDECARS {
+        let mut src_os = src_db.as_os_str().to_os_string();
+        src_os.push(suffix);
+        let src = PathBuf::from(src_os);
+        if !src.exists() {
+            continue;
+        }
+
+        let mut dest_os = dest_db.as_os_str().to_os_string();
+        dest_os.push(suffix);
+        let dest = PathBuf::from(dest_os);
+
+        if dest.exists() {
+            // Idempotent: skip if already present.
+            copied.push(dest);
+            continue;
+        }
+
+        fs::copy(&src, &dest).map_err(|e| {
+            format!(
+                "failed to copy sidecar {} -> {}: {e}",
+                src.display(),
+                dest.display()
+            )
+        })?;
+        copied.push(dest);
+    }
+
+    Ok(copied)
+}
+
+fn copy_db_with_sidecars(src_db: &Path, dest_db: &Path) -> Result<(), String> {
+    fs::copy(src_db, dest_db).map_err(|e| {
+        format!(
+            "failed to copy {} -> {}: {e}",
+            src_db.display(),
+            dest_db.display()
+        )
+    })?;
+    let _ = copy_sidecars(src_db, dest_db)?;
+    Ok(())
+}
+
+fn upsert_checksum(checksums_path: &Path, golden_db: &Path, sha256_hex: &str) -> Result<(), String> {
+    let filename = golden_db
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("golden db has no filename")?
+        .to_owned();
+
+    let mut lines: Vec<(String, String)> = Vec::new();
+    if checksums_path.exists() {
+        let contents = fs::read_to_string(checksums_path)
+            .map_err(|e| format!("cannot read {}: {e}", checksums_path.display()))?;
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some((hex, name)) = line.split_once("  ") else {
+                continue;
+            };
+            lines.push((name.trim().to_owned(), hex.trim().to_owned()));
+        }
+    }
+
+    let mut replaced = false;
+    for (name, hex) in &mut lines {
+        if name == &filename {
+            *hex = sha256_hex.to_owned();
+            replaced = true;
+        }
+    }
+    if !replaced {
+        lines.push((filename, sha256_hex.to_owned()));
+    }
+
+    lines.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut out = String::new();
+    for (name, hex) in &lines {
+        let _ = writeln!(out, "{hex}  {name}");
+    }
+    fs::write(checksums_path, out.as_bytes())
+        .map_err(|e| format!("cannot write {}: {e}", checksums_path.display()))?;
+
+    Ok(())
+}
+
+fn discover_golden_fixture_ids(golden_dir: &Path) -> Result<Vec<String>, String> {
+    let mut ids = Vec::new();
+    let entries = fs::read_dir(golden_dir)
+        .map_err(|e| format!("cannot read golden dir {}: {e}", golden_dir.display()))?;
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("db") {
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                if !stem.is_empty() {
+                    ids.push(stem.to_owned());
+                }
+            }
+        }
+    }
+    ids.sort();
+    Ok(ids)
+}
+
+fn resolve_golden_db_in(golden_dir: &Path, db_name: &str) -> Result<PathBuf, String> {
+    // If it looks like a path and exists, use it directly.
+    let as_path = PathBuf::from(db_name);
+    if as_path.exists() {
+        return Ok(as_path);
+    }
+
+    // Try golden directory with .db extension.
+    let golden = golden_dir.join(format!("{db_name}.db"));
+    if golden.exists() {
+        return Ok(golden);
+    }
+
+    // Try golden directory without adding .db (user may have included it).
+    let golden_bare = golden_dir.join(db_name);
+    if golden_bare.exists() {
+        return Ok(golden_bare);
+    }
+
+    Err(format!(
+        "cannot find database `{db_name}` (tried {}, {}, and literal path)",
+        golden.display(),
+        golden_bare.display(),
+    ))
+}
+
+#[cfg(unix)]
+fn set_read_only(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(path)
+        .map_err(|e| format!("cannot stat {}: {e}", path.display()))?
+        .permissions();
+    perms.set_mode(0o444);
+    fs::set_permissions(path, perms)
+        .map_err(|e| format!("cannot chmod {}: {e}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_read_only(_path: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
