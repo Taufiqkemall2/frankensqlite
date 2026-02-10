@@ -25,6 +25,7 @@ members = [
     "crates/fsqlite",
     "crates/fsqlite-cli",
     "crates/fsqlite-harness",
+    "crates/fsqlite-e2e",
 ]
 
 [workspace.package]
@@ -74,6 +75,7 @@ fsqlite-core = { path = "crates/fsqlite-core" }
 fsqlite = { path = "crates/fsqlite" }
 fsqlite-cli = { path = "crates/fsqlite-cli" }
 fsqlite-harness = { path = "crates/fsqlite-harness" }
+fsqlite-e2e = { path = "crates/fsqlite-e2e" }
 
 # External dependencies
 thiserror = "2.0"
@@ -93,6 +95,8 @@ nix = { version = "0.29", default-features = false, features = ["fs"] }
 libc = "0.2"
 chacha20poly1305 = "0.10"
 argon2 = "0.5"
+rand = "0.8"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Dev dependencies
 criterion = { version = "0.5", features = ["html_reports"] }

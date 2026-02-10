@@ -7,6 +7,7 @@
 pub mod commit_pipeline;
 pub mod eprocess;
 pub mod fault_vfs;
+pub mod fixture_discovery;
 pub mod fslab;
 pub mod log;
 pub mod oracle;

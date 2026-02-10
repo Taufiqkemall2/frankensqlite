@@ -16,11 +16,12 @@ const DEP_BUILD_BEAD_ID: &str = "bd-2v8x";
 const DESC_BEAD_ID: &str = "bd-sxm2";
 
 /// The 23 crates specified in §8.1.
-const EXPECTED_CRATES: [&str; 23] = [
+const EXPECTED_CRATES: [&str; 24] = [
     "fsqlite-ast",
     "fsqlite-btree",
     "fsqlite-cli",
     "fsqlite-core",
+    "fsqlite-e2e",
     "fsqlite-error",
     "fsqlite-ext-fts3",
     "fsqlite-ext-fts5",
@@ -89,6 +90,7 @@ fn layer_assignments() -> HashMap<&'static str, u8> {
     m.insert("fsqlite", 8);
     // Layer 9: apps
     m.insert("fsqlite-cli", 9);
+    m.insert("fsqlite-e2e", 9);
     m.insert("fsqlite-harness", 9);
     m
 }
@@ -380,14 +382,14 @@ fn concise_description_allowed(crate_name: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_workspace_crate_count_is_23() {
+fn test_workspace_crate_count_is_24() {
     let metadata = cargo_metadata_cached();
     let members = workspace_member_names(metadata);
 
     assert_eq!(
         members.len(),
-        23,
-        "bead_id={BEAD_ID} case=crate_count expected=23 actual={} members={members:?}",
+        24,
+        "bead_id={BEAD_ID} case=crate_count expected=24 actual={} members={members:?}",
         members.len()
     );
 
@@ -504,7 +506,7 @@ fn test_mvcc_at_layer_3() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_all_23_crates_exist() {
+fn test_all_24_crates_exist() {
     let metadata = cargo_metadata_cached();
     let members = workspace_member_names(metadata);
     let expected: BTreeSet<String> = EXPECTED_CRATES
@@ -514,8 +516,8 @@ fn test_all_23_crates_exist() {
 
     assert_eq!(
         members.len(),
-        23,
-        "bead_id={ARCH_BEAD_ID} case=all_23_crates_exist expected=23 actual={}",
+        24,
+        "bead_id={ARCH_BEAD_ID} case=all_24_crates_exist expected=24 actual={}",
         members.len()
     );
     assert_eq!(
@@ -948,7 +950,7 @@ fn test_e2e_bd_1wwc() {
 
     // 1. Member count
     let member_count = members.len();
-    assert_eq!(member_count, 23, "member_count={member_count}");
+    assert_eq!(member_count, 24, "member_count={member_count}");
 
     // 2. Members missing from spec
     let expected: HashSet<&str> = EXPECTED_CRATES.iter().copied().collect();
