@@ -390,7 +390,7 @@ mod tests {
         drop(reader);
 
         // Restore the WAL if it was removed by the reader's close.
-        let wal_len = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        let wal_len = fs::metadata(&wal_path).map_or(0, |m| m.len());
         if wal_len <= wal_header_len && wal_backup.exists() {
             fs::copy(&wal_backup, &wal_path).expect("restore WAL");
         }
