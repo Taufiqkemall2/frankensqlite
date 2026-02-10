@@ -82,15 +82,15 @@ fn test_persistence_all_value_types() {
 
     {
         let conn = Connection::open(&path_str).unwrap();
-        conn.execute("CREATE TABLE types (i INTEGER, r REAL, t TEXT, n INTEGER);")
+        conn.execute("CREATE TABLE types (i INTEGER, r REAL, t TEXT, b BLOB, n INTEGER);")
             .unwrap();
-        conn.execute("INSERT INTO types VALUES (42, 3.14, 'hello world', NULL);")
+        conn.execute("INSERT INTO types VALUES (42, 3.14, 'hello world', X'DEADBEEF', NULL);")
             .unwrap();
     }
 
     {
         let conn = Connection::open(&path_str).unwrap();
-        let rows = conn.query("SELECT i, r, t, n FROM types;").unwrap();
+        let rows = conn.query("SELECT i, r, t, b, n FROM types;").unwrap();
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
         assert_eq!(row.get(0), Some(&SqliteValue::Integer(42)));
@@ -99,9 +99,11 @@ fn test_persistence_all_value_types() {
             row.get(2),
             Some(&SqliteValue::Text("hello world".to_owned()))
         );
-        // NOTE: BLOB round-trip via X'...' hex literals is currently broken
-        // (data lost on reload). Tracked as a separate bug.
-        assert_eq!(row.get(3), Some(&SqliteValue::Null));
+        assert_eq!(
+            row.get(3),
+            Some(&SqliteValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]))
+        );
+        assert_eq!(row.get(4), Some(&SqliteValue::Null));
     }
 }
 
@@ -271,10 +273,7 @@ fn test_e2e_bd_121m_persistence_roundtrip() {
     // Phase 1: populate database with multiple tables and value types.
     {
         let conn = Connection::open(&path_str).unwrap();
-        // NOTE: "key" is a reserved word causing parse errors on reload.
-        // Using "k" instead. BLOB X'...' hex round-trip also broken.
-        // Both tracked as separate bugs.
-        conn.execute("CREATE TABLE meta (k TEXT, val TEXT);")
+        conn.execute("CREATE TABLE meta (\"key\" TEXT, val TEXT);")
             .unwrap();
         conn.execute("CREATE TABLE data (id INTEGER, score REAL);")
             .unwrap();
@@ -287,7 +286,7 @@ fn test_e2e_bd_121m_persistence_roundtrip() {
         conn.execute("INSERT INTO data VALUES (2, 88.8);").unwrap();
 
         // Modify: update one row, delete another.
-        conn.execute("UPDATE meta SET val = '2.0' WHERE k = 'version';")
+        conn.execute("UPDATE meta SET val = '2.0' WHERE \"key\" = 'version';")
             .unwrap();
         conn.execute("DELETE FROM data WHERE id = 1;").unwrap();
     }
@@ -296,7 +295,7 @@ fn test_e2e_bd_121m_persistence_roundtrip() {
     {
         let conn = Connection::open(&path_str).unwrap();
 
-        let meta = conn.query("SELECT k, val FROM meta;").unwrap();
+        let meta = conn.query("SELECT \"key\", val FROM meta;").unwrap();
         assert_eq!(meta.len(), 2);
         // Find the version row.
         let version_key = SqliteValue::Text("version".to_owned());
@@ -319,7 +318,7 @@ fn test_e2e_bd_121m_persistence_roundtrip() {
     // Phase 3: reopen again to verify no corruption from the second open.
     {
         let conn = Connection::open(&path_str).unwrap();
-        let meta = conn.query("SELECT k, val FROM meta;").unwrap();
+        let meta = conn.query("SELECT \"key\", val FROM meta;").unwrap();
         assert_eq!(meta.len(), 2);
         let data = conn.query("SELECT id FROM data;").unwrap();
         assert_eq!(data.len(), 1);

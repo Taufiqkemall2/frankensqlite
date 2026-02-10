@@ -1895,7 +1895,9 @@ fn affinity_char_to_type(affinity: char) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{Connection, Row};
+    use fsqlite_ast::Statement;
     use fsqlite_error::FrankenError;
+    use fsqlite_types::opcode::{Opcode, P4};
     use fsqlite_types::value::SqliteValue;
 
     fn row_values(row: &Row) -> Vec<SqliteValue> {
@@ -3048,6 +3050,32 @@ mod tests {
     }
 
     #[test]
+    fn test_blob_literal_codegen_emits_p4_bytes() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (bl BLOB);").unwrap();
+
+        let stmt = super::parse_single_statement("INSERT INTO t VALUES (X'DEADBEEF');").unwrap();
+        let Statement::Insert(insert) = stmt else {
+            panic!("expected INSERT statement");
+        };
+
+        let program = conn.compile_table_insert(&insert).unwrap();
+        let blob_ops: Vec<_> = program
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::Blob)
+            .collect();
+
+        assert_eq!(blob_ops.len(), 1, "expected exactly one OP_Blob");
+        match &blob_ops[0].p4 {
+            P4::Blob(bytes) => {
+                assert_eq!(bytes, &vec![0xDE, 0xAD, 0xBE, 0xEF]);
+            }
+            other => panic!("expected P4::Blob, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_persistence_memory_path_no_file() {
         let dir = tempfile::tempdir().unwrap();
 
@@ -3143,6 +3171,64 @@ mod tests {
                 vec![
                     SqliteValue::Integer(2),
                     SqliteValue::Text("updated".to_owned()),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn test_persistence_reserved_word_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reserved.db");
+        let path_str = path.to_str().unwrap();
+
+        // Use bare reserved words (key, value) — the persistence dump
+        // must double-quote them to produce valid SQL on reload.
+        {
+            let conn = Connection::open(path_str).unwrap();
+            conn.execute("CREATE TABLE meta (\"key\" TEXT, \"value\" TEXT);")
+                .unwrap();
+            conn.execute("INSERT INTO meta VALUES ('version', '1.0');")
+                .unwrap();
+        }
+
+        {
+            let conn = Connection::open(path_str).unwrap();
+            let rows = conn.query("SELECT \"key\", \"value\" FROM meta;").unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                row_values(&rows[0]),
+                vec![
+                    SqliteValue::Text("version".to_owned()),
+                    SqliteValue::Text("1.0".to_owned()),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn test_persistence_reserved_table_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resname.db");
+        let path_str = path.to_str().unwrap();
+
+        {
+            let conn = Connection::open(path_str).unwrap();
+            conn.execute("CREATE TABLE \"order\" (id INTEGER, item TEXT);")
+                .unwrap();
+            conn.execute("INSERT INTO \"order\" VALUES (1, 'widget');")
+                .unwrap();
+        }
+
+        {
+            let conn = Connection::open(path_str).unwrap();
+            let rows = conn.query("SELECT id, item FROM \"order\";").unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                row_values(&rows[0]),
+                vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("widget".to_owned())
                 ],
             );
         }
