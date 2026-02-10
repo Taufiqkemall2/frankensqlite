@@ -110,30 +110,24 @@ impl std::fmt::Debug for PreparedStatement {
 impl PreparedStatement {
     /// Execute as a query and return all result rows.
     pub fn query(&self) -> Result<Vec<Row>> {
-        let mut rows = execute_program_with_postprocess(
+        execute_program_with_postprocess(
             &self.program,
             None,
             self.func_registry.as_ref(),
             self.expression_postprocess.as_ref(),
-        )?;
-        if self.distinct {
-            dedup_rows(&mut rows);
-        }
-        Ok(rows)
+            self.distinct,
+        )
     }
 
     /// Execute as a query with bound SQL parameters (`?1`, `?2`, ...).
     pub fn query_with_params(&self, params: &[SqliteValue]) -> Result<Vec<Row>> {
-        let mut rows = execute_program_with_postprocess(
+        execute_program_with_postprocess(
             &self.program,
             Some(params),
             self.func_registry.as_ref(),
             self.expression_postprocess.as_ref(),
-        )?;
-        if self.distinct {
-            dedup_rows(&mut rows);
-        }
-        Ok(rows)
+            self.distinct,
+        )
     }
 
     /// Execute as a query and return exactly one row.
@@ -596,10 +590,24 @@ impl Connection {
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
+        if select.with.is_some() {
+            return Err(FrankenError::NotImplemented(
+                "WITH is not supported with GROUP BY in this connection path".to_owned(),
+            ));
+        }
+        if !select.body.compounds.is_empty() {
+            return Err(FrankenError::NotImplemented(
+                "compound SELECT is not supported with GROUP BY in this connection path"
+                    .to_owned(),
+            ));
+        }
+
         // Extract GROUP BY expressions and result columns from the AST.
         let SelectCore::Select {
             columns,
             group_by: group_by_exprs,
+            having,
+            windows,
             ..
         } = &select.body.select
         else {
@@ -607,6 +615,16 @@ impl Connection {
                 "GROUP BY on non-SELECT core".to_owned(),
             ));
         };
+        if having.is_some() {
+            return Err(FrankenError::NotImplemented(
+                "HAVING is not supported in this GROUP BY connection path".to_owned(),
+            ));
+        }
+        if !windows.is_empty() {
+            return Err(FrankenError::NotImplemented(
+                "WINDOW is not supported in this GROUP BY connection path".to_owned(),
+            ));
+        }
 
         // Find the table name from the FROM clause.
         let table_name = match &select.body.select {
@@ -655,16 +673,46 @@ impl Connection {
                     expr: Expr::FunctionCall { name, args, .. },
                     ..
                 } if is_agg_fn(name) => {
+                    let func = name.to_ascii_lowercase();
                     let arg_col = match args {
-                        FunctionArgs::Star => None,
-                        FunctionArgs::List(exprs) if exprs.is_empty() => None,
-                        FunctionArgs::List(exprs) => {
-                            let col_name = expr_col_name(&exprs[0]);
-                            col_name.and_then(|n| table_schema.column_index(n))
+                        FunctionArgs::Star => {
+                            if func == "count" {
+                                None
+                            } else {
+                                return Err(FrankenError::NotImplemented(format!(
+                                    "{func}(*) is not supported in this GROUP BY connection path"
+                                )));
+                            }
+                        }
+                        FunctionArgs::List(exprs) if exprs.is_empty() => {
+                            if func == "count" {
+                                None
+                            } else {
+                                return Err(FrankenError::NotImplemented(format!(
+                                    "{func}() with no args is not supported in this GROUP BY connection path"
+                                )));
+                            }
+                        }
+                        FunctionArgs::List(exprs) if exprs.len() == 1 => {
+                            let col_name = expr_col_name(&exprs[0]).ok_or_else(|| {
+                                FrankenError::NotImplemented(format!(
+                                    "non-column argument to aggregate {func}() is not supported in this GROUP BY connection path"
+                                ))
+                            })?;
+                            Some(table_schema.column_index(col_name).ok_or_else(|| {
+                                FrankenError::Internal(format!(
+                                    "aggregate column not found: {col_name}"
+                                ))
+                            })?)
+                        }
+                        FunctionArgs::List(_exprs) => {
+                            return Err(FrankenError::NotImplemented(format!(
+                                "{func}() with multiple args is not supported in this GROUP BY connection path"
+                            )));
                         }
                     };
                     Ok(GroupByColumn::Agg {
-                        name: name.to_ascii_lowercase(),
+                        name: func,
                         arg_col,
                     })
                 }
@@ -677,6 +725,11 @@ impl Connection {
                     let idx = table_schema.column_index(col_name).ok_or_else(|| {
                         FrankenError::Internal(format!("result column not found: {col_name}"))
                     })?;
+                    if !group_key_indices.contains(&idx) {
+                        return Err(FrankenError::NotImplemented(format!(
+                            "non-aggregate result column '{col_name}' must appear in GROUP BY"
+                        )));
+                    }
                     Ok(GroupByColumn::Plain(idx))
                 }
                 ResultColumn::Star | ResultColumn::TableStar(_) => Err(

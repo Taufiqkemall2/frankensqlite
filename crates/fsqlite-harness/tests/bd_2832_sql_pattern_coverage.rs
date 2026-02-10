@@ -388,27 +388,17 @@ fn test_in_list() {
 // ── Multi-row INSERT ────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "multi-row INSERT not yet implemented — see bd-2of2"]
 fn test_multi_row_insert() {
     let conn = Connection::open(":memory:").unwrap();
     conn.execute("CREATE TABLE m (x INTEGER);").unwrap();
     // SQLite supports INSERT INTO ... VALUES (...), (...), (...)
-    let result = conn.execute("INSERT INTO m VALUES (1), (2), (3);");
-    match result {
-        Ok(count) => {
-            // Should insert 3 rows.
-            assert_eq!(count, 3);
-            let rows = conn.query("SELECT x FROM m;").unwrap();
-            assert_eq!(rows.len(), 3);
-        }
-        Err(e) => {
-            let msg = format!("{e}");
-            assert!(
-                msg.contains("not implemented") || msg.contains("NotImplemented"),
-                "unexpected error: {e}"
-            );
-        }
-    }
+    conn.execute("INSERT INTO m VALUES (1), (2), (3);").unwrap();
+    // Verify all three rows were inserted.
+    let rows = conn.query("SELECT x FROM m ORDER BY x;").unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(int(&rows[0], 0), 1);
+    assert_eq!(int(&rows[1], 0), 2);
+    assert_eq!(int(&rows[2], 0), 3);
 }
 
 // ── CAST expressions ────────────────────────────────────────────────────────
