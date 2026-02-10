@@ -86,6 +86,12 @@ pub struct PreparedStatement {
     /// For table-backed SELECT, the statement must execute against the same
     /// MemDatabase as the Connection that prepared it.
     db: Option<Rc<RefCell<MemDatabase>>>,
+    /// For table-backed `SELECT DISTINCT ... LIMIT/OFFSET`, we compile an
+    /// unbounded program and apply the LIMIT/OFFSET after de-duplication.
+    ///
+    /// This mirrors `Connection::execute_statement`'s distinct+limit handling
+    /// to avoid returning too few rows when LIMIT is applied before DISTINCT.
+    post_distinct_limit: Option<LimitClause>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -132,6 +138,9 @@ impl PreparedStatement {
         if self.distinct {
             dedup_rows(&mut rows);
         }
+        if let Some(limit_clause) = self.post_distinct_limit.as_ref() {
+            apply_limit_clause(&mut rows, limit_clause);
+        }
         Ok(rows)
     }
 
@@ -154,6 +163,9 @@ impl PreparedStatement {
         };
         if self.distinct {
             dedup_rows(&mut rows);
+        }
+        if let Some(limit_clause) = self.post_distinct_limit.as_ref() {
+            apply_limit_clause(&mut rows, limit_clause);
         }
         Ok(rows)
     }
@@ -476,16 +488,26 @@ impl Connection {
                     expression_postprocess,
                     distinct: is_distinct_select(select),
                     db: None,
+                    post_distinct_limit: None,
                 })
             }
             Statement::Select(select) => {
-                let program = self.compile_table_select(select)?;
+                let distinct = is_distinct_select(select);
+                let limit_clause = select.limit.clone();
+                let program = if distinct && limit_clause.is_some() {
+                    let mut unbounded = select.clone();
+                    unbounded.limit = None;
+                    self.compile_table_select(&unbounded)?
+                } else {
+                    self.compile_table_select(select)?
+                };
                 Ok(PreparedStatement {
                     program,
                     func_registry: registry,
                     expression_postprocess: None,
-                    distinct: is_distinct_select(select),
+                    distinct,
                     db: Some(Rc::clone(&self.db)),
+                    post_distinct_limit: if distinct { limit_clause } else { None },
                 })
             }
             _ => Err(FrankenError::NotImplemented(
@@ -2836,6 +2858,27 @@ mod tests {
         let conn = Connection::open(":memory:").unwrap();
         let stmt = conn
             .prepare("VALUES (2), (1), (3) ORDER BY 1 LIMIT 2;")
+            .unwrap();
+        let rows = stmt.query().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(1)]);
+        assert_eq!(row_values(&rows[1]), vec![SqliteValue::Integer(2)]);
+    }
+
+    #[test]
+    fn test_prepared_table_select_distinct_limit_applies_after_dedup() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (v INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1), (1), (2);").unwrap();
+
+        // Both prepared and non-prepared paths must return two distinct rows.
+        let direct = conn
+            .query("SELECT DISTINCT v FROM t ORDER BY v LIMIT 2;")
+            .unwrap();
+        assert_eq!(direct.len(), 2);
+
+        let stmt = conn
+            .prepare("SELECT DISTINCT v FROM t ORDER BY v LIMIT 2;")
             .unwrap();
         let rows = stmt.query().unwrap();
         assert_eq!(rows.len(), 2);
