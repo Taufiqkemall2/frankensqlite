@@ -789,6 +789,18 @@ mod tests {
     }
 
     #[test]
+    fn test_lex_blob_non_ascii_no_panic() {
+        // bd-20gf regression: multi-byte UTF-8 inside a blob literal must
+        // produce an error, not panic on string-slice boundary.
+        let tokens = kinds("X'U\u{05fc} '");
+        assert!(matches!(tokens[0], TokenKind::Error(_)));
+
+        // Also test with raw non-hex ASCII chars.
+        let tokens2 = kinds("X'GG'");
+        assert!(matches!(tokens2[0], TokenKind::Error(_)));
+    }
+
+    #[test]
     fn test_lex_variables() {
         let tokens = kinds("?1 :name @param $var ?");
         assert_eq!(tokens[0], TokenKind::QuestionNum(1));

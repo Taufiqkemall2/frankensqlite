@@ -1508,15 +1508,15 @@ fn apply_limit_offset_postprocess(rows: &mut Vec<Row>, limit_clause: &LimitClaus
 fn type_name_to_affinity_char(name: &str) -> char {
     let upper = name.to_uppercase();
     if upper.contains("INT") {
-        'd' // INTEGER affinity
+        'D' // INTEGER affinity
     } else if upper.contains("CHAR") || upper.contains("TEXT") || upper.contains("CLOB") {
-        'C' // TEXT affinity
+        'B' // TEXT affinity
     } else if upper.contains("BLOB") || upper.is_empty() {
-        'B' // BLOB (none) affinity
+        'A' // BLOB (none) affinity
     } else if upper.contains("REAL") || upper.contains("FLOA") || upper.contains("DOUB") {
         'E' // REAL affinity
     } else {
-        'A' // NUMERIC affinity
+        'C' // NUMERIC affinity
     }
 }
 
@@ -3391,6 +3391,103 @@ mod tests {
         assert_eq!(
             row_values(&rows[0]),
             vec![SqliteValue::Text("beta".to_owned())]
+        );
+    }
+
+    #[test]
+    fn test_select_order_by_rowid() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER, b TEXT);").unwrap();
+        // Insert out of order by `a` to ensure sorting uses rowid, not `a`.
+        conn.execute("INSERT INTO t VALUES (30, 'third');").unwrap();
+        conn.execute("INSERT INTO t VALUES (10, 'first');").unwrap();
+        conn.execute("INSERT INTO t VALUES (20, 'second');")
+            .unwrap();
+
+        // ORDER BY rowid should return rows in insertion order (rowid 1, 2, 3).
+        let rows = conn.query("SELECT a, b FROM t ORDER BY rowid;").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Integer(30),
+                SqliteValue::Text("third".to_owned())
+            ]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![
+                SqliteValue::Integer(10),
+                SqliteValue::Text("first".to_owned())
+            ]
+        );
+        assert_eq!(
+            row_values(&rows[2]),
+            vec![
+                SqliteValue::Integer(20),
+                SqliteValue::Text("second".to_owned())
+            ]
+        );
+
+        // ORDER BY rowid DESC should return rows in reverse insertion order.
+        let rows = conn
+            .query("SELECT a, b FROM t ORDER BY rowid DESC;")
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Integer(20),
+                SqliteValue::Text("second".to_owned())
+            ]
+        );
+        assert_eq!(
+            row_values(&rows[2]),
+            vec![
+                SqliteValue::Integer(30),
+                SqliteValue::Text("third".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn test_select_order_by_rowid_aliases() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t2 (x TEXT);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES ('c');").unwrap();
+        conn.execute("INSERT INTO t2 VALUES ('a');").unwrap();
+        conn.execute("INSERT INTO t2 VALUES ('b');").unwrap();
+
+        // _rowid_ alias
+        let rows = conn.query("SELECT x FROM t2 ORDER BY _rowid_;").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Text("c".to_owned())]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![SqliteValue::Text("a".to_owned())]
+        );
+        assert_eq!(
+            row_values(&rows[2]),
+            vec![SqliteValue::Text("b".to_owned())]
+        );
+
+        // oid alias
+        let rows = conn.query("SELECT x FROM t2 ORDER BY oid;").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Text("c".to_owned())]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![SqliteValue::Text("a".to_owned())]
+        );
+        assert_eq!(
+            row_values(&rows[2]),
+            vec![SqliteValue::Text("b".to_owned())]
         );
     }
 

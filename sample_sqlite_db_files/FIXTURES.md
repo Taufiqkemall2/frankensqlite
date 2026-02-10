@@ -223,16 +223,175 @@ cargo run -p fsqlite-e2e --bin realdb-e2e -- smoke
 A new contributor who follows these four steps will have a working fixture corpus
 and can run the full E2E suite.
 
-## PII and Security Considerations
+## Inclusion Policy
 
-Some `/dp/` databases may contain sensitive data (API keys, user emails, session
-tokens).  Before adding a fixture:
+### Allowed Roots
 
-- Review table names and schemas for obvious PII indicators
-- Spot-check a few rows of each table
-- If in doubt, **exclude the database** rather than attempting partial redaction
-- Set `safety.pii_risk` in the manifest entry to document the assessment
+The default discovery root is `/dp/`.  Override with `--root` on the CLI.
+Additional roots may be added but each source directory must be explicitly
+opted-in; recursive scans never escape the configured root.
 
-The existing corpus was curated from internal development tool databases
-(beads, flywheel, session search) that contain only project metadata, not user
-data.
+### File Extensions
+
+Discovery considers files with these extensions: `.db`, `.sqlite`, `.sqlite3`.
+Other extensions are silently ignored unless the file passes a SQLite magic
+header check and `--allow-bad-header` is used during import.
+
+### Size Thresholds
+
+| Threshold | Value | Behavior |
+|-----------|-------|----------|
+| Soft cap (discovery) | 512 MiB | Files larger than this are skipped during `corpus scan`. |
+| Hard cap (golden) | No fixed limit | Large files are allowed in `golden/` but tagged `large`. |
+| CI-friendly subset | < 20 MiB | Tests that need fast turnaround should filter on the `small` or `medium` tags. |
+
+To override the soft cap during scan: increase `DiscoveryConfig::max_file_size`.
+
+### WAL/SHM/Journal Sidecars
+
+- **At capture time**: The backup API checkpoints WAL data into the main file.
+  The golden `.db` is self-contained.
+- **Sidecar copies**: `-wal`, `-shm`, and `-journal` sidecars from the source
+  are copied alongside the golden file for reference only (these are git-ignored).
+  They are not required for tests; the harness uses the main `.db` file.
+- **Active writers**: If the source is actively written during backup, the
+  backup API serializes the snapshot.  No manual locking is needed.
+
+### Exclusion Rules
+
+Skip a database if any of these apply:
+
+- `PRAGMA integrity_check` fails on the source (even after retry)
+- The file contains known PII (see sensitivity rules below)
+- The file is a temporary/cache database with no stable schema
+- The file is a WAL-only database with no useful data (empty tables)
+
+## Tagging Taxonomy
+
+Tags provide a stable vocabulary for fixture selection and reporting.  Each
+golden file should have at least one project tag and one size tag.
+
+### Project Tags
+
+Derived from the source path or assigned manually at import via `--tag`:
+
+| Tag | Description |
+|-----|-------------|
+| `beads` | Beads issue tracker databases (`.beads/beads.db`) |
+| `flywheel` | Flywheel ecosystem databases (connectors, gateway, private) |
+| `agent-tools` | Agent tooling databases (session search, skills, DCG, meta-skill) |
+| `app-data` | Application data databases (brenner-bot, idea-analyzer, prompts) |
+| `infra` | Infrastructure databases (asupersync, NTM, RCH, dp-level) |
+| `frankensqlite` | FrankenSQLite's own beads database |
+| `frankentui` | FrankenTUI's own beads database |
+
+### Size Tags (Auto-assigned)
+
+| Tag | Threshold |
+|-----|-----------|
+| `small` | < 64 KiB |
+| `medium` | 64 KiB - 4 MiB |
+| `large` | > 4 MiB |
+
+### Feature Tags (Optional)
+
+| Tag | When to use |
+|-----|-------------|
+| `wal` | Journal mode is WAL |
+| `many-indexes` | > 20 indexes |
+| `many-tables` | > 20 user tables |
+| `fts` | Contains FTS3/FTS5 virtual tables |
+| `custom-collation` | Uses non-default collation sequences |
+
+### Tag Usage
+
+- `realdb-e2e run --tag beads` selects only beads fixtures
+- Reports group results by tag for cross-fixture comparison
+- CI smoke tests filter on `small` + `medium` tags for speed
+
+## Sensitivity and PII Policy
+
+### Metadata Rules
+
+Metadata JSON (`metadata/*.json`) is git-tracked and therefore **public within
+the repo**.  The following rules apply:
+
+**Allowed in metadata:**
+- Schema structure: table names, column names, column types, constraints
+- Aggregate statistics: row counts, page counts, file size
+- PRAGMA values: page_size, journal_mode, user_version, application_id
+- Index and trigger names
+- Source path (shows project structure, not data)
+
+**Forbidden in metadata:**
+- Row contents or sample data
+- Column value distributions or histograms
+- Query results or query logs
+- Any field that could leak secrets, tokens, or credentials
+
+### PII Assessment
+
+Before ingesting any fixture, assess PII risk:
+
+| Risk Level | Meaning | Action |
+|------------|---------|--------|
+| `unlikely` | Internal dev tool, no user data (beads, flywheel) | Ingest freely |
+| `possible` | Contains project names or author fields | Review schema, ingest if safe |
+| `likely` | Contains emails, tokens, user content | **Do not ingest** |
+| `unknown` | Not yet assessed | Treat as `possible` until reviewed |
+
+Set `safety.pii_risk` in the manifest entry to document the assessment.
+
+### Existing Corpus Assessment
+
+The current corpus consists of internal development tool databases
+(beads, flywheel, session search, agent tools).  These contain only project
+metadata (issue titles, timestamps, schema DDL) and are assessed as `unlikely`
+PII risk.  No databases containing user-facing data, credentials, or personal
+information have been ingested.
+
+## Concrete Examples
+
+### Example 1: Beads Database (WAL mode, medium size)
+
+```
+Source:  /dp/frankensqlite/.beads/beads.db
+db_id:   frankensqlite
+Tags:    beads, frankensqlite, large, wal
+Size:    ~10 MiB
+Journal: WAL
+Tables:  issues, comments, dependencies, events, labels, ...
+PII:     unlikely (issue tracker metadata only)
+```
+
+Import command:
+```bash
+realdb-e2e corpus import --db /dp/frankensqlite/.beads/beads.db \
+  --id frankensqlite --tag beads
+```
+
+### Example 2: Agent Tool Database (WAL mode, large)
+
+```
+Source:  /dp/flywheel_connectors/.beads/beads.db
+db_id:   flywheel_connectors
+Tags:    flywheel, large, wal, many-indexes
+Size:    ~17 MiB
+Journal: WAL
+Tables:  issues, comments, dependencies, events, labels, ...
+PII:     unlikely (flywheel project metadata)
+```
+
+### Example 3: Small Infrastructure Database
+
+```
+Source:  /dp/dp_level/dp_level.db
+db_id:   dp_level
+Tags:    infra, medium, wal
+Size:    ~3 MiB
+Journal: WAL
+Tables:  (project-specific infrastructure tables)
+PII:     unlikely (infrastructure metadata)
+```
+
+This fixture is useful for fast CI smoke tests due to its small size.
