@@ -13,9 +13,11 @@ workspace = true
 [dependencies]
 fsqlite = { workspace = true }
 fsqlite-core = { workspace = true }
+fsqlite-error = { workspace = true }
 fsqlite-harness = { workspace = true }
 fsqlite-vfs = { workspace = true }
 fsqlite-types = { workspace = true }
+fsqlite-wal = { workspace = true }
 rusqlite = { workspace = true }
 sha2 = { workspace = true }
 rand = { workspace = true }

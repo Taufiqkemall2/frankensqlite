@@ -47,6 +47,11 @@ const REQUIRED_TOKENS: [&str; 11] = [
     "ERROR",
 ];
 
+// Performance measurements in unit tests are inherently noisy on shared CI /
+// multi-agent dev hosts. We run multiple iterations and take the median to
+// avoid failing the gate due to transient scheduler / load jitter.
+const PERF_MEASURE_RUNS: usize = 3;
+
 // -------------------------------------------------------------------------
 // Compliance gate helpers (same pattern as bd-bca.2)
 // -------------------------------------------------------------------------
@@ -159,6 +164,12 @@ fn make_page(seed: u32) -> PageData {
 // -------------------------------------------------------------------------
 // OLTP-style workload runner
 // -------------------------------------------------------------------------
+
+fn median_sample(mut samples: Vec<f64>) -> f64 {
+    assert!(!samples.is_empty(), "median_sample requires non-empty samples");
+    samples.sort_by(|a, b| a.total_cmp(b));
+    samples[samples.len() / 2]
+}
 
 /// Inline xorshift step (deterministic PRNG).
 fn xorshift(seed: &mut u64) -> u64 {
@@ -508,8 +519,26 @@ fn test_ssi_overhead_oltp_below_7_percent() -> Result<(), String> {
     // 500μs simulated work per transaction models realistic B-tree traversal
     // and I/O latency. SSI commit overhead (~10-17μs) yields ~2-3% overhead,
     // well within the 7% OLTP budget.
-    let tps_with_ssi = run_oltp_workload(2000, 4, 100, true, 8, 2, 500);
-    let tps_without_ssi = run_oltp_workload(2000, 4, 100, false, 8, 2, 500);
+    let mut tps_with_ssi_samples = Vec::with_capacity(PERF_MEASURE_RUNS);
+    let mut tps_without_ssi_samples = Vec::with_capacity(PERF_MEASURE_RUNS);
+
+    // Alternate ordering to avoid systematic warm-cache bias.
+    for i in 0..PERF_MEASURE_RUNS {
+        let (first_ssi, second_ssi) = if i % 2 == 0 { (true, false) } else { (false, true) };
+        let tps_first = run_oltp_workload(2000, 4, 100, first_ssi, 8, 2, 500);
+        let tps_second = run_oltp_workload(2000, 4, 100, second_ssi, 8, 2, 500);
+
+        if first_ssi {
+            tps_with_ssi_samples.push(tps_first);
+            tps_without_ssi_samples.push(tps_second);
+        } else {
+            tps_without_ssi_samples.push(tps_first);
+            tps_with_ssi_samples.push(tps_second);
+        }
+    }
+
+    let tps_with_ssi = median_sample(tps_with_ssi_samples);
+    let tps_without_ssi = median_sample(tps_without_ssi_samples);
 
     eprintln!(
         "INFO bead_id={BEAD_ID} case=oltp_overhead tps_ssi={tps_with_ssi:.1} tps_no_ssi={tps_without_ssi:.1}"
@@ -631,8 +660,26 @@ fn test_ssi_overhead_microbenchmark_below_20_percent() -> Result<(), String> {
     // 1 write + 250μs of simulated work. SSI overhead should be < 20%.
     // 250μs (vs OLTP's 500μs) keeps the SSI fraction visible while providing
     // enough amortization to avoid flaky results from timing jitter.
-    let tps_with_ssi = run_oltp_workload(1000, 4, 20, true, 4, 1, 250);
-    let tps_without_ssi = run_oltp_workload(1000, 4, 20, false, 4, 1, 250);
+    let mut tps_with_ssi_samples = Vec::with_capacity(PERF_MEASURE_RUNS);
+    let mut tps_without_ssi_samples = Vec::with_capacity(PERF_MEASURE_RUNS);
+
+    // Alternate ordering to avoid systematic warm-cache bias.
+    for i in 0..PERF_MEASURE_RUNS {
+        let (first_ssi, second_ssi) = if i % 2 == 0 { (true, false) } else { (false, true) };
+        let tps_first = run_oltp_workload(1000, 4, 20, first_ssi, 4, 1, 250);
+        let tps_second = run_oltp_workload(1000, 4, 20, second_ssi, 4, 1, 250);
+
+        if first_ssi {
+            tps_with_ssi_samples.push(tps_first);
+            tps_without_ssi_samples.push(tps_second);
+        } else {
+            tps_without_ssi_samples.push(tps_first);
+            tps_with_ssi_samples.push(tps_second);
+        }
+    }
+
+    let tps_with_ssi = median_sample(tps_with_ssi_samples);
+    let tps_without_ssi = median_sample(tps_without_ssi_samples);
 
     eprintln!(
         "INFO bead_id={BEAD_ID} case=micro_overhead tps_ssi={tps_with_ssi:.1} tps_no_ssi={tps_without_ssi:.1}"

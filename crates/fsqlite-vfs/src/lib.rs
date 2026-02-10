@@ -52,6 +52,13 @@ pub mod host_fs {
         Ok(())
     }
 
+    pub fn remove_file(path: &Path) -> Result<()> {
+        std::fs::remove_file(path).map_err(|e| {
+            std::io::Error::new(e.kind(), format!("remove {}: {e}", path.display()))
+        })?;
+        Ok(())
+    }
+
     pub fn create_empty_file(path: &Path) -> Result<()> {
         write(path, [])?;
         Ok(())

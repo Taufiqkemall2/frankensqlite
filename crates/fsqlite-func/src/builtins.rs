@@ -630,13 +630,20 @@ impl ScalarFunction for RoundFunc {
             return Ok(SqliteValue::Null);
         }
         let x = args[0].to_float();
+        // Clamp N to [0, 30] matching SQLite behavior.
         let n = if args.len() > 1 && !args[1].is_null() {
-            args[1].to_integer()
+            args[1].to_integer().clamp(0, 30)
         } else {
             0
         };
-        // Round half away from zero (NOT banker's rounding)
-        let factor = 10.0_f64.powi(i32::try_from(n).unwrap_or(0));
+        // Values beyond 2^52 have no fractional part — return unchanged
+        if !(-4_503_599_627_370_496.0..=4_503_599_627_370_496.0).contains(&x) {
+            return Ok(SqliteValue::Float(x));
+        }
+        // Round half away from zero (NOT banker's rounding).
+        // n is in [0, 30] so the i32 cast is lossless.
+        #[allow(clippy::cast_possible_truncation)]
+        let factor = 10.0_f64.powi(n as i32);
         let rounded = if x >= 0.0 {
             (x * factor + 0.5).floor() / factor
         } else {
@@ -2486,6 +2493,49 @@ mod tests {
                 .invoke(&[SqliteValue::Float(3.14159), SqliteValue::Integer(2)])
                 .unwrap(),
             SqliteValue::Float(3.14)
+        );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn test_round_extreme_n_clamped() {
+        // N > 30 is clamped to 30 (matches C SQLite)
+        assert_eq!(
+            RoundFunc
+                .invoke(&[SqliteValue::Float(1.5), SqliteValue::Integer(400)])
+                .unwrap(),
+            RoundFunc
+                .invoke(&[SqliteValue::Float(1.5), SqliteValue::Integer(30)])
+                .unwrap(),
+        );
+        // Negative N is clamped to 0 (matches C SQLite)
+        assert_eq!(
+            RoundFunc
+                .invoke(&[SqliteValue::Float(2.5), SqliteValue::Integer(-5)])
+                .unwrap(),
+            SqliteValue::Float(3.0)
+        );
+        // i64::MAX is clamped to 30
+        let result = RoundFunc
+            .invoke(&[SqliteValue::Float(1.5), SqliteValue::Integer(i64::MAX)])
+            .unwrap();
+        if let SqliteValue::Float(v) = result {
+            assert!(!v.is_nan(), "round must never return NaN");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn test_round_large_value_no_fractional() {
+        // Values beyond 2^52 have no fractional part — returned unchanged
+        let big = 9_007_199_254_740_993.0_f64;
+        assert_eq!(
+            RoundFunc.invoke(&[SqliteValue::Float(big)]).unwrap(),
+            SqliteValue::Float(big)
+        );
+        assert_eq!(
+            RoundFunc.invoke(&[SqliteValue::Float(-big)]).unwrap(),
+            SqliteValue::Float(-big)
         );
     }
 

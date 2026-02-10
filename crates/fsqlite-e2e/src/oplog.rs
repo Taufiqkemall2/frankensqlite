@@ -205,13 +205,17 @@ pub fn preset_commutative_inserts_disjoint_keys(
     worker_count: u16,
     rows_per_worker: u32,
 ) -> OpLog {
+    // Keep transactions short so heavily-contended executors (like stock SQLite)
+    // don't spend a long time holding the single-writer lock.
+    let transaction_size = rows_per_worker.clamp(1, 5);
+
     let header = OpLogHeader {
         fixture_id: fixture_id.to_owned(),
         seed,
         rng: RngSpec::default(),
         concurrency: ConcurrencyModel {
             worker_count,
-            transaction_size: rows_per_worker,
+            transaction_size,
             commit_order_policy: "free".to_owned(),
         },
         preset: Some("commutative_inserts_disjoint_keys".to_owned()),
@@ -235,39 +239,43 @@ pub fn preset_commutative_inserts_disjoint_keys(
     // Each worker inserts into a disjoint key range.
     for w in 0..worker_count {
         let base_key = i64::from(w) * i64::from(rows_per_worker);
-        records.push(OpRecord {
-            op_id,
-            worker: w,
-            kind: OpKind::Begin,
-            expected: None,
-        });
-        op_id += 1;
+        for chunk_start in (0..rows_per_worker).step_by(transaction_size as usize) {
+            let chunk_end = (chunk_start + transaction_size).min(rows_per_worker);
 
-        for r in 0..rows_per_worker {
-            let key = base_key + i64::from(r);
             records.push(OpRecord {
                 op_id,
                 worker: w,
-                kind: OpKind::Insert {
-                    table: "t0".to_owned(),
-                    key,
-                    values: vec![
-                        ("val".to_owned(), format!("w{w}_r{r}")),
-                        ("num".to_owned(), format!("{}", f64::from(r) * 1.1)),
-                    ],
-                },
-                expected: Some(ExpectedResult::AffectedRows(1)),
+                kind: OpKind::Begin,
+                expected: None,
+            });
+            op_id += 1;
+
+            for r in chunk_start..chunk_end {
+                let key = base_key + i64::from(r);
+                records.push(OpRecord {
+                    op_id,
+                    worker: w,
+                    kind: OpKind::Insert {
+                        table: "t0".to_owned(),
+                        key,
+                        values: vec![
+                            ("val".to_owned(), format!("w{w}_r{r}")),
+                            ("num".to_owned(), format!("{}", f64::from(r) * 1.1)),
+                        ],
+                    },
+                    expected: Some(ExpectedResult::AffectedRows(1)),
+                });
+                op_id += 1;
+            }
+
+            records.push(OpRecord {
+                op_id,
+                worker: w,
+                kind: OpKind::Commit,
+                expected: None,
             });
             op_id += 1;
         }
-
-        records.push(OpRecord {
-            op_id,
-            worker: w,
-            kind: OpKind::Commit,
-            expected: None,
-        });
-        op_id += 1;
     }
 
     // Final verification query.
@@ -314,31 +322,31 @@ pub fn preset_hot_page_contention(
     let mut records = Vec::new();
     let mut op_id: u64 = 0;
 
-    // Schema + seed data (worker 0).
-    records.push(OpRecord {
-        op_id,
-        worker: 0,
-        kind: OpKind::Sql {
-            statement:
-                "CREATE TABLE IF NOT EXISTS hot (id INTEGER PRIMARY KEY, counter INTEGER DEFAULT 0)"
-                    .to_owned(),
-        },
-        expected: None,
-    });
-    op_id += 1;
-
-    for k in 0..hot_rows {
+    // Schema + seed data (all workers). We use `INSERT OR IGNORE` so each worker
+    // can safely seed without depending on a specific start order.
+    for w in 0..worker_count {
         records.push(OpRecord {
             op_id,
-            worker: 0,
-            kind: OpKind::Insert {
-                table: "hot".to_owned(),
-                key: i64::from(k),
-                values: vec![("counter".to_owned(), "0".to_owned())],
+            worker: w,
+            kind: OpKind::Sql {
+                statement: "CREATE TABLE IF NOT EXISTS hot (id INTEGER PRIMARY KEY, counter INTEGER DEFAULT 0)"
+                    .to_owned(),
             },
-            expected: Some(ExpectedResult::AffectedRows(1)),
+            expected: None,
         });
         op_id += 1;
+
+        for k in 0..hot_rows {
+            records.push(OpRecord {
+                op_id,
+                worker: w,
+                kind: OpKind::Sql {
+                    statement: format!("INSERT OR IGNORE INTO hot (id, counter) VALUES ({k}, 0)"),
+                },
+                expected: None,
+            });
+            op_id += 1;
+        }
     }
 
     // Contention rounds: each worker updates every hot row once per round.
@@ -411,31 +419,33 @@ pub fn preset_mixed_read_write(
     let mut records = Vec::new();
     let mut op_id: u64 = 0;
 
-    // Schema (worker 0).
-    records.push(OpRecord {
-        op_id,
-        worker: 0,
-        kind: OpKind::Sql {
-            statement: "CREATE TABLE IF NOT EXISTS mixed (id INTEGER PRIMARY KEY, val TEXT)"
-                .to_owned(),
-        },
-        expected: None,
-    });
-    op_id += 1;
-
-    // Seed some initial data.
-    for k in 0..100 {
+    // Schema + seed (all workers). Like other presets, we avoid depending on
+    // executors to serialize worker 0's setup operations.
+    for w in 0..worker_count {
         records.push(OpRecord {
             op_id,
-            worker: 0,
-            kind: OpKind::Insert {
-                table: "mixed".to_owned(),
-                key: k,
-                values: vec![("val".to_owned(), format!("init_{k}"))],
+            worker: w,
+            kind: OpKind::Sql {
+                statement: "CREATE TABLE IF NOT EXISTS mixed (id INTEGER PRIMARY KEY, val TEXT)"
+                    .to_owned(),
             },
-            expected: Some(ExpectedResult::AffectedRows(1)),
+            expected: None,
         });
         op_id += 1;
+
+        for k in 0..100 {
+            records.push(OpRecord {
+                op_id,
+                worker: w,
+                kind: OpKind::Sql {
+                    statement: format!(
+                        "INSERT OR IGNORE INTO mixed (id, val) VALUES ({k}, 'init_{k}')"
+                    ),
+                },
+                expected: None,
+            });
+            op_id += 1;
+        }
     }
 
     // Mixed operations: even op_ids read, odd op_ids write.
@@ -530,8 +540,10 @@ mod tests {
         assert_eq!(log.header.concurrency.worker_count, 4);
         assert_eq!(log.header.concurrency.commit_order_policy, "free");
 
-        // 1 CREATE + 4 workers × (1 BEGIN + 10 INSERTs + 1 COMMIT) + 1 SELECT = 50
-        assert_eq!(log.records.len(), 50);
+        assert_eq!(log.header.concurrency.transaction_size, 5);
+
+        // 1 CREATE + 4 workers × (2 × (1 BEGIN + 5 INSERTs + 1 COMMIT)) + 1 SELECT = 58
+        assert_eq!(log.records.len(), 58);
 
         // Verify disjoint key ranges: worker 0 = [0..10), worker 1 = [10..20), etc.
         let insert_keys: Vec<(u16, i64)> = log
@@ -558,9 +570,9 @@ mod tests {
         assert_eq!(log.header.preset.as_deref(), Some("hot_page_contention"));
         assert_eq!(log.header.concurrency.commit_order_policy, "deterministic");
 
-        // 1 CREATE + 10 seed INSERTs + 2 rounds × 3 workers × (1 BEGIN + 10 UPDATEs + 1 COMMIT)
-        // = 1 + 10 + 2 × 3 × 12 = 83
-        assert_eq!(log.records.len(), 83);
+        // 3 workers × (1 CREATE + 10 seed INSERT OR IGNORE) + 2 rounds × 3 workers × (1 BEGIN + 10 UPDATEs + 1 COMMIT)
+        // = 3 × 11 + 2 × 3 × 12 = 105
+        assert_eq!(log.records.len(), 105);
 
         // All updates target keys 0..10.
         let update_keys: Vec<i64> = log
@@ -592,10 +604,22 @@ mod tests {
         );
 
         assert!(
-            log.records.iter().any(|r| {
-                matches!(&r.kind, OpKind::Insert { table, .. } if table == "mixed") && r.op_id > 101 // past initial seed data
-            }),
+            log.records
+                .iter()
+                .any(|r| { matches!(&r.kind, OpKind::Insert { table, .. } if table == "mixed") }),
             "should have write operations"
+        );
+
+        let first_begin = log
+            .records
+            .iter()
+            .position(|r| matches!(r.kind, OpKind::Begin))
+            .expect("mixed preset must include a BEGIN");
+        assert!(
+            log.records[first_begin..]
+                .iter()
+                .any(|r| { matches!(&r.kind, OpKind::Insert { table, .. } if table == "mixed") }),
+            "should have write operations after the mixed section begins"
         );
     }
 

@@ -594,10 +594,8 @@ impl PartialOrd for SqliteValue {
             (Self::Null, Self::Null) => Some(Ordering::Equal),
             (Self::Integer(a), Self::Integer(b)) => Some(a.cmp(b)),
             (Self::Float(a), Self::Float(b)) => a.partial_cmp(b),
-            #[allow(clippy::cast_precision_loss)]
-            (Self::Integer(a), Self::Float(b)) => (*a as f64).partial_cmp(b),
-            #[allow(clippy::cast_precision_loss)]
-            (Self::Float(a), Self::Integer(b)) => a.partial_cmp(&(*b as f64)),
+            (Self::Integer(a), Self::Float(b)) => Some(int_float_cmp(*a, *b)),
+            (Self::Float(a), Self::Integer(b)) => Some(int_float_cmp(*b, *a).reverse()),
             (Self::Text(a), Self::Text(b)) => Some(a.cmp(b)),
             (Self::Blob(a), Self::Blob(b)) => Some(a.cmp(b)),
             _ => None,
@@ -685,6 +683,36 @@ fn try_coerce_text_to_numeric(s: &str) -> Option<SqliteValue> {
         return Some(SqliteValue::Float(f));
     }
     None
+}
+
+/// Compare an integer with a float, preserving precision for large i64 values.
+///
+/// Matches C SQLite's `sqlite3IntFloatCompare` algorithm. The naive
+/// `(i as f64).partial_cmp(&r)` loses precision for |i| > 2^53.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+fn int_float_cmp(i: i64, r: f64) -> Ordering {
+    if r.is_nan() {
+        // SQLite treats NaN as NULL, and all integers are greater than NULL.
+        return Ordering::Greater;
+    }
+    // If r is out of i64 range, the answer is obvious.
+    if r < -9_223_372_036_854_775_808.0 {
+        return Ordering::Greater;
+    }
+    if r >= 9_223_372_036_854_775_808.0 {
+        return Ordering::Less;
+    }
+    // Truncate float to integer and compare integer parts.
+    let y = r as i64;
+    match i.cmp(&y) {
+        Ordering::Less => Ordering::Less,
+        Ordering::Greater => Ordering::Greater,
+        // Integer parts equal — use float comparison as tiebreaker.
+        Ordering::Equal => {
+            let s = i as f64;
+            s.partial_cmp(&r).unwrap_or(Ordering::Equal)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -801,6 +829,53 @@ mod tests {
 
         let int = SqliteValue::Integer(2);
         assert!(int > float);
+    }
+
+    #[test]
+    fn test_int_float_precision_at_i64_boundary() {
+        // i64::MAX cast to f64 rounds UP to 9223372036854775808.0.
+        // The naive (i as f64) comparison would say Equal, but C SQLite
+        // correctly reports i64::MAX < 9223372036854775808.0.
+        let imax = SqliteValue::Integer(i64::MAX);
+        let fmax = SqliteValue::Float(9_223_372_036_854_775_808.0);
+        assert_eq!(
+            imax.partial_cmp(&fmax),
+            Some(Ordering::Less),
+            "i64::MAX must be Less than 9223372036854775808.0"
+        );
+
+        // Two distinct large integers that map to the same f64.
+        let a = SqliteValue::Integer(i64::MAX);
+        let b = SqliteValue::Integer(i64::MAX - 1);
+        let f = SqliteValue::Float(i64::MAX as f64);
+        // a > b, but both should compare consistently vs the float.
+        assert_eq!(a.partial_cmp(&b), Some(Ordering::Greater));
+        // Both are less than the rounded-up float.
+        assert_eq!(a.partial_cmp(&f), Some(Ordering::Less));
+        assert_eq!(b.partial_cmp(&f), Some(Ordering::Less));
+    }
+
+    #[test]
+    fn test_int_float_precision_symmetric() {
+        // Float-vs-Integer should be the reverse of Integer-vs-Float.
+        let i = SqliteValue::Integer(i64::MAX);
+        let f = SqliteValue::Float(9_223_372_036_854_775_808.0);
+        assert_eq!(f.partial_cmp(&i), Some(Ordering::Greater));
+    }
+
+    #[test]
+    fn test_int_float_exact_representation() {
+        // For exactly representable values, equality still works.
+        let i = SqliteValue::Integer(42);
+        let f = SqliteValue::Float(42.0);
+        assert_eq!(i.partial_cmp(&f), Some(Ordering::Equal));
+        assert_eq!(f.partial_cmp(&i), Some(Ordering::Equal));
+
+        // Integer 3 vs Float 3.5 — Integer is less.
+        let i = SqliteValue::Integer(3);
+        let f = SqliteValue::Float(3.5);
+        assert_eq!(i.partial_cmp(&f), Some(Ordering::Less));
+        assert_eq!(f.partial_cmp(&i), Some(Ordering::Greater));
     }
 
     #[test]

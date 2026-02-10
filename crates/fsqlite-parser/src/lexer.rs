@@ -445,8 +445,14 @@ impl<'a> Lexer<'a> {
                 return TokenKind::Error("empty hex literal".to_owned());
             }
             let hex_str = String::from_utf8_lossy(&self.src[hex_start..self.pos]);
-            return match i64::from_str_radix(&hex_str, 16) {
-                Ok(v) => TokenKind::Integer(v),
+            // Parse as u64 and bitwise-cast to i64 — matching C SQLite's
+            // sqlite3DecOrHexToI64 which uses memcpy(pOut, &u, 8).
+            return match u64::from_str_radix(&hex_str, 16) {
+                Ok(v) => {
+                    #[allow(clippy::cast_possible_wrap)]
+                    let i = v as i64;
+                    TokenKind::Integer(i)
+                }
                 Err(_) => TokenKind::Error(format!("hex literal out of range at byte {}", start)),
             };
         }
@@ -891,5 +897,21 @@ mod tests {
         assert_eq!(tokens[2], TokenKind::KwFrom);
         assert_eq!(tokens[3], TokenKind::Id("b".to_owned()));
         assert_eq!(tokens[4], TokenKind::Eof);
+    }
+
+    #[test]
+    fn test_lex_hex_large_values() {
+        // C SQLite parses hex as u64 and memcpy to i64.
+        // 0xFFFFFFFFFFFFFFFF = u64::MAX → i64 -1.
+        let tokens = kinds("0xFFFFFFFFFFFFFFFF");
+        assert_eq!(tokens[0], TokenKind::Integer(-1));
+
+        // 0x8000000000000000 = i64::MIN.
+        let tokens = kinds("0x8000000000000000");
+        assert_eq!(tokens[0], TokenKind::Integer(i64::MIN));
+
+        // 0x7FFFFFFFFFFFFFFF = i64::MAX.
+        let tokens = kinds("0x7FFFFFFFFFFFFFFF");
+        assert_eq!(tokens[0], TokenKind::Integer(i64::MAX));
     }
 }

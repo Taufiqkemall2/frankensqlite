@@ -3,8 +3,14 @@
 //! Provides `DbFecHeader`, `DbFecGroupMeta`, page group partitioning (G=64, R=4),
 //! O(1) segment offset computation, stale-sidecar guard via `db_gen_digest`, and
 //! the read-path repair algorithm.
+//!
+//! Note: the sidecar generation and group-read helpers are intentionally public so
+//! the `fsqlite-e2e` recovery demos can validate end-to-end repair flows.
+
+use std::path::{Path, PathBuf};
 
 use fsqlite_error::{FrankenError, Result};
+use fsqlite_vfs::host_fs;
 use tracing::{debug, error, info, warn};
 
 // ---------------------------------------------------------------------------
@@ -702,6 +708,349 @@ pub fn attempt_page_repair(
 }
 
 // ---------------------------------------------------------------------------
+// Sidecar generation utility (bd-2r4z)
+// ---------------------------------------------------------------------------
+
+/// Compute the `.db-fec` sidecar path from a database path.
+#[must_use]
+pub fn db_fec_path_for_db(db_path: &Path) -> PathBuf {
+    let mut p = db_path.as_os_str().to_owned();
+    p.push("-fec");
+    PathBuf::from(p)
+}
+
+/// SQLite header field offsets (big-endian u32/u16).
+const SQLITE_HEADER_MIN_BYTES: usize = 100;
+const PAGE_SIZE_OFFSET: usize = 16;
+const CHANGE_COUNTER_OFFSET: usize = 24;
+const PAGE_COUNT_OFFSET: usize = 28;
+const FREELIST_COUNT_OFFSET: usize = 36;
+const SCHEMA_COOKIE_OFFSET: usize = 40;
+
+/// Fields extracted from a SQLite database header for FEC generation.
+#[derive(Debug, Clone, Copy)]
+pub struct DbHeaderFields {
+    pub page_size: u32,
+    pub change_counter: u32,
+    pub page_count: u32,
+    pub freelist_count: u32,
+    pub schema_cookie: u32,
+}
+
+/// Read the header fields from a SQLite database file.
+pub fn read_db_header_fields(db_path: &Path) -> Result<DbHeaderFields> {
+    let data = host_fs::read(db_path)?;
+    parse_db_header_fields(&data)
+}
+
+/// Parse header fields from raw database bytes.
+pub fn parse_db_header_fields(data: &[u8]) -> Result<DbHeaderFields> {
+    if data.len() < SQLITE_HEADER_MIN_BYTES {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "database too short for header: {} < {SQLITE_HEADER_MIN_BYTES}",
+                data.len()
+            ),
+        });
+    }
+
+    let page_size_raw = u16::from_be_bytes(
+        data[PAGE_SIZE_OFFSET..PAGE_SIZE_OFFSET + 2]
+            .try_into()
+            .expect("fixed-length slice"),
+    );
+    // SQLite encoding: 1 means 65536.
+    let page_size = if page_size_raw == 1 {
+        65536
+    } else {
+        u32::from(page_size_raw)
+    };
+
+    let change_counter = u32::from_be_bytes(
+        data[CHANGE_COUNTER_OFFSET..CHANGE_COUNTER_OFFSET + 4]
+            .try_into()
+            .expect("fixed-length slice"),
+    );
+    let page_count = u32::from_be_bytes(
+        data[PAGE_COUNT_OFFSET..PAGE_COUNT_OFFSET + 4]
+            .try_into()
+            .expect("fixed-length slice"),
+    );
+    let freelist_count = u32::from_be_bytes(
+        data[FREELIST_COUNT_OFFSET..FREELIST_COUNT_OFFSET + 4]
+            .try_into()
+            .expect("fixed-length slice"),
+    );
+    let schema_cookie = u32::from_be_bytes(
+        data[SCHEMA_COOKIE_OFFSET..SCHEMA_COOKIE_OFFSET + 4]
+            .try_into()
+            .expect("fixed-length slice"),
+    );
+
+    Ok(DbHeaderFields {
+        page_size,
+        change_counter,
+        page_count,
+        freelist_count,
+        schema_cookie,
+    })
+}
+
+/// Compute XOR parity repair symbols for a group of source pages.
+///
+/// Symbol 0 is the XOR of all source pages (single-fault recovery).
+/// Symbols 1..R-1 use byte-rotated XOR for additional redundancy.
+#[must_use]
+fn compute_xor_parity(source_pages: &[&[u8]], page_size: usize, r_repair: u32) -> Vec<Vec<u8>> {
+    let mut symbols = Vec::with_capacity(r_repair as usize);
+
+    // Symbol 0: straight XOR parity.
+    let mut parity = vec![0u8; page_size];
+    for page in source_pages {
+        for (j, &b) in page.iter().enumerate() {
+            parity[j] ^= b;
+        }
+    }
+    symbols.push(parity);
+
+    // Symbols 1..R-1: rotated XOR for multi-fault tolerance.
+    for r in 1..r_repair {
+        let mut sym = vec![0u8; page_size];
+        for (i, page) in source_pages.iter().enumerate() {
+            let shift = (r as usize * (i + 1)) % page_size.max(1);
+            for (j, &b) in page.iter().enumerate() {
+                sym[(j + shift) % page_size] ^= b;
+            }
+        }
+        symbols.push(sym);
+    }
+
+    symbols
+}
+
+/// Read a single page from raw database bytes, zero-padding if file is short.
+fn read_page_from_bytes(db_data: &[u8], pgno: u32, page_size: usize) -> Vec<u8> {
+    let offset = (pgno as usize - 1) * page_size;
+    if offset + page_size <= db_data.len() {
+        db_data[offset..offset + page_size].to_vec()
+    } else {
+        let mut page = vec![0u8; page_size];
+        if offset < db_data.len() {
+            let available = db_data.len() - offset;
+            page[..available].copy_from_slice(&db_data[offset..offset + available]);
+        }
+        page
+    }
+}
+
+/// Generate a complete `.db-fec` sidecar from raw database bytes.
+///
+/// Returns the sidecar file content as a byte vector. The layout is:
+/// `[DbFecHeader][Seg_page1][Seg_group0][Seg_group1]...`
+///
+/// Each general segment is padded to `full_segment_len` for O(1) random access.
+#[allow(clippy::too_many_lines)]
+pub fn generate_db_fec_from_bytes(db_data: &[u8]) -> Result<Vec<u8>> {
+    let fields = parse_db_header_fields(db_data)?;
+    let ps = fields.page_size as usize;
+
+    let header = DbFecHeader::new(
+        fields.page_size,
+        fields.change_counter,
+        fields.page_count,
+        fields.freelist_count,
+        fields.schema_cookie,
+    );
+    let digest = header.db_gen_digest;
+    let groups = partition_page_groups(fields.page_count);
+
+    // Pre-compute segment sizes for O(1) layout.
+    let seg1_len = group_segment_size(1, HEADER_PAGE_R_REPAIR, fields.page_size);
+    let full_seg_len = group_segment_size(DEFAULT_GROUP_SIZE, DEFAULT_R_REPAIR, fields.page_size);
+
+    // Total sidecar size: header + seg1 + (num_general_groups * full_seg_len).
+    let num_general_groups = groups.len().saturating_sub(1);
+    let total_size = DB_FEC_HEADER_SIZE + seg1_len + num_general_groups * full_seg_len;
+    let mut sidecar = vec![0u8; total_size];
+
+    // Write header.
+    sidecar[..DB_FEC_HEADER_SIZE].copy_from_slice(&header.to_bytes());
+
+    let mut cursor = DB_FEC_HEADER_SIZE;
+
+    for (gi, group) in groups.iter().enumerate() {
+        // Read source pages.
+        let source_refs: Vec<Vec<u8>> = (0..group.group_size)
+            .map(|i| read_page_from_bytes(db_data, group.start_pgno + i, ps))
+            .collect();
+        let source_slices: Vec<&[u8]> = source_refs.iter().map(Vec::as_slice).collect();
+
+        // Compute per-page hashes.
+        let hashes: Vec<[u8; 16]> = source_slices.iter().map(|p| page_xxh3_128(p)).collect();
+
+        // Build group metadata.
+        let meta = DbFecGroupMeta::new(
+            fields.page_size,
+            group.start_pgno,
+            group.group_size,
+            group.repair,
+            hashes,
+            digest,
+        );
+
+        // Compute repair symbols.
+        let repair_symbols = compute_xor_parity(&source_slices, ps, group.repair);
+
+        // Write metadata.
+        let meta_bytes = meta.to_bytes();
+        sidecar[cursor..cursor + meta_bytes.len()].copy_from_slice(&meta_bytes);
+        cursor += meta_bytes.len();
+
+        // Write repair symbols.
+        for sym in &repair_symbols {
+            sidecar[cursor..cursor + ps].copy_from_slice(sym);
+            cursor += ps;
+        }
+
+        // Pad general segments to full_seg_len for O(1) access.
+        if gi > 0 {
+            let actual_seg_size = meta_bytes.len() + group.repair as usize * ps;
+            let padding = full_seg_len - actual_seg_size;
+            cursor += padding; // Already zeroed by vec![0u8; total_size].
+        }
+    }
+
+    info!(
+        bead_id = "bd-2r4z",
+        page_count = fields.page_count,
+        page_size = fields.page_size,
+        groups = groups.len(),
+        sidecar_bytes = sidecar.len(),
+        "generated .db-fec sidecar"
+    );
+
+    Ok(sidecar)
+}
+
+/// Generate a `.db-fec` sidecar for a database file path.
+pub fn generate_db_fec_sidecar(db_path: &Path) -> Result<Vec<u8>> {
+    let db_data = host_fs::read(db_path)?;
+    generate_db_fec_from_bytes(&db_data)
+}
+
+/// Generate and write a `.db-fec` sidecar file, returning the sidecar path.
+pub fn write_db_fec_sidecar(db_path: &Path) -> Result<PathBuf> {
+    let sidecar_data = generate_db_fec_sidecar(db_path)?;
+    let sidecar_path = db_fec_path_for_db(db_path);
+    host_fs::write(&sidecar_path, &sidecar_data)?;
+
+    info!(
+        bead_id = "bd-2r4z",
+        db_path = %db_path.display(),
+        sidecar_path = %sidecar_path.display(),
+        sidecar_bytes = sidecar_data.len(),
+        "wrote .db-fec sidecar"
+    );
+
+    Ok(sidecar_path)
+}
+
+/// Read the [`DbFecHeader`] from a `.db-fec` sidecar file.
+pub fn read_db_fec_header(sidecar_path: &Path) -> Result<DbFecHeader> {
+    let data = host_fs::read(sidecar_path)?;
+    if data.len() < DB_FEC_HEADER_SIZE {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "sidecar too short for header: {} < {DB_FEC_HEADER_SIZE}",
+                data.len()
+            ),
+        });
+    }
+    let buf: [u8; DB_FEC_HEADER_SIZE] = data[..DB_FEC_HEADER_SIZE]
+        .try_into()
+        .expect("fixed-length slice");
+    DbFecHeader::from_bytes(&buf)
+}
+
+/// Read group metadata and repair symbols for a target page from sidecar bytes.
+///
+/// Returns `(group_meta, repair_symbols)` where repair symbols are `(esi, data)` pairs
+/// compatible with [`attempt_page_repair`].
+#[allow(clippy::type_complexity)]
+pub fn read_db_fec_group_for_page(
+    sidecar_data: &[u8],
+    header: &DbFecHeader,
+    target_pgno: u32,
+) -> Result<(DbFecGroupMeta, Vec<(u32, Vec<u8>)>)> {
+    let ps = header.page_size as usize;
+
+    // Determine which segment to read.
+    let (seg_offset, group_size_hint) = if target_pgno == 1 {
+        (DB_FEC_HEADER_SIZE, 1_u32)
+    } else {
+        let gi =
+            find_full_group_index(target_pgno).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!("invalid target page number: {target_pgno}"),
+            })?;
+        let seg1_len = group_segment_size(1, HEADER_PAGE_R_REPAIR, header.page_size);
+        let full_seg_len =
+            group_segment_size(DEFAULT_GROUP_SIZE, DEFAULT_R_REPAIR, header.page_size);
+        let offset = segment_offset(gi, seg1_len, full_seg_len);
+        (offset, DEFAULT_GROUP_SIZE)
+    };
+
+    if seg_offset >= sidecar_data.len() {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "sidecar too short for segment at offset {seg_offset}: len={}",
+                sidecar_data.len()
+            ),
+        });
+    }
+
+    // Read group metadata (variable-length due to hash array).
+    let meta_size = DbFecGroupMeta::serialized_size_for(group_size_hint);
+    let meta_end = seg_offset + meta_size;
+    if meta_end > sidecar_data.len() {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "sidecar truncated reading group meta at {seg_offset}: need {meta_size}, have {}",
+                sidecar_data.len() - seg_offset
+            ),
+        });
+    }
+    let meta = DbFecGroupMeta::from_bytes(&sidecar_data[seg_offset..meta_end])?;
+
+    let actual_r = meta.r_repair;
+
+    // Read repair symbols.
+    let mut symbols = Vec::with_capacity(actual_r as usize);
+    let actual_meta_size = meta.serialized_size();
+    let mut sym_cursor = seg_offset + actual_meta_size;
+    for r_idx in 0..actual_r {
+        if sym_cursor + ps > sidecar_data.len() {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!("sidecar truncated reading repair symbol {r_idx} at {sym_cursor}"),
+            });
+        }
+        let esi = meta.group_size + r_idx;
+        symbols.push((esi, sidecar_data[sym_cursor..sym_cursor + ps].to_vec()));
+        sym_cursor += ps;
+    }
+
+    debug!(
+        bead_id = "bd-2r4z",
+        target_pgno,
+        group_start = meta.start_pgno,
+        K = meta.group_size,
+        R = actual_r,
+        "read .db-fec group for repair"
+    );
+
+    Ok((meta, symbols))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1195,5 +1544,217 @@ mod tests {
                 + DEFAULT_R_REPAIR as usize * ps as usize;
             assert_eq!(general_seg, expected_general_seg);
         }
+    }
+
+    // -- Sidecar generation utility tests (bd-2r4z) --
+
+    fn make_synthetic_db(page_size: u32, page_count: u32) -> Vec<u8> {
+        let ps = page_size as usize;
+        let mut db = vec![0u8; ps * page_count as usize];
+        db[..16].copy_from_slice(b"SQLite format 3\0");
+        #[allow(clippy::cast_possible_truncation)]
+        let ps_enc: u16 = if page_size == 65536 {
+            1
+        } else {
+            page_size as u16
+        };
+        db[PAGE_SIZE_OFFSET..PAGE_SIZE_OFFSET + 2].copy_from_slice(&ps_enc.to_be_bytes());
+        db[CHANGE_COUNTER_OFFSET..CHANGE_COUNTER_OFFSET + 4].copy_from_slice(&1_u32.to_be_bytes());
+        db[PAGE_COUNT_OFFSET..PAGE_COUNT_OFFSET + 4].copy_from_slice(&page_count.to_be_bytes());
+        db[FREELIST_COUNT_OFFSET..FREELIST_COUNT_OFFSET + 4].copy_from_slice(&0_u32.to_be_bytes());
+        db[SCHEMA_COOKIE_OFFSET..SCHEMA_COOKIE_OFFSET + 4].copy_from_slice(&42_u32.to_be_bytes());
+        for pgno in 1..=page_count {
+            let offset = (pgno as usize - 1) * ps;
+            let start = if pgno == 1 { 100 } else { 0 };
+            for j in start..ps {
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    db[offset + j] = ((pgno as usize * 37 + j * 13) & 0xFF) as u8;
+                }
+            }
+        }
+        db
+    }
+
+    #[test]
+    fn test_parse_db_header_fields() {
+        let db = make_synthetic_db(4096, 10);
+        let fields = parse_db_header_fields(&db).expect("parse");
+        assert_eq!(fields.page_size, 4096);
+        assert_eq!(fields.change_counter, 1);
+        assert_eq!(fields.page_count, 10);
+        assert_eq!(fields.freelist_count, 0);
+        assert_eq!(fields.schema_cookie, 42);
+    }
+
+    #[test]
+    fn test_parse_db_header_too_short() {
+        assert!(parse_db_header_fields(&[0u8; 50]).is_err());
+    }
+
+    #[test]
+    fn test_db_fec_path_for_db() {
+        let p = db_fec_path_for_db(Path::new("/tmp/test.db"));
+        assert_eq!(p, PathBuf::from("/tmp/test.db-fec"));
+    }
+
+    #[test]
+    fn test_generate_db_fec_sidecar_header_valid() {
+        let db = make_synthetic_db(512, 5);
+        let sidecar = generate_db_fec_from_bytes(&db).expect("generate");
+        assert!(sidecar.len() >= DB_FEC_HEADER_SIZE);
+        let mut hdr_buf = [0u8; DB_FEC_HEADER_SIZE];
+        hdr_buf.copy_from_slice(&sidecar[..DB_FEC_HEADER_SIZE]);
+        let hdr = DbFecHeader::from_bytes(&hdr_buf).expect("header");
+        assert_eq!(hdr.page_size, 512);
+        assert!(hdr.is_current(1, 5, 0, 42));
+    }
+
+    #[test]
+    fn test_generate_and_read_group_roundtrip() {
+        let db = make_synthetic_db(512, 5);
+        let sidecar = generate_db_fec_from_bytes(&db).expect("generate");
+        let mut hdr_buf = [0u8; DB_FEC_HEADER_SIZE];
+        hdr_buf.copy_from_slice(&sidecar[..DB_FEC_HEADER_SIZE]);
+        let hdr = DbFecHeader::from_bytes(&hdr_buf).expect("header");
+        let (meta1, syms1) = read_db_fec_group_for_page(&sidecar, &hdr, 1).expect("page 1 group");
+        assert_eq!(meta1.start_pgno, 1);
+        assert_eq!(meta1.group_size, 1);
+        assert_eq!(meta1.r_repair, HEADER_PAGE_R_REPAIR);
+        assert_eq!(syms1.len(), HEADER_PAGE_R_REPAIR as usize);
+        let (meta2, syms2) = read_db_fec_group_for_page(&sidecar, &hdr, 2).expect("page 2 group");
+        assert_eq!(meta2.start_pgno, 2);
+        assert_eq!(meta2.group_size, 4);
+        assert_eq!(syms2.len(), DEFAULT_R_REPAIR as usize);
+        for i in 0..meta2.group_size {
+            let page = read_page_from_bytes(&db, meta2.start_pgno + i, 512);
+            assert!(verify_page_xxh3_128(
+                &page,
+                &meta2.source_page_xxh3_128[i as usize]
+            ));
+        }
+    }
+
+    #[test]
+    fn test_sidecar_encode_corrupt_decode_cycle() {
+        let ps = 512_usize;
+        let mut db = make_synthetic_db(512, 5);
+        let sidecar = generate_db_fec_from_bytes(&db).expect("generate");
+        let mut hdr_buf = [0u8; DB_FEC_HEADER_SIZE];
+        hdr_buf.copy_from_slice(&sidecar[..DB_FEC_HEADER_SIZE]);
+        let hdr = DbFecHeader::from_bytes(&hdr_buf).expect("header");
+        let target_pgno = 3_u32;
+        let original_page = read_page_from_bytes(&db, target_pgno, ps);
+        let corrupt_offset = (target_pgno as usize - 1) * ps;
+        for b in &mut db[corrupt_offset..corrupt_offset + ps] {
+            *b = 0xDE;
+        }
+        let (meta, repair_symbols) =
+            read_db_fec_group_for_page(&sidecar, &hdr, target_pgno).expect("read group");
+        let corrupted_data = read_page_from_bytes(&db, target_pgno, ps);
+        let idx = (target_pgno - meta.start_pgno) as usize;
+        assert!(!verify_page_xxh3_128(
+            &corrupted_data,
+            &meta.source_page_xxh3_128[idx]
+        ));
+        let read_fn = |pgno: u32| -> Vec<u8> { read_page_from_bytes(&db, pgno, ps) };
+        let (recovered, result) =
+            attempt_page_repair(target_pgno, &meta, &read_fn, &repair_symbols)
+                .expect("repair should succeed");
+        assert_eq!(recovered, original_page);
+        assert!(matches!(result, RepairResult::Repaired { pgno: 3, .. }));
+    }
+
+    #[test]
+    fn test_sidecar_header_page_repair() {
+        let ps = 256_usize;
+        let mut db = make_synthetic_db(256, 3);
+        let sidecar = generate_db_fec_from_bytes(&db).expect("generate");
+        let mut hdr_buf = [0u8; DB_FEC_HEADER_SIZE];
+        hdr_buf.copy_from_slice(&sidecar[..DB_FEC_HEADER_SIZE]);
+        let hdr = DbFecHeader::from_bytes(&hdr_buf).expect("header");
+        let original_page1 = read_page_from_bytes(&db, 1, ps);
+        for b in &mut db[..ps] {
+            *b = 0xCC;
+        }
+        let (meta, repair_symbols) =
+            read_db_fec_group_for_page(&sidecar, &hdr, 1).expect("read group");
+        assert_eq!(meta.group_size, 1);
+        assert_eq!(meta.r_repair, 4);
+        let read_fn = |_pgno: u32| -> Vec<u8> { read_page_from_bytes(&db, 1, ps) };
+        let (recovered, _) =
+            attempt_page_repair(1, &meta, &read_fn, &repair_symbols).expect("repair page 1");
+        assert_eq!(recovered, original_page1);
+    }
+
+    #[test]
+    fn test_sidecar_stale_digest_detection() {
+        let db = make_synthetic_db(512, 5);
+        let sidecar = generate_db_fec_from_bytes(&db).expect("generate");
+        let mut hdr_buf = [0u8; DB_FEC_HEADER_SIZE];
+        hdr_buf.copy_from_slice(&sidecar[..DB_FEC_HEADER_SIZE]);
+        let hdr = DbFecHeader::from_bytes(&hdr_buf).expect("header");
+        assert!(hdr.is_current(1, 5, 0, 42));
+        assert!(!hdr.is_current(2, 5, 0, 42));
+        assert!(!hdr.is_current(1, 6, 0, 42));
+    }
+
+    #[test]
+    fn test_sidecar_xxh3_validates_corruption() {
+        let db = make_synthetic_db(512, 5);
+        let sidecar = generate_db_fec_from_bytes(&db).expect("generate");
+        let mut hdr_buf = [0u8; DB_FEC_HEADER_SIZE];
+        hdr_buf.copy_from_slice(&sidecar[..DB_FEC_HEADER_SIZE]);
+        let hdr = DbFecHeader::from_bytes(&hdr_buf).expect("header");
+        let (meta, _) = read_db_fec_group_for_page(&sidecar, &hdr, 3).expect("read");
+        let page = read_page_from_bytes(&db, 3, 512);
+        let idx = (3 - meta.start_pgno) as usize;
+        assert!(verify_page_xxh3_128(&page, &meta.source_page_xxh3_128[idx]));
+        let corrupt = vec![0xFF_u8; 512];
+        assert!(!verify_page_xxh3_128(
+            &corrupt,
+            &meta.source_page_xxh3_128[idx]
+        ));
+    }
+
+    #[test]
+    fn test_sidecar_large_db_128_pages() {
+        let mut db = make_synthetic_db(512, 128);
+        let sidecar = generate_db_fec_from_bytes(&db).expect("generate");
+        let mut hdr_buf = [0u8; DB_FEC_HEADER_SIZE];
+        hdr_buf.copy_from_slice(&sidecar[..DB_FEC_HEADER_SIZE]);
+        let hdr = DbFecHeader::from_bytes(&hdr_buf).expect("header");
+        let (m1, _) = read_db_fec_group_for_page(&sidecar, &hdr, 1).expect("page 1");
+        assert_eq!(m1.group_size, 1);
+        let (m2, _) = read_db_fec_group_for_page(&sidecar, &hdr, 30).expect("page 30");
+        assert_eq!(m2.start_pgno, 2);
+        assert_eq!(m2.group_size, 64);
+        let (m3, _) = read_db_fec_group_for_page(&sidecar, &hdr, 100).expect("page 100");
+        assert_eq!(m3.start_pgno, 66);
+        assert_eq!(m3.group_size, 63);
+        let original = read_page_from_bytes(&db, 100, 512);
+        let off = (100 - 1) * 512;
+        for b in &mut db[off..off + 512] {
+            *b = 0xBB;
+        }
+        let (meta, syms) = read_db_fec_group_for_page(&sidecar, &hdr, 100).expect("read");
+        let read_fn = |pgno: u32| -> Vec<u8> { read_page_from_bytes(&db, pgno, 512) };
+        let (recovered, _) =
+            attempt_page_repair(100, &meta, &read_fn, &syms).expect("repair page 100");
+        assert_eq!(recovered, original);
+    }
+
+    #[test]
+    fn test_sidecar_file_write_read_roundtrip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test.db");
+        let db = make_synthetic_db(512, 5);
+        std::fs::write(&db_path, &db).expect("write db");
+        let sidecar_path = write_db_fec_sidecar(&db_path).expect("write sidecar");
+        assert_eq!(sidecar_path, db_fec_path_for_db(&db_path));
+        assert!(sidecar_path.exists());
+        let hdr = read_db_fec_header(&sidecar_path).expect("read header");
+        assert_eq!(hdr.page_size, 512);
+        assert!(hdr.is_current(1, 5, 0, 42));
     }
 }

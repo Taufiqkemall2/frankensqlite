@@ -477,10 +477,11 @@ impl VdbeEngine {
                 }
 
                 Opcode::Null => {
-                    // Set registers p2..p2+p3 to NULL (p3 is count-1, or 0
-                    // for a single register).
+                    // Set registers p2..p3 to NULL.  When p3 == 0 only p2 is
+                    // set.  p3 is an absolute register number (matching C
+                    // SQLite where cnt = p3 - p2).
                     let start = op.p2;
-                    let end = if op.p3 > 0 { start + op.p3 } else { start };
+                    let end = if op.p3 > 0 { op.p3 } else { start };
                     for r in start..=end {
                         self.set_reg(r, SqliteValue::Null);
                     }
@@ -2117,7 +2118,8 @@ fn opcode_register_spans(op: &VdbeOp) -> OpcodeRegisterSpans {
             (-1, 0, write_start, write_len)
         }
         Opcode::Null => {
-            let write_count = if op.p3 > 0 { op.p3 + 1 } else { 1 };
+            // p3 is absolute end register; count = p3 - p2 + 1 (or 1 if p3==0).
+            let write_count = if op.p3 > 0 { op.p3 - op.p2 + 1 } else { 1 };
             let (write_start, write_len) = range(op.p2, write_count);
             (-1, 0, write_start, write_len)
         }
@@ -3646,8 +3648,8 @@ mod tests {
             b.emit_op(Opcode::Integer, 1, r1, 0, P4::None, 0);
             b.emit_op(Opcode::Integer, 2, r2, 0, P4::None, 0);
             b.emit_op(Opcode::Integer, 3, r3, 0, P4::None, 0);
-            // Null range: p2=r1, p3=2 → set r1, r2, r3 to NULL
-            b.emit_op(Opcode::Null, 0, r1, 2, P4::None, 0);
+            // Null range: p2=r1, p3=r3 → set r1..=r3 to NULL (absolute end register).
+            b.emit_op(Opcode::Null, 0, r1, r3, P4::None, 0);
             b.emit_op(Opcode::ResultRow, r1, 3, 0, P4::None, 0);
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);

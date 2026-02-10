@@ -62,7 +62,9 @@ pub fn is_sqlite_format(path: &Path) -> bool {
 pub fn persist_to_sqlite(path: &Path, schema: &[TableSchema], db: &MemDatabase) -> Result<()> {
     // Remove existing file so the pager creates a fresh one.
     if path.exists() {
-        host_fs::remove_file(path)?;
+        // Truncate to empty so the pager treats it as a fresh DB, without
+        // requiring delete permissions on the parent directory.
+        host_fs::create_empty_file(path)?;
     }
 
     let cx = Cx::new();
@@ -533,7 +535,7 @@ mod tests {
     fn test_is_sqlite_format_text_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("text.db");
-        host_fs::write(&path, "CREATE TABLE t (x);".as_bytes()).unwrap();
+        host_fs::write(&path, b"CREATE TABLE t (x);").unwrap();
         assert!(!is_sqlite_format(&path));
     }
 

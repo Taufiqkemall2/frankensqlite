@@ -124,9 +124,18 @@ impl Sqlite3Executor {
     pub fn run(&self, oplog: &OpLog, db_path: &Path) -> E2eResult<RunReport> {
         let worker_count = oplog.header.concurrency.worker_count;
 
+        // Treat the leading SQL-only prefix as global setup (DDL/PRAGMAs) that
+        // must run before any concurrent workers start.
+        let setup_len = oplog
+            .records
+            .iter()
+            .take_while(|r| matches!(&r.kind, OpKind::Sql { .. }))
+            .count();
+        let setup_records = &oplog.records[..setup_len];
+
         // Split records by worker.
         let mut worker_ops: HashMap<u16, Vec<&OpRecord>> = HashMap::new();
-        for rec in &oplog.records {
+        for rec in oplog.records.iter().skip(setup_len) {
             worker_ops.entry(rec.worker).or_default().push(rec);
         }
 
@@ -142,6 +151,31 @@ impl Sqlite3Executor {
             p
         };
 
+        // Initialize the DB once: journal_mode + any setup SQL.
+        let setup_sql = self.generate_setup_sql(setup_records);
+        let setup_path = scratch.join("setup.sql");
+        std::fs::write(&setup_path, setup_sql.as_bytes())?;
+        let setup_out = std::process::Command::new(&self.config.sqlite3_bin)
+            .arg(db_path)
+            .stdin(std::process::Stdio::from(std::fs::File::open(&setup_path)?))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .map_err(|e| {
+                E2eError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("failed to run sqlite3 setup: {e}"),
+                ))
+            })?;
+        if !setup_out.status.success() {
+            let code = setup_out.status.code().unwrap_or(-1);
+            let stderr_full = String::from_utf8_lossy(&setup_out.stderr).into_owned();
+            let stderr_snip = truncate_string(&stderr_full, 4096);
+            return Err(E2eError::Io(std::io::Error::other(format!(
+                "sqlite3 setup failed (exit={code}): {stderr_snip}"
+            ))));
+        }
+
         // Generate per-worker SQL scripts.
         let mut worker_scripts: Vec<(u16, PathBuf, usize)> = Vec::new();
         for w in 0..worker_count {
@@ -153,37 +187,12 @@ impl Sqlite3Executor {
             worker_scripts.push((w, script_path, stmt_count));
         }
 
-        // Run worker 0 first (schema setup), then remaining workers concurrently.
+        // Run all workers concurrently.
         let start = Instant::now();
-        let mut workers: Vec<WorkerReport> = Vec::with_capacity(worker_scripts.len());
+        let mut handles: Vec<(u16, usize, std::process::Child, Instant)> =
+            Vec::with_capacity(worker_scripts.len());
 
-        // Phase 1: worker 0 runs alone to establish schema.
-        if let Some(&(w, ref script_path, stmt_count)) = worker_scripts.first() {
-            let worker_start = Instant::now();
-            let output = std::process::Command::new(&self.config.sqlite3_bin)
-                .arg(db_path)
-                .stdin(std::process::Stdio::from(std::fs::File::open(script_path)?))
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .output()
-                .map_err(|e| {
-                    E2eError::Io(std::io::Error::new(
-                        e.kind(),
-                        format!("failed to spawn sqlite3 for worker {w}: {e}"),
-                    ))
-                })?;
-            workers.push(Self::collect_worker_report(
-                w,
-                stmt_count,
-                &output,
-                &worker_start,
-            ));
-        }
-
-        // Phase 2: workers 1..N run concurrently.
-        let mut handles: Vec<(u16, usize, std::process::Child, Instant)> = Vec::new();
-
-        for (w, script_path, stmt_count) in worker_scripts.iter().skip(1) {
+        for (w, script_path, stmt_count) in &worker_scripts {
             let child = std::process::Command::new(&self.config.sqlite3_bin)
                 .arg(db_path)
                 .stdin(std::process::Stdio::from(std::fs::File::open(script_path)?))
@@ -199,7 +208,8 @@ impl Sqlite3Executor {
             handles.push((*w, *stmt_count, child, Instant::now()));
         }
 
-        // Collect concurrent results.
+        // Collect results.
+        let mut workers: Vec<WorkerReport> = Vec::with_capacity(handles.len());
         for (w, stmt_count, child, worker_start) in handles {
             let output = child.wait_with_output()?;
             workers.push(Self::collect_worker_report(
@@ -259,8 +269,8 @@ impl Sqlite3Executor {
         // (e.g. journal_mode) will wait instead of failing immediately.
         let _ = writeln!(
             sql,
-            ".bail on\nPRAGMA busy_timeout={};\nPRAGMA journal_mode={};\nPRAGMA synchronous={};",
-            self.config.busy_timeout_ms, self.config.journal_mode, self.config.synchronous,
+            ".bail on\nPRAGMA busy_timeout={};\nPRAGMA synchronous={};",
+            self.config.busy_timeout_ms, self.config.synchronous,
         );
 
         for op in ops {
@@ -296,6 +306,28 @@ impl Sqlite3Executor {
                 OpKind::Begin => sql.push_str("BEGIN;\n"),
                 OpKind::Commit => sql.push_str("COMMIT;\n"),
                 OpKind::Rollback => sql.push_str("ROLLBACK;\n"),
+            }
+        }
+
+        sql
+    }
+
+    fn generate_setup_sql(&self, setup_records: &[OpRecord]) -> String {
+        let mut sql = String::with_capacity(setup_records.len() * 80 + 128);
+
+        let _ = writeln!(
+            sql,
+            ".bail on\nPRAGMA busy_timeout={};\nPRAGMA journal_mode={};\nPRAGMA synchronous={};",
+            self.config.busy_timeout_ms, self.config.journal_mode, self.config.synchronous,
+        );
+
+        for rec in setup_records {
+            if let OpKind::Sql { statement } = &rec.kind {
+                sql.push_str(statement);
+                if !statement.ends_with(';') {
+                    sql.push(';');
+                }
+                sql.push('\n');
             }
         }
 
@@ -378,7 +410,6 @@ mod tests {
     fn test_generate_worker_sql_preamble() {
         let executor = Sqlite3Executor::with_defaults();
         let sql = executor.generate_worker_sql(&[]);
-        assert!(sql.contains("PRAGMA journal_mode=wal"));
         assert!(sql.contains("PRAGMA synchronous=NORMAL"));
         assert!(sql.contains("PRAGMA busy_timeout=5000"));
         assert!(sql.contains(".bail on"));

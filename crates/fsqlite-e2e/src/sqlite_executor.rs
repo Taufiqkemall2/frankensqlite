@@ -89,9 +89,30 @@ pub fn run_oplog_sqlite(
         )));
     }
 
-    // Partition records by worker.
+    // Extract leading SQL-only records as global setup (DDL/PRAGMAs).
+    let setup_len = oplog
+        .records
+        .iter()
+        .take_while(|r| matches!(&r.kind, OpKind::Sql { .. }))
+        .count();
+
+    // Run setup SQL on a single connection first.
+    if setup_len > 0 {
+        let setup_conn = Connection::open(db_path)?;
+        for pragma in &config.pragmas {
+            setup_conn.execute_batch(pragma)?;
+        }
+        for rec in &oplog.records[..setup_len] {
+            if let OpKind::Sql { statement } = &rec.kind {
+                setup_conn.execute_batch(statement)?;
+            }
+        }
+        drop(setup_conn);
+    }
+
+    // Partition remaining records by worker.
     let mut per_worker: Vec<Vec<OpRecord>> = vec![Vec::new(); usize::from(worker_count)];
-    for rec in &oplog.records {
+    for rec in oplog.records.iter().skip(setup_len) {
         let idx = usize::from(rec.worker);
         if idx >= per_worker.len() {
             return Err(E2eError::Io(std::io::Error::new(
@@ -153,7 +174,7 @@ pub fn run_oplog_sqlite(
 
     let ops_total = ops_ok + ops_err;
     let ops_per_sec = if wall.as_secs_f64() > 0.0 {
-        f64::from(ops_ok) / wall.as_secs_f64()
+        (ops_ok as f64) / wall.as_secs_f64()
     } else {
         0.0
     };
@@ -190,7 +211,7 @@ fn run_worker(
         error: None,
     };
 
-    let conn = match Connection::open(db_path) {
+    let mut conn = match Connection::open(db_path) {
         Ok(c) => c,
         Err(e) => {
             stats.error = Some(format!("worker {worker_id} open failed: {e}"));
@@ -215,7 +236,7 @@ fn run_worker(
 
         let mut attempt: u32 = 0;
         loop {
-            match execute_batch(&conn, &batch) {
+            match execute_batch(&mut conn, &batch) {
                 Ok((ok, err)) => {
                     stats.ops_ok += ok;
                     stats.ops_err += err;
@@ -233,7 +254,6 @@ fn run_worker(
                         break;
                     }
                     std::thread::sleep(backoff_duration(config, attempt));
-                    continue;
                 }
                 Err(BatchError::Fatal(msg)) => {
                     stats.error = Some(format!("worker {worker_id}: {msg}"));
@@ -319,31 +339,31 @@ enum BatchError {
     Fatal(String),
 }
 
-fn execute_batch(conn: &Connection, batch: &Batch) -> Result<(u64, u64), BatchError> {
-    let tx = conn.transaction().map_err(|e| classify_rusqlite_error(e))?;
+fn execute_batch(conn: &mut Connection, batch: &Batch) -> Result<(u64, u64), BatchError> {
+    let tx = conn
+        .transaction()
+        .map_err(|e| classify_rusqlite_error(&e))?;
 
     let mut ok: u64 = 0;
-    let mut err: u64 = 0;
 
     for op in &batch.ops {
         match execute_op(&tx, op) {
             Ok(()) => ok = ok.saturating_add(1),
             Err(OpError::Busy(msg)) => return Err(BatchError::Busy(msg)),
             Err(OpError::Fatal(msg)) => {
-                err = err.saturating_add(1);
                 return Err(BatchError::Fatal(msg));
             }
         }
     }
 
     if batch.commit {
-        tx.commit().map_err(|e| classify_rusqlite_error(e))?;
+        tx.commit().map_err(|e| classify_rusqlite_error(&e))?;
     } else {
         // Rollback by dropping the transaction.
         drop(tx);
     }
 
-    Ok((ok, err))
+    Ok((ok, 0))
 }
 
 #[derive(Debug)]
@@ -388,7 +408,7 @@ fn execute_sql_stmt(
                 }
                 Ok(())
             }
-            Err(e) => Err(classify_rusqlite_error_as_op(e)),
+            Err(e) => Err(classify_rusqlite_error_as_op(&e)),
         }
     } else {
         match tx.execute(trimmed, []) {
@@ -402,7 +422,7 @@ fn execute_sql_stmt(
                 }
                 Ok(())
             }
-            Err(e) => Err(classify_rusqlite_error_as_op(e)),
+            Err(e) => Err(classify_rusqlite_error_as_op(&e)),
         }
     }
 }
@@ -444,7 +464,7 @@ fn execute_structured_insert(
             }
             Ok(())
         }
-        Err(e) => Err(classify_rusqlite_error_as_op(e)),
+        Err(e) => Err(classify_rusqlite_error_as_op(&e)),
     }
 }
 
@@ -485,7 +505,7 @@ fn execute_structured_update(
             }
             Ok(())
         }
-        Err(e) => Err(classify_rusqlite_error_as_op(e)),
+        Err(e) => Err(classify_rusqlite_error_as_op(&e)),
     }
 }
 
@@ -519,7 +539,7 @@ fn parse_sql_value(s: &str) -> Value {
     Value::Text(s.to_owned())
 }
 
-fn classify_rusqlite_error(err: rusqlite::Error) -> BatchError {
+fn classify_rusqlite_error(err: &rusqlite::Error) -> BatchError {
     let code = err.sqlite_error_code();
     if matches!(
         code,
@@ -531,7 +551,7 @@ fn classify_rusqlite_error(err: rusqlite::Error) -> BatchError {
     }
 }
 
-fn classify_rusqlite_error_as_op(err: rusqlite::Error) -> OpError {
+fn classify_rusqlite_error_as_op(err: &rusqlite::Error) -> OpError {
     let code = err.sqlite_error_code();
     if matches!(
         code,
@@ -546,8 +566,8 @@ fn classify_rusqlite_error_as_op(err: rusqlite::Error) -> OpError {
 fn backoff_duration(config: &SqliteExecConfig, attempt: u32) -> Duration {
     // Exponential backoff with cap.
     let shift = attempt.min(31);
-    let factor: u32 = 1_u32.saturating_shl(shift);
-    let ms = u64::try_from(factor).unwrap_or(u64::MAX);
+    let factor: u32 = 1_u32 << shift;
+    let ms = u64::from(factor);
     let base_ms = duration_to_u64_ms(config.busy_backoff);
     let max_ms = duration_to_u64_ms(config.busy_backoff_max);
     let raw = base_ms.saturating_mul(ms);
