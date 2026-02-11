@@ -947,8 +947,8 @@ impl Connection {
                 let root_page = schema[idx].root_page;
                 schema.remove(idx);
                 drop(schema);
-                // Remove associated in-memory table storage.
-                self.db.borrow_mut().tables.remove(&root_page);
+                // Remove associated in-memory table storage (via undo-logged path).
+                self.db.borrow_mut().destroy_table(root_page);
                 Ok(())
             }
             None => {
@@ -1980,10 +1980,10 @@ fn has_joins(select: &SelectStatement) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// IN (SELECT ...) → IN (literal_list) rewriting helpers
+// Subquery rewriting helpers (IN, EXISTS, scalar subqueries)
 // ---------------------------------------------------------------------------
 
-/// Walk a `SelectCore` and rewrite any `InSet::Subquery` found in its
+/// Walk a `SelectCore` and rewrite subquery expressions found in its
 /// result columns, WHERE clause, or HAVING clause.
 fn rewrite_in_select_core(core: &mut SelectCore, conn: &Connection) -> Result<()> {
     if let SelectCore::Select {
@@ -4814,6 +4814,57 @@ mod tests {
             .execute("CREATE TABLE t1 (x INTEGER);")
             .expect_err("duplicate table should fail");
         assert!(matches!(err, FrankenError::Internal(_)));
+    }
+
+    #[test]
+    fn test_drop_table_removes_table_and_allows_recreate() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t_drop (x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t_drop VALUES (1);").unwrap();
+
+        conn.execute("DROP TABLE t_drop;").unwrap();
+
+        let err = conn
+            .query("SELECT x FROM t_drop;")
+            .expect_err("dropped table should no longer be queryable");
+        assert!(matches!(err, FrankenError::Internal(msg) if msg.contains("no such table")));
+
+        // Re-creating with the same name should succeed after DROP.
+        conn.execute("CREATE TABLE t_drop (x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t_drop VALUES (2);").unwrap();
+        let rows = conn.query("SELECT x FROM t_drop;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(2)]);
+    }
+
+    #[test]
+    fn test_drop_table_if_exists_ignores_missing_table() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("DROP TABLE IF EXISTS t_missing;").unwrap();
+    }
+
+    #[test]
+    fn test_drop_table_missing_without_if_exists_errors() {
+        let conn = Connection::open(":memory:").unwrap();
+        let err = conn
+            .execute("DROP TABLE t_missing;")
+            .expect_err("missing table should error without IF EXISTS");
+        assert!(matches!(err, FrankenError::NoSuchTable { name } if name == "t_missing"));
+    }
+
+    #[test]
+    fn test_drop_table_rollback_restores_table() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t_tx_drop (x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t_tx_drop VALUES (7);").unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("DROP TABLE t_tx_drop;").unwrap();
+        conn.execute("ROLLBACK;").unwrap();
+
+        let rows = conn.query("SELECT x FROM t_tx_drop;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(7)]);
     }
 
     #[test]
