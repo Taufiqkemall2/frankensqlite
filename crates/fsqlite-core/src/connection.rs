@@ -921,14 +921,15 @@ impl Connection {
             }
             CreateTableBody::AsSelect(select_stmt) => {
                 // Execute the SELECT to get result rows.
-                let rows = self.execute_statement(
-                    Statement::Select(*select_stmt.clone()),
-                    None,
-                )?;
+                let rows = self.execute_statement(Statement::Select(*select_stmt.clone()), None)?;
                 // Infer column names from the SELECT columns.
                 let col_names = infer_select_column_names(select_stmt);
                 let width = rows.first().map_or(
-                    if col_names.is_empty() { 1 } else { col_names.len() },
+                    if col_names.is_empty() {
+                        1
+                    } else {
+                        col_names.len()
+                    },
                     |r| r.values().len(),
                 );
                 let col_infos: Vec<ColumnInfo> = (0..width)
@@ -2891,9 +2892,7 @@ fn sort_rows_by_order_terms(
                 })
             };
             let idx = idx.ok_or_else(|| {
-                FrankenError::Internal(
-                    "ORDER BY expression not found in SELECT list".to_owned(),
-                )
+                FrankenError::Internal("ORDER BY expression not found in SELECT list".to_owned())
             })?;
             let desc = matches!(term.direction, Some(SortDirection::Desc));
             Ok((idx, desc))
@@ -6346,6 +6345,64 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(600));
+    }
+
+    // ── CREATE TABLE AS SELECT tests ─────────────────────────────────
+
+    #[test]
+    fn test_create_table_as_select() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE src (a INTEGER, b TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO src VALUES (1, 'x');").unwrap();
+        conn.execute("INSERT INTO src VALUES (2, 'y');").unwrap();
+        conn.execute("INSERT INTO src VALUES (3, 'z');").unwrap();
+
+        conn.execute("CREATE TABLE dst AS SELECT a, b FROM src WHERE a >= 2;")
+            .unwrap();
+
+        let rows = conn.query("SELECT a, b FROM dst ORDER BY a;").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("y".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(3));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("z".to_owned()));
+    }
+
+    #[test]
+    fn test_create_table_as_select_empty() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE src (x INTEGER);").unwrap();
+
+        // Create from empty result set.
+        conn.execute("CREATE TABLE dst AS SELECT x FROM src WHERE x > 100;")
+            .unwrap();
+
+        let rows = conn.query("SELECT x FROM dst;").unwrap();
+        assert_eq!(rows.len(), 0);
+
+        // Verify we can insert into the new table.
+        conn.execute("INSERT INTO dst VALUES (42);").unwrap();
+        let rows = conn.query("SELECT x FROM dst;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(42));
+    }
+
+    #[test]
+    fn test_create_table_as_select_with_expression() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE src (a INTEGER, b INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO src VALUES (10, 20);").unwrap();
+        conn.execute("INSERT INTO src VALUES (30, 40);").unwrap();
+
+        conn.execute("CREATE TABLE dst AS SELECT a + b AS total FROM src;")
+            .unwrap();
+
+        let rows = conn.query("SELECT total FROM dst ORDER BY total;").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(30));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(70));
     }
 
     #[test]
