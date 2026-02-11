@@ -1374,18 +1374,12 @@ impl Connection {
             .find(|t| t.name.eq_ignore_ascii_case(&table_name))
             .ok_or_else(|| FrankenError::Internal(format!("table not found: {table_name}")))?;
 
-        // Resolve GROUP BY key column indices.
-        let group_key_indices: Vec<usize> = group_by_exprs
+        // Build a column map for expression evaluation: (table_name, col_name).
+        let col_map: Vec<(String, String)> = table_schema
+            .columns
             .iter()
-            .map(|expr| {
-                let col_name = expr_col_name(expr).ok_or_else(|| {
-                    FrankenError::NotImplemented("GROUP BY with non-column expression".to_owned())
-                })?;
-                table_schema.column_index(col_name).ok_or_else(|| {
-                    FrankenError::Internal(format!("GROUP BY column not found: {col_name}"))
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+            .map(|c| (table_name.clone(), c.name.clone()))
+            .collect();
 
         // Parse result columns into GroupByColumn descriptors.
         let result_descriptors: Vec<GroupByColumn> = columns
@@ -1439,20 +1433,22 @@ impl Connection {
                     })
                 }
                 ResultColumn::Expr { expr, .. } => {
-                    let col_name = expr_col_name(expr).ok_or_else(|| {
-                        FrankenError::NotImplemented(
-                            "GROUP BY with non-column non-aggregate expression".to_owned(),
-                        )
-                    })?;
-                    let idx = table_schema.column_index(col_name).ok_or_else(|| {
-                        FrankenError::Internal(format!("result column not found: {col_name}"))
-                    })?;
-                    if !group_key_indices.contains(&idx) {
+                    // The expression must match one of the GROUP BY expressions
+                    // (either structurally or as a column reference to a GROUP BY column).
+                    let in_group_by = group_by_exprs.iter().any(|gb| gb == expr)
+                        || expr_col_name(expr).is_some_and(|col_name| {
+                            group_by_exprs.iter().any(|gb| {
+                                expr_col_name(gb)
+                                    .is_some_and(|gc| gc.eq_ignore_ascii_case(col_name))
+                            })
+                        });
+                    if !in_group_by {
+                        let label = expr_col_name(expr).unwrap_or("<expression>");
                         return Err(FrankenError::NotImplemented(format!(
-                            "non-aggregate result column '{col_name}' must appear in GROUP BY"
+                            "non-aggregate result column '{label}' must appear in GROUP BY"
                         )));
                     }
-                    Ok(GroupByColumn::Plain(idx))
+                    Ok(GroupByColumn::Plain(Box::new(expr.clone())))
                 }
                 ResultColumn::Star | ResultColumn::TableStar(_) => Err(
                     FrankenError::NotImplemented("SELECT * with GROUP BY".to_owned()),
@@ -1474,12 +1470,14 @@ impl Connection {
         let program = self.compile_table_select(&raw_select)?;
         let raw_rows = self.execute_table_program(&program, params)?;
 
-        // Group rows by key columns.
+        // Group rows by evaluating GROUP BY expressions for each row.
         let mut groups: Vec<(Vec<SqliteValue>, Vec<Vec<SqliteValue>>)> = Vec::new();
         for row in &raw_rows {
-            let key: Vec<SqliteValue> = group_key_indices
+            let key: Vec<SqliteValue> = group_by_exprs
                 .iter()
-                .map(|&idx| row.get(idx).cloned().unwrap_or(SqliteValue::Null))
+                .map(|expr| {
+                    eval_join_expr(expr, row.values(), &col_map).unwrap_or(SqliteValue::Null)
+                })
                 .collect();
             if let Some(group) = groups.iter_mut().find(|(k, _)| k == &key) {
                 group.1.push(row.values().to_vec());
@@ -1494,15 +1492,12 @@ impl Connection {
             let mut values = Vec::with_capacity(result_descriptors.len());
             for desc in &result_descriptors {
                 match desc {
-                    GroupByColumn::Plain(col_idx) => {
-                        // Use the value from the first row in the group.
-                        values.push(
-                            group_rows
-                                .first()
-                                .and_then(|r| r.get(*col_idx))
-                                .cloned()
-                                .unwrap_or(SqliteValue::Null),
-                        );
+                    GroupByColumn::Plain(expr) => {
+                        // Evaluate the expression against the first row in the group.
+                        let val = group_rows.first().map_or(SqliteValue::Null, |r| {
+                            eval_join_expr(expr, r, &col_map).unwrap_or(SqliteValue::Null)
+                        });
+                        values.push(val);
                     }
                     GroupByColumn::Agg { name, arg_col } => {
                         if name == "count" && arg_col.is_none() {
@@ -1629,29 +1624,25 @@ impl Connection {
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
-        let ctes = select
-            .with
-            .as_ref()
-            .map_or(&[][..], |w| w.ctes.as_slice());
+        let ctes = select.with.as_ref().map_or(&[][..], |w| w.ctes.as_slice());
         let mut temp_names: Vec<String> = Vec::with_capacity(ctes.len());
         for cte in ctes {
             let cte_name = &cte.name;
             // Execute the CTE body query to get its result rows.
-            let cte_rows = self.execute_statement(
-                Statement::Select(cte.query.clone()),
-                params,
-            )?;
+            let cte_rows = self.execute_statement(Statement::Select(cte.query.clone()), params)?;
             // Determine column definitions from the CTE.
-            let col_names: Vec<String> = if !cte.columns.is_empty() {
-                cte.columns.clone()
-            } else if let Some(first_row) = cte_rows.first() {
-                first_row
-                    .column_names
-                    .iter()
-                    .map(|c| c.clone())
-                    .collect()
+            let col_names: Vec<String> = if cte.columns.is_empty() {
+                // Infer column names from the CTE query's SELECT columns.
+                let inferred = infer_select_column_names(&cte.query);
+                if inferred.is_empty() {
+                    // Fallback: generate numbered names from result width.
+                    let width = cte_rows.first().map_or(1, |r| r.values().len());
+                    (0..width).map(|i| format!("_c{i}")).collect()
+                } else {
+                    inferred
+                }
             } else {
-                vec!["_c0".to_owned()]
+                cte.columns.clone()
             };
             // Create the temporary table via direct schema manipulation.
             let col_infos: Vec<ColumnInfo> = col_names
@@ -1672,7 +1663,8 @@ impl Connection {
             temp_names.push(cte_name.clone());
             // Insert the CTE result rows into the temporary table.
             for (i, row) in cte_rows.iter().enumerate() {
-                let vals: Vec<SqliteValue> = row.values.iter().cloned().collect();
+                let vals: Vec<SqliteValue> = row.values().to_vec();
+                #[allow(clippy::cast_possible_wrap)]
                 let rowid = (i + 1) as i64;
                 let mut db = self.db.borrow_mut();
                 if let Some(table) = db.get_table_mut(root_page) {
@@ -2056,6 +2048,30 @@ fn has_joins(select: &SelectStatement) -> bool {
     )
 }
 
+/// Infer column names from a SELECT statement's result columns.
+fn infer_select_column_names(select: &SelectStatement) -> Vec<String> {
+    let core = &select.body.select;
+    if let SelectCore::Select { columns, .. } = core {
+        columns
+            .iter()
+            .enumerate()
+            .map(|(i, col)| match col {
+                ResultColumn::Expr {
+                    alias: Some(alias), ..
+                } => alias.clone(),
+                ResultColumn::Expr { expr, .. } => match expr {
+                    Expr::Column(col_ref, _) => col_ref.column.clone(),
+                    _ => format!("_c{i}"),
+                },
+                ResultColumn::Star => "*".to_owned(),
+                ResultColumn::TableStar(name) => format!("{name}.*"),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Subquery rewriting helpers (IN, EXISTS, scalar subqueries)
 // ---------------------------------------------------------------------------
@@ -2227,8 +2243,8 @@ fn is_agg_fn(name: &str) -> bool {
 
 /// Describes one result column in a GROUP BY query.
 enum GroupByColumn {
-    /// A non-aggregate column reference; stores the column index in the raw row.
-    Plain(usize),
+    /// A non-aggregate expression that appears in GROUP BY; evaluated per-group.
+    Plain(Box<Expr>),
     /// An aggregate function; stores (func_name_lower, arg_col_index_or_None_for_star).
     Agg {
         name: String,
@@ -5572,6 +5588,111 @@ mod tests {
         assert_eq!(rows.len(), 4, "all except a=3 should pass != 3");
     }
 
+    // ── Expression-based GROUP BY tests (bd-2ej2) ─────────────────
+
+    #[test]
+    fn test_group_by_arithmetic_expression() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER, b INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10);").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 20);").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 10);").unwrap();
+        conn.execute("INSERT INTO t VALUES (4, 20);").unwrap();
+
+        let rows = conn
+            .query("SELECT a + b, COUNT(*) FROM t GROUP BY a + b ORDER BY a + b;")
+            .unwrap();
+        assert_eq!(rows.len(), 4);
+        // Each a+b is unique: 11, 13, 22, 24
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(11));
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn test_group_by_expression_with_duplicate_keys() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (val INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t VALUES (2);").unwrap();
+        conn.execute("INSERT INTO t VALUES (3);").unwrap();
+        conn.execute("INSERT INTO t VALUES (4);").unwrap();
+        conn.execute("INSERT INTO t VALUES (5);").unwrap();
+        conn.execute("INSERT INTO t VALUES (6);").unwrap();
+
+        // GROUP BY val % 2 groups into even (0) and odd (1).
+        let rows = conn
+            .query("SELECT val % 2, COUNT(*) FROM t GROUP BY val % 2 ORDER BY val % 2;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        // Evens: 2,4,6
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(3));
+        // Odds: 1,3,5
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[1].values()[1], SqliteValue::Integer(3));
+    }
+
+    #[test]
+    fn test_group_by_function_expression() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (name TEXT, score INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES ('Alice', 90);").unwrap();
+        conn.execute("INSERT INTO t VALUES ('Bob', 80);").unwrap();
+        conn.execute("INSERT INTO t VALUES ('Ann', 70);").unwrap();
+        conn.execute("INSERT INTO t VALUES ('Bill', 85);").unwrap();
+
+        // GROUP BY LENGTH(name): 'Bob' and 'Ann' have length 3, 'Bill' has 4, 'Alice' has 5.
+        let rows = conn
+            .query("SELECT LENGTH(name), SUM(score) FROM t GROUP BY LENGTH(name) ORDER BY LENGTH(name);")
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(3));
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(150)); // Bob(80) + Ann(70)
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(4));
+        assert_eq!(rows[1].values()[1], SqliteValue::Integer(85)); // Bill
+        assert_eq!(rows[2].values()[0], SqliteValue::Integer(5));
+        assert_eq!(rows[2].values()[1], SqliteValue::Integer(90)); // Alice
+    }
+
+    #[test]
+    fn test_group_by_expression_with_having() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (val INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t VALUES (2);").unwrap();
+        conn.execute("INSERT INTO t VALUES (3);").unwrap();
+        conn.execute("INSERT INTO t VALUES (4);").unwrap();
+        conn.execute("INSERT INTO t VALUES (5);").unwrap();
+        conn.execute("INSERT INTO t VALUES (6);").unwrap();
+
+        // GROUP BY val % 3 with HAVING COUNT(*) > 1: all groups have exactly 2 items.
+        let rows = conn
+            .query("SELECT val % 3, COUNT(*) FROM t GROUP BY val % 3 HAVING COUNT(*) >= 2;")
+            .unwrap();
+        // val%3=0: {3,6}, val%3=1: {1,4}, val%3=2: {2,5} — all have count 2.
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn test_group_by_expression_with_aggregate_sum() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER, b INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10);").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 20);").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 30);").unwrap();
+        conn.execute("INSERT INTO t VALUES (4, 40);").unwrap();
+
+        // GROUP BY a % 2: even {2,4} and odd {1,3}.
+        let rows = conn
+            .query("SELECT a % 2, SUM(b) FROM t GROUP BY a % 2 ORDER BY a % 2;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(60)); // 20+40
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[1].values()[1], SqliteValue::Integer(40)); // 10+30
+    }
+
     #[test]
     fn test_compound_select_union_all() {
         let conn = Connection::open(":memory:").unwrap();
@@ -6023,6 +6144,81 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
         assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+    }
+
+    // ── CTE (WITH clause) tests ─────────────────────────────────────
+
+    #[test]
+    fn test_cte_basic() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER, b TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'x');").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (2, 'y');").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (3, 'z');").unwrap();
+
+        let rows = conn
+            .query("WITH cte AS (SELECT a, b FROM t1 WHERE a > 1) SELECT a, b FROM cte ORDER BY a;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("y".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(3));
+    }
+
+    #[test]
+    fn test_cte_with_column_names() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (val INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (10);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (20);").unwrap();
+
+        let rows = conn
+            .query("WITH nums(n) AS (SELECT val FROM t1) SELECT n FROM nums ORDER BY n;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(10));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(20));
+    }
+
+    #[test]
+    fn test_cte_multiple() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (b INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (2);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (10);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (20);").unwrap();
+
+        let rows = conn
+            .query(
+                "WITH c1 AS (SELECT a FROM t1), c2 AS (SELECT b FROM t2) \
+                 SELECT a FROM c1 ORDER BY a;",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+    }
+
+    #[test]
+    fn test_cte_with_aggregation() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE sales (amount INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO sales VALUES (100);").unwrap();
+        conn.execute("INSERT INTO sales VALUES (200);").unwrap();
+        conn.execute("INSERT INTO sales VALUES (300);").unwrap();
+
+        let rows = conn
+            .query(
+                "WITH totals AS (SELECT SUM(amount) AS total FROM sales) \
+                 SELECT total FROM totals;",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(600));
     }
 
     #[test]
