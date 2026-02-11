@@ -2237,13 +2237,34 @@ impl Connection {
                 .map(|s| s.col_names.len())
                 .sum();
 
+            // NATURAL JOIN: auto-derive USING constraint from shared column
+            // names between the left side and the right table.
+            let natural_constraint;
+            let effective_constraint = if join.join_type.natural {
+                let left_cols: Vec<&str> = table_sources[..=join_idx]
+                    .iter()
+                    .flat_map(|s| s.col_names.iter().map(String::as_str))
+                    .collect();
+                let right_src = &table_sources[join_idx + 1];
+                let shared: Vec<String> = right_src
+                    .col_names
+                    .iter()
+                    .filter(|c| left_cols.iter().any(|l| l.eq_ignore_ascii_case(c.as_str())))
+                    .cloned()
+                    .collect();
+                natural_constraint = JoinConstraint::Using(shared);
+                Some(&natural_constraint)
+            } else {
+                join.constraint.as_ref()
+            };
+
             combined = execute_single_join(
                 &combined,
                 right_rows,
                 right_width,
                 current_width,
                 join.join_type.kind,
-                join.constraint.as_ref(),
+                effective_constraint,
                 &col_map,
             )?;
         }
@@ -7224,11 +7245,12 @@ mod tests {
         assert_eq!(rows.len(), 2);
         let vals: Vec<i64> = rows
             .iter()
-            .map(|r| match r.values()[0] {
-                SqliteValue::Integer(i) => i,
-                _ => panic!("expected integer"),
+            .filter_map(|r| match r.values()[0] {
+                SqliteValue::Integer(i) => Some(i),
+                _ => None,
             })
             .collect();
+        assert_eq!(vals.len(), rows.len());
         assert!(vals.contains(&2));
         assert!(vals.contains(&3));
     }
@@ -7290,11 +7312,12 @@ mod tests {
         assert_eq!(rows.len(), 2);
         let names: Vec<&str> = rows
             .iter()
-            .map(|r| match &r.values()[0] {
-                SqliteValue::Text(s) => s.as_str(),
-                _ => panic!("expected text"),
+            .filter_map(|r| match &r.values()[0] {
+                SqliteValue::Text(s) => Some(s.as_str()),
+                _ => None,
             })
             .collect();
+        assert_eq!(names.len(), rows.len());
         assert!(names.contains(&"Alice"));
         assert!(names.contains(&"Bob"));
     }
@@ -9058,11 +9081,12 @@ mod tests {
         // Alice (2 orders), Bob (1 order), Carol (NULL).
         let names: Vec<String> = rows
             .iter()
-            .map(|r| match &r.values()[0] {
-                SqliteValue::Text(s) => s.clone(),
-                _ => panic!("expected text"),
+            .filter_map(|r| match &r.values()[0] {
+                SqliteValue::Text(s) => Some(s.clone()),
+                _ => None,
             })
             .collect();
+        assert_eq!(names.len(), rows.len());
         assert_eq!(names, vec!["Alice", "Alice", "Bob", "Carol"]);
         // Carol's amount should be NULL.
         assert_eq!(rows[3].values()[1], SqliteValue::Null);
@@ -9337,6 +9361,80 @@ mod tests {
             row_values(&rows[1]),
             vec![SqliteValue::Null, SqliteValue::Text("b".to_owned())]
         );
+    }
+
+    #[test]
+    fn test_natural_join() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE employees (id INTEGER, name TEXT, dept_id INTEGER);")
+            .unwrap();
+        conn.execute("CREATE TABLE departments (dept_id INTEGER, dept_name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO employees VALUES (1, 'alice', 10);")
+            .unwrap();
+        conn.execute("INSERT INTO employees VALUES (2, 'bob', 20);")
+            .unwrap();
+        conn.execute("INSERT INTO departments VALUES (10, 'eng');")
+            .unwrap();
+        conn.execute("INSERT INTO departments VALUES (30, 'hr');")
+            .unwrap();
+
+        // NATURAL JOIN matches on shared column 'dept_id'.
+        let rows = conn
+            .query("SELECT employees.name, departments.dept_name FROM employees NATURAL JOIN departments;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Text("alice".to_owned()),
+                SqliteValue::Text("eng".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn test_natural_left_join() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE l (id INTEGER, val TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE r (id INTEGER, tag TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO l VALUES (1, 'a');").unwrap();
+        conn.execute("INSERT INTO l VALUES (2, 'b');").unwrap();
+        conn.execute("INSERT INTO r VALUES (1, 'x');").unwrap();
+
+        let rows = conn
+            .query("SELECT l.val, r.tag FROM l NATURAL LEFT JOIN r ORDER BY l.val;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Text("a".to_owned()),
+                SqliteValue::Text("x".to_owned())
+            ]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![SqliteValue::Text("b".to_owned()), SqliteValue::Null]
+        );
+    }
+
+    #[test]
+    fn test_natural_join_no_shared_columns() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (b INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (2);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (10);").unwrap();
+
+        // No shared columns: NATURAL JOIN degenerates to CROSS JOIN.
+        let rows = conn
+            .query("SELECT t1.a, t2.b FROM t1 NATURAL JOIN t2;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
     }
 }
 
