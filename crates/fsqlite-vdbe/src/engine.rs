@@ -3883,10 +3883,17 @@ mod tests {
             codegen_insert(&mut b, &stmt, &schema, &ctx).expect("codegen should succeed");
             let prog = b.finish().expect("program should build");
 
+            // Provide a MemDatabase so Insert stores the row and SeekRowid
+            // (used by emit_returning) can find it.
+            let mut db = MemDatabase::new();
+            let root = db.create_table(2);
+            assert_eq!(root, 2);
+
             let mut engine = VdbeEngine::new(prog.register_count());
+            engine.set_database(db);
             let outcome = engine.execute(&prog).expect("execution should succeed");
             assert_eq!(outcome, ExecOutcome::Done);
-            // RETURNING emits a ResultRow with the new rowid.
+            // RETURNING * emits a ResultRow with all columns.
             assert_eq!(engine.results().len(), 1);
         }
 

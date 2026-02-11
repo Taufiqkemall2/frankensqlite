@@ -2014,9 +2014,9 @@ fn codegen_insert_values(
             0,
         );
 
-        // RETURNING clause: emit ResultRow with rowid if present.
+        // RETURNING clause: position cursor on inserted row and read columns.
         if !returning.is_empty() {
-            b.emit_op(Opcode::ResultRow, rowid_reg, 1, 0, P4::None, 0);
+            emit_returning(b, cursor, table, returning, rowid_reg)?;
         }
     }
 
@@ -2162,9 +2162,9 @@ fn codegen_insert_select(
         0,
     );
 
-    // RETURNING clause: emit ResultRow with rowid if present.
+    // RETURNING clause: position cursor on inserted row and read columns.
     if !returning.is_empty() {
-        b.emit_op(Opcode::ResultRow, rowid_reg, 1, 0, P4::None, 0);
+        emit_returning(b, write_cursor, target_table, returning, rowid_reg)?;
     }
 
     // Skip label for WHERE-filtered rows.
@@ -2530,6 +2530,35 @@ fn emit_column_reads(
             }
         }
     }
+    Ok(())
+}
+
+/// Emit RETURNING clause opcodes after an INSERT.
+///
+/// Positions the cursor on the just-inserted row via `SeekRowid`, reads the
+/// requested columns, and emits a `ResultRow`.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_returning(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    returning: &[ResultColumn],
+    rowid_reg: i32,
+) -> Result<(), CodegenError> {
+    let skip_returning = b.emit_label();
+    b.emit_jump_to_label(
+        Opcode::SeekRowid,
+        cursor,
+        rowid_reg,
+        skip_returning,
+        P4::None,
+        0,
+    );
+    let ret_count = result_column_count(returning, table);
+    let ret_regs = b.alloc_regs(ret_count);
+    emit_column_reads(b, cursor, returning, table, None, &[], ret_regs)?;
+    b.emit_op(Opcode::ResultRow, ret_regs, ret_count, 0, P4::None, 0);
+    b.resolve_label(skip_returning);
     Ok(())
 }
 

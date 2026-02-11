@@ -2050,4 +2050,78 @@ mod tests {
             // IN subquery not yet supported — that's fine for now
         }
     }
+
+    // Test: INSERT ... RETURNING *
+    #[test]
+    fn probe_insert_returning_star() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, age INTEGER);")
+            .unwrap();
+        let rows = conn
+            .query("INSERT INTO t VALUES (1, 'Alice', 30) RETURNING *;")
+            .unwrap();
+        assert_eq!(rows.len(), 1, "RETURNING * should produce 1 row");
+        // RETURNING * includes all columns: id (rowid alias), name, age
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("Alice".to_owned()),
+                SqliteValue::Integer(30),
+            ]
+        );
+    }
+
+    // Test: INSERT ... RETURNING specific columns
+    #[test]
+    fn probe_insert_returning_columns() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, age INTEGER);")
+            .unwrap();
+        let rows = conn
+            .query("INSERT INTO t VALUES (1, 'Bob', 25) RETURNING name, age;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Text("Bob".to_owned()),
+                SqliteValue::Integer(25),
+            ]
+        );
+    }
+
+    // Test: INSERT ... RETURNING rowid
+    #[test]
+    fn probe_insert_returning_rowid() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        let rows = conn
+            .query("INSERT INTO t VALUES (42, 'test') RETURNING id;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(42));
+    }
+
+    // Test: Multi-row INSERT ... RETURNING
+    #[test]
+    fn probe_insert_returning_multi_row() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a');").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'b');").unwrap();
+        // INSERT SELECT with RETURNING
+        conn.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        let rows = conn
+            .query("INSERT INTO t2 SELECT * FROM t RETURNING *;")
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "Multi-row INSERT RETURNING should produce 2 rows"
+        );
+    }
 }

@@ -658,11 +658,14 @@ impl Connection {
             }
             Statement::Insert(ref insert) => {
                 if let fsqlite_ast::InsertSource::Select(select_stmt) = &insert.source {
-                    let affected =
-                        self.execute_insert_select_fallback(insert, select_stmt, params)?;
-                    self.persist_if_needed()?;
-                    *self.last_changes.borrow_mut() = affected;
-                    return Ok(Vec::new());
+                    // Use VDBE path when RETURNING is present; fallback otherwise.
+                    if insert.returning.is_empty() {
+                        let affected =
+                            self.execute_insert_select_fallback(insert, select_stmt, params)?;
+                        self.persist_if_needed()?;
+                        *self.last_changes.borrow_mut() = affected;
+                        return Ok(Vec::new());
+                    }
                 }
 
                 // Route INSERT OR REPLACE / INSERT OR IGNORE through a
@@ -688,10 +691,14 @@ impl Connection {
                     }
                 };
                 let program = self.compile_table_insert(insert)?;
-                self.execute_table_program(&program, params)?;
+                let rows = self.execute_table_program(&program, params)?;
                 self.persist_if_needed()?;
                 *self.last_changes.borrow_mut() = affected;
-                Ok(Vec::new())
+                if insert.returning.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    Ok(rows)
+                }
             }
             Statement::Update(ref update) => {
                 let affected =
@@ -1943,8 +1950,38 @@ impl Connection {
         };
         let having_expr = having.as_deref();
 
-        // Step 4: Parse result descriptors.
-        let result_descriptors: Vec<GroupByColumn> = columns
+        // Step 4a: Expand Star / TableStar into explicit column references
+        // using the col_map so GROUP BY can process them individually.
+        let expanded_columns: Vec<ResultColumn> = columns
+            .iter()
+            .flat_map(|col| match col {
+                ResultColumn::Star => col_map
+                    .iter()
+                    .map(|(tbl, c)| ResultColumn::Expr {
+                        expr: Expr::Column(
+                            ColumnRef::qualified(tbl.clone(), c.clone()),
+                            Span::new(0, 0),
+                        ),
+                        alias: None,
+                    })
+                    .collect::<Vec<_>>(),
+                ResultColumn::TableStar(tbl) => col_map
+                    .iter()
+                    .filter(|(t, _)| t.eq_ignore_ascii_case(tbl))
+                    .map(|(t, c)| ResultColumn::Expr {
+                        expr: Expr::Column(
+                            ColumnRef::qualified(t.clone(), c.clone()),
+                            Span::new(0, 0),
+                        ),
+                        alias: None,
+                    })
+                    .collect::<Vec<_>>(),
+                other @ ResultColumn::Expr { .. } => vec![other.clone()],
+            })
+            .collect();
+
+        // Step 4b: Parse result columns into GroupByColumn descriptors.
+        let result_descriptors: Vec<GroupByColumn> = expanded_columns
             .iter()
             .map(|col| match col {
                 ResultColumn::Expr {
@@ -2056,7 +2093,7 @@ impl Connection {
                     having,
                     &values,
                     &result_descriptors,
-                    columns,
+                    &expanded_columns,
                     group_rows,
                     &col_names,
                 ) {
@@ -2068,7 +2105,7 @@ impl Connection {
 
         // Step 7: ORDER BY and LIMIT.
         if !select.order_by.is_empty() {
-            sort_rows_by_order_terms(&mut result, &select.order_by, columns)?;
+            sort_rows_by_order_terms(&mut result, &select.order_by, &expanded_columns)?;
         }
         if let Some(ref limit_clause) = select.limit {
             apply_limit_offset_postprocess(&mut result, limit_clause);
@@ -10975,5 +11012,58 @@ mod transaction_lifecycle_tests {
         // DROP TRIGGER should succeed silently even though triggers
         // are not implemented (no-op stub).
         conn.execute("DROP TRIGGER IF EXISTS my_trigger").unwrap();
+    }
+
+    #[test]
+    fn test_select_star_group_by_join() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, amount REAL)",
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO customers VALUES (1, 'Alice')")
+            .unwrap();
+        conn.execute("INSERT INTO customers VALUES (2, 'Bob')")
+            .unwrap();
+        conn.execute("INSERT INTO orders VALUES (1, 1, 10.0)")
+            .unwrap();
+        conn.execute("INSERT INTO orders VALUES (2, 1, 20.0)")
+            .unwrap();
+        conn.execute("INSERT INTO orders VALUES (3, 2, 30.0)")
+            .unwrap();
+        // SELECT * with GROUP BY on a JOIN — picks one row per group
+        let rows = conn
+            .query(
+                "SELECT * FROM orders JOIN customers ON orders.customer_id = customers.id \
+                 GROUP BY customers.id ORDER BY customers.id",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_select_table_star_group_by_join() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        conn.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY, t1_id INTEGER, score INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'a')").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (2, 'b')").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (1, 1, 10)").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (2, 1, 20)").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (3, 2, 30)").unwrap();
+        // SELECT t1.* with GROUP BY
+        let rows = conn
+            .query(
+                "SELECT t1.* FROM t1 JOIN t2 ON t1.id = t2.t1_id \
+                 GROUP BY t1.id ORDER BY t1.id",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get(1).unwrap(), &SqliteValue::Text("a".into()));
+        assert_eq!(rows[1].get(1).unwrap(), &SqliteValue::Text("b".into()));
     }
 }
