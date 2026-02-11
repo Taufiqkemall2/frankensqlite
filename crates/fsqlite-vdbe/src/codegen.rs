@@ -6173,6 +6173,118 @@ mod tests {
     }
 
     #[test]
+    fn test_codegen_update_where_in_subquery_supported_without_rewrite() {
+        // UPDATE t SET b = ?1 WHERE a IN (SELECT b FROM s)
+        let subquery = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::Column(ColumnRef::bare("b"), Span::ZERO),
+                        alias: None,
+                    }],
+                    from: Some(from_table("s")),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+        let stmt = UpdateStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: None,
+                index_hint: None,
+            },
+            assignments: vec![Assignment {
+                target: AssignmentTarget::Column("b".to_owned()),
+                value: placeholder(1),
+            }],
+            from: None,
+            where_clause: Some(Expr::In {
+                expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+                set: InSet::Subquery(Box::new(subquery)),
+                not: false,
+                span: Span::ZERO,
+            }),
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+
+        let schema = test_schema_with_subquery_source();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_update(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::OpenRead && op.p2 == 3),
+            "expected subquery probe OpenRead on root page 3"
+        );
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::Eq),
+            "expected Eq comparison in IN probe scan"
+        );
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::Insert),
+            "expected update writeback Insert"
+        );
+    }
+
+    #[test]
+    fn test_codegen_delete_where_in_table_supported_without_rewrite() {
+        // DELETE FROM t WHERE a IN s
+        let stmt = DeleteStatement {
+            with: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: None,
+                index_hint: None,
+            },
+            where_clause: Some(Expr::In {
+                expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+                set: InSet::Table(QualifiedName::bare("s")),
+                not: false,
+                span: Span::ZERO,
+            }),
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+
+        let schema = test_schema_with_subquery_source();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_delete(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::OpenRead && op.p2 == 3),
+            "expected IN-table probe OpenRead on root page 3"
+        );
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::Eq),
+            "expected Eq comparison in IN probe scan"
+        );
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::Delete),
+            "expected delete operation"
+        );
+    }
+
+    #[test]
     fn test_codegen_delete_where_bare_rowid_eq() {
         // DELETE FROM t WHERE rowid = ?1
         // Ensures unqualified rowid in Eq fast-path emits Rowid opcode.
