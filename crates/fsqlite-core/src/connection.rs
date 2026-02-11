@@ -4108,6 +4108,40 @@ mod tests {
     }
 
     #[test]
+    fn test_select_order_by_expression() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER, b TEXT);").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 'c');").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a');").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'b');").unwrap();
+
+        // ORDER BY a + 0 (expression, not bare column) — should sort by `a`.
+        let rows = conn.query("SELECT a, b FROM t ORDER BY a + 0;").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("a".to_owned())
+            ]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![
+                SqliteValue::Integer(2),
+                SqliteValue::Text("b".to_owned())
+            ]
+        );
+        assert_eq!(
+            row_values(&rows[2]),
+            vec![
+                SqliteValue::Integer(3),
+                SqliteValue::Text("c".to_owned())
+            ]
+        );
+    }
+
+    #[test]
     fn test_select_projection_rowid_aliases() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t3 (x TEXT);").unwrap();

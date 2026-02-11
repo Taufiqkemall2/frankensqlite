@@ -557,6 +557,12 @@ fn codegen_select_distinct_scan(
         })
     });
 
+    // DISTINCT state (record compare against previous output row).
+    let cur_rec = b.alloc_reg();
+    let prev_rec = b.alloc_reg();
+    b.emit_op(Opcode::Null, 0, prev_rec, 0, P4::None, 0);
+    let dup_skip = b.emit_label();
+
     // SorterSort: sort and position at first row; jump to done if empty.
     b.emit_jump_to_label(
         Opcode::SorterSort,
@@ -580,12 +586,6 @@ fn codegen_select_distinct_scan(
         0,
     );
 
-    // OFFSET: skip rows while offset counter > 0.
-    let output_skip = b.emit_label();
-    if let Some(off_r) = offset_reg {
-        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, output_skip, P4::None, 0);
-    }
-
     // Extract output columns from sorted record.
     for i in 0..num_data_cols {
         b.emit_op(
@@ -599,10 +599,6 @@ fn codegen_select_distinct_scan(
     }
 
     // DISTINCT: pack output into a record and compare with previous row.
-    let cur_rec = b.alloc_reg();
-    let prev_rec = b.alloc_reg();
-    let dup_skip = b.emit_label();
-
     b.emit_op(
         Opcode::MakeRecord,
         out_regs,
@@ -617,6 +613,12 @@ fn codegen_select_distinct_scan(
 
     // Update previous record to current for next comparison.
     b.emit_op(Opcode::Copy, cur_rec, prev_rec, 0, P4::None, 0);
+
+    // OFFSET applies after duplicate elimination.
+    let output_skip = b.emit_label();
+    if let Some(off_r) = offset_reg {
+        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, output_skip, P4::None, 0);
+    }
 
     // ResultRow.
     b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
@@ -704,15 +706,11 @@ fn codegen_select_ordered_scan(
     done_label: crate::Label,
     end_label: crate::Label,
 ) -> Result<(), CodegenError> {
-    // Resolve ORDER BY sources (column indices or rowid).
+    // Resolve ORDER BY sources (column indices, rowid, or expressions).
     let sort_keys: Vec<SortKeySource> = order_by
         .iter()
-        .map(|term| {
-            resolve_sort_key(&term.expr, table, table_alias).ok_or_else(|| {
-                CodegenError::Unsupported("non-column ORDER BY expression".to_owned())
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|term| resolve_sort_key(&term.expr, table, table_alias))
+        .collect();
 
     let num_sort_keys = sort_keys.len();
     let num_data_cols = usize::try_from(out_col_count).map_err(|_| {
@@ -770,6 +768,11 @@ fn codegen_select_ordered_scan(
     let sorter_base = b.alloc_regs(total_sorter_cols as i32);
     {
         let mut reg = sorter_base;
+        let scan = ScanCtx {
+            cursor,
+            table,
+            table_alias,
+        };
         for key in &sort_keys {
             match key {
                 SortKeySource::Column(col_idx) => {
@@ -778,6 +781,9 @@ fn codegen_select_ordered_scan(
                 }
                 SortKeySource::Rowid => {
                     b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
+                }
+                SortKeySource::Expression(expr) => {
+                    emit_expr(b, expr, reg, Some(&scan));
                 }
             }
             reg += 1;
@@ -844,6 +850,16 @@ fn codegen_select_ordered_scan(
         })
     });
 
+    // DISTINCT state (used only when DISTINCT is requested).
+    let distinct_state = if distinct == Distinctness::Distinct {
+        let cur_rec = b.alloc_reg();
+        let prev_rec = b.alloc_reg();
+        b.emit_op(Opcode::Null, 0, prev_rec, 0, P4::None, 0);
+        Some((cur_rec, prev_rec, b.emit_label()))
+    } else {
+        None
+    };
+
     // SorterSort: sort and position at first row; jump to done if empty.
     b.emit_jump_to_label(
         Opcode::SorterSort,
@@ -868,12 +884,6 @@ fn codegen_select_ordered_scan(
         0,
     );
 
-    // OFFSET: skip rows while offset counter > 0.
-    let output_skip = b.emit_label();
-    if let Some(off_r) = offset_reg {
-        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, output_skip, P4::None, 0);
-    }
-
     // Extract data columns from the sorted record.
     // The sorter record has sort-key columns first, then data columns.
     // We use Column on the sorter cursor to read individual fields.
@@ -892,11 +902,7 @@ fn codegen_select_ordered_scan(
 
     // DISTINCT: skip rows whose output columns match the previous row.
     // Pack output into a record, compare with previous record; if equal, skip.
-    let distinct_skip = if distinct == Distinctness::Distinct {
-        let cur_rec = b.alloc_reg();
-        let prev_rec = b.alloc_reg();
-        let skip = b.emit_label();
-
+    if let Some((cur_rec, prev_rec, skip)) = distinct_state {
         // Pack current output columns into a record.
         b.emit_op(
             Opcode::MakeRecord,
@@ -912,11 +918,13 @@ fn codegen_select_ordered_scan(
 
         // Update previous record to current.
         b.emit_op(Opcode::Copy, cur_rec, prev_rec, 0, P4::None, 0);
+    }
 
-        Some(skip)
-    } else {
-        None
-    };
+    // OFFSET applies after duplicate elimination.
+    let output_skip = b.emit_label();
+    if let Some(off_r) = offset_reg {
+        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, output_skip, P4::None, 0);
+    }
 
     // ResultRow.
     b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
@@ -927,7 +935,7 @@ fn codegen_select_ordered_scan(
     }
 
     // Resolve DISTINCT skip label (if active).
-    if let Some(skip) = distinct_skip {
+    if let Some((_, _, skip)) = distinct_state {
         b.resolve_label(skip);
     }
 
@@ -2331,6 +2339,14 @@ fn emit_where_filter(
                     SortKeySource::Rowid => {
                         b.emit_op(Opcode::Rowid, cursor, col_reg, 0, P4::None, 0);
                     }
+                    SortKeySource::Expression(expr) => {
+                        let scan = ScanCtx {
+                            cursor,
+                            table,
+                            table_alias,
+                        };
+                        emit_expr(b, &expr, col_reg, Some(&scan));
+                    }
                 }
                 emit_expr(b, right, val_reg, None);
                 b.emit_jump_to_label(Opcode::Ne, val_reg, col_reg, skip_label, P4::None, 0);
@@ -2345,6 +2361,14 @@ fn emit_where_filter(
                     }
                     SortKeySource::Rowid => {
                         b.emit_op(Opcode::Rowid, cursor, col_reg, 0, P4::None, 0);
+                    }
+                    SortKeySource::Expression(expr) => {
+                        let scan = ScanCtx {
+                            cursor,
+                            table,
+                            table_alias,
+                        };
+                        emit_expr(b, &expr, col_reg, Some(&scan));
                     }
                 }
                 emit_expr(b, left, val_reg, None);
@@ -2394,28 +2418,29 @@ fn matches_table_or_alias(qualifier: &str, table: &TableSchema, table_alias: Opt
 enum SortKeySource {
     Column(usize),
     Rowid,
+    /// Arbitrary expression (e.g., `a + b`, `LENGTH(name)`, `CASE WHEN ...`).
+    Expression(Expr),
 }
 
-/// Resolve a column reference to a `SortKeySource` (column index or rowid).
-fn resolve_sort_key(
-    expr: &Expr,
-    table: &TableSchema,
-    table_alias: Option<&str>,
-) -> Option<SortKeySource> {
+/// Resolve an ORDER BY expression to a `SortKeySource`.
+///
+/// Returns `Column` or `Rowid` for simple column references; falls back to
+/// `Expression` for arbitrary expressions (arithmetic, function calls, etc.).
+fn resolve_sort_key(expr: &Expr, table: &TableSchema, table_alias: Option<&str>) -> SortKeySource {
     if let Expr::Column(col_ref, _) = expr {
-        if let Some(qualifier) = &col_ref.table
-            && !matches_table_or_alias(qualifier, table, table_alias)
-        {
-            return None;
+        if let Some(qualifier) = &col_ref.table {
+            if !matches_table_or_alias(qualifier, table, table_alias) {
+                return SortKeySource::Expression(expr.clone());
+            }
         }
         if let Some(idx) = table.column_index(&col_ref.column) {
-            return Some(SortKeySource::Column(idx));
+            return SortKeySource::Column(idx);
         }
         if is_rowid_alias(&col_ref.column) {
-            return Some(SortKeySource::Rowid);
+            return SortKeySource::Rowid;
         }
     }
-    None
+    SortKeySource::Expression(expr.clone())
 }
 
 /// Resolve a column reference expression to either a column index or rowid.
@@ -3718,6 +3743,54 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_codegen_select_distinct_full_scan_offset_after_dedup() {
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::Distinct,
+                    columns: vec![ResultColumn::Star],
+                    from: Some(from_table("t")),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: Some(LimitClause {
+                limit: Expr::Literal(Literal::Integer(5), Span::ZERO),
+                offset: Some(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            }),
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let eq_pos = prog
+            .ops()
+            .iter()
+            .position(|op| op.opcode == Opcode::Eq)
+            .expect("missing DISTINCT Eq opcode");
+        let ifpos_pos = prog
+            .ops()
+            .iter()
+            .position(|op| op.opcode == Opcode::IfPos)
+            .expect("missing OFFSET IfPos opcode");
+        assert!(
+            eq_pos < ifpos_pos,
+            "DISTINCT dedup must run before OFFSET filtering"
+        );
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::Null),
+            "expected DISTINCT previous-record register initialization"
+        );
+    }
+
     // === Test: SELECT DISTINCT with ORDER BY ===
     #[test]
     fn test_codegen_select_distinct_with_order_by() {
@@ -3769,6 +3842,58 @@ mod tests {
                 Opcode::SorterNext,
             ]
         ));
+    }
+
+    #[test]
+    fn test_codegen_select_distinct_with_order_by_offset_after_dedup() {
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::Distinct,
+                    columns: vec![ResultColumn::Star],
+                    from: Some(from_table("t")),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![OrderingTerm {
+                expr: Expr::Column(ColumnRef::bare("a"), Span::ZERO),
+                direction: Some(SortDirection::Asc),
+                nulls: None,
+            }],
+            limit: Some(LimitClause {
+                limit: Expr::Literal(Literal::Integer(5), Span::ZERO),
+                offset: Some(Expr::Literal(Literal::Integer(2), Span::ZERO)),
+            }),
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let eq_pos = prog
+            .ops()
+            .iter()
+            .position(|op| op.opcode == Opcode::Eq)
+            .expect("missing DISTINCT Eq opcode");
+        let ifpos_pos = prog
+            .ops()
+            .iter()
+            .position(|op| op.opcode == Opcode::IfPos)
+            .expect("missing OFFSET IfPos opcode");
+        assert!(
+            eq_pos < ifpos_pos,
+            "DISTINCT dedup must run before OFFSET filtering"
+        );
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::Null),
+            "expected DISTINCT previous-record register initialization"
+        );
     }
 
     // === Test 3: UPDATE by rowid ===
@@ -4343,6 +4468,30 @@ mod tests {
         }
     }
 
+    fn star_select_order_by_expr(table: &str, expr: Expr) -> SelectStatement {
+        SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Star],
+                    from: Some(from_table(table)),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![OrderingTerm {
+                expr,
+                direction: None,
+                nulls: None,
+            }],
+            limit: None,
+        }
+    }
+
     // === Test 15: SELECT with ORDER BY ===
     #[test]
     fn test_codegen_select_order_by() {
@@ -4444,6 +4593,70 @@ mod tests {
         );
     }
 
+    // === Test 17b: ORDER BY arithmetic expression ===
+    #[test]
+    fn test_codegen_select_order_by_arithmetic_expression() {
+        let stmt = star_select_order_by_expr(
+            "t",
+            Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+                op: AstBinaryOp::Add,
+                right: Box::new(Expr::Column(ColumnRef::bare("b"), Span::ZERO)),
+                span: Span::ZERO,
+            },
+        );
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::SorterOpen,
+                Opcode::OpenRead,
+                Opcode::Add,
+                Opcode::SorterInsert,
+                Opcode::SorterSort,
+                Opcode::ResultRow,
+            ]
+        ));
+    }
+
+    // === Test 17c: ORDER BY scalar function expression ===
+    #[test]
+    fn test_codegen_select_order_by_function_expression() {
+        let stmt = star_select_order_by_expr(
+            "t",
+            Expr::FunctionCall {
+                name: "length".to_owned(),
+                args: FunctionArgs::List(vec![Expr::Column(ColumnRef::bare("b"), Span::ZERO)]),
+                distinct: false,
+                filter: None,
+                over: None,
+                span: Span::ZERO,
+            },
+        );
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::SorterOpen,
+                Opcode::OpenRead,
+                Opcode::PureFunc,
+                Opcode::SorterInsert,
+                Opcode::SorterSort,
+                Opcode::ResultRow,
+            ]
+        ));
+    }
+
     // === Test 18: ORDER BY no sorter without ORDER BY ===
     #[test]
     fn test_codegen_select_no_order_by_no_sorter() {
@@ -4513,6 +4726,75 @@ mod tests {
             target_op.opcode,
             Opcode::SorterData,
             "SorterNext should jump back to SorterData"
+        );
+    }
+
+    // === Test: SELECT ORDER BY expression (a + 1) ===
+    #[test]
+    fn test_codegen_select_order_by_expression() {
+        // SELECT * FROM t ORDER BY a + 1
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Star],
+                    from: Some(from_table("t")),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![OrderingTerm {
+                expr: Expr::BinaryOp {
+                    left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+                    op: fsqlite_ast::BinaryOp::Add,
+                    right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+                    span: Span::ZERO,
+                },
+                direction: None,
+                nulls: None,
+            }],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // Should use the sorter (two-pass pattern).
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::SorterOpen,
+                Opcode::OpenRead,
+                Opcode::Rewind,
+                Opcode::SorterInsert,
+                Opcode::Next,
+                Opcode::SorterSort,
+                Opcode::SorterData,
+                Opcode::ResultRow,
+                Opcode::SorterNext,
+                Opcode::Halt,
+            ]
+        ));
+
+        // The sort key is an expression, so we should see an Add opcode
+        // in the first pass (before SorterInsert).
+        let sorter_insert_idx = prog
+            .ops()
+            .iter()
+            .position(|op| op.opcode == Opcode::SorterInsert)
+            .unwrap();
+        let has_add_before_sorter = prog.ops()[..sorter_insert_idx]
+            .iter()
+            .any(|op| op.opcode == Opcode::Add);
+        assert!(
+            has_add_before_sorter,
+            "expression ORDER BY should emit Add before SorterInsert"
         );
     }
 
