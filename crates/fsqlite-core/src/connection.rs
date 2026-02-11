@@ -1,7 +1,7 @@
 //! SQL connection API with Phase 5 pager/WAL/B-tree storage wiring.
 //!
 //! Supports expression-only SELECT statements as well as table-backed DML:
-//! CREATE TABLE, INSERT, SELECT (with FROM), UPDATE, and DELETE. Table
+//! CREATE TABLE, DROP TABLE, INSERT, SELECT (with FROM), UPDATE, and DELETE. Table
 //! storage currently uses the in-memory `MemDatabase` backend for execution,
 //! while a [`PagerBackend`] is initialized alongside for future Phase 5
 //! sub-tasks (bd-1dqg, bd-25c6) that will wire the transaction lifecycle
@@ -14,10 +14,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use fsqlite_ast::{
-    BinaryOp, CompoundOp, CreateTableBody, Distinctness, Expr, FunctionArgs, InSet, JoinConstraint,
-    JoinKind, LikeOp, LimitClause, Literal, NullsOrder, OrderingTerm, PlaceholderType,
-    ResultColumn, SelectBody, SelectCore, SelectStatement, SortDirection, Statement,
-    TableOrSubquery, UnaryOp,
+    BinaryOp, CompoundOp, CreateTableBody, Distinctness, DropObjectType, Expr, FunctionArgs,
+    InSet, JoinConstraint, JoinKind, LikeOp, LimitClause, Literal, NullsOrder, OrderingTerm,
+    PlaceholderType, ResultColumn, SelectBody, SelectCore, SelectStatement, SortDirection,
+    Statement, TableOrSubquery, UnaryOp,
 };
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::FunctionRegistry;
@@ -678,8 +678,13 @@ impl Connection {
                 Ok(Vec::new())
             }
             Statement::Pragma(ref pragma) => self.execute_pragma(pragma),
+            Statement::Drop(ref drop_stmt) => {
+                self.execute_drop(drop_stmt)?;
+                self.persist_if_needed()?;
+                Ok(Vec::new())
+            }
             _ => Err(FrankenError::NotImplemented(
-                "only SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, transaction control, and PRAGMA are supported".to_owned(),
+                "only SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, DROP TABLE, transaction control, and PRAGMA are supported".to_owned(),
             )),
         }
     }
@@ -920,6 +925,42 @@ impl Connection {
         });
 
         Ok(())
+    }
+
+    /// Execute a DROP statement (currently supports DROP TABLE only).
+    fn execute_drop(&self, drop_stmt: &fsqlite_ast::DropStatement) -> Result<()> {
+        if drop_stmt.object_type != DropObjectType::Table {
+            return Err(FrankenError::NotImplemented(format!(
+                "DROP {:?} is not supported yet",
+                drop_stmt.object_type
+            )));
+        }
+
+        let table_name = &drop_stmt.name.name;
+        let mut schema = self.schema.borrow_mut();
+        let table_idx = schema
+            .iter()
+            .position(|t| t.name.eq_ignore_ascii_case(table_name));
+
+        match table_idx {
+            Some(idx) => {
+                let root_page = schema[idx].root_page;
+                schema.remove(idx);
+                drop(schema);
+                // Remove associated in-memory table storage.
+                self.db.borrow_mut().tables.remove(&root_page);
+                Ok(())
+            }
+            None => {
+                if drop_stmt.if_exists {
+                    Ok(())
+                } else {
+                    Err(FrankenError::Internal(format!(
+                        "no such table: {table_name}",
+                    )))
+                }
+            }
+        }
     }
 
     // ── Transaction control ──────────────────────────────────────────────
