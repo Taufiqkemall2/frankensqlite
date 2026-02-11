@@ -2288,10 +2288,23 @@ pub fn codegen_update(
     }
 
     // Evaluate new values from AST expressions and overwrite changed columns.
+    // A ScanCtx is required so that column references in SET expressions
+    // (e.g., `SET val = val + 5`) resolve to the cursor's current row.
+    let update_ctx = ScanCtx {
+        cursor,
+        table,
+        table_alias: stmt.table.alias.as_deref(),
+        schema: Some(schema),
+    };
     for (assign_idx, col_idx) in assignment_cols.iter().enumerate() {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let target = col_regs + *col_idx as i32;
-        emit_expr(b, &stmt.assignments[assign_idx].value, target, None);
+        emit_expr(
+            b,
+            &stmt.assignments[assign_idx].value,
+            target,
+            Some(&update_ctx),
+        );
     }
 
     // Get the current rowid for re-insertion.
@@ -6322,5 +6335,73 @@ mod tests {
                 Opcode::Delete,
             ]
         ));
+    }
+
+    // === Test: UPDATE SET with column self-reference (bd-2eau) ===
+
+    #[test]
+    fn test_codegen_update_set_column_self_ref() {
+        // UPDATE t SET a = a + 1
+        // The SET expression `a + 1` should generate a Column opcode to read
+        // the current value of `a`, NOT a Null opcode.
+        let stmt = UpdateStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: None,
+                index_hint: None,
+            },
+            assignments: vec![Assignment {
+                target: AssignmentTarget::Column("a".to_owned()),
+                value: Expr::BinaryOp {
+                    left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+                    op: AstBinaryOp::Add,
+                    right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+                    span: Span::ZERO,
+                },
+            }],
+            from: None,
+            where_clause: None,
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_update(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // The SET expression should emit Column (reading `a`) + Integer(1) + Add,
+        // NOT Null. Count Column opcodes — there should be at least 3:
+        // 2 from reading all columns, plus 1+ from evaluating `a` in the expression.
+        let column_count = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::Column)
+            .count();
+        assert!(
+            column_count >= 3,
+            "expected >= 3 Column ops (2 for reading all cols + 1 for SET expr), got {column_count}"
+        );
+
+        // There should be an Add opcode for `a + 1`.
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::Add),
+            "expected Add opcode for `a + 1` expression"
+        );
+
+        // There should be NO Null opcodes for column references.
+        // (Null would only appear if the ScanCtx was missing.)
+        let null_count = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::Null)
+            .count();
+        assert_eq!(
+            null_count, 0,
+            "expected 0 Null opcodes (column refs should resolve), got {null_count}"
+        );
     }
 }

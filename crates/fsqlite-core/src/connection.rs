@@ -804,14 +804,9 @@ impl Connection {
         select_stmt: &fsqlite_ast::SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<usize> {
-        if insert.with.is_some()
-            || insert.or_conflict.is_some()
-            || !insert.upsert.is_empty()
-            || !insert.returning.is_empty()
-        {
+        if insert.with.is_some() || !insert.upsert.is_empty() || !insert.returning.is_empty() {
             return Err(FrankenError::NotImplemented(
-                "INSERT ... SELECT fallback does not support WITH/OR CONFLICT/UPSERT/RETURNING"
-                    .to_owned(),
+                "INSERT ... SELECT fallback does not support WITH/UPSERT/RETURNING".to_owned(),
             ));
         }
 
@@ -844,17 +839,30 @@ impl Connection {
             .map(|idx| format!("?{idx}"))
             .collect::<Vec<_>>()
             .join(", ");
-        let insert_sql = format!("INSERT INTO {qualified_table} VALUES ({placeholders});");
+        // Include the conflict clause if present so that each INSERT
+        // row is handled with the correct conflict resolution.
+        let conflict_clause = match &insert.or_conflict {
+            Some(fsqlite_ast::ConflictAction::Replace) => "OR REPLACE ",
+            Some(fsqlite_ast::ConflictAction::Ignore) => "OR IGNORE ",
+            Some(fsqlite_ast::ConflictAction::Abort) => "OR ABORT ",
+            Some(fsqlite_ast::ConflictAction::Fail) => "OR FAIL ",
+            Some(fsqlite_ast::ConflictAction::Rollback) => "OR ROLLBACK ",
+            None => "",
+        };
+        let insert_sql =
+            format!("INSERT {conflict_clause}INTO {qualified_table} VALUES ({placeholders});");
 
+        let mut affected = 0usize;
         for row in &source_rows {
             let mut ordered_values = vec![SqliteValue::Null; table_columns.len()];
             for (source_idx, target_idx) in source_target_indices.iter().copied().enumerate() {
                 ordered_values[target_idx] = row.values()[source_idx].clone();
             }
             self.execute_with_params(&insert_sql, &ordered_values)?;
+            affected += 1;
         }
 
-        Ok(source_rows.len())
+        Ok(affected)
     }
 
     /// Handle INSERT OR REPLACE / INSERT OR IGNORE for VALUES source by
@@ -1259,9 +1267,10 @@ impl Connection {
                     Err(FrankenError::Internal(format!("no such view: {obj_name}")))
                 }
             }
-            DropObjectType::Trigger => Err(FrankenError::NotImplemented(
-                "DROP TRIGGER is not supported yet".to_owned(),
-            )),
+            DropObjectType::Trigger => {
+                // Triggers are not implemented; silently succeed (nothing to drop).
+                Ok(())
+            }
         }
     }
 
@@ -10907,5 +10916,59 @@ mod transaction_lifecycle_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Float(2.72));
         assert_eq!(rows[0].get(1).unwrap(), &SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn test_insert_or_replace_select_source() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        conn.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO src VALUES (1, 'alice')").unwrap();
+        conn.execute("INSERT INTO src VALUES (2, 'bob')").unwrap();
+        conn.execute("INSERT INTO dst VALUES (1, 'old_alice')")
+            .unwrap();
+        // Replace id=1, insert id=2
+        conn.execute("INSERT OR REPLACE INTO dst SELECT * FROM src")
+            .unwrap();
+        let rows = conn.query("SELECT id, name FROM dst ORDER BY id").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get(1).unwrap(), &SqliteValue::Text("alice".into()));
+        assert_eq!(rows[1].get(1).unwrap(), &SqliteValue::Text("bob".into()));
+    }
+
+    #[test]
+    fn test_insert_or_ignore_select_source() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        conn.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO src VALUES (1, 'alice')").unwrap();
+        conn.execute("INSERT INTO src VALUES (2, 'bob')").unwrap();
+        conn.execute("INSERT INTO dst VALUES (1, 'old_alice')")
+            .unwrap();
+        // Ignore id=1 conflict, insert id=2
+        conn.execute("INSERT OR IGNORE INTO dst SELECT * FROM src")
+            .unwrap();
+        let rows = conn.query("SELECT id, name FROM dst ORDER BY id").unwrap();
+        assert_eq!(rows.len(), 2);
+        // id=1 should keep original value
+        assert_eq!(
+            rows[0].get(1).unwrap(),
+            &SqliteValue::Text("old_alice".into())
+        );
+        assert_eq!(rows[1].get(1).unwrap(), &SqliteValue::Text("bob".into()));
+    }
+
+    #[test]
+    fn test_drop_trigger_noop() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        // DROP TRIGGER should succeed silently even though triggers
+        // are not implemented (no-op stub).
+        conn.execute("DROP TRIGGER IF EXISTS my_trigger").unwrap();
     }
 }
