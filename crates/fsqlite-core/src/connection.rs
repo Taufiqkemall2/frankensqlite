@@ -14,8 +14,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use fsqlite_ast::{
-    BinaryOp, CompoundOp, CreateTableBody, Distinctness, DropObjectType, Expr, FunctionArgs,
-    InSet, JoinConstraint, JoinKind, LikeOp, LimitClause, Literal, NullsOrder, OrderingTerm,
+    BinaryOp, CompoundOp, CreateTableBody, Distinctness, DropObjectType, Expr, FunctionArgs, InSet,
+    JoinConstraint, JoinKind, LikeOp, LimitClause, Literal, NullsOrder, OrderingTerm,
     PlaceholderType, ResultColumn, SelectBody, SelectCore, SelectStatement, SortDirection,
     Statement, TableOrSubquery, UnaryOp,
 };
@@ -955,9 +955,9 @@ impl Connection {
                 if drop_stmt.if_exists {
                     Ok(())
                 } else {
-                    Err(FrankenError::Internal(format!(
-                        "no such table: {table_name}",
-                    )))
+                    Err(FrankenError::NoSuchTable {
+                        name: table_name.clone(),
+                    })
                 }
             }
         }
@@ -1623,8 +1623,8 @@ impl Connection {
         Ok(result)
     }
 
-    /// Pre-process a SELECT statement, rewriting `IN (SELECT ...)` sub-expressions
-    /// into `IN (val1, val2, ...)` by eagerly executing each inner sub-query.
+    /// Pre-process a SELECT statement, eagerly evaluating subquery expressions:
+    /// `IN (SELECT ...)`, `EXISTS (SELECT ...)`, and scalar `(SELECT ...)`.
     fn rewrite_in_subqueries(&self, select: &SelectStatement) -> Result<SelectStatement> {
         let mut result = select.clone();
         rewrite_in_select_core(&mut result.body.select, self)?;
@@ -2008,8 +2008,9 @@ fn rewrite_in_select_core(core: &mut SelectCore, conn: &Connection) -> Result<()
     Ok(())
 }
 
-/// Recursively walk an expression tree and replace every `Expr::In` whose set
-/// is `InSet::Subquery(sub)` with `InSet::List(literals)`.
+/// Recursively walk an expression tree and eagerly evaluate subquery
+/// expressions: `IN (SELECT ...)`, `EXISTS (SELECT ...)`, and scalar
+/// subqueries `(SELECT ...)`.
 fn rewrite_in_expr(expr: &mut Expr, conn: &Connection) -> Result<()> {
     match expr {
         Expr::In {
@@ -2029,6 +2030,34 @@ fn rewrite_in_expr(expr: &mut Expr, conn: &Connection) -> Result<()> {
                     rewrite_in_expr(e, conn)?;
                 }
             }
+        }
+        Expr::Exists {
+            subquery,
+            not,
+            span,
+        } => {
+            let rows = conn.execute_statement(Statement::Select(*subquery.clone()), Some(&[]))?;
+            let exists = !rows.is_empty();
+            let result = if *not { !exists } else { exists };
+            *expr = Expr::Literal(Literal::Integer(i64::from(result)), *span);
+        }
+        Expr::Subquery(sub, span) => {
+            let rows = conn.execute_statement(Statement::Select(*sub.clone()), Some(&[]))?;
+            let val = rows
+                .into_iter()
+                .next()
+                .and_then(|row| row.values.into_iter().next())
+                .unwrap_or(SqliteValue::Null);
+            *expr = Expr::Literal(
+                match val {
+                    SqliteValue::Integer(i) => Literal::Integer(i),
+                    SqliteValue::Float(f) => Literal::Float(f),
+                    SqliteValue::Text(s) => Literal::String(s),
+                    SqliteValue::Blob(b) => Literal::Blob(b),
+                    SqliteValue::Null => Literal::Null,
+                },
+                *span,
+            );
         }
         Expr::BinaryOp { left, right, .. } => {
             rewrite_in_expr(left, conn)?;
@@ -4849,7 +4878,10 @@ mod tests {
         let err = conn
             .execute("DROP TABLE t_missing;")
             .expect_err("missing table should error without IF EXISTS");
-        assert!(matches!(err, FrankenError::NoSuchTable { name } if name == "t_missing"));
+        assert!(
+            matches!(err, FrankenError::NoSuchTable { ref name } if name == "t_missing"),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
@@ -5862,6 +5894,62 @@ mod tests {
         let rows = conn.query("SELECT a FROM t1 ORDER BY a;").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn test_exists_subquery_filters_rows() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (b INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (2);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (10);").unwrap();
+
+        let rows = conn
+            .query("SELECT a FROM t1 WHERE EXISTS (SELECT b FROM t2) ORDER BY a;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+
+        conn.execute("DELETE FROM t2;").unwrap();
+        let rows = conn
+            .query("SELECT a FROM t1 WHERE EXISTS (SELECT b FROM t2);")
+            .unwrap();
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_scalar_subquery_in_where_clause() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (b INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (2);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (3);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (2);").unwrap();
+
+        let rows = conn
+            .query("SELECT a FROM t1 WHERE a = (SELECT b FROM t2);")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
+    }
+
+    #[test]
+    fn test_scalar_subquery_empty_set_rewrites_to_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (b INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (2);").unwrap();
+
+        let rows = conn
+            .query("SELECT a FROM t1 WHERE (SELECT b FROM t2) IS NULL ORDER BY a;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
     }
 
     #[test]

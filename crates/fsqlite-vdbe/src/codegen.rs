@@ -3402,7 +3402,7 @@ mod tests {
     use crate::ProgramBuilder;
     use fsqlite_ast::{
         Assignment, AssignmentTarget, BinaryOp as AstBinaryOp, ColumnRef, DeleteStatement,
-        Distinctness, Expr, FromClause, InsertSource, InsertStatement, LimitClause, Literal,
+        Distinctness, Expr, FromClause, InSet, InsertSource, InsertStatement, LimitClause, Literal,
         OrderingTerm, PlaceholderType, QualifiedName, QualifiedTableRef, ResultColumn, SelectBody,
         SelectCore, SelectStatement, SortDirection, Span, TableOrSubquery, UpdateStatement,
     };
@@ -3446,6 +3446,35 @@ mod tests {
                 columns: vec!["b".to_owned()],
             }],
         }]
+    }
+
+    fn test_schema_with_subquery_source() -> Vec<TableSchema> {
+        vec![
+            TableSchema {
+                name: "t".to_owned(),
+                root_page: 2,
+                columns: vec![
+                    ColumnInfo {
+                        name: "a".to_owned(),
+                        affinity: 'd',
+                    },
+                    ColumnInfo {
+                        name: "b".to_owned(),
+                        affinity: 'C',
+                    },
+                ],
+                indexes: vec![],
+            },
+            TableSchema {
+                name: "s".to_owned(),
+                root_page: 3,
+                columns: vec![ColumnInfo {
+                    name: "b".to_owned(),
+                    affinity: 'd',
+                }],
+                indexes: vec![],
+            },
+        ]
     }
 
     fn from_table(name: &str) -> FromClause {
@@ -4523,6 +4552,122 @@ mod tests {
                 Opcode::ResultRow,
             ]
         ));
+    }
+
+    #[test]
+    fn test_codegen_select_where_in_subquery_emits_scan_probe() {
+        let subquery = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::Column(ColumnRef::bare("b"), Span::ZERO),
+                        alias: None,
+                    }],
+                    from: Some(from_table("s")),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+        let where_expr = Expr::In {
+            expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            set: InSet::Subquery(Box::new(subquery)),
+            not: false,
+            span: Span::ZERO,
+        };
+        let stmt = simple_select(&["a"], "t", Some(Box::new(where_expr)));
+
+        let schema = test_schema_with_subquery_source();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let open_reads: Vec<_> = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::OpenRead)
+            .collect();
+        assert_eq!(
+            open_reads.len(),
+            2,
+            "outer + subquery OpenRead expected; ops={:?}",
+            prog.ops()
+        );
+        assert!(
+            open_reads.iter().any(|op| op.p2 == 3),
+            "expected subquery root-page OpenRead"
+        );
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::Eq),
+            "expected Eq comparison in IN probe scan"
+        );
+    }
+
+    #[test]
+    fn test_resolve_in_probe_source_subquery_supported() {
+        let subquery = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::Column(ColumnRef::bare("b"), Span::ZERO),
+                        alias: None,
+                    }],
+                    from: Some(from_table("s")),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+        let set = InSet::Subquery(Box::new(subquery));
+        let schema = test_schema_with_subquery_source();
+        assert!(super::resolve_in_probe_source(&set, &schema).is_some());
+    }
+
+    #[test]
+    fn test_codegen_select_where_in_table_emits_scan_probe() {
+        let where_expr = Expr::In {
+            expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            set: InSet::Table(QualifiedName::bare("s")),
+            not: false,
+            span: Span::ZERO,
+        };
+        let stmt = simple_select(&["a"], "t", Some(Box::new(where_expr)));
+
+        let schema = test_schema_with_subquery_source();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let open_reads: Vec<_> = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::OpenRead)
+            .collect();
+        assert_eq!(open_reads.len(), 2, "outer + IN table OpenRead expected");
+        assert!(
+            open_reads.iter().any(|op| op.p2 == 3),
+            "expected IN table root-page OpenRead"
+        );
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::Eq),
+            "expected Eq comparison in IN probe scan"
+        );
     }
 
     // === Test 10: INSERT RETURNING ===

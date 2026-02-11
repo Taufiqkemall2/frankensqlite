@@ -559,7 +559,8 @@ impl MemDatabase {
         }
     }
 
-    fn destroy_table(&mut self, root_page: i32) {
+    /// Drop a table by root page and record undo information.
+    pub fn destroy_table(&mut self, root_page: i32) {
         if let Some(table) = self.tables.remove(&root_page) {
             self.push_undo(MemDbUndoOp::DestroyTable { root_page, table });
         }
