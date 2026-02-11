@@ -1261,11 +1261,7 @@ impl Connection {
                 "GROUP BY on non-SELECT core".to_owned(),
             ));
         };
-        if having.is_some() {
-            return Err(FrankenError::NotImplemented(
-                "HAVING is not supported in this GROUP BY connection path".to_owned(),
-            ));
-        }
+        let having_expr = having.as_deref();
         if !windows.is_empty() {
             return Err(FrankenError::NotImplemented(
                 "WINDOW is not supported in this GROUP BY connection path".to_owned(),
@@ -1439,6 +1435,12 @@ impl Connection {
                             values.push(compute_aggregate(name, &agg_values));
                         }
                     }
+                }
+            }
+            // Apply HAVING filter: skip groups that don't satisfy the predicate.
+            if let Some(having) = having_expr {
+                if !evaluate_having_predicate(having, &values, &result_descriptors, columns) {
+                    continue;
                 }
             }
             result.push(Row { values });
@@ -1697,6 +1699,168 @@ fn build_raw_scan_select(select: &SelectStatement) -> SelectStatement {
         },
         order_by: vec![],
         limit: None,
+    }
+}
+
+/// Evaluate a HAVING predicate against a group's computed result values.
+///
+/// Returns `true` if the group passes the HAVING filter.
+fn evaluate_having_predicate(
+    expr: &Expr,
+    values: &[SqliteValue],
+    descriptors: &[GroupByColumn],
+    columns: &[ResultColumn],
+) -> bool {
+    match evaluate_having_value(expr, values, descriptors, columns) {
+        SqliteValue::Integer(n) => n != 0,
+        SqliteValue::Float(f) => f != 0.0,
+        SqliteValue::Null => false,
+        _ => true,
+    }
+}
+
+/// Evaluate a HAVING expression to a `SqliteValue` using the group's result values.
+#[allow(clippy::too_many_lines)]
+fn evaluate_having_value(
+    expr: &Expr,
+    values: &[SqliteValue],
+    descriptors: &[GroupByColumn],
+    columns: &[ResultColumn],
+) -> SqliteValue {
+    match expr {
+        // Aggregate function — find matching result column.
+        Expr::FunctionCall { name, args, .. } if is_agg_fn(name) => {
+            let lower = name.to_ascii_lowercase();
+            for (i, desc) in descriptors.iter().enumerate() {
+                if let GroupByColumn::Agg {
+                    name: agg_name,
+                    arg_col,
+                } = desc
+                {
+                    if *agg_name != lower {
+                        continue;
+                    }
+                    let args_match = match args {
+                        FunctionArgs::Star => arg_col.is_none(),
+                        FunctionArgs::List(exprs) if exprs.is_empty() => arg_col.is_none(),
+                        FunctionArgs::List(exprs) => {
+                            // Check if the argument column name matches.
+                            if let Some(arg_name) = expr_col_name(&exprs[0]) {
+                                // Find the result column's argument column in the AST.
+                                if let Some(ResultColumn::Expr {
+                                    expr:
+                                        Expr::FunctionCall {
+                                            args: FunctionArgs::List(result_args),
+                                            ..
+                                        },
+                                    ..
+                                }) = columns.get(i)
+                                {
+                                    result_args
+                                        .first()
+                                        .and_then(|e| expr_col_name(e))
+                                        .is_some_and(|n| n == arg_name)
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        }
+                    };
+                    if args_match {
+                        return values.get(i).cloned().unwrap_or(SqliteValue::Null);
+                    }
+                }
+            }
+            SqliteValue::Null
+        }
+
+        // Column reference — find matching plain column in descriptors.
+        Expr::Column(col_ref, _) => {
+            let col_name = &col_ref.column;
+            // Match against the AST result columns to find the right index.
+            for (i, rc) in columns.iter().enumerate() {
+                if let ResultColumn::Expr { expr, .. } = rc {
+                    if let Some(name) = expr_col_name(expr) {
+                        if name == col_name.as_str() {
+                            return values.get(i).cloned().unwrap_or(SqliteValue::Null);
+                        }
+                    }
+                }
+            }
+            SqliteValue::Null
+        }
+
+        // Literal values.
+        Expr::Literal(lit, _) => match lit {
+            fsqlite_ast::Literal::Integer(n) => SqliteValue::Integer(*n),
+            fsqlite_ast::Literal::Float(f) => SqliteValue::Float(*f),
+            fsqlite_ast::Literal::String(s) => SqliteValue::Text(s.clone()),
+            _ => SqliteValue::Null,
+        },
+
+        // Binary operations.
+        Expr::BinaryOp {
+            left, op, right, ..
+        } => {
+            let lv = evaluate_having_value(left, values, descriptors, columns);
+            let rv = evaluate_having_value(right, values, descriptors, columns);
+            match op {
+                fsqlite_ast::BinaryOp::Gt => SqliteValue::Integer(i64::from(
+                    cmp_values(&lv, &rv) == std::cmp::Ordering::Greater,
+                )),
+                fsqlite_ast::BinaryOp::Lt => SqliteValue::Integer(i64::from(
+                    cmp_values(&lv, &rv) == std::cmp::Ordering::Less,
+                )),
+                fsqlite_ast::BinaryOp::Ge => SqliteValue::Integer(i64::from(
+                    cmp_values(&lv, &rv) != std::cmp::Ordering::Less,
+                )),
+                fsqlite_ast::BinaryOp::Le => SqliteValue::Integer(i64::from(
+                    cmp_values(&lv, &rv) != std::cmp::Ordering::Greater,
+                )),
+                fsqlite_ast::BinaryOp::Eq => SqliteValue::Integer(i64::from(
+                    cmp_values(&lv, &rv) == std::cmp::Ordering::Equal,
+                )),
+                fsqlite_ast::BinaryOp::Ne => SqliteValue::Integer(i64::from(
+                    cmp_values(&lv, &rv) != std::cmp::Ordering::Equal,
+                )),
+                fsqlite_ast::BinaryOp::And => {
+                    let lb = matches!(lv, SqliteValue::Integer(n) if n != 0);
+                    let rb = matches!(rv, SqliteValue::Integer(n) if n != 0);
+                    SqliteValue::Integer(i64::from(lb && rb))
+                }
+                fsqlite_ast::BinaryOp::Or => {
+                    let lb = matches!(lv, SqliteValue::Integer(n) if n != 0);
+                    let rb = matches!(rv, SqliteValue::Integer(n) if n != 0);
+                    SqliteValue::Integer(i64::from(lb || rb))
+                }
+                _ => SqliteValue::Null,
+            }
+        }
+
+        _ => SqliteValue::Null,
+    }
+}
+
+/// Compare two `SqliteValue`s for ordering.
+fn cmp_values(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Ordering {
+    match (a, b) {
+        (SqliteValue::Integer(ai), SqliteValue::Integer(bi)) => ai.cmp(bi),
+        (SqliteValue::Integer(ai), SqliteValue::Float(bf)) => (*ai as f64)
+            .partial_cmp(bf)
+            .unwrap_or(std::cmp::Ordering::Equal),
+        (SqliteValue::Float(af), SqliteValue::Integer(bi)) => af
+            .partial_cmp(&(*bi as f64))
+            .unwrap_or(std::cmp::Ordering::Equal),
+        (SqliteValue::Float(af), SqliteValue::Float(bf)) => {
+            af.partial_cmp(bf).unwrap_or(std::cmp::Ordering::Equal)
+        }
+        (SqliteValue::Text(at), SqliteValue::Text(bt)) => at.cmp(bt),
+        (SqliteValue::Null, SqliteValue::Null) => std::cmp::Ordering::Equal,
+        (SqliteValue::Null, _) => std::cmp::Ordering::Less,
+        (_, SqliteValue::Null) => std::cmp::Ordering::Greater,
+        _ => std::cmp::Ordering::Equal,
     }
 }
 
@@ -4130,6 +4294,35 @@ mod tests {
             row_values(&rows[2]),
             vec![SqliteValue::Integer(3), SqliteValue::Text("c".to_owned())]
         );
+    }
+
+    #[test]
+    fn test_select_group_by_having() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER, b TEXT);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'x');").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'y');").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'z');").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 'w');").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 'v');").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 'u');").unwrap();
+
+        // HAVING count(*) > 1 should exclude group a=2 (count=1).
+        let rows = conn
+            .query("SELECT a, count(*) FROM t GROUP BY a HAVING count(*) > 1;")
+            .unwrap();
+        assert_eq!(rows.len(), 2, "should have 2 groups with count > 1");
+        // Groups: a=1 (count=2), a=3 (count=3).
+        let a_vals: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| match &r.values()[0] {
+                SqliteValue::Integer(n) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        assert!(a_vals.contains(&1), "group a=1 should pass HAVING");
+        assert!(a_vals.contains(&3), "group a=3 should pass HAVING");
+        assert!(!a_vals.contains(&2), "group a=2 should be filtered");
     }
 
     #[test]

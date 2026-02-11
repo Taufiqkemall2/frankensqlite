@@ -143,15 +143,16 @@ pub fn codegen_select(
     schema: &[TableSchema],
     _ctx: &CodegenContext,
 ) -> Result<(), CodegenError> {
-    let (columns, from, where_clause, group_by, distinct) = match &stmt.body.select {
+    let (columns, from, where_clause, group_by, having, distinct) = match &stmt.body.select {
         SelectCore::Select {
             columns,
             from,
             where_clause,
             group_by,
+            having,
             distinct,
             ..
-        } => (columns, from, where_clause, group_by, *distinct),
+        } => (columns, from, where_clause, group_by, having, *distinct),
         SelectCore::Values(_) => {
             return Err(CodegenError::Unsupported("VALUES in SELECT".to_owned()));
         }
@@ -282,6 +283,7 @@ pub fn codegen_select(
             columns,
             where_clause.as_deref(),
             group_by,
+            having.as_deref(),
             out_regs,
             out_col_count,
             done_label,
@@ -1335,6 +1337,7 @@ fn codegen_select_group_by_aggregate(
     columns: &[ResultColumn],
     where_clause: Option<&Expr>,
     group_by: &[Expr],
+    having: Option<&Expr>,
     out_regs: i32,
     out_col_count: i32,
     done_label: crate::Label,
@@ -1576,7 +1579,22 @@ fn codegen_select_group_by_aggregate(
             }
         }
     }
+    // HAVING filter: skip this group's output if HAVING predicate is false.
+    let having_skip_label = b.emit_label();
+    if let Some(having_expr) = having {
+        emit_having_filter(
+            b,
+            having_expr,
+            &output_cols,
+            &agg_columns,
+            &group_key_table_cols,
+            table,
+            out_regs,
+            having_skip_label,
+        );
+    }
     b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    b.resolve_label(having_skip_label);
     // Reset accumulators for next group.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     for i in 0..num_aggs as i32 {
@@ -1696,7 +1714,24 @@ fn codegen_select_group_by_aggregate(
             }
         }
     }
-    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    // HAVING filter for the final group.
+    if let Some(having_expr) = having {
+        let final_having_skip = b.emit_label();
+        emit_having_filter(
+            b,
+            having_expr,
+            &output_cols,
+            &agg_columns,
+            &group_key_table_cols,
+            table,
+            out_regs,
+            final_having_skip,
+        );
+        b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+        b.resolve_label(final_having_skip);
+    } else {
+        b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    }
 
     // Done: Close sorter + Halt.
     b.resolve_label(done_label);
@@ -2303,6 +2338,243 @@ fn emit_column_reads(
         }
     }
     Ok(())
+}
+
+/// Emit a HAVING filter for GROUP BY queries.
+///
+/// Evaluates the HAVING expression against the already-built output row.
+/// Aggregate function calls and column references are resolved to the
+/// corresponding output registers. If the predicate is false, jumps to
+/// `skip_label` (skipping the `ResultRow`).
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::too_many_arguments
+)]
+fn emit_having_filter(
+    b: &mut ProgramBuilder,
+    having_expr: &Expr,
+    output_cols: &[GroupByOutputCol],
+    agg_columns: &[AggColumn],
+    group_key_table_cols: &[usize],
+    table: &TableSchema,
+    out_regs: i32,
+    skip_label: crate::Label,
+) {
+    let result_reg = b.alloc_temp();
+    emit_having_expr(
+        b,
+        having_expr,
+        result_reg,
+        output_cols,
+        agg_columns,
+        group_key_table_cols,
+        table,
+        out_regs,
+    );
+    // If result is falsy (0 or NULL), skip this group's ResultRow.
+    b.emit_jump_to_label(Opcode::IfNot, result_reg, 0, skip_label, P4::None, 0);
+    b.free_temp(result_reg);
+}
+
+/// Evaluate a HAVING expression into `dest_reg`.
+///
+/// Maps aggregate function calls and column references to the output
+/// registers that already hold the finalized group results.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
+fn emit_having_expr(
+    b: &mut ProgramBuilder,
+    expr: &Expr,
+    dest_reg: i32,
+    output_cols: &[GroupByOutputCol],
+    agg_columns: &[AggColumn],
+    group_key_table_cols: &[usize],
+    table: &TableSchema,
+    out_regs: i32,
+) {
+    match expr {
+        // Aggregate function call — resolve to the corresponding output register.
+        Expr::FunctionCall { name, args, .. } if is_aggregate_function(name) => {
+            let lower = name.to_ascii_lowercase();
+            // Find the matching aggregate by name + argument structure.
+            let agg_idx = agg_columns.iter().position(|agg| {
+                if agg.name != lower {
+                    return false;
+                }
+                match args {
+                    FunctionArgs::Star => agg.num_args == 0,
+                    FunctionArgs::List(exprs) => {
+                        if exprs.is_empty() {
+                            return agg.num_args == 0;
+                        }
+                        // Match by argument column index.
+                        if let Some(ci) = resolve_column_index(&exprs[0], table) {
+                            agg.arg_col_index == Some(ci)
+                        } else {
+                            false
+                        }
+                    }
+                }
+            });
+            if let Some(ai) = agg_idx {
+                // Find the output register for this aggregate.
+                for (i, oc) in output_cols.iter().enumerate() {
+                    if matches!(oc, GroupByOutputCol::Aggregate { agg_index } if *agg_index == ai) {
+                        b.emit_op(Opcode::Copy, out_regs + i as i32, dest_reg, 0, P4::None, 0);
+                        return;
+                    }
+                }
+            }
+            // Fallback: treat as zero (unknown aggregate in HAVING).
+            b.emit_op(Opcode::Integer, 0, dest_reg, 0, P4::None, 0);
+        }
+
+        // Column reference — resolve to the corresponding group-key output register.
+        Expr::Column(col_ref, _) => {
+            let col_name = &col_ref.column;
+            if let Some(col_idx) = table.columns.iter().position(|c| c.name == *col_name) {
+                // Find the output column whose group key maps to this table column.
+                for (i, oc) in output_cols.iter().enumerate() {
+                    if let GroupByOutputCol::GroupKey { key_index, .. } = oc {
+                        if group_key_table_cols.get(*key_index) == Some(&col_idx) {
+                            b.emit_op(Opcode::Copy, out_regs + i as i32, dest_reg, 0, P4::None, 0);
+                            return;
+                        }
+                    }
+                }
+            }
+            // Fallback: emit NULL for unresolved column.
+            b.emit_op(Opcode::Null, 0, dest_reg, 0, P4::None, 0);
+        }
+
+        // Binary comparison — evaluate both sides, then compare.
+        Expr::BinaryOp {
+            left, op, right, ..
+        } => {
+            let left_reg = b.alloc_temp();
+            let right_reg = b.alloc_temp();
+            emit_having_expr(
+                b,
+                left,
+                left_reg,
+                output_cols,
+                agg_columns,
+                group_key_table_cols,
+                table,
+                out_regs,
+            );
+            emit_having_expr(
+                b,
+                right,
+                right_reg,
+                output_cols,
+                agg_columns,
+                group_key_table_cols,
+                table,
+                out_regs,
+            );
+
+            match op {
+                fsqlite_ast::BinaryOp::Gt => {
+                    let true_label = b.emit_label();
+                    let done_label = b.emit_label();
+                    b.emit_jump_to_label(Opcode::Gt, right_reg, left_reg, true_label, P4::None, 0);
+                    b.emit_op(Opcode::Integer, 0, dest_reg, 0, P4::None, 0);
+                    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+                    b.resolve_label(true_label);
+                    b.emit_op(Opcode::Integer, 1, dest_reg, 0, P4::None, 0);
+                    b.resolve_label(done_label);
+                }
+                fsqlite_ast::BinaryOp::Lt => {
+                    let true_label = b.emit_label();
+                    let done_label = b.emit_label();
+                    b.emit_jump_to_label(Opcode::Lt, right_reg, left_reg, true_label, P4::None, 0);
+                    b.emit_op(Opcode::Integer, 0, dest_reg, 0, P4::None, 0);
+                    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+                    b.resolve_label(true_label);
+                    b.emit_op(Opcode::Integer, 1, dest_reg, 0, P4::None, 0);
+                    b.resolve_label(done_label);
+                }
+                fsqlite_ast::BinaryOp::Ge => {
+                    let true_label = b.emit_label();
+                    let done_label = b.emit_label();
+                    b.emit_jump_to_label(Opcode::Ge, right_reg, left_reg, true_label, P4::None, 0);
+                    b.emit_op(Opcode::Integer, 0, dest_reg, 0, P4::None, 0);
+                    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+                    b.resolve_label(true_label);
+                    b.emit_op(Opcode::Integer, 1, dest_reg, 0, P4::None, 0);
+                    b.resolve_label(done_label);
+                }
+                fsqlite_ast::BinaryOp::Le => {
+                    let true_label = b.emit_label();
+                    let done_label = b.emit_label();
+                    b.emit_jump_to_label(Opcode::Le, right_reg, left_reg, true_label, P4::None, 0);
+                    b.emit_op(Opcode::Integer, 0, dest_reg, 0, P4::None, 0);
+                    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+                    b.resolve_label(true_label);
+                    b.emit_op(Opcode::Integer, 1, dest_reg, 0, P4::None, 0);
+                    b.resolve_label(done_label);
+                }
+                fsqlite_ast::BinaryOp::Eq => {
+                    let true_label = b.emit_label();
+                    let done_label = b.emit_label();
+                    b.emit_jump_to_label(Opcode::Eq, right_reg, left_reg, true_label, P4::None, 0);
+                    b.emit_op(Opcode::Integer, 0, dest_reg, 0, P4::None, 0);
+                    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+                    b.resolve_label(true_label);
+                    b.emit_op(Opcode::Integer, 1, dest_reg, 0, P4::None, 0);
+                    b.resolve_label(done_label);
+                }
+                fsqlite_ast::BinaryOp::Ne => {
+                    let true_label = b.emit_label();
+                    let done_label = b.emit_label();
+                    b.emit_jump_to_label(Opcode::Ne, right_reg, left_reg, true_label, P4::None, 0);
+                    b.emit_op(Opcode::Integer, 0, dest_reg, 0, P4::None, 0);
+                    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+                    b.resolve_label(true_label);
+                    b.emit_op(Opcode::Integer, 1, dest_reg, 0, P4::None, 0);
+                    b.resolve_label(done_label);
+                }
+                fsqlite_ast::BinaryOp::And => {
+                    let false_label = b.emit_label();
+                    let done_label = b.emit_label();
+                    b.emit_jump_to_label(Opcode::IfNot, left_reg, 0, false_label, P4::None, 0);
+                    b.emit_jump_to_label(Opcode::IfNot, right_reg, 0, false_label, P4::None, 0);
+                    b.emit_op(Opcode::Integer, 1, dest_reg, 0, P4::None, 0);
+                    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+                    b.resolve_label(false_label);
+                    b.emit_op(Opcode::Integer, 0, dest_reg, 0, P4::None, 0);
+                    b.resolve_label(done_label);
+                }
+                fsqlite_ast::BinaryOp::Or => {
+                    let true_label = b.emit_label();
+                    let done_label = b.emit_label();
+                    b.emit_jump_to_label(Opcode::IfPos, left_reg, 0, true_label, P4::None, 0);
+                    b.emit_jump_to_label(Opcode::IfPos, right_reg, 0, true_label, P4::None, 0);
+                    b.emit_op(Opcode::Integer, 0, dest_reg, 0, P4::None, 0);
+                    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+                    b.resolve_label(true_label);
+                    b.emit_op(Opcode::Integer, 1, dest_reg, 0, P4::None, 0);
+                    b.resolve_label(done_label);
+                }
+                _ => {
+                    emit_expr(b, expr, dest_reg, None);
+                }
+            }
+            b.free_temp(right_reg);
+            b.free_temp(left_reg);
+        }
+
+        // For any other expression, delegate to the standard evaluator.
+        _ => {
+            emit_expr(b, expr, dest_reg, None);
+        }
+    }
 }
 
 /// Emit a WHERE filter for scan-based UPDATE/DELETE.
@@ -5182,6 +5454,87 @@ mod tests {
             matches!(&fin.p4, P4::FuncName(f) if f == "avg"),
             "AggFinal P4 should be FuncName(avg), got {:?}",
             fin.p4
+        );
+    }
+
+    // === Test: GROUP BY with HAVING clause ===
+    #[test]
+    fn test_codegen_select_group_by_having() {
+        // SELECT a, count(*) FROM t GROUP BY a HAVING count(*) > 1
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![
+                        ResultColumn::Expr {
+                            expr: Expr::Column(ColumnRef::bare("a"), Span::ZERO),
+                            alias: None,
+                        },
+                        ResultColumn::Expr {
+                            expr: Expr::FunctionCall {
+                                name: "count".to_owned(),
+                                args: FunctionArgs::Star,
+                                distinct: false,
+                                filter: None,
+                                over: None,
+                                span: Span::ZERO,
+                            },
+                            alias: None,
+                        },
+                    ],
+                    from: Some(from_table("t")),
+                    where_clause: None,
+                    group_by: vec![Expr::Column(ColumnRef::bare("a"), Span::ZERO)],
+                    having: Some(Box::new(Expr::BinaryOp {
+                        left: Box::new(Expr::FunctionCall {
+                            name: "count".to_owned(),
+                            args: FunctionArgs::Star,
+                            distinct: false,
+                            filter: None,
+                            over: None,
+                            span: Span::ZERO,
+                        }),
+                        op: AstBinaryOp::Gt,
+                        right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+                        span: Span::ZERO,
+                    })),
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // Should produce GROUP BY with HAVING filter: SorterOpen, AggStep,
+        // AggFinal, IfNot (HAVING check), ResultRow.
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::SorterOpen,
+                Opcode::AggStep,
+                Opcode::AggFinal,
+                Opcode::IfNot, // HAVING filter
+                Opcode::ResultRow,
+                Opcode::Halt,
+            ]
+        ));
+
+        // There should be IfNot opcodes (HAVING filter) in the program.
+        let if_not_count = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::IfNot)
+            .count();
+        assert!(
+            if_not_count >= 1,
+            "HAVING should generate at least one IfNot, got {if_not_count}"
         );
     }
 
