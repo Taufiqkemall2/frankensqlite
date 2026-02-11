@@ -20,11 +20,12 @@ use fsqlite_ast::{
 };
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::FunctionRegistry;
-use fsqlite_pager::SimplePager;
 use fsqlite_pager::traits::{MvccPager, TransactionHandle, TransactionMode};
+use fsqlite_pager::{JournalMode, SimplePager};
 use fsqlite_parser::Parser;
 use fsqlite_types::PageSize;
 use fsqlite_types::cx::Cx;
+use fsqlite_types::flags::{AccessFlags, VfsOpenFlags};
 use fsqlite_types::opcode::{Opcode, P4};
 use fsqlite_types::value::SqliteValue;
 use fsqlite_vdbe::codegen::{
@@ -36,6 +37,10 @@ use fsqlite_vdbe::{ProgramBuilder, VdbeProgram};
 use fsqlite_vfs::MemoryVfs;
 #[cfg(unix)]
 use fsqlite_vfs::UnixVfs;
+use fsqlite_vfs::traits::Vfs;
+use fsqlite_wal::{WalFile, WalSalts};
+
+use crate::wal_adapter::WalBackendAdapter;
 
 // ---------------------------------------------------------------------------
 // Phase 5: Pager backend abstraction (bd-3iw8)
@@ -106,6 +111,77 @@ impl PagerBackend {
             Self::Unix(p) => Ok(Box::new(p.begin(cx, mode)?)),
         }
     }
+
+    fn journal_mode(&self) -> JournalMode {
+        match self {
+            Self::Memory(p) => p.journal_mode(),
+            #[cfg(unix)]
+            Self::Unix(p) => p.journal_mode(),
+        }
+    }
+
+    fn set_journal_mode(&self, cx: &Cx, mode: JournalMode) -> Result<JournalMode> {
+        match self {
+            Self::Memory(p) => p.set_journal_mode(cx, mode),
+            #[cfg(unix)]
+            Self::Unix(p) => p.set_journal_mode(cx, mode),
+        }
+    }
+
+    fn install_wal_backend(&self, cx: &Cx, db_path: &str) -> Result<()> {
+        let wal_path = wal_path_for_db_path(db_path);
+        match self {
+            Self::Memory(p) => {
+                let vfs = MemoryVfs::new();
+                install_wal_backend_with_vfs(p, &vfs, cx, &wal_path)
+            }
+            #[cfg(unix)]
+            Self::Unix(p) => {
+                let vfs = UnixVfs::new();
+                install_wal_backend_with_vfs(p, &vfs, cx, &wal_path)
+            }
+        }
+    }
+}
+
+fn wal_path_for_db_path(path: &str) -> PathBuf {
+    let mut db_path = if path == ":memory:" {
+        PathBuf::from("/:memory:")
+    } else {
+        PathBuf::from(path)
+    }
+    .into_os_string();
+    db_path.push("-wal");
+    PathBuf::from(db_path)
+}
+
+fn install_wal_backend_with_vfs<V>(
+    pager: &Arc<SimplePager<V>>,
+    vfs: &V,
+    cx: &Cx,
+    wal_path: &Path,
+) -> Result<()>
+where
+    V: Vfs + Send + Sync + 'static,
+    V::File: Send + Sync + 'static,
+{
+    if vfs.access(cx, wal_path, AccessFlags::EXISTS)? {
+        let open_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::WAL;
+        let (file, _) = vfs.open(cx, Some(wal_path), open_flags)?;
+        match WalFile::open(cx, file) {
+            Ok(wal) => {
+                pager.set_wal_backend(Box::new(WalBackendAdapter::new(wal)))?;
+                return Ok(());
+            }
+            Err(FrankenError::WalCorrupt { .. }) => {}
+            Err(err) => return Err(err),
+        }
+    }
+
+    let create_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
+    let (file, _) = vfs.open(cx, Some(wal_path), create_flags)?;
+    let wal = WalFile::create(cx, file, PageSize::DEFAULT.get(), 0, WalSalts::default())?;
+    pager.set_wal_backend(Box::new(WalBackendAdapter::new(wal)))
 }
 
 /// Build a [`FunctionRegistry`] populated with all built-in scalar,
@@ -388,6 +464,7 @@ impl Connection {
             concurrent_mode_default: RefCell::new(true),
             pragma_state: RefCell::new(fsqlite_vdbe::pragma::ConnectionPragmaState::default()),
         };
+        conn.apply_current_journal_mode_to_pager()?;
         conn.load_persisted_state_if_present()?;
         Ok(conn)
     }
@@ -640,7 +717,10 @@ impl Connection {
             .as_ref()
             .map_or(String::new(), |a| format!(" AS {a}"));
         let sql = if let Some(cond) = where_clause {
-            format!("SELECT * FROM {}{alias_clause} WHERE {cond}", table_ref.name)
+            format!(
+                "SELECT * FROM {}{alias_clause} WHERE {cond}",
+                table_ref.name
+            )
         } else {
             format!("SELECT * FROM {}", table_ref.name)
         };
@@ -907,26 +987,44 @@ impl Connection {
     ///   automatically promoted to `BEGIN CONCURRENT`.
     fn execute_pragma(&self, pragma: &fsqlite_ast::PragmaStatement) -> Result<Vec<Row>> {
         // First try connection-level knobs (journal_mode, synchronous, etc.).
-        {
+        let pragma_name = pragma.name.name.to_ascii_lowercase();
+        let maybe_prior_journal_mode = if pragma_name == "journal_mode" && pragma.value.is_some() {
+            Some(self.pragma_state.borrow().journal_mode.clone())
+        } else {
+            None
+        };
+
+        let pragma_out = {
             let mut state = self.pragma_state.borrow_mut();
-            match fsqlite_vdbe::pragma::apply_connection_pragma(&mut state, pragma)? {
-                fsqlite_vdbe::pragma::PragmaOutput::Text(s) => {
-                    return Ok(vec![Row {
-                        values: vec![SqliteValue::Text(s)],
-                    }]);
+            fsqlite_vdbe::pragma::apply_connection_pragma(&mut state, pragma)?
+        };
+
+        if let Some(prior_journal_mode) = maybe_prior_journal_mode {
+            if let fsqlite_vdbe::pragma::PragmaOutput::Text(ref mode) = pragma_out {
+                if let Err(err) = self.apply_journal_mode_to_pager(mode) {
+                    self.pragma_state.borrow_mut().journal_mode = prior_journal_mode;
+                    return Err(err);
                 }
-                fsqlite_vdbe::pragma::PragmaOutput::Int(n) => {
-                    return Ok(vec![Row {
-                        values: vec![SqliteValue::Integer(n)],
-                    }]);
-                }
-                fsqlite_vdbe::pragma::PragmaOutput::Bool(b) => {
-                    return Ok(vec![Row {
-                        values: vec![SqliteValue::Integer(i64::from(b))],
-                    }]);
-                }
-                fsqlite_vdbe::pragma::PragmaOutput::Unsupported => {}
             }
+        }
+
+        match pragma_out {
+            fsqlite_vdbe::pragma::PragmaOutput::Text(s) => {
+                return Ok(vec![Row {
+                    values: vec![SqliteValue::Text(s)],
+                }]);
+            }
+            fsqlite_vdbe::pragma::PragmaOutput::Int(n) => {
+                return Ok(vec![Row {
+                    values: vec![SqliteValue::Integer(n)],
+                }]);
+            }
+            fsqlite_vdbe::pragma::PragmaOutput::Bool(b) => {
+                return Ok(vec![Row {
+                    values: vec![SqliteValue::Integer(i64::from(b))],
+                }]);
+            }
+            fsqlite_vdbe::pragma::PragmaOutput::Unsupported => {}
         }
 
         // fsqlite-specific: concurrent_mode toggle.
@@ -955,6 +1053,37 @@ impl Connection {
             }
             // Unrecognised pragmas are silently ignored (SQLite compatibility).
             _ => Ok(Vec::new()),
+        }
+    }
+
+    fn apply_current_journal_mode_to_pager(&self) -> Result<()> {
+        let journal_mode = self.pragma_state.borrow().journal_mode.clone();
+        self.apply_journal_mode_to_pager(&journal_mode)
+    }
+
+    fn apply_journal_mode_to_pager(&self, journal_mode: &str) -> Result<()> {
+        let cx = Cx::new();
+        let requested_mode = if journal_mode.eq_ignore_ascii_case("wal") {
+            JournalMode::Wal
+        } else {
+            JournalMode::Delete
+        };
+
+        if requested_mode == JournalMode::Wal {
+            match self.pager.set_journal_mode(&cx, JournalMode::Wal) {
+                Ok(_) => Ok(()),
+                Err(FrankenError::Unsupported) => {
+                    self.pager.install_wal_backend(&cx, &self.path)?;
+                    self.pager.set_journal_mode(&cx, JournalMode::Wal)?;
+                    Ok(())
+                }
+                Err(err) => Err(err),
+            }
+        } else if self.pager.journal_mode() != JournalMode::Delete {
+            self.pager.set_journal_mode(&cx, JournalMode::Delete)?;
+            Ok(())
+        } else {
+            Ok(())
         }
     }
 
@@ -4958,6 +5087,7 @@ mod tests {
             *rows[0].get(0).unwrap(),
             SqliteValue::Text("wal".to_owned())
         );
+        assert_eq!(conn.pager.journal_mode(), fsqlite_pager::JournalMode::Wal);
     }
 
     #[test]
@@ -4976,6 +5106,19 @@ mod tests {
             *rows[0].get(0).unwrap(),
             SqliteValue::Text("truncate".to_owned())
         );
+        assert_eq!(
+            conn.pager.journal_mode(),
+            fsqlite_pager::JournalMode::Delete
+        );
+
+        // Pager mode should switch to WAL when requested.
+        let rows = conn.query("PRAGMA journal_mode='wal';").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            *rows[0].get(0).unwrap(),
+            SqliteValue::Text("wal".to_owned())
+        );
+        assert_eq!(conn.pager.journal_mode(), fsqlite_pager::JournalMode::Wal);
     }
 
     #[test]
