@@ -1198,6 +1198,54 @@ mod tests {
     }
 
     #[test]
+    fn where_in_subquery() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (b INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1), (2), (3);")
+            .unwrap();
+        conn.execute("INSERT INTO t2 VALUES (2), (3), (4);")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT a FROM t1 WHERE a IN (SELECT b FROM t2) ORDER BY a;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(2)]);
+        assert_eq!(row_values(&rows[1]), vec![SqliteValue::Integer(3)]);
+    }
+
+    #[test]
+    fn where_exists_subquery() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (b INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1), (2);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (7);").unwrap();
+
+        let rows = conn
+            .query("SELECT a FROM t1 WHERE EXISTS (SELECT b FROM t2) ORDER BY a;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+
+        conn.execute("DELETE FROM t2;").unwrap();
+        let rows = conn
+            .query("SELECT a FROM t1 WHERE EXISTS (SELECT b FROM t2);")
+            .unwrap();
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn scalar_subquery_expression() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE s (v INTEGER);").unwrap();
+        conn.execute("INSERT INTO s VALUES (41);").unwrap();
+
+        let row = conn.query_row("SELECT (SELECT v FROM s) + 1;").unwrap();
+        assert_eq!(row_values(&row), vec![SqliteValue::Integer(42)]);
+    }
+
+    #[test]
     fn where_not_between() {
         let conn = Connection::open(":memory:").unwrap();
         setup_bd2832(&conn);
