@@ -2330,8 +2330,10 @@ impl VdbeEngine {
 
                 // ── Catch-all for remaining opcodes ─────────────────────
                 _ => {
-                    // Unimplemented opcode: skip (no-op for now).
-                    pc += 1;
+                    return Ok(ExecOutcome::Error {
+                        code: 1,
+                        message: format!("unimplemented opcode {:?} at pc={}", op.opcode, pc),
+                    });
                 }
             }
         }
