@@ -1216,6 +1216,41 @@ mod tests {
     }
 
     #[test]
+    fn where_in_table_name() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (b INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1), (2), (3);")
+            .unwrap();
+        conn.execute("INSERT INTO t2 VALUES (2), (3), (4);")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT a FROM t1 WHERE a IN t2 ORDER BY a;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(2)]);
+        assert_eq!(row_values(&rows[1]), vec![SqliteValue::Integer(3)]);
+    }
+
+    #[test]
+    fn where_not_in_table_name() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (b INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1), (2), (3);")
+            .unwrap();
+        conn.execute("INSERT INTO t2 VALUES (2), (3), (4);")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT a FROM t1 WHERE a NOT IN t2 ORDER BY a;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
     fn where_exists_subquery() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
@@ -1243,6 +1278,54 @@ mod tests {
 
         let row = conn.query_row("SELECT (SELECT v FROM s) + 1;").unwrap();
         assert_eq!(row_values(&row), vec![SqliteValue::Integer(42)]);
+    }
+
+    #[test]
+    fn update_where_in_table_name() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER, flag TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE t2 (b INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'orig'), (2, 'orig'), (3, 'orig');")
+            .unwrap();
+        conn.execute("INSERT INTO t2 VALUES (2), (3);").unwrap();
+
+        conn.execute("UPDATE t1 SET flag='hit' WHERE a IN t2;")
+            .unwrap();
+
+        let rows = conn.query("SELECT a, flag FROM t1 ORDER BY a;").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("orig".to_owned())
+            ]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![SqliteValue::Integer(2), SqliteValue::Text("hit".to_owned())]
+        );
+        assert_eq!(
+            row_values(&rows[2]),
+            vec![SqliteValue::Integer(3), SqliteValue::Text("hit".to_owned())]
+        );
+    }
+
+    #[test]
+    fn delete_where_in_table_name() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (b INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1), (2), (3);")
+            .unwrap();
+        conn.execute("INSERT INTO t2 VALUES (2), (3);").unwrap();
+
+        conn.execute("DELETE FROM t1 WHERE a IN t2;").unwrap();
+
+        let rows = conn.query("SELECT a FROM t1 ORDER BY a;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(1)]);
     }
 
     #[test]
@@ -1299,6 +1382,29 @@ mod tests {
         assert_eq!(
             row_values(&rows[1]),
             vec![SqliteValue::Text("b".to_owned()), SqliteValue::Integer(1)]
+        );
+    }
+
+    #[test]
+    fn group_by_alias_star_expansion() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE ga (k TEXT, v INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO ga VALUES ('a', 10);").unwrap();
+        conn.execute("INSERT INTO ga VALUES ('a', 10);").unwrap();
+        conn.execute("INSERT INTO ga VALUES ('b', 20);").unwrap();
+
+        let rows = conn
+            .query("SELECT t.* FROM ga AS t GROUP BY k, v ORDER BY k, v;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Text("a".to_owned()), SqliteValue::Integer(10)]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![SqliteValue::Text("b".to_owned()), SqliteValue::Integer(20)]
         );
     }
 
