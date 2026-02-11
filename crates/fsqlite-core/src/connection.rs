@@ -562,6 +562,9 @@ impl Connection {
                 Ok(Vec::new())
             }
             Statement::Select(ref select) => {
+                // Pre-process: rewrite IN (SELECT ...) to IN (literal_list).
+                let rewritten = self.rewrite_in_subqueries(select)?;
+                let select = &rewritten;
                 let distinct = is_distinct_select(select);
                 // Compound SELECT (UNION/UNION ALL/INTERSECT/EXCEPT).
                 if !select.body.compounds.is_empty() {
@@ -1553,6 +1556,18 @@ impl Connection {
         Ok(result)
     }
 
+    /// Pre-process a SELECT statement, rewriting `IN (SELECT ...)` sub-expressions
+    /// into `IN (val1, val2, ...)` by eagerly executing each inner sub-query.
+    fn rewrite_in_subqueries(&self, select: &SelectStatement) -> Result<SelectStatement> {
+        let mut result = select.clone();
+        rewrite_in_select_core(&mut result.body.select, self)?;
+        // Also rewrite any compound arms.
+        for (_op, core) in &mut result.body.compounds {
+            rewrite_in_select_core(core, self)?;
+        }
+        Ok(result)
+    }
+
     /// Execute a SELECT with JOINs using in-memory nested-loop evaluation.
     ///
     /// Loads each table's rows independently, then combines them according to
@@ -1895,6 +1910,127 @@ fn has_joins(select: &SelectStatement) -> bool {
         &select.body.select,
         SelectCore::Select { from: Some(from), .. } if !from.joins.is_empty()
     )
+}
+
+// ---------------------------------------------------------------------------
+// IN (SELECT ...) → IN (literal_list) rewriting helpers
+// ---------------------------------------------------------------------------
+
+/// Walk a `SelectCore` and rewrite any `InSet::Subquery` found in its
+/// result columns, WHERE clause, or HAVING clause.
+fn rewrite_in_select_core(core: &mut SelectCore, conn: &Connection) -> Result<()> {
+    if let SelectCore::Select {
+        columns,
+        where_clause,
+        having,
+        ..
+    } = core
+    {
+        for col in columns.iter_mut() {
+            if let ResultColumn::Expr { expr, .. } = col {
+                rewrite_in_expr(expr, conn)?;
+            }
+        }
+        if let Some(wh) = where_clause.as_mut() {
+            rewrite_in_expr(wh, conn)?;
+        }
+        if let Some(hv) = having.as_mut() {
+            rewrite_in_expr(hv, conn)?;
+        }
+    }
+    Ok(())
+}
+
+/// Recursively walk an expression tree and replace every `Expr::In` whose set
+/// is `InSet::Subquery(sub)` with `InSet::List(literals)`.
+fn rewrite_in_expr(expr: &mut Expr, conn: &Connection) -> Result<()> {
+    match expr {
+        Expr::In {
+            set, expr: inner, ..
+        } => {
+            rewrite_in_expr(inner, conn)?;
+            if let InSet::Subquery(sub) = set {
+                let rows = conn.execute_statement(Statement::Select(*sub.clone()), Some(&[]))?;
+                let literals: Vec<Expr> = rows
+                    .into_iter()
+                    .filter_map(|row| row.values.into_iter().next())
+                    .map(value_to_literal_expr)
+                    .collect();
+                *set = InSet::List(literals);
+            } else if let InSet::List(exprs) = set {
+                for e in exprs.iter_mut() {
+                    rewrite_in_expr(e, conn)?;
+                }
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            rewrite_in_expr(left, conn)?;
+            rewrite_in_expr(right, conn)?;
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. } => {
+            rewrite_in_expr(inner, conn)?;
+        }
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            rewrite_in_expr(inner, conn)?;
+            rewrite_in_expr(low, conn)?;
+            rewrite_in_expr(high, conn)?;
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(op) = operand.as_mut() {
+                rewrite_in_expr(op, conn)?;
+            }
+            for (cond, then) in whens.iter_mut() {
+                rewrite_in_expr(cond, conn)?;
+                rewrite_in_expr(then, conn)?;
+            }
+            if let Some(el) = else_expr.as_mut() {
+                rewrite_in_expr(el, conn)?;
+            }
+        }
+        Expr::FunctionCall {
+            args: FunctionArgs::List(exprs),
+            ..
+        } => {
+            for e in exprs.iter_mut() {
+                rewrite_in_expr(e, conn)?;
+            }
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            ..
+        } => {
+            rewrite_in_expr(inner, conn)?;
+            rewrite_in_expr(pattern, conn)?;
+        }
+        // Leaf nodes that contain no sub-expressions.
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Convert a `SqliteValue` into a synthetic `Expr::Literal`.
+fn value_to_literal_expr(val: SqliteValue) -> Expr {
+    use fsqlite_ast::Span;
+    match val {
+        SqliteValue::Integer(i) => Expr::Literal(Literal::Integer(i), Span::ZERO),
+        SqliteValue::Float(f) => Expr::Literal(Literal::Float(f), Span::ZERO),
+        SqliteValue::Text(s) => Expr::Literal(Literal::String(s), Span::ZERO),
+        SqliteValue::Blob(b) => Expr::Literal(Literal::Blob(b), Span::ZERO),
+        SqliteValue::Null => Expr::Literal(Literal::Null, Span::ZERO),
+    }
 }
 
 /// Known aggregate function names (must match codegen.rs).
@@ -5452,6 +5588,101 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".to_owned()));
         assert_eq!(rows[0].values()[1], SqliteValue::Text("Widget".to_owned()));
+    }
+
+    // ── IN (SELECT ...) subquery tests ──────────────────────────────
+
+    #[test]
+    fn test_in_subquery_basic() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (b INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (2);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (3);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (2);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (3);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (4);").unwrap();
+
+        let rows = conn
+            .query("SELECT a FROM t1 WHERE a IN (SELECT b FROM t2);")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let vals: Vec<i64> = rows
+            .iter()
+            .map(|r| match r.values()[0] {
+                SqliteValue::Integer(i) => i,
+                _ => panic!("expected integer"),
+            })
+            .collect();
+        assert!(vals.contains(&2));
+        assert!(vals.contains(&3));
+    }
+
+    #[test]
+    fn test_not_in_subquery() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (b INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (2);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (3);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (2);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (3);").unwrap();
+
+        let rows = conn
+            .query("SELECT a FROM t1 WHERE a NOT IN (SELECT b FROM t2);")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn test_in_subquery_empty() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (b INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1);").unwrap();
+
+        // Subquery returns empty set — no rows should match.
+        let rows = conn
+            .query("SELECT a FROM t1 WHERE a IN (SELECT b FROM t2);")
+            .unwrap();
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_in_subquery_with_join() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE employees (id INTEGER, dept_id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE departments (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO departments VALUES (1, 'Engineering');")
+            .unwrap();
+        conn.execute("INSERT INTO departments VALUES (2, 'Sales');")
+            .unwrap();
+        conn.execute("INSERT INTO employees VALUES (10, 1, 'Alice');")
+            .unwrap();
+        conn.execute("INSERT INTO employees VALUES (20, 2, 'Bob');")
+            .unwrap();
+        conn.execute("INSERT INTO employees VALUES (30, 3, 'Charlie');")
+            .unwrap();
+
+        // Use IN subquery to filter employees by valid department.
+        let rows = conn
+            .query("SELECT name FROM employees WHERE dept_id IN (SELECT id FROM departments);")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let names: Vec<&str> = rows
+            .iter()
+            .map(|r| match &r.values()[0] {
+                SqliteValue::Text(s) => s.as_str(),
+                _ => panic!("expected text"),
+            })
+            .collect();
+        assert!(names.contains(&"Alice"));
+        assert!(names.contains(&"Bob"));
     }
 
     #[test]
