@@ -723,8 +723,13 @@ impl Connection {
                 self.execute_create_view(create_view)?;
                 Ok(Vec::new())
             }
+            // Maintenance stubs: these are no-ops for in-memory databases but
+            // accepted for SQL compatibility (applications often call them).
+            Statement::Vacuum(_) | Statement::Analyze(_) | Statement::Reindex(_) => {
+                Ok(Vec::new())
+            }
             _ => Err(FrankenError::NotImplemented(
-                "only SELECT, INSERT, UPDATE, DELETE, DDL (CREATE/DROP/ALTER TABLE, CREATE INDEX/VIEW), transaction control, and PRAGMA are supported".to_owned(),
+                "only SELECT, INSERT, UPDATE, DELETE, DDL (CREATE/DROP/ALTER TABLE, CREATE INDEX/VIEW), transaction control, PRAGMA, VACUUM, ANALYZE, and REINDEX are supported".to_owned(),
             )),
         }
     }
@@ -5208,6 +5213,26 @@ mod tests {
     }
 
     #[test]
+    fn test_maintenance_statement_stubs_execute_as_noops() {
+        let conn = Connection::open(":memory:").expect("in-memory path should open");
+        conn.execute("CREATE TABLE t (id INTEGER);")
+            .expect("CREATE TABLE should succeed");
+        conn.execute("INSERT INTO t VALUES (1);")
+            .expect("INSERT should succeed");
+
+        conn.execute("VACUUM;").expect("VACUUM stub should succeed");
+        conn.execute("ANALYZE;")
+            .expect("ANALYZE stub should succeed");
+        conn.execute("REINDEX;")
+            .expect("REINDEX stub should succeed");
+
+        let rows = conn
+            .query("SELECT COUNT(*) FROM t;")
+            .expect("COUNT should succeed");
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
     fn test_query_comparison_expression() {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("SELECT 3 > 2, 1 = 1, 5 < 3;").unwrap();
@@ -5932,6 +5957,36 @@ mod tests {
         .unwrap();
         let rows = conn.query("SELECT * FROM totals;").unwrap();
         assert_eq!(rows.len(), 2);
+    }
+
+    // ── VACUUM / ANALYZE / REINDEX compatibility stubs (bd-x7i7) ──
+
+    #[test]
+    fn test_vacuum() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+        // VACUUM should succeed as a no-op.
+        conn.execute("VACUUM;").unwrap();
+        // Data should be unaffected.
+        let rows = conn.query("SELECT * FROM t;").unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn test_analyze() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER);").unwrap();
+        conn.execute("ANALYZE;").unwrap();
+        conn.execute("ANALYZE t;").unwrap();
+    }
+
+    #[test]
+    fn test_reindex() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER);").unwrap();
+        conn.execute("REINDEX;").unwrap();
+        conn.execute("REINDEX t;").unwrap();
     }
 
     #[test]
