@@ -1035,10 +1035,9 @@ mod tests {
         for i in 0..k {
             let esi = i as u32;
             let expected = &data[i * sym_size..(i + 1) * sym_size];
-            let actual = sink
-                .symbols
-                .get(&esi)
-                .unwrap_or_else(|| panic!("source symbol ESI {esi} missing"));
+            let actual = sink.symbols.get(&esi);
+            assert!(actual.is_some(), "source symbol ESI {esi} missing");
+            let actual = actual.expect("source symbol existence asserted");
             assert_eq!(
                 actual, expected,
                 "bead_id={BEAD_ID} case=encode_source_symbol_matches esi={esi}"
@@ -1099,12 +1098,10 @@ mod tests {
                     "test_pipeline_decode complete"
                 );
             }
-            DecodeOutcome::Failure(failure) => {
-                panic!(
-                    "bead_id={BEAD_ID} case=decode_unexpected_failure reason={:?}",
-                    failure.reason
-                );
-            }
+            DecodeOutcome::Failure(failure) => unreachable!(
+                "bead_id={BEAD_ID} case=decode_unexpected_failure reason={:?}",
+                failure.reason
+            ),
         }
     }
 
@@ -1389,7 +1386,7 @@ mod tests {
                 );
             }
             DecodeOutcome::Success(_) => {
-                panic!("bead_id={BEAD_ID} case=decode_should_have_failed");
+                unreachable!("bead_id={BEAD_ID} case=decode_should_have_failed")
             }
         }
     }
@@ -1440,7 +1437,7 @@ mod tests {
                 );
             }
             DecodeOutcome::Success(_) => {
-                panic!("bead_id=bd-faz4 case=decode_failure_expected");
+                unreachable!("bead_id=bd-faz4 case=decode_failure_expected")
             }
         }
     }
@@ -1481,12 +1478,10 @@ mod tests {
                     "bead_id=bd-faz4 case=repair_success_proof_consistent"
                 );
             }
-            DecodeOutcome::Failure(failure) => {
-                panic!(
-                    "bead_id=bd-faz4 case=repair_success_should_decode reason={:?}",
-                    failure.reason
-                );
-            }
+            DecodeOutcome::Failure(failure) => unreachable!(
+                "bead_id=bd-faz4 case=repair_success_should_decode reason={:?}",
+                failure.reason
+            ),
         }
     }
 
@@ -1526,12 +1521,10 @@ mod tests {
                         "bead_id={BEAD_ID} case=e2e_roundtrip symbol_size={symbol_size}"
                     );
                 }
-                DecodeOutcome::Failure(f) => {
-                    panic!(
-                        "bead_id={BEAD_ID} case=e2e_roundtrip_failure symbol_size={symbol_size} reason={:?}",
-                        f.reason
-                    );
-                }
+                DecodeOutcome::Failure(f) => unreachable!(
+                    "bead_id={BEAD_ID} case=e2e_roundtrip_failure symbol_size={symbol_size} reason={:?}",
+                    f.reason
+                ),
             }
         }
     }
@@ -1577,12 +1570,10 @@ mod tests {
                     "E2E 64-page roundtrip complete"
                 );
             }
-            DecodeOutcome::Failure(f) => {
-                panic!(
-                    "bead_id={BEAD_ID} case=e2e_64_failure reason={:?}",
-                    f.reason
-                );
-            }
+            DecodeOutcome::Failure(f) => unreachable!(
+                "bead_id={BEAD_ID} case=e2e_64_failure reason={:?}",
+                f.reason
+            ),
         }
     }
 
@@ -1628,12 +1619,10 @@ mod tests {
                     "bead_id={BEAD_ID} case=e2e_named_byte_perfect_recovery"
                 );
             }
-            DecodeOutcome::Failure(f) => {
-                panic!(
-                    "bead_id={BEAD_ID} case=e2e_named_unexpected_failure reason={:?}",
-                    f.reason
-                );
-            }
+            DecodeOutcome::Failure(f) => unreachable!(
+                "bead_id={BEAD_ID} case=e2e_named_unexpected_failure reason={:?}",
+                f.reason
+            ),
         }
     }
 
@@ -1687,12 +1676,10 @@ mod tests {
                     "bead_id={BEAD_ID} case=retry_second_attempt_succeeds"
                 );
             }
-            DecodeOutcome::Failure(f) => {
-                panic!(
-                    "bead_id={BEAD_ID} case=retry_second_should_succeed reason={:?}",
-                    f.reason
-                );
-            }
+            DecodeOutcome::Failure(f) => unreachable!(
+                "bead_id={BEAD_ID} case=retry_second_should_succeed reason={:?}",
+                f.reason
+            ),
         }
     }
 
@@ -1740,12 +1727,10 @@ mod tests {
                     "bead_id={BEAD_ID} case=exact_k_symbols_used"
                 );
             }
-            DecodeOutcome::Failure(f) => {
-                panic!(
-                    "bead_id={BEAD_ID} case=exact_k_should_succeed reason={:?}",
-                    f.reason
-                );
-            }
+            DecodeOutcome::Failure(f) => unreachable!(
+                "bead_id={BEAD_ID} case=exact_k_should_succeed reason={:?}",
+                f.reason
+            ),
         }
     }
 }

@@ -928,7 +928,7 @@ mod tests {
         };
         let result = select(&m, &filter);
         let SelectionResult::NoMatch { reason } = result else {
-            panic!("expected NoMatch, got {result:?}");
+            unreachable!("expected NoMatch, got {result:?}");
         };
         assert!(reason.contains("nonexistent"));
         assert!(reason.contains("tag=rare"));

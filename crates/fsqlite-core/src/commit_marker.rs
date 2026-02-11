@@ -726,7 +726,7 @@ mod tests {
                 assert_eq!(complete_records, 5);
                 assert_eq!(trailing_bytes, 44);
             }
-            other => panic!("expected TornTail, got {other:?}"),
+            other => unreachable!("expected TornTail, got {other:?}"),
         }
     }
 
@@ -755,7 +755,7 @@ mod tests {
             }) => {
                 assert_eq!(complete_records, 4, "valid prefix is records 0-3");
             }
-            other => panic!("expected TornTail, got {other:?}"),
+            other => unreachable!("expected TornTail, got {other:?}"),
         }
     }
 
@@ -776,7 +776,7 @@ mod tests {
                 assert_eq!(expected, start_seq + 1);
                 assert_eq!(actual, start_seq + 2);
             }
-            other => panic!("expected CommitSeqMismatch, got {other:?}"),
+            other => unreachable!("expected CommitSeqMismatch, got {other:?}"),
         }
     }
 
@@ -1124,7 +1124,7 @@ mod tests {
                 assert_eq!(complete_records, 999);
                 assert_eq!(trailing_bytes, COMMIT_MARKER_RECORD_BYTES / 2);
             }
-            other => panic!("expected torn-tail integrity result, got {other:?}"),
+            other => unreachable!("expected torn-tail integrity result, got {other:?}"),
         }
     }
 

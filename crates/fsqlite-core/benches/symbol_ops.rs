@@ -66,7 +66,7 @@ fn run_replication_roundtrip(packet_bytes: &[Vec<u8>]) -> usize {
             | PacketResult::Erasure => {}
         }
     }
-    panic!("replication packet stream did not reach decode-ready state");
+    unreachable!("replication packet stream did not reach decode-ready state");
 }
 
 fn build_replication_packet_path(

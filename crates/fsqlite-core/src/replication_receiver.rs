@@ -1381,10 +1381,10 @@ mod tests {
 
         let mut last_result = PacketResult::Accepted;
         for pkt in &packets {
-            match receiver.process_packet(pkt) {
-                Ok(r) => last_result = r,
-                Err(e) => panic!("bead_id={TEST_BEAD_ID} case=decode_at_k unexpected error: {e}"),
-            }
+            let result = receiver
+                .process_packet(pkt)
+                .expect("bead_id={TEST_BEAD_ID} case=decode_at_k unexpected error");
+            last_result = result;
         }
 
         assert_eq!(
@@ -1755,16 +1755,12 @@ mod tests {
 
         let mut last_result = PacketResult::Accepted;
         for pkt in &wire_packets {
-            match receiver.process_packet(pkt) {
-                Ok(r) => {
-                    last_result = r;
-                    if r == PacketResult::DecodeReady {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    panic!("bead_id={TEST_BEAD_ID} case=e2e_compliance unexpected error: {e}")
-                }
+            let result = receiver
+                .process_packet(pkt)
+                .expect("bead_id={TEST_BEAD_ID} case=e2e_compliance unexpected error");
+            last_result = result;
+            if result == PacketResult::DecodeReady {
+                break;
             }
         }
 
