@@ -4120,24 +4120,15 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert_eq!(
             row_values(&rows[0]),
-            vec![
-                SqliteValue::Integer(1),
-                SqliteValue::Text("a".to_owned())
-            ]
+            vec![SqliteValue::Integer(1), SqliteValue::Text("a".to_owned())]
         );
         assert_eq!(
             row_values(&rows[1]),
-            vec![
-                SqliteValue::Integer(2),
-                SqliteValue::Text("b".to_owned())
-            ]
+            vec![SqliteValue::Integer(2), SqliteValue::Text("b".to_owned())]
         );
         assert_eq!(
             row_values(&rows[2]),
-            vec![
-                SqliteValue::Integer(3),
-                SqliteValue::Text("c".to_owned())
-            ]
+            vec![SqliteValue::Integer(3), SqliteValue::Text("c".to_owned())]
         );
     }
 
