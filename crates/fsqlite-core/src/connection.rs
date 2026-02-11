@@ -4453,6 +4453,64 @@ fn eval_join_expr(
             };
             Ok(eval_scalar_fn(name, &arg_vals))
         }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            op,
+            not,
+            ..
+        } => {
+            let val = eval_join_expr(inner, row, col_map)?;
+            let pat = eval_join_expr(pattern, row, col_map)?;
+            let matched = match (&val, &pat) {
+                (SqliteValue::Text(s), SqliteValue::Text(p)) => match op {
+                    LikeOp::Like => simple_like_match(p, s),
+                    LikeOp::Glob => simple_glob_match(p, s),
+                    _ => false,
+                },
+                _ => false,
+            };
+            Ok(SqliteValue::Integer(i64::from(if *not {
+                !matched
+            } else {
+                matched
+            })))
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            let base = operand
+                .as_ref()
+                .map(|e| eval_join_expr(e, row, col_map))
+                .transpose()?;
+            for (when_expr, then_expr) in whens {
+                let when_val = eval_join_expr(when_expr, row, col_map)?;
+                let matches = if let Some(ref b) = base {
+                    cmp_values(b, &when_val) == std::cmp::Ordering::Equal
+                } else {
+                    is_sqlite_truthy(&when_val)
+                };
+                if matches {
+                    return eval_join_expr(then_expr, row, col_map);
+                }
+            }
+            if let Some(else_e) = else_expr {
+                eval_join_expr(else_e, row, col_map)
+            } else {
+                Ok(SqliteValue::Null)
+            }
+        }
+        Expr::Cast {
+            expr: inner,
+            type_name,
+            ..
+        } => {
+            let val = eval_join_expr(inner, row, col_map)?;
+            Ok(apply_cast(val, &type_name.name))
+        }
         _ => Ok(SqliteValue::Null),
     }
 }
@@ -4530,6 +4588,94 @@ fn eval_join_binary_op(left: &SqliteValue, op: BinaryOp, right: &SqliteValue) ->
             SqliteValue::Text(format!("{l}{r}"))
         }
         _ => SqliteValue::Null,
+    }
+}
+
+/// Simple case-insensitive LIKE pattern match (`%` = any sequence, `_` = any char).
+fn simple_like_match(pattern: &str, string: &str) -> bool {
+    let pat: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
+    let txt: Vec<char> = string.to_ascii_lowercase().chars().collect();
+    like_dp(&pat, &txt, 0, 0)
+}
+
+fn like_dp(pat: &[char], txt: &[char], pi: usize, ti: usize) -> bool {
+    if pi == pat.len() {
+        return ti == txt.len();
+    }
+    match pat[pi] {
+        '%' => {
+            // Match zero or more characters.
+            let mut t = ti;
+            loop {
+                if like_dp(pat, txt, pi + 1, t) {
+                    return true;
+                }
+                if t >= txt.len() {
+                    return false;
+                }
+                t += 1;
+            }
+        }
+        '_' => {
+            // Match exactly one character.
+            ti < txt.len() && like_dp(pat, txt, pi + 1, ti + 1)
+        }
+        c => ti < txt.len() && txt[ti] == c && like_dp(pat, txt, pi + 1, ti + 1),
+    }
+}
+
+/// Simple GLOB pattern match (`*` = any sequence, `?` = any char, case-sensitive).
+fn simple_glob_match(pattern: &str, string: &str) -> bool {
+    let pat: Vec<char> = pattern.chars().collect();
+    let txt: Vec<char> = string.chars().collect();
+    glob_dp(&pat, &txt, 0, 0)
+}
+
+fn glob_dp(pat: &[char], txt: &[char], pi: usize, ti: usize) -> bool {
+    if pi == pat.len() {
+        return ti == txt.len();
+    }
+    match pat[pi] {
+        '*' => {
+            let mut t = ti;
+            loop {
+                if glob_dp(pat, txt, pi + 1, t) {
+                    return true;
+                }
+                if t >= txt.len() {
+                    return false;
+                }
+                t += 1;
+            }
+        }
+        '?' => ti < txt.len() && glob_dp(pat, txt, pi + 1, ti + 1),
+        c => ti < txt.len() && txt[ti] == c && glob_dp(pat, txt, pi + 1, ti + 1),
+    }
+}
+
+/// Apply a CAST to a value based on the target type name.
+#[allow(clippy::cast_possible_truncation)]
+fn apply_cast(val: SqliteValue, type_name: &str) -> SqliteValue {
+    let lower = type_name.to_ascii_lowercase();
+    match lower.as_str() {
+        "integer" | "int" | "bigint" | "smallint" | "tinyint" => match val {
+            SqliteValue::Integer(_) => val,
+            SqliteValue::Float(f) => SqliteValue::Integer(f as i64),
+            SqliteValue::Text(ref s) => s
+                .parse::<i64>()
+                .map_or(SqliteValue::Integer(0), SqliteValue::Integer),
+            _ => SqliteValue::Integer(0),
+        },
+        "real" | "float" | "double" => match val {
+            SqliteValue::Float(_) => val,
+            SqliteValue::Integer(n) => SqliteValue::Float(n as f64),
+            SqliteValue::Text(ref s) => s
+                .parse::<f64>()
+                .map_or(SqliteValue::Float(0.0), SqliteValue::Float),
+            _ => SqliteValue::Float(0.0),
+        },
+        "text" | "varchar" | "char" | "clob" => SqliteValue::Text(sqlite_value_to_text(&val)),
+        _ => val,
     }
 }
 
@@ -5972,6 +6118,121 @@ mod tests {
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(60)); // 20+40
         assert_eq!(rows[1].values()[0], SqliteValue::Integer(1));
         assert_eq!(rows[1].values()[1], SqliteValue::Integer(40)); // 10+30
+    }
+
+    // ── LIKE/CASE/CAST expression evaluation tests (bd-3pss) ──────
+
+    #[test]
+    fn test_join_where_like() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE t2 (id INTEGER, tag TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'Alice');").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (2, 'Bob');").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (1, 'admin');").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (2, 'basic');").unwrap();
+
+        let rows = conn
+            .query("SELECT t1.name FROM t1 INNER JOIN t2 ON t1.id = t2.id WHERE t1.name LIKE 'A%';")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".to_owned()));
+    }
+
+    #[test]
+    fn test_case_expression_in_select() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (val INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t VALUES (2);").unwrap();
+        conn.execute("INSERT INTO t VALUES (3);").unwrap();
+
+        let rows = conn
+            .query(
+                "SELECT CASE WHEN val = 1 THEN 'one' WHEN val = 2 THEN 'two' ELSE 'other' END FROM t ORDER BY val;",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("one".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("two".to_owned()));
+        assert_eq!(rows[2].values()[0], SqliteValue::Text("other".to_owned()));
+    }
+
+    #[test]
+    fn test_cast_expression() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (val TEXT);").unwrap();
+        conn.execute("INSERT INTO t VALUES ('42');").unwrap();
+        conn.execute("INSERT INTO t VALUES ('7');").unwrap();
+
+        let rows = conn
+            .query("SELECT CAST(val AS INTEGER) FROM t ORDER BY CAST(val AS INTEGER);")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(7));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(42));
+    }
+
+    #[test]
+    fn test_like_not_like() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (name TEXT);").unwrap();
+        conn.execute("INSERT INTO t VALUES ('Alice');").unwrap();
+        conn.execute("INSERT INTO t VALUES ('Bob');").unwrap();
+        conn.execute("INSERT INTO t VALUES ('Anna');").unwrap();
+
+        let rows = conn
+            .query("SELECT name FROM t WHERE name LIKE 'A%' ORDER BY name;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("Anna".to_owned()));
+
+        let rows = conn
+            .query("SELECT name FROM t WHERE name NOT LIKE 'A%';")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Bob".to_owned()));
+    }
+
+    #[test]
+    fn test_like_underscore_single_char() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (code TEXT);").unwrap();
+        conn.execute("INSERT INTO t VALUES ('AB');").unwrap();
+        conn.execute("INSERT INTO t VALUES ('AC');").unwrap();
+        conn.execute("INSERT INTO t VALUES ('ABC');").unwrap();
+
+        let rows = conn
+            .query("SELECT code FROM t WHERE code LIKE 'A_' ORDER BY code;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("AB".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("AC".to_owned()));
+    }
+
+    #[test]
+    fn test_case_with_operand() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (status INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (0);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t VALUES (2);").unwrap();
+
+        let rows = conn
+            .query(
+                "SELECT CASE status WHEN 0 THEN 'inactive' WHEN 1 THEN 'active' ELSE 'unknown' END FROM t ORDER BY status;",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Text("inactive".to_owned())
+        );
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("active".to_owned()));
+        assert_eq!(rows[2].values()[0], SqliteValue::Text("unknown".to_owned()));
     }
 
     #[test]
