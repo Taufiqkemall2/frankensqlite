@@ -5,6 +5,7 @@
 //! - `cargo fmt --check` — formatting consistency
 //! - `cargo check --all-targets` — compilation without warnings
 //! - `cargo clippy --all-targets -- -D warnings` — pedantic lint enforcement
+//! - `ubs <changed-files>` — scan staged changes for common bugs
 //! - No references to `master` branch (must be `main`)
 //!
 //! All checks are run against the `fsqlite-e2e` package specifically, keeping
@@ -48,6 +49,8 @@ pub struct GateResult {
 pub struct GateConfig {
     /// Workspace root directory (where `Cargo.toml` lives).
     pub workspace_root: std::path::PathBuf,
+    /// Whether to run UBS on staged changes.
+    pub check_ubs: bool,
     /// Whether to scan for `master` branch references.
     pub check_master_refs: bool,
     /// Maximum length of output snippets in reports.
@@ -58,6 +61,7 @@ impl Default for GateConfig {
     fn default() -> Self {
         Self {
             workspace_root: std::path::PathBuf::from("."),
+            check_ubs: true,
             check_master_refs: true,
             max_snippet_len: 2000,
         }
@@ -70,11 +74,15 @@ impl Default for GateConfig {
 #[must_use]
 pub fn run_all_gates(config: &GateConfig) -> GateReport {
     let start = std::time::Instant::now();
-    let mut gates = Vec::with_capacity(4);
+    let mut gates = Vec::with_capacity(5);
 
     gates.push(run_fmt_gate(config));
     gates.push(run_check_gate(config));
     gates.push(run_clippy_gate(config));
+
+    if config.check_ubs {
+        gates.push(run_ubs_gate(config));
+    }
 
     if config.check_master_refs {
         gates.push(run_master_refs_gate(config));
@@ -158,6 +166,68 @@ fn run_clippy_gate(config: &GateConfig) -> GateResult {
         &["clippy", "--all-targets", "--", "-D", "warnings"],
         config.max_snippet_len,
     )
+}
+
+fn run_ubs_gate(config: &GateConfig) -> GateResult {
+    let start = std::time::Instant::now();
+
+    let staged_files = match staged_files(&config.workspace_root) {
+        Ok(files) => files,
+        Err(e) => {
+            #[allow(clippy::cast_possible_truncation)]
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            return GateResult {
+                name: "ubs".to_owned(),
+                passed: false,
+                summary: format!("Failed to list staged files: {e}"),
+                output_snippet: String::new(),
+                elapsed_ms,
+            };
+        }
+    };
+
+    let scan_files: Vec<String> = staged_files
+        .into_iter()
+        .filter(|p| {
+            Path::new(p)
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e == "rs" || e == "toml")
+        })
+        .filter(|p| config.workspace_root.join(p).is_file())
+        .collect();
+
+    if scan_files.is_empty() {
+        #[allow(clippy::cast_possible_truncation)]
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        return GateResult {
+            name: "ubs".to_owned(),
+            passed: true,
+            summary: "No staged Rust/TOML files; skipping UBS".to_owned(),
+            output_snippet: String::new(),
+            elapsed_ms,
+        };
+    }
+
+    let result = Command::new("ubs")
+        .current_dir(&config.workspace_root)
+        .arg("--only=rust,toml")
+        .args(scan_files)
+        .output();
+
+    #[allow(clippy::cast_possible_truncation)]
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+
+    match result {
+        Ok(output) => gate_result_from_output("ubs", &output, elapsed_ms, config.max_snippet_len),
+        Err(e) => GateResult {
+            name: "ubs".to_owned(),
+            passed: false,
+            summary: format!("Failed to execute: {e}"),
+            output_snippet: String::new(),
+            elapsed_ms,
+        },
+    }
 }
 
 /// Scan for references to `master` branch in source files.
@@ -253,6 +323,30 @@ fn gate_result_from_output(
         output_snippet: snippet,
         elapsed_ms,
     }
+}
+
+fn staged_files(workspace_root: &Path) -> Result<Vec<String>, String> {
+    let output = Command::new("git")
+        .current_dir(workspace_root)
+        .args(["diff", "--name-only", "--cached"])
+        .output()
+        .map_err(|e| format!("failed to execute git: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "git diff --name-only --cached failed: exit code {}: {stderr}",
+            output.status.code().unwrap_or(-1)
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
 }
 
 /// Scan `.rs` files under `dir` for references to "master" branch.
