@@ -236,7 +236,7 @@ fn render_settings(out: &mut String, settings: &HarnessSettings, result: &Showca
         result
             .concurrency_levels
             .iter()
-            .map(|c| c.to_string())
+            .map(std::string::ToString::to_string)
             .collect::<Vec<_>>()
             .join(", ")
     );
@@ -491,6 +491,7 @@ fn render_scaling_efficiency(out: &mut String, rows: &[ScalingRow]) {
 
 // ── Contention metrics ───────────────────────────────────────────────
 
+#[allow(clippy::items_after_statements)]
 fn render_contention_metrics(out: &mut String, perf: &PerfResult) {
     let _ = writeln!(out, "## Contention Metrics\n");
     let _ = writeln!(
@@ -517,8 +518,10 @@ fn render_contention_metrics(out: &mut String, perf: &PerfResult) {
     );
 
     // Collect pairs at each concurrency.
-    let mut grouped: BTreeMap<(String, u16), (Option<&CellOutcome>, Option<&CellOutcome>)> =
-        BTreeMap::new();
+    #[allow(clippy::items_after_statements)]
+    type PerfGroupMap<'a> =
+        BTreeMap<(String, u16), (Option<&'a CellOutcome>, Option<&'a CellOutcome>)>;
+    let mut grouped: PerfGroupMap<'_> = BTreeMap::new();
     for cell in &perf.cells {
         if cell.summary.is_none() {
             continue;

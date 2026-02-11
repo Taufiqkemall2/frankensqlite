@@ -1361,6 +1361,321 @@ impl CorruptionPattern {
     }
 }
 
+// ── Corruption Strategy Catalog (bd-2als.4.1) ───────────────────────────
+
+/// Category of file targeted by a corruption strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CorruptionCategory {
+    /// The main `.db` database file.
+    DatabaseFile,
+    /// The WAL journal (`.db-wal`).
+    Wal,
+    /// The WAL-FEC sidecar (`.db-wal-fec`).
+    Sidecar,
+}
+
+impl fmt::Display for CorruptionCategory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DatabaseFile => f.write_str("database_file"),
+            Self::Wal => f.write_str("wal"),
+            Self::Sidecar => f.write_str("sidecar"),
+        }
+    }
+}
+
+/// Impact severity of a corruption strategy.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub enum CorruptionSeverity {
+    /// Subtle — may evade detection without checksums (e.g., single bit flip).
+    Subtle,
+    /// Moderate — detectable and potentially recoverable with FEC.
+    Moderate,
+    /// Severe — major structural damage; recovery unlikely without redundancy.
+    Severe,
+}
+
+impl fmt::Display for CorruptionSeverity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Subtle => f.write_str("subtle"),
+            Self::Moderate => f.write_str("moderate"),
+            Self::Severe => f.write_str("severe"),
+        }
+    }
+}
+
+/// A single entry in the corruption strategy catalog.
+///
+/// Each entry describes one deterministic corruption technique with enough
+/// metadata for downstream runners (bd-2als.4.2, bd-2als.4.3) to discover,
+/// filter, and instantiate strategies.
+///
+/// The catalog is the "menu" from which the corruption demo runner and CI
+/// smoke select strategies to apply.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CatalogEntry {
+    /// Stable, filesystem-safe identifier (e.g., `"header_zero"`).
+    pub strategy_id: String,
+    /// Human-readable name for reports.
+    pub name: String,
+    /// Narrative description of what this strategy does.
+    pub description: String,
+    /// Which file type this strategy targets.
+    pub category: CorruptionCategory,
+    /// Expected impact severity.
+    pub severity: CorruptionSeverity,
+    /// Default seed for reproducible corruption.
+    pub default_seed: u64,
+    /// The concrete pattern with default parameterization.
+    pub pattern: CorruptionPattern,
+}
+
+impl CatalogEntry {
+    /// Apply this catalog entry to a file, returning a structured report.
+    ///
+    /// # Errors
+    ///
+    /// Returns `E2eError::Io` if the file cannot be read, written, or fails
+    /// safety checks (golden path).
+    pub fn inject(&self, path: &Path, page_size: u32) -> E2eResult<CorruptionReport> {
+        let injector = CorruptionInjector::with_page_size(path.to_path_buf(), page_size)?;
+        injector.inject(&self.pattern)
+    }
+}
+
+/// Return the complete catalog of corruption strategies.
+///
+/// This is the canonical "menu" for the demo runner (bd-2als.4.4) and CI
+/// smoke (bd-2als.6.4).  Each entry carries default parameters and a seed;
+/// callers can override the seed or adjust parameters as needed.
+///
+/// Strategies are organized by category:
+/// - **Database file**: header, page, bitflip, truncation
+/// - **WAL**: frame corruption, truncation, bitrot, torn writes
+/// - **Sidecar**: FEC repair symbol corruption
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn corruption_strategy_catalog() -> Vec<CatalogEntry> {
+    vec![
+        // ── Database file strategies ────────────────────────────────────
+        CatalogEntry {
+            strategy_id: "header_zero".to_owned(),
+            name: "Header Zero".to_owned(),
+            description: "Zero the 100-byte SQLite database header. \
+                Prevents file format recognition; sqlite3 cannot open the file."
+                .to_owned(),
+            category: CorruptionCategory::DatabaseFile,
+            severity: CorruptionSeverity::Severe,
+            default_seed: 0,
+            pattern: CorruptionPattern::HeaderZero,
+        },
+        CatalogEntry {
+            strategy_id: "page_zero_pg2".to_owned(),
+            name: "Page Zero (page 2)".to_owned(),
+            description: "Zero an entire database page (default: page 2, first data page). \
+                Destroys B-tree structure for that page; sqlite3 integrity_check fails."
+                .to_owned(),
+            category: CorruptionCategory::DatabaseFile,
+            severity: CorruptionSeverity::Severe,
+            default_seed: 0,
+            pattern: CorruptionPattern::PageZero { page_number: 2 },
+        },
+        CatalogEntry {
+            strategy_id: "bitflip_db_single".to_owned(),
+            name: "Single Bit Flip (DB)".to_owned(),
+            description: "Flip one bit in the database file (byte 200, bit 3). \
+                Subtle corruption that may go undetected without page checksums."
+                .to_owned(),
+            category: CorruptionCategory::DatabaseFile,
+            severity: CorruptionSeverity::Subtle,
+            default_seed: 0,
+            pattern: CorruptionPattern::BitFlip {
+                byte_offset: 200,
+                bit_position: 3,
+            },
+        },
+        CatalogEntry {
+            strategy_id: "bitflip_db_region".to_owned(),
+            name: "Regional Bit Flips (DB)".to_owned(),
+            description: "Flip 8 random bits within a 512-byte region starting at byte 4096 \
+                (page 2). Simulates localized bitrot affecting multiple cells on one page."
+                .to_owned(),
+            category: CorruptionCategory::DatabaseFile,
+            severity: CorruptionSeverity::Moderate,
+            default_seed: 42,
+            pattern: CorruptionPattern::BitFlipMany {
+                offset: 4096,
+                length: 512,
+                count: 8,
+                seed: 42,
+            },
+        },
+        CatalogEntry {
+            strategy_id: "truncate_db_half".to_owned(),
+            name: "Truncate DB (50%)".to_owned(),
+            description: "Truncate the database file to half its expected size. \
+                Simulates catastrophic storage failure; multiple pages lost."
+                .to_owned(),
+            category: CorruptionCategory::DatabaseFile,
+            severity: CorruptionSeverity::Severe,
+            default_seed: 0,
+            // The actual new_len must be computed at runtime from file size.
+            // This default targets a 2-page (8192-byte) DB truncated to 1 page.
+            pattern: CorruptionPattern::TruncateTo { new_len: 4096 },
+        },
+        CatalogEntry {
+            strategy_id: "page_partial_pg2".to_owned(),
+            name: "Partial Page Corrupt (page 2)".to_owned(),
+            description: "Overwrite 128 bytes within page 2 with random data. \
+                Corrupts B-tree cell content while leaving the page header intact."
+                .to_owned(),
+            category: CorruptionCategory::DatabaseFile,
+            severity: CorruptionSeverity::Moderate,
+            default_seed: 77,
+            pattern: CorruptionPattern::PagePartialCorrupt {
+                page_number: 2,
+                offset_within_page: 64,
+                length: 128,
+                seed: 77,
+            },
+        },
+        // ── WAL strategies ──────────────────────────────────────────────
+        CatalogEntry {
+            strategy_id: "wal_truncate_0".to_owned(),
+            name: "WAL Truncate (0 frames)".to_owned(),
+            description: "Truncate the WAL to just its header (0 frames kept). \
+                All committed-but-uncheckpointed data is lost."
+                .to_owned(),
+            category: CorruptionCategory::Wal,
+            severity: CorruptionSeverity::Severe,
+            default_seed: 0,
+            pattern: CorruptionPattern::WalTruncate { frames: 0 },
+        },
+        CatalogEntry {
+            strategy_id: "wal_frame_corrupt_0_1".to_owned(),
+            name: "WAL Frame Corrupt (frames 0-1)".to_owned(),
+            description: "Overwrite the payload of the first two WAL frames with random data. \
+                The cumulative checksum chain breaks; sqlite3 discards from frame 0."
+                .to_owned(),
+            category: CorruptionCategory::Wal,
+            severity: CorruptionSeverity::Moderate,
+            default_seed: 42,
+            pattern: CorruptionPattern::WalFrameCorrupt {
+                frame_numbers: vec![0, 1],
+                seed: 42,
+            },
+        },
+        CatalogEntry {
+            strategy_id: "wal_bitrot_0_3".to_owned(),
+            name: "WAL Bitrot (frames 0-3)".to_owned(),
+            description: "Flip 5 random bits across WAL frames 0 through 3. \
+                Simulates gradual storage degradation in the WAL region."
+                .to_owned(),
+            category: CorruptionCategory::Wal,
+            severity: CorruptionSeverity::Moderate,
+            default_seed: 99,
+            pattern: CorruptionPattern::WalBitRot {
+                frame_start: 0,
+                frame_end: 3,
+                flips: 5,
+                seed: 99,
+            },
+        },
+        CatalogEntry {
+            strategy_id: "wal_bitflip_frame0".to_owned(),
+            name: "WAL Single Bit Flip (frame 0)".to_owned(),
+            description: "Flip one bit in the first WAL frame's payload. \
+                Minimal corruption that breaks the checksum chain at the earliest point."
+                .to_owned(),
+            category: CorruptionCategory::Wal,
+            severity: CorruptionSeverity::Subtle,
+            default_seed: 0,
+            pattern: CorruptionPattern::WalFrameBitFlip {
+                frame_index: 0,
+                byte_offset_within_payload: 100,
+                bit_position: 3,
+            },
+        },
+        CatalogEntry {
+            strategy_id: "wal_torn_write_frame1".to_owned(),
+            name: "WAL Torn Write (frame 1)".to_owned(),
+            description: "Simulate a torn write by truncating the WAL mid-frame (1024 bytes \
+                into frame 1's payload). Represents power loss during a write."
+                .to_owned(),
+            category: CorruptionCategory::Wal,
+            severity: CorruptionSeverity::Moderate,
+            default_seed: 0,
+            pattern: CorruptionPattern::WalTornTruncate {
+                frame_index: 1,
+                bytes_into_payload: 1024,
+            },
+        },
+        // ── Sidecar strategies ──────────────────────────────────────────
+        CatalogEntry {
+            strategy_id: "sidecar_corrupt_symbols".to_owned(),
+            name: "FEC Sidecar Corrupt".to_owned(),
+            description: "Overwrite 512 bytes of the WAL-FEC sidecar starting at offset 64. \
+                Destroys repair symbols; FrankenSQLite falls back to WAL truncation."
+                .to_owned(),
+            category: CorruptionCategory::Sidecar,
+            severity: CorruptionSeverity::Moderate,
+            default_seed: 55,
+            pattern: CorruptionPattern::SidecarCorrupt {
+                offset: 64,
+                length: 512,
+                seed: 55,
+            },
+        },
+    ]
+}
+
+/// Filter the catalog to only database file strategies.
+#[must_use]
+pub fn db_file_strategies() -> Vec<CatalogEntry> {
+    corruption_strategy_catalog()
+        .into_iter()
+        .filter(|e| e.category == CorruptionCategory::DatabaseFile)
+        .collect()
+}
+
+/// Filter the catalog to only WAL strategies.
+#[must_use]
+pub fn wal_strategies() -> Vec<CatalogEntry> {
+    corruption_strategy_catalog()
+        .into_iter()
+        .filter(|e| e.category == CorruptionCategory::Wal)
+        .collect()
+}
+
+/// Filter the catalog to only sidecar strategies.
+#[must_use]
+pub fn sidecar_strategies() -> Vec<CatalogEntry> {
+    corruption_strategy_catalog()
+        .into_iter()
+        .filter(|e| e.category == CorruptionCategory::Sidecar)
+        .collect()
+}
+
+/// Filter the catalog to strategies at or above a severity threshold.
+#[must_use]
+pub fn strategies_by_severity(min_severity: CorruptionSeverity) -> Vec<CatalogEntry> {
+    corruption_strategy_catalog()
+        .into_iter()
+        .filter(|e| e.severity >= min_severity)
+        .collect()
+}
+
+/// Look up a single catalog entry by its `strategy_id`.
+#[must_use]
+pub fn catalog_entry_by_id(strategy_id: &str) -> Option<CatalogEntry> {
+    corruption_strategy_catalog()
+        .into_iter()
+        .find(|e| e.strategy_id == strategy_id)
+}
+
 // ── Legacy API (preserved for backward compat) ──────────────────────────
 
 /// Legacy corruption strategy enum.
@@ -2155,6 +2470,479 @@ mod tests {
         assert_eq!(pages_in_range(100, 100, 4096), Vec::<u32>::new());
     }
 
+    // -- TruncateTo tests --
+
+    #[test]
+    fn test_truncate_to() {
+        let (_dir, path) = temp_db(8192);
+        let injector = CorruptionInjector::new(path.clone()).unwrap();
+
+        let report = injector
+            .inject(&CorruptionPattern::TruncateTo { new_len: 4096 })
+            .unwrap();
+
+        assert_eq!(report.affected_bytes, 4096);
+        assert_eq!(report.affected_pages, vec![2]);
+
+        let data = std::fs::read(&path).unwrap();
+        assert_eq!(data.len(), 4096);
+        assert!(data.iter().all(|&b| b == 0xAA));
+    }
+
+    #[test]
+    fn test_truncate_to_partial_page() {
+        let (_dir, path) = temp_db(8192);
+        let injector = CorruptionInjector::new(path.clone()).unwrap();
+
+        let report = injector
+            .inject(&CorruptionPattern::TruncateTo { new_len: 2048 })
+            .unwrap();
+
+        assert_eq!(report.affected_bytes, 6144);
+        assert!(report.affected_pages.contains(&1));
+        assert!(report.affected_pages.contains(&2));
+
+        let data = std::fs::read(&path).unwrap();
+        assert_eq!(data.len(), 2048);
+    }
+
+    #[test]
+    fn test_truncate_to_rejects_no_op() {
+        let size = 4096;
+        let (_dir, path) = temp_db(size);
+        let injector = CorruptionInjector::new(path).unwrap();
+
+        let err = injector
+            .inject(&CorruptionPattern::TruncateTo {
+                new_len: u64::try_from(size).unwrap(),
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("must be <"));
+    }
+
+    // -- BitFlipMany tests --
+
+    #[test]
+    fn test_bit_flip_many_deterministic() {
+        let (_dir, path) = temp_db(8192);
+        let injector = CorruptionInjector::new(path.clone()).unwrap();
+
+        let pattern = CorruptionPattern::BitFlipMany {
+            offset: 100,
+            length: 200,
+            count: 10,
+            seed: 42,
+        };
+
+        injector.inject(&pattern).unwrap();
+        let a = std::fs::read(&path).unwrap();
+
+        std::fs::write(&path, vec![0xAA_u8; 8192]).unwrap();
+        injector.inject(&pattern).unwrap();
+        let b = std::fs::read(&path).unwrap();
+
+        assert_eq!(a, b, "same seed must produce identical corruption");
+    }
+
+    #[test]
+    fn test_bit_flip_many_modifies_correct_region() {
+        let (_dir, path) = temp_db(8192);
+        let injector = CorruptionInjector::new(path.clone()).unwrap();
+
+        let report = injector
+            .inject(&CorruptionPattern::BitFlipMany {
+                offset: 100,
+                length: 50,
+                count: 5,
+                seed: 77,
+            })
+            .unwrap();
+
+        let data = std::fs::read(&path).unwrap();
+
+        // Region before should be untouched
+        assert!(data[..100].iter().all(|&b| b == 0xAA));
+        // Region after should be untouched
+        assert!(data[150..].iter().all(|&b| b == 0xAA));
+        // Some bytes in region should be modified
+        assert!(data[100..150].iter().any(|&b| b != 0xAA));
+        // Report should be non-empty
+        assert!(!report.modifications.is_empty());
+    }
+
+    #[test]
+    fn test_bit_flip_many_rejects_zero_count() {
+        let (_dir, path) = temp_db(4096);
+        let injector = CorruptionInjector::new(path).unwrap();
+
+        let err = injector
+            .inject(&CorruptionPattern::BitFlipMany {
+                offset: 0,
+                length: 100,
+                count: 0,
+                seed: 0,
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("count must be > 0"));
+    }
+
+    #[test]
+    fn test_bit_flip_many_rejects_out_of_range() {
+        let (_dir, path) = temp_db(4096);
+        let injector = CorruptionInjector::new(path).unwrap();
+
+        let err = injector
+            .inject(&CorruptionPattern::BitFlipMany {
+                offset: 4000,
+                length: 200,
+                count: 5,
+                seed: 0,
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("exceeds file size"));
+    }
+
+    // -- WalTruncate tests --
+
+    #[test]
+    fn test_wal_truncate() {
+        // WAL: 32-byte header + 3 frames of (24 + 4096)
+        let frame_size = 24 + 4096;
+        let wal_size = 32 + 3 * frame_size;
+        let (_dir, path) = temp_db(wal_size);
+
+        // Write recognizable pgno values
+        let mut wal = std::fs::read(&path).unwrap();
+        for i in 0u32..3 {
+            let frame_start = 32 + (i as usize) * frame_size;
+            wal[frame_start..frame_start + 4].copy_from_slice(&(i + 1).to_be_bytes());
+        }
+        std::fs::write(&path, &wal).unwrap();
+
+        let injector = CorruptionInjector::new(path.clone()).unwrap();
+        let report = injector
+            .inject(&CorruptionPattern::WalTruncate { frames: 1 })
+            .unwrap();
+
+        // Should have truncated 2 frames
+        assert_eq!(
+            report.affected_bytes,
+            u64::try_from(2 * frame_size).unwrap()
+        );
+        assert!(report.affected_pages.contains(&2));
+        assert!(report.affected_pages.contains(&3));
+
+        let data = std::fs::read(&path).unwrap();
+        assert_eq!(data.len(), 32 + frame_size);
+    }
+
+    #[test]
+    fn test_wal_truncate_to_zero_frames() {
+        let frame_size = 24 + 4096;
+        let wal_size = 32 + 2 * frame_size;
+        let (_dir, path) = temp_db(wal_size);
+
+        let mut wal = std::fs::read(&path).unwrap();
+        wal[32..36].copy_from_slice(&1u32.to_be_bytes());
+        let f1 = 32 + frame_size;
+        wal[f1..f1 + 4].copy_from_slice(&2u32.to_be_bytes());
+        std::fs::write(&path, &wal).unwrap();
+
+        let injector = CorruptionInjector::new(path.clone()).unwrap();
+        injector
+            .inject(&CorruptionPattern::WalTruncate { frames: 0 })
+            .unwrap();
+
+        let data = std::fs::read(&path).unwrap();
+        assert_eq!(data.len(), 32, "should only keep WAL header");
+    }
+
+    #[test]
+    fn test_wal_truncate_rejects_no_op() {
+        let frame_size = 24 + 4096;
+        let wal_size = 32 + 2 * frame_size;
+        let (_dir, path) = temp_db(wal_size);
+
+        let injector = CorruptionInjector::new(path).unwrap();
+        let err = injector
+            .inject(&CorruptionPattern::WalTruncate { frames: 2 })
+            .unwrap_err();
+        assert!(err.to_string().contains("already <="));
+    }
+
+    // -- WalFrameBitFlip tests --
+
+    #[test]
+    fn test_wal_frame_bit_flip() {
+        let frame_size = 24 + 4096;
+        let wal_size = 32 + 2 * frame_size;
+        let (_dir, path) = temp_db_filled(wal_size, 0);
+
+        // Write recognizable pgno for frame 0
+        let mut wal = std::fs::read(&path).unwrap();
+        wal[32..36].copy_from_slice(&5u32.to_be_bytes());
+        std::fs::write(&path, &wal).unwrap();
+
+        let injector = CorruptionInjector::new(path.clone()).unwrap();
+        let report = injector
+            .inject(&CorruptionPattern::WalFrameBitFlip {
+                frame_index: 0,
+                byte_offset_within_payload: 100,
+                bit_position: 3,
+            })
+            .unwrap();
+
+        assert_eq!(report.affected_bytes, 1);
+        assert_eq!(report.affected_pages, vec![5]);
+
+        // Payload byte at offset 100 within frame 0 should have bit 3 flipped
+        let data = std::fs::read(&path).unwrap();
+        let payload_start = 32 + 24; // WAL header + frame header
+        assert_eq!(data[payload_start + 100], 1 << 3);
+    }
+
+    #[test]
+    fn test_wal_frame_bit_flip_rejects_bad_bit() {
+        let frame_size = 24 + 4096;
+        let wal_size = 32 + frame_size;
+        let (_dir, path) = temp_db(wal_size);
+
+        let injector = CorruptionInjector::new(path).unwrap();
+        let err = injector
+            .inject(&CorruptionPattern::WalFrameBitFlip {
+                frame_index: 0,
+                byte_offset_within_payload: 0,
+                bit_position: 8,
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("bit_position"));
+    }
+
+    #[test]
+    fn test_wal_frame_bit_flip_rejects_bad_offset() {
+        let frame_size = 24 + 4096;
+        let wal_size = 32 + frame_size;
+        let (_dir, path) = temp_db(wal_size);
+
+        let injector = CorruptionInjector::new(path).unwrap();
+        let err = injector
+            .inject(&CorruptionPattern::WalFrameBitFlip {
+                frame_index: 0,
+                byte_offset_within_payload: 4096,
+                bit_position: 0,
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("exceeds page size"));
+    }
+
+    // -- WalBitRot tests --
+
+    #[test]
+    fn test_wal_bit_rot_deterministic() {
+        let frame_size = 24 + 4096;
+        let wal_size = 32 + 4 * frame_size;
+        let (_dir, path) = temp_db(wal_size);
+
+        // Write pgno values
+        let mut wal = std::fs::read(&path).unwrap();
+        for i in 0u32..4 {
+            let fs = 32 + (i as usize) * frame_size;
+            wal[fs..fs + 4].copy_from_slice(&(i + 1).to_be_bytes());
+        }
+        std::fs::write(&path, &wal).unwrap();
+
+        let pattern = CorruptionPattern::WalBitRot {
+            frame_start: 0,
+            frame_end: 3,
+            flips: 10,
+            seed: 42,
+        };
+
+        let injector = CorruptionInjector::new(path.clone()).unwrap();
+        injector.inject(&pattern).unwrap();
+        let a = std::fs::read(&path).unwrap();
+
+        // Reset and re-corrupt
+        std::fs::write(&path, &wal).unwrap();
+        injector.inject(&pattern).unwrap();
+        let b = std::fs::read(&path).unwrap();
+
+        assert_eq!(a, b, "same seed must produce identical corruption");
+    }
+
+    #[test]
+    fn test_wal_bit_rot_reports_affected_pages() {
+        let frame_size = 24 + 4096;
+        let wal_size = 32 + 2 * frame_size;
+        let (_dir, path) = temp_db(wal_size);
+
+        let mut wal = std::fs::read(&path).unwrap();
+        wal[32..36].copy_from_slice(&7u32.to_be_bytes());
+        let f1 = 32 + frame_size;
+        wal[f1..f1 + 4].copy_from_slice(&8u32.to_be_bytes());
+        std::fs::write(&path, &wal).unwrap();
+
+        let injector = CorruptionInjector::new(path).unwrap();
+        let report = injector
+            .inject(&CorruptionPattern::WalBitRot {
+                frame_start: 0,
+                frame_end: 1,
+                flips: 5,
+                seed: 99,
+            })
+            .unwrap();
+
+        // Should report the db page numbers from the WAL frame headers
+        for page in &report.affected_pages {
+            assert!(*page == 7 || *page == 8);
+        }
+    }
+
+    #[test]
+    fn test_wal_bit_rot_rejects_zero_flips() {
+        let frame_size = 24 + 4096;
+        let wal_size = 32 + frame_size;
+        let (_dir, path) = temp_db(wal_size);
+
+        let injector = CorruptionInjector::new(path).unwrap();
+        let err = injector
+            .inject(&CorruptionPattern::WalBitRot {
+                frame_start: 0,
+                frame_end: 0,
+                flips: 0,
+                seed: 0,
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("flips must be > 0"));
+    }
+
+    #[test]
+    fn test_wal_bit_rot_rejects_inverted_range() {
+        let frame_size = 24 + 4096;
+        let wal_size = 32 + 2 * frame_size;
+        let (_dir, path) = temp_db(wal_size);
+
+        let injector = CorruptionInjector::new(path).unwrap();
+        let err = injector
+            .inject(&CorruptionPattern::WalBitRot {
+                frame_start: 1,
+                frame_end: 0,
+                flips: 1,
+                seed: 0,
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("frame_start must be <= frame_end"));
+    }
+
+    // -- WalTornTruncate tests --
+
+    #[test]
+    fn test_wal_torn_truncate() {
+        let frame_size = 24 + 4096;
+        let wal_size = 32 + 2 * frame_size;
+        let (_dir, path) = temp_db(wal_size);
+
+        let injector = CorruptionInjector::new(path.clone()).unwrap();
+        let report = injector
+            .inject(&CorruptionPattern::WalTornTruncate {
+                frame_index: 1,
+                bytes_into_payload: 512,
+            })
+            .unwrap();
+
+        // Should truncate from the middle of frame 1's payload
+        let expected_len = 32 + frame_size + 24 + 512;
+        let data = std::fs::read(&path).unwrap();
+        assert_eq!(data.len(), expected_len);
+        assert!(report.affected_bytes > 0);
+    }
+
+    #[test]
+    fn test_wal_torn_truncate_at_payload_start() {
+        let frame_size = 24 + 4096;
+        let wal_size = 32 + 2 * frame_size;
+        let (_dir, path) = temp_db(wal_size);
+
+        let injector = CorruptionInjector::new(path.clone()).unwrap();
+        injector
+            .inject(&CorruptionPattern::WalTornTruncate {
+                frame_index: 0,
+                bytes_into_payload: 0,
+            })
+            .unwrap();
+
+        // Should truncate right after frame 0's header (no payload written)
+        let expected_len = 32 + 24; // WAL header + frame header
+        let data = std::fs::read(&path).unwrap();
+        assert_eq!(data.len(), expected_len);
+    }
+
+    #[test]
+    fn test_wal_torn_truncate_rejects_payload_overflow() {
+        let frame_size = 24 + 4096;
+        let wal_size = 32 + frame_size;
+        let (_dir, path) = temp_db(wal_size);
+
+        let injector = CorruptionInjector::new(path).unwrap();
+        let err = injector
+            .inject(&CorruptionPattern::WalTornTruncate {
+                frame_index: 0,
+                bytes_into_payload: 4096, // == page_size, must be < page_size
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("exceeds page size"));
+    }
+
+    // -- Scenario id tests --
+
+    #[test]
+    fn test_scenario_id_is_filesystem_safe() {
+        let patterns = [
+            CorruptionPattern::BitFlip {
+                byte_offset: 42,
+                bit_position: 3,
+            },
+            CorruptionPattern::BitFlipMany {
+                offset: 0,
+                length: 100,
+                count: 5,
+                seed: 99,
+            },
+            CorruptionPattern::PageZero { page_number: 2 },
+            CorruptionPattern::TruncateTo { new_len: 1024 },
+            CorruptionPattern::HeaderZero,
+            CorruptionPattern::WalTruncate { frames: 3 },
+            CorruptionPattern::WalBitRot {
+                frame_start: 0,
+                frame_end: 2,
+                flips: 8,
+                seed: 42,
+            },
+            CorruptionPattern::WalTornTruncate {
+                frame_index: 1,
+                bytes_into_payload: 512,
+            },
+        ];
+
+        for p in &patterns {
+            let id = p.scenario_id();
+            assert!(!id.is_empty(), "scenario_id must not be empty for {p}");
+            assert!(
+                id.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "scenario_id must be filesystem-safe: {id}"
+            );
+            assert!(
+                !id.starts_with('_') && !id.starts_with('-'),
+                "scenario_id must not start with separator: {id}"
+            );
+            assert!(
+                !id.ends_with('_') && !id.ends_with('-'),
+                "scenario_id must not end with separator: {id}"
+            );
+        }
+    }
+
     // -- Legacy tests --
 
     #[test]
@@ -2216,5 +3004,171 @@ mod tests {
         let c2 = std::fs::read(&path).unwrap();
 
         assert_eq!(c1, c2, "same seed must produce identical corruption");
+    }
+
+    // ── Catalog tests (bd-2als.4.1) ─────────────────────────────────
+
+    #[test]
+    fn test_catalog_nonempty() {
+        let catalog = corruption_strategy_catalog();
+        assert!(
+            catalog.len() >= 12,
+            "expected at least 12 catalog entries, got {}",
+            catalog.len()
+        );
+    }
+
+    #[test]
+    fn test_catalog_unique_strategy_ids() {
+        let catalog = corruption_strategy_catalog();
+        let mut ids: Vec<&str> = catalog.iter().map(|e| e.strategy_id.as_str()).collect();
+        let original_len = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            original_len,
+            "catalog has duplicate strategy_ids"
+        );
+    }
+
+    #[test]
+    fn test_catalog_scenario_ids_filesystem_safe() {
+        let catalog = corruption_strategy_catalog();
+        for entry in &catalog {
+            let sid = entry.pattern.scenario_id();
+            assert!(
+                !sid.is_empty(),
+                "empty scenario_id for {}",
+                entry.strategy_id
+            );
+            assert!(
+                sid.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "non-filesystem-safe scenario_id for {}: {sid}",
+                entry.strategy_id
+            );
+        }
+    }
+
+    #[test]
+    fn test_catalog_covers_all_categories() {
+        let catalog = corruption_strategy_catalog();
+        let has_db = catalog
+            .iter()
+            .any(|e| e.category == CorruptionCategory::DatabaseFile);
+        let has_wal = catalog
+            .iter()
+            .any(|e| e.category == CorruptionCategory::Wal);
+        let has_sidecar = catalog
+            .iter()
+            .any(|e| e.category == CorruptionCategory::Sidecar);
+        assert!(has_db, "catalog missing DatabaseFile category");
+        assert!(has_wal, "catalog missing Wal category");
+        assert!(has_sidecar, "catalog missing Sidecar category");
+    }
+
+    #[test]
+    fn test_catalog_covers_all_severities() {
+        let catalog = corruption_strategy_catalog();
+        let has_subtle = catalog
+            .iter()
+            .any(|e| e.severity == CorruptionSeverity::Subtle);
+        let has_moderate = catalog
+            .iter()
+            .any(|e| e.severity == CorruptionSeverity::Moderate);
+        let has_severe = catalog
+            .iter()
+            .any(|e| e.severity == CorruptionSeverity::Severe);
+        assert!(has_subtle, "catalog missing Subtle severity");
+        assert!(has_moderate, "catalog missing Moderate severity");
+        assert!(has_severe, "catalog missing Severe severity");
+    }
+
+    #[test]
+    fn test_catalog_filter_by_category() {
+        let db = db_file_strategies();
+        assert!(
+            db.iter()
+                .all(|e| e.category == CorruptionCategory::DatabaseFile)
+        );
+        assert!(!db.is_empty());
+
+        let wal = wal_strategies();
+        assert!(wal.iter().all(|e| e.category == CorruptionCategory::Wal));
+        assert!(!wal.is_empty());
+
+        let sc = sidecar_strategies();
+        assert!(sc.iter().all(|e| e.category == CorruptionCategory::Sidecar));
+        assert!(!sc.is_empty());
+    }
+
+    #[test]
+    fn test_catalog_filter_by_severity() {
+        let severe = strategies_by_severity(CorruptionSeverity::Severe);
+        assert!(
+            severe
+                .iter()
+                .all(|e| e.severity >= CorruptionSeverity::Severe)
+        );
+        assert!(!severe.is_empty());
+
+        let moderate_plus = strategies_by_severity(CorruptionSeverity::Moderate);
+        assert!(moderate_plus.len() >= severe.len());
+    }
+
+    #[test]
+    fn test_catalog_lookup_by_id() {
+        let entry = catalog_entry_by_id("header_zero");
+        assert!(entry.is_some(), "expected to find header_zero in catalog");
+        let entry = entry.unwrap();
+        assert_eq!(entry.strategy_id, "header_zero");
+        assert_eq!(entry.category, CorruptionCategory::DatabaseFile);
+
+        let missing = catalog_entry_by_id("nonexistent_strategy");
+        assert!(missing.is_none());
+    }
+
+    #[test]
+    fn test_catalog_entry_inject_header_zero() {
+        let (_dir, path) = temp_db(8192);
+        let entry = catalog_entry_by_id("header_zero").unwrap();
+        let report = entry.inject(&path, DEFAULT_PAGE_SIZE).unwrap();
+        assert_eq!(report.affected_bytes, 100);
+        assert_eq!(report.affected_pages, vec![1]);
+
+        let data = std::fs::read(&path).unwrap();
+        assert!(data[..100].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_catalog_entry_inject_rejects_golden() {
+        let dir = tempfile::tempdir().unwrap();
+        let golden = dir.path().join("golden").join("test.db");
+        std::fs::create_dir_all(golden.parent().unwrap()).unwrap();
+        std::fs::write(&golden, [0u8; 4096]).unwrap();
+
+        let entry = catalog_entry_by_id("header_zero").unwrap();
+        assert!(entry.inject(&golden, DEFAULT_PAGE_SIZE).is_err());
+    }
+
+    #[test]
+    fn test_catalog_deterministic() {
+        let (_dir, path) = temp_db(8192);
+        let entry = catalog_entry_by_id("bitflip_db_region").unwrap();
+
+        let r1 = entry.inject(&path, DEFAULT_PAGE_SIZE).unwrap();
+        let d1 = std::fs::read(&path).unwrap();
+
+        // Reset and re-inject
+        std::fs::write(&path, vec![0xAA_u8; 8192]).unwrap();
+        let r2 = entry.inject(&path, DEFAULT_PAGE_SIZE).unwrap();
+        let d2 = std::fs::read(&path).unwrap();
+
+        assert_eq!(
+            d1, d2,
+            "same catalog entry must produce identical corruption"
+        );
+        assert_eq!(r1.scenario_id, r2.scenario_id);
     }
 }

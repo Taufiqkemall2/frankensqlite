@@ -247,8 +247,7 @@ pub fn write_mismatch_bundle(
     };
 
     // 3. Write metadata.json.
-    let metadata_json = serde_json::to_string_pretty(&metadata)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let metadata_json = serde_json::to_string_pretty(&metadata).map_err(std::io::Error::other)?;
     std::fs::write(bundle_dir.join("metadata.json"), &metadata_json)?;
 
     // 4. Compute and write diffs (best-effort — don't fail the whole bundle).
@@ -633,13 +632,13 @@ fn render_repro_md(meta: &BundleMetadata, bundle_name: &str) -> String {
     md.push_str("```bash\n");
     let _ = writeln!(md, "# Bundle directory:");
     let _ = writeln!(md, "ls reports/mismatches/{bundle_name}/");
-    md.push_str("\n");
+    md.push('\n');
     let _ = writeln!(md, "# View schema diff:");
     let _ = writeln!(md, "cat reports/mismatches/{bundle_name}/schema_diff.txt");
-    md.push_str("\n");
+    md.push('\n');
     let _ = writeln!(md, "# View data diff:");
     let _ = writeln!(md, "cat reports/mismatches/{bundle_name}/dump_diff.txt");
-    md.push_str("\n");
+    md.push('\n');
     let _ = writeln!(md, "# View PRAGMA diff:");
     let _ = writeln!(md, "cat reports/mismatches/{bundle_name}/pragma_diff.txt");
     md.push_str("```\n");
