@@ -608,7 +608,7 @@ impl Connection {
                         dedup_rows(&mut rows);
                     }
                     Ok(rows)
-                } else if has_group_by(select) && has_joins(select) {
+                } else if has_group_by(select) && (has_joins(select) || has_subquery_source(select)) {
                     // GROUP BY + JOIN: materialize the join as a temp table,
                     // then GROUP BY on that temp table.
                     let rewritten = self.rewrite_in_subqueries_select(select)?;
@@ -626,8 +626,10 @@ impl Connection {
                         dedup_rows(&mut rows);
                     }
                     Ok(rows)
-                } else if has_joins(select) {
+                } else if has_joins(select) || has_subquery_source(select) {
                     // Fallback path: eagerly rewrite IN subqueries.
+                    // Also handles subquery in FROM (derived tables) even
+                    // without explicit JOINs.
                     let rewritten = self.rewrite_in_subqueries_select(select)?;
                     let mut rows = self.execute_join_select(&rewritten, params)?;
                     if distinct {
@@ -2600,42 +2602,87 @@ impl Connection {
         };
 
         // ── 1. Resolve all table sources (primary + joined tables) ──
-        let schema = self.schema.borrow();
         let mut table_sources: Vec<JoinTableSource> = Vec::with_capacity(1 + from.joins.len());
+        // Preloaded rows for subquery sources (index-aligned with table_sources).
+        let mut preloaded: Vec<Option<Vec<Vec<SqliteValue>>>> = Vec::new();
 
-        // Primary table.
-        let (primary_name, primary_alias) = resolve_table_name(&from.source)?;
-        let primary_schema = schema
-            .iter()
-            .find(|t| t.name.eq_ignore_ascii_case(&primary_name))
-            .ok_or_else(|| FrankenError::Internal(format!("table not found: {primary_name}")))?;
-        let primary_col_names: Vec<String> = primary_schema
-            .columns
-            .iter()
-            .map(|c| c.name.clone())
-            .collect();
-        table_sources.push(JoinTableSource {
-            table_name: primary_name.clone(),
-            alias: primary_alias,
-            col_names: primary_col_names,
-        });
+        {
+            let schema = self.schema.borrow();
 
-        // Joined tables.
-        for join in &from.joins {
-            let (name, alias) = resolve_table_name(&join.table)?;
-            let join_schema = schema
-                .iter()
-                .find(|t| t.name.eq_ignore_ascii_case(&name))
-                .ok_or_else(|| FrankenError::Internal(format!("table not found: {name}")))?;
-            let col_names: Vec<String> =
-                join_schema.columns.iter().map(|c| c.name.clone()).collect();
-            table_sources.push(JoinTableSource {
-                table_name: name,
-                alias,
-                col_names,
-            });
+            // Helper closure: resolve a TableOrSubquery into a JoinTableSource
+            // and optional preloaded rows (for subqueries).
+            let resolve_source =
+                |source: &TableOrSubquery,
+                 schema: &[TableSchema]|
+                 -> Result<(JoinTableSource, Option<Vec<Vec<SqliteValue>>>)> {
+                    match source {
+                        TableOrSubquery::Table { name, alias, .. } => {
+                            let tbl = schema
+                                .iter()
+                                .find(|t| t.name.eq_ignore_ascii_case(&name.name))
+                                .ok_or_else(|| {
+                                    FrankenError::Internal(format!(
+                                        "table not found: {}",
+                                        name.name
+                                    ))
+                                })?;
+                            let col_names: Vec<String> =
+                                tbl.columns.iter().map(|c| c.name.clone()).collect();
+                            Ok((
+                                JoinTableSource {
+                                    table_name: name.name.clone(),
+                                    alias: alias.clone(),
+                                    col_names,
+                                },
+                                None,
+                            ))
+                        }
+                        TableOrSubquery::Subquery { query, alias } => {
+                            let col_names = infer_select_column_names(query);
+                            let label = alias.clone().unwrap_or_else(|| "_subquery".to_owned());
+                            Ok((
+                                JoinTableSource {
+                                    table_name: label,
+                                    alias: alias.clone(),
+                                    col_names,
+                                },
+                                // Rows will be loaded after dropping schema borrow.
+                                Some(Vec::new()),
+                            ))
+                        }
+                        _ => Err(FrankenError::NotImplemented(
+                            "only named tables and subqueries are supported in JOIN".to_owned(),
+                        )),
+                    }
+                };
+
+            // Primary table.
+            let (src, pre) = resolve_source(&from.source, &schema)?;
+            table_sources.push(src);
+            preloaded.push(pre);
+
+            // Joined tables.
+            for join in &from.joins {
+                let (src, pre) = resolve_source(&join.table, &schema)?;
+                table_sources.push(src);
+                preloaded.push(pre);
+            }
         }
-        drop(schema);
+
+        // Execute subqueries now that the schema borrow is dropped.
+        // Collect all subquery sources (from.source + from.joins[*].table).
+        let all_sources: Vec<&TableOrSubquery> = std::iter::once(&from.source)
+            .chain(from.joins.iter().map(|j| &j.table))
+            .collect();
+        for (i, pre) in preloaded.iter_mut().enumerate() {
+            if pre.is_some() {
+                if let TableOrSubquery::Subquery { query, .. } = all_sources[i] {
+                    let rows =
+                        self.execute_statement(Statement::Select(query.as_ref().clone()), None)?;
+                    *pre = Some(rows.iter().map(|r| r.values().to_vec()).collect());
+                }
+            }
+        }
 
         // ── 2. Build the combined column map ──
         // col_map entries: (table_label, col_name, combined_index)
@@ -2649,10 +2696,16 @@ impl Connection {
 
         // ── 3. Load each table's raw rows ──
         let mut table_rows: Vec<Vec<Vec<SqliteValue>>> = Vec::with_capacity(table_sources.len());
-        for src in &table_sources {
-            let scan_sql = format!("SELECT * FROM {}", src.table_name);
-            let rows = self.query(&scan_sql)?;
-            table_rows.push(rows.iter().map(|r| r.values().to_vec()).collect());
+        for (i, src) in table_sources.iter().enumerate() {
+            if let Some(rows) = preloaded[i].take() {
+                // Subquery: use preloaded rows.
+                table_rows.push(rows);
+            } else {
+                // Named table: scan from database.
+                let scan_sql = format!("SELECT * FROM {}", src.table_name);
+                let rows = self.query(&scan_sql)?;
+                table_rows.push(rows.iter().map(|r| r.values().to_vec()).collect());
+            }
         }
 
         // ── 4. Perform joins ──
@@ -2939,6 +2992,25 @@ fn has_joins(select: &SelectStatement) -> bool {
         &select.body.select,
         SelectCore::Select { from: Some(from), .. } if !from.joins.is_empty()
     )
+}
+
+/// Check if the FROM source contains a subquery (derived table) that
+/// requires the fallback JOIN path instead of the VDBE codegen path.
+fn has_subquery_source(select: &SelectStatement) -> bool {
+    if let SelectCore::Select {
+        from: Some(from), ..
+    } = &select.body.select
+    {
+        if matches!(from.source, TableOrSubquery::Subquery { .. }) {
+            return true;
+        }
+        for join in &from.joins {
+            if matches!(join.table, TableOrSubquery::Subquery { .. }) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Infer column names from a SELECT statement's result columns.
@@ -5054,16 +5126,6 @@ struct JoinTableSource {
     table_name: String,
     alias: Option<String>,
     col_names: Vec<String>,
-}
-
-/// Extract the table name and optional alias from a `TableOrSubquery`.
-fn resolve_table_name(source: &TableOrSubquery) -> Result<(String, Option<String>)> {
-    match source {
-        TableOrSubquery::Table { name, alias, .. } => Ok((name.name.clone(), alias.clone())),
-        _ => Err(FrankenError::NotImplemented(
-            "only named tables are supported in JOIN".to_owned(),
-        )),
-    }
 }
 
 /// Perform a single join step: combine left-side rows with right-side rows.
@@ -10424,5 +10486,75 @@ mod transaction_lifecycle_tests {
             .unwrap();
         let rows = conn.query("SELECT id FROM t ORDER BY id").unwrap();
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_subquery_in_from() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'alice')").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'bob')").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 'carol')").unwrap();
+        let rows = conn
+            .query("SELECT s.name FROM (SELECT id, name FROM t WHERE id > 1) AS s ORDER BY s.name")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Text("bob".into()));
+        assert_eq!(rows[1].get(0).unwrap(), &SqliteValue::Text("carol".into()));
+    }
+
+    #[test]
+    fn test_join_with_subquery() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, amount INTEGER)",
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO customers VALUES (1, 'alice')")
+            .unwrap();
+        conn.execute("INSERT INTO customers VALUES (2, 'bob')")
+            .unwrap();
+        conn.execute("INSERT INTO orders VALUES (1, 1, 100)")
+            .unwrap();
+        conn.execute("INSERT INTO orders VALUES (2, 1, 200)")
+            .unwrap();
+        conn.execute("INSERT INTO orders VALUES (3, 2, 50)")
+            .unwrap();
+        // Join a named table with a subquery
+        let rows = conn
+            .query(
+                "SELECT c.name, o.total FROM customers AS c \
+                 JOIN (SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id) AS o \
+                 ON c.id = o.customer_id ORDER BY c.name",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Text("alice".into()));
+        assert_eq!(rows[0].get(1).unwrap(), &SqliteValue::Integer(300));
+        assert_eq!(rows[1].get(0).unwrap(), &SqliteValue::Text("bob".into()));
+        assert_eq!(rows[1].get(1).unwrap(), &SqliteValue::Integer(50));
+    }
+
+    #[test]
+    fn test_subquery_as_primary_table() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+        conn.execute("INSERT INTO t VALUES (10)").unwrap();
+        conn.execute("INSERT INTO t VALUES (20)").unwrap();
+        // Subquery as the primary (left) table in a JOIN
+        let rows = conn
+            .query(
+                "SELECT a.x, t.x FROM (SELECT x FROM t WHERE x = 10) AS a \
+                 CROSS JOIN t ORDER BY t.x",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(10));
+        assert_eq!(rows[0].get(1).unwrap(), &SqliteValue::Integer(10));
+        assert_eq!(rows[1].get(0).unwrap(), &SqliteValue::Integer(10));
+        assert_eq!(rows[1].get(1).unwrap(), &SqliteValue::Integer(20));
     }
 }
