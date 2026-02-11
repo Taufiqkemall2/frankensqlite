@@ -3582,9 +3582,7 @@ mod tests {
         conn.execute("UPDATE t_alias_upd AS tt SET b = 'updated' WHERE tt.a > 1;")
             .unwrap();
 
-        let rows = conn
-            .query("SELECT b FROM t_alias_upd ORDER BY a;")
-            .unwrap();
+        let rows = conn.query("SELECT b FROM t_alias_upd ORDER BY a;").unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(
             row_values(&rows[0]),
@@ -3603,7 +3601,8 @@ mod tests {
     #[test]
     fn test_delete_where_qualified_table_alias_expression() {
         let conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE t_alias_del (a INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t_alias_del (a INTEGER);")
+            .unwrap();
         conn.execute("INSERT INTO t_alias_del VALUES (1);").unwrap();
         conn.execute("INSERT INTO t_alias_del VALUES (2);").unwrap();
         conn.execute("INSERT INTO t_alias_del VALUES (3);").unwrap();
