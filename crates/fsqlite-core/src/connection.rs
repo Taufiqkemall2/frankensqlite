@@ -2024,13 +2024,13 @@ impl Connection {
             .map(|c| (effective_label.to_owned(), c.name.clone()))
             .collect();
 
-        // Resolve the INTEGER PRIMARY KEY column index so that rowid/_rowid_/oid
-        // aliases can be resolved by the expression evaluator.
-        let rowid_col_idx = self
+        // Resolve the INTEGER PRIMARY KEY column name so that rowid/_rowid_/oid
+        // aliases in GROUP BY and result columns can be rewritten to the real name.
+        let rowid_real_col: Option<String> = self
             .rowid_alias_columns
             .borrow()
             .get(&table_name.to_ascii_lowercase())
-            .copied();
+            .map(|&idx| table_schema.columns[idx].name.clone());
 
         // Check if any result column is Star/TableStar — if so, we relax the
         // "must appear in GROUP BY" validation (SQLite allows this).
@@ -2071,7 +2071,7 @@ impl Connection {
             .collect();
 
         // Parse result columns into GroupByColumn descriptors.
-        let result_descriptors: Vec<GroupByColumn> = expanded_columns
+        let mut result_descriptors: Vec<GroupByColumn> = expanded_columns
             .iter()
             .map(|col| match col {
                 ResultColumn::Expr {
@@ -2104,7 +2104,18 @@ impl Connection {
                                     "non-column argument to aggregate {func}() is not supported in this GROUP BY connection path"
                                 ))
                             })?;
-                            Some(table_schema.column_index(col_name).ok_or_else(|| {
+                            // Resolve rowid aliases to the real column index.
+                            let idx = table_schema.column_index(col_name).or_else(|| {
+                                if is_rowid_alias(col_name) {
+                                    self.rowid_alias_columns
+                                        .borrow()
+                                        .get(&table_name.to_ascii_lowercase())
+                                        .copied()
+                                } else {
+                                    None
+                                }
+                            });
+                            Some(idx.ok_or_else(|| {
                                 FrankenError::Internal(format!(
                                     "aggregate column not found: {col_name}"
                                 ))
@@ -2147,6 +2158,21 @@ impl Connection {
             .collect();
 
         drop(schema);
+
+        // Rewrite rowid/_rowid_/oid aliases in GROUP BY and result column
+        // expressions so that the expression evaluator can resolve them
+        // against the col_map (which only contains declared column names).
+        let mut group_by_exprs = group_by_exprs.clone();
+        if let Some(real_col) = &rowid_real_col {
+            for expr in &mut group_by_exprs {
+                rewrite_rowid_aliases_in_expr(expr, real_col);
+            }
+            for desc in &mut result_descriptors {
+                if let GroupByColumn::Plain(expr) = desc {
+                    rewrite_rowid_aliases_in_expr(expr, real_col);
+                }
+            }
+        }
 
         // Compile and execute a raw SELECT * scan (no aggregates, no GROUP BY).
         let raw_select = build_raw_scan_select(select);
@@ -5194,6 +5220,78 @@ fn find_col_in_map(
     }
 }
 
+/// Check whether a column name is an implicit rowid alias (`rowid`, `_rowid_`, `oid`).
+fn is_rowid_alias(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == "rowid" || lower == "_rowid_" || lower == "oid"
+}
+
+/// Rewrite rowid alias references in an expression tree so that `rowid`,
+/// `_rowid_`, and `oid` column references become the real column name of the
+/// `INTEGER PRIMARY KEY` column (the rowid alias).
+fn rewrite_rowid_aliases_in_expr(expr: &mut Expr, real_col: &str) {
+    match expr {
+        Expr::Column(col_ref, _) if is_rowid_alias(&col_ref.column) => {
+            real_col.clone_into(&mut col_ref.column);
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            rewrite_rowid_aliases_in_expr(left, real_col);
+            rewrite_rowid_aliases_in_expr(right, real_col);
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. } => {
+            rewrite_rowid_aliases_in_expr(inner, real_col);
+        }
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            rewrite_rowid_aliases_in_expr(inner, real_col);
+            rewrite_rowid_aliases_in_expr(low, real_col);
+            rewrite_rowid_aliases_in_expr(high, real_col);
+        }
+        Expr::In {
+            expr: inner, set, ..
+        } => {
+            rewrite_rowid_aliases_in_expr(inner, real_col);
+            if let InSet::List(exprs) = set {
+                for e in exprs {
+                    rewrite_rowid_aliases_in_expr(e, real_col);
+                }
+            }
+        }
+        Expr::FunctionCall {
+            args: FunctionArgs::List(exprs),
+            ..
+        } => {
+            for e in exprs {
+                rewrite_rowid_aliases_in_expr(e, real_col);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(op) = operand {
+                rewrite_rowid_aliases_in_expr(op, real_col);
+            }
+            for (when_e, then_e) in whens {
+                rewrite_rowid_aliases_in_expr(when_e, real_col);
+                rewrite_rowid_aliases_in_expr(then_e, real_col);
+            }
+            if let Some(el) = else_expr {
+                rewrite_rowid_aliases_in_expr(el, real_col);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Convert an AST literal to a `SqliteValue` (for JOIN expression evaluation).
 fn literal_to_join_value(lit: &Literal) -> SqliteValue {
     match lit {
@@ -7175,6 +7273,66 @@ mod tests {
             row_values(&rows[1]),
             vec![SqliteValue::Integer(2), SqliteValue::Text("y".to_owned())]
         );
+    }
+
+    // ── GROUP BY + rowid alias resolution (bd-399s) ──────
+
+    #[test]
+    fn test_group_by_rowid_alias() {
+        // GROUP BY rowid must resolve to the INTEGER PRIMARY KEY column
+        // so that each row has a distinct group key.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, num REAL);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'alpha', 1.5);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'beta', 2.5);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 'gamma', 3.5);")
+            .unwrap();
+
+        // Each rowid is unique, so COUNT(*) should be 1 for every group.
+        let rows = conn
+            .query("SELECT rowid, COUNT(*) AS cnt FROM t GROUP BY rowid ORDER BY rowid;")
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Integer(1), SqliteValue::Integer(1)]
+        );
+        assert_eq!(
+            row_values(&rows[2]),
+            vec![SqliteValue::Integer(3), SqliteValue::Integer(1)]
+        );
+
+        // HAVING cnt > 1 should return nothing (no duplicate rowids).
+        let dups = conn
+            .query("SELECT rowid, COUNT(*) AS cnt FROM t GROUP BY rowid HAVING cnt > 1;")
+            .unwrap();
+        assert!(dups.is_empty(), "expected no duplicate rowids");
+    }
+
+    #[test]
+    fn test_group_by_rowid_alias_variants() {
+        // _rowid_ and oid should also resolve correctly.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t2 (pk INTEGER PRIMARY KEY, x TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t2 VALUES (10, 'a');").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (20, 'b');").unwrap();
+
+        let rows = conn
+            .query("SELECT _rowid_, COUNT(*) FROM t2 GROUP BY _rowid_ ORDER BY _rowid_;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(10));
+        assert_eq!(row_values(&rows[1])[0], SqliteValue::Integer(20));
+
+        let rows = conn
+            .query("SELECT oid, COUNT(*) FROM t2 GROUP BY oid ORDER BY oid;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(10));
     }
 
     // ── GROUP BY + JOIN tests (bd-29mz) ──────
