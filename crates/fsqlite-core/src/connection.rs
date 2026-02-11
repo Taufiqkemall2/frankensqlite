@@ -1135,19 +1135,6 @@ impl Connection {
 
         match &create.body {
             CreateTableBody::Columns { columns, .. } => {
-                let col_infos: Vec<ColumnInfo> = columns
-                    .iter()
-                    .map(|col| {
-                        let affinity = col
-                            .type_name
-                            .as_ref()
-                            .map_or('B', |tn| type_name_to_affinity_char(&tn.name));
-                        ColumnInfo {
-                            name: col.name.clone(),
-                            affinity,
-                        }
-                    })
-                    .collect();
                 // Detect INTEGER PRIMARY KEY column (rowid alias).
                 let rowid_col_idx = columns.iter().enumerate().find_map(|(i, col)| {
                     let is_integer = col
@@ -1160,6 +1147,21 @@ impl Connection {
                         .any(|c| matches!(c.kind, ColumnConstraintKind::PrimaryKey { .. }));
                     (is_integer && is_pk).then_some(i)
                 });
+                let col_infos: Vec<ColumnInfo> = columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, col)| {
+                        let affinity = col
+                            .type_name
+                            .as_ref()
+                            .map_or('B', |tn| type_name_to_affinity_char(&tn.name));
+                        ColumnInfo {
+                            name: col.name.clone(),
+                            affinity,
+                            is_ipk: rowid_col_idx.is_some_and(|idx| idx == i),
+                        }
+                    })
+                    .collect();
                 if let Some(idx) = rowid_col_idx {
                     self.rowid_alias_columns
                         .borrow_mut()
@@ -1194,6 +1196,7 @@ impl Connection {
                             .cloned()
                             .unwrap_or_else(|| format!("_c{i}")),
                         affinity: 'B',
+                        is_ipk: false,
                     })
                     .collect();
                 let root_page = self.db.borrow_mut().create_table(width);
@@ -1335,6 +1338,7 @@ impl Connection {
                 table.columns.push(ColumnInfo {
                     name: col_def.name.clone(),
                     affinity,
+                    is_ipk: false,
                 });
                 Ok(())
             }
@@ -1521,6 +1525,7 @@ impl Connection {
                     .map(|i| ColumnInfo {
                         name: format!("_c{i}"),
                         affinity: 'B',
+                        is_ipk: false,
                     })
                     .collect()
             } else {
@@ -1529,6 +1534,7 @@ impl Connection {
                     .map(|n| ColumnInfo {
                         name: n.clone(),
                         affinity: 'B',
+                        is_ipk: false,
                     })
                     .collect()
             };
@@ -1910,6 +1916,7 @@ impl Connection {
         let mut builder = ProgramBuilder::new();
         let ctx = CodegenContext {
             concurrent_mode: self.is_concurrent_transaction(),
+            rowid_alias_col_idx: None,
         };
         codegen_select(&mut builder, select, &schema, &ctx).map_err(codegen_error_to_franken)?;
         builder.finish()
@@ -2654,6 +2661,7 @@ impl Connection {
                 .map(|name| ColumnInfo {
                     name: name.clone(),
                     affinity: 'B', // BLOB affinity (no type coercion)
+                    is_ipk: false,
                 })
                 .collect();
             let num_columns = col_infos.len();
@@ -2901,7 +2909,13 @@ impl Connection {
 
         // ── 5. Apply WHERE filter ──
         if let Some(where_expr) = where_clause {
-            combined.retain(|row| eval_join_predicate(where_expr, row, &col_map).unwrap_or(false));
+            let mut filtered = Vec::with_capacity(combined.len());
+            for row in combined {
+                if eval_join_predicate(where_expr, &row, &col_map)? {
+                    filtered.push(row);
+                }
+            }
+            combined = filtered;
         }
 
         // ── 6. Project result columns ──
@@ -2954,8 +2968,14 @@ impl Connection {
     fn compile_table_insert(&self, insert: &fsqlite_ast::InsertStatement) -> Result<VdbeProgram> {
         let schema = self.schema.borrow();
         let mut builder = ProgramBuilder::new();
+        let rowid_alias_col_idx = self
+            .rowid_alias_columns
+            .borrow()
+            .get(&insert.table.name.to_ascii_lowercase())
+            .copied();
         let ctx = CodegenContext {
             concurrent_mode: self.is_concurrent_transaction(),
+            rowid_alias_col_idx,
         };
         codegen_insert(&mut builder, insert, &schema, &ctx).map_err(codegen_error_to_franken)?;
         builder.finish()
@@ -2967,6 +2987,7 @@ impl Connection {
         let mut builder = ProgramBuilder::new();
         let ctx = CodegenContext {
             concurrent_mode: self.is_concurrent_transaction(),
+            rowid_alias_col_idx: None,
         };
         codegen_update(&mut builder, update, &schema, &ctx).map_err(codegen_error_to_franken)?;
         builder.finish()
@@ -2978,6 +2999,7 @@ impl Connection {
         let mut builder = ProgramBuilder::new();
         let ctx = CodegenContext {
             concurrent_mode: self.is_concurrent_transaction(),
+            rowid_alias_col_idx: None,
         };
         codegen_delete(&mut builder, delete, &schema, &ctx).map_err(codegen_error_to_franken)?;
         builder.finish()
@@ -5318,7 +5340,7 @@ struct JoinTableSource {
 }
 
 /// Perform a single join step: combine left-side rows with right-side rows.
-#[allow(clippy::too_many_lines, clippy::unnecessary_wraps)]
+#[allow(clippy::too_many_lines)]
 fn execute_single_join(
     left: &[Vec<SqliteValue>],
     right: &[Vec<SqliteValue>],
@@ -5351,9 +5373,7 @@ fn execute_single_join(
             // Evaluate join constraint.
             let passes = match constraint {
                 None => true,
-                Some(JoinConstraint::On(expr)) => {
-                    eval_join_predicate(expr, &combined, col_map).unwrap_or(false)
-                }
+                Some(JoinConstraint::On(expr)) => eval_join_predicate(expr, &combined, col_map)?,
                 Some(JoinConstraint::Using(cols)) => {
                     eval_using_constraint(cols, &combined, col_map, left_width)
                 }
@@ -5417,6 +5437,11 @@ fn eval_using_constraint(
 
         match (left_val, right_val) {
             (Some(l), Some(r)) => {
+                // SQL join semantics: USING expands to equality checks,
+                // and `NULL = NULL` is not true.
+                if matches!(l, SqliteValue::Null) || matches!(r, SqliteValue::Null) {
+                    return false;
+                }
                 if cmp_sqlite_values(l, r) != std::cmp::Ordering::Equal {
                     return false;
                 }
@@ -5510,10 +5535,17 @@ fn eval_join_expr(
         } => {
             let val = eval_join_expr(inner, row, col_map)?;
             let found = match set {
-                InSet::List(exprs) => exprs.iter().any(|e| {
-                    eval_join_expr(e, row, col_map)
-                        .is_ok_and(|v| cmp_values(&val, &v) == std::cmp::Ordering::Equal)
-                }),
+                InSet::List(exprs) => {
+                    let mut found = false;
+                    for e in exprs {
+                        let set_val = eval_join_expr(e, row, col_map)?;
+                        if cmp_values(&val, &set_val) == std::cmp::Ordering::Equal {
+                            found = true;
+                            break;
+                        }
+                    }
+                    found
+                }
                 _ => {
                     return Err(FrankenError::NotImplemented(
                         "IN subquery in JOIN not supported".to_owned(),
@@ -10405,6 +10437,57 @@ mod tests {
     }
 
     #[test]
+    fn test_join_on_unknown_column_errors() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (b INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (1);").unwrap();
+
+        let err = conn
+            .query("SELECT * FROM t1 INNER JOIN t2 ON t1.missing = t2.b;")
+            .expect_err("unknown ON column should error");
+        assert!(
+            err.to_string().contains("column not found"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_join_where_unknown_column_errors() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (b INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (1);").unwrap();
+
+        let err = conn
+            .query("SELECT * FROM t1 INNER JOIN t2 ON t1.a = t2.b WHERE t2.missing = 1;")
+            .expect_err("unknown WHERE column in JOIN context should error");
+        assert!(
+            err.to_string().contains("column not found"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_join_where_in_list_unknown_column_errors() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (b INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (1);").unwrap();
+
+        let err = conn
+            .query("SELECT * FROM t1 INNER JOIN t2 ON t1.a = t2.b WHERE t1.a IN (t2.missing);")
+            .expect_err("unknown column in JOIN IN-list should error");
+        assert!(
+            err.to_string().contains("column not found"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn test_implicit_join_comma() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
@@ -10566,6 +10649,37 @@ mod tests {
             row_values(&rows[1]),
             vec![SqliteValue::Null, SqliteValue::Text("b".to_owned())]
         );
+    }
+
+    #[test]
+    fn test_right_join_using_nulls_do_not_match() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE l (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE r (id INTEGER, tag TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO l VALUES (NULL, 'left-null');")
+            .unwrap();
+        conn.execute("INSERT INTO l VALUES (1, 'left-one');")
+            .unwrap();
+        conn.execute("INSERT INTO r VALUES (NULL, 'right-null');")
+            .unwrap();
+        conn.execute("INSERT INTO r VALUES (1, 'right-one');")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT l.name, r.tag FROM l RIGHT JOIN r USING (id);")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let vals: Vec<Vec<SqliteValue>> = rows.iter().map(row_values).collect();
+        assert!(vals.contains(&vec![
+            SqliteValue::Text("left-one".to_owned()),
+            SqliteValue::Text("right-one".to_owned())
+        ]));
+        assert!(vals.contains(&vec![
+            SqliteValue::Null,
+            SqliteValue::Text("right-null".to_owned())
+        ]));
     }
 
     #[test]
@@ -11259,14 +11373,8 @@ mod transaction_lifecycle_tests {
             .query("SELECT grp, GROUP_CONCAT(val, ' | ') FROM t GROUP BY grp ORDER BY grp")
             .unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(
-            rows[0].get(1).unwrap(),
-            &SqliteValue::Text("a | b".into())
-        );
-        assert_eq!(
-            rows[1].get(1).unwrap(),
-            &SqliteValue::Text("c".into())
-        );
+        assert_eq!(rows[0].get(1).unwrap(), &SqliteValue::Text("a | b".into()));
+        assert_eq!(rows[1].get(1).unwrap(), &SqliteValue::Text("c".into()));
     }
 
     #[test]
@@ -11281,10 +11389,7 @@ mod transaction_lifecycle_tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         // Default separator is comma
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &SqliteValue::Text("a,b".into())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Text("a,b".into()));
     }
 
     #[test]
@@ -11294,8 +11399,10 @@ mod transaction_lifecycle_tests {
             .unwrap();
         conn.execute("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT)")
             .unwrap();
-        conn.execute("INSERT INTO customers VALUES (1, 'Alice')").unwrap();
-        conn.execute("INSERT INTO customers VALUES (2, 'Bob')").unwrap();
+        conn.execute("INSERT INTO customers VALUES (1, 'Alice')")
+            .unwrap();
+        conn.execute("INSERT INTO customers VALUES (2, 'Bob')")
+            .unwrap();
         conn.execute("INSERT INTO orders VALUES (1, 1)").unwrap();
         conn.execute("INSERT INTO orders VALUES (2, 1)").unwrap();
         conn.execute("INSERT INTO orders VALUES (3, 2)").unwrap();

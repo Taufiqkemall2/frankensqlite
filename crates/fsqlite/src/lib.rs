@@ -2235,6 +2235,7 @@ mod tests {
         conn.execute("INSERT INTO t DEFAULT VALUES;").unwrap();
         let rows = conn.query("SELECT id, name, val FROM t;").unwrap();
         assert_eq!(rows.len(), 1, "DEFAULT VALUES should insert 1 row");
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
         // name and val should be NULL (defaults)
         assert_eq!(row_values(&rows[0])[1], SqliteValue::Null);
         assert_eq!(row_values(&rows[0])[2], SqliteValue::Null);

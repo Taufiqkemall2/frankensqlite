@@ -24,6 +24,10 @@ pub struct ColumnInfo {
     /// Type affinity character: 'd' (integer), 'e' (real), 'B' (blob),
     /// 'C' (text), 'A' (numeric). Lowercase = exact, uppercase = heuristic.
     pub affinity: char,
+    /// True if this column is the INTEGER PRIMARY KEY (rowid alias).
+    /// Column reads for IPK columns must emit `Rowid` instead of `Column`
+    /// because the value is stored as the B-tree key, not in the data record.
+    pub is_ipk: bool,
 }
 
 /// Index metadata needed for codegen (index-scan SELECT).
@@ -83,6 +87,10 @@ pub struct CodegenContext {
     /// Whether we're in `BEGIN CONCURRENT` mode.
     /// When true, `OP_NewRowid` uses the snapshot-independent allocator.
     pub concurrent_mode: bool,
+    /// Optional column index for an `INTEGER PRIMARY KEY` rowid alias on the
+    /// target table. Used by INSERT DEFAULT VALUES to keep the aliased column
+    /// in sync with the generated rowid.
+    pub rowid_alias_col_idx: Option<usize>,
 }
 
 /// Errors during code generation.
@@ -1954,6 +1962,11 @@ pub fn codegen_insert(
                 P4::None,
                 0,
             );
+            if let Some(ipk_idx) = ctx.rowid_alias_col_idx {
+                #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+                let ipk_reg = col_regs + ipk_idx as i32;
+                b.emit_op(Opcode::Copy, rowid_reg, ipk_reg, 0, P4::None, 0);
+            }
             let rec_reg = b.alloc_reg();
             b.emit_op(
                 Opcode::MakeRecord,
@@ -2532,8 +2545,12 @@ fn emit_column_reads(
     for col in columns {
         match col {
             ResultColumn::Star => {
-                for i in 0..table.columns.len() {
-                    b.emit_op(Opcode::Column, cursor, i as i32, reg, P4::None, 0);
+                for (i, ci) in table.columns.iter().enumerate() {
+                    if ci.is_ipk {
+                        b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
+                    } else {
+                        b.emit_op(Opcode::Column, cursor, i as i32, reg, P4::None, 0);
+                    }
                     reg += 1;
                 }
             }
@@ -2541,8 +2558,12 @@ fn emit_column_reads(
                 if !matches_table_or_alias(qualifier, table, table_alias) {
                     return Err(CodegenError::TableNotFound(qualifier.clone()));
                 }
-                for i in 0..table.columns.len() {
-                    b.emit_op(Opcode::Column, cursor, i as i32, reg, P4::None, 0);
+                for (i, ci) in table.columns.iter().enumerate() {
+                    if ci.is_ipk {
+                        b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
+                    } else {
+                        b.emit_op(Opcode::Column, cursor, i as i32, reg, P4::None, 0);
+                    }
                     reg += 1;
                 }
             }
@@ -2562,7 +2583,11 @@ fn emit_column_reads(
                                 column: col_ref.column.clone(),
                             }
                         })?;
-                        b.emit_op(Opcode::Column, cursor, col_idx as i32, reg, P4::None, 0);
+                        if table.columns[col_idx].is_ipk {
+                            b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
+                        } else {
+                            b.emit_op(Opcode::Column, cursor, col_idx as i32, reg, P4::None, 0);
+                        }
                     }
                 } else {
                     // Evaluate non-column expressions (literals, arithmetic, CASE, CAST, etc.)
@@ -4846,6 +4871,7 @@ mod tests {
         let schema = test_schema();
         let ctx = CodegenContext {
             concurrent_mode: true,
+            ..CodegenContext::default()
         };
         let mut b = ProgramBuilder::new();
         codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
@@ -4890,6 +4916,7 @@ mod tests {
         let schema = test_schema();
         let ctx = CodegenContext {
             concurrent_mode: true,
+            ..CodegenContext::default()
         };
         let mut b = ProgramBuilder::new();
         codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
