@@ -2851,7 +2851,14 @@ fn emit_index_deletes(b: &mut ProgramBuilder, table: &TableSchema, table_cursor:
                 if table.columns.get(col_idx).is_some_and(|c| c.is_ipk) {
                     b.emit_op(Opcode::Rowid, table_cursor, dst_reg, 0, P4::None, 0);
                 } else {
-                    b.emit_op(Opcode::Column, table_cursor, col_idx as i32, dst_reg, P4::None, 0);
+                    b.emit_op(
+                        Opcode::Column,
+                        table_cursor,
+                        col_idx as i32,
+                        dst_reg,
+                        P4::None,
+                        0,
+                    );
                 }
             }
         }
@@ -3287,7 +3294,9 @@ fn emit_where_filter(
                     }
                 }
                 emit_expr(b, right, val_reg, None);
-                b.emit_jump_to_label(Opcode::Ne, val_reg, col_reg, skip_label, P4::None, 0);
+                // Use NULLEQ flag (0x80) so NULL != value returns true, skipping NULL rows.
+                // In SQL, NULL = 'alice' is unknown, which evaluates to false for WHERE.
+                b.emit_jump_to_label(Opcode::Ne, val_reg, col_reg, skip_label, P4::None, 0x80);
                 b.free_temp(val_reg);
                 b.free_temp(col_reg);
             } else if let Some(resolved) = resolve_column_ref(right, table, table_alias) {
@@ -3311,7 +3320,8 @@ fn emit_where_filter(
                     }
                 }
                 emit_expr(b, left, val_reg, None);
-                b.emit_jump_to_label(Opcode::Ne, val_reg, col_reg, skip_label, P4::None, 0);
+                // Use NULLEQ flag (0x80) so NULL != value returns true, skipping NULL rows.
+                b.emit_jump_to_label(Opcode::Ne, val_reg, col_reg, skip_label, P4::None, 0x80);
                 b.free_temp(val_reg);
                 b.free_temp(col_reg);
             }

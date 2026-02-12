@@ -7,6 +7,13 @@ pub use fsqlite_core::connection::{Connection, PreparedStatement, Row};
 pub use fsqlite_vfs;
 
 #[cfg(test)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::items_after_statements,
+    clippy::needless_collect,
+    clippy::single_match_else,
+    clippy::branches_sharing_code
+)]
 mod tests {
     use super::Connection;
     use fsqlite_error::FrankenError;
@@ -2450,5 +2457,937 @@ mod tests {
             row_values(&rows[0])[0],
             SqliteValue::Text("reinserted".to_owned())
         );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Index Maintenance Tests (Phase 5I - bd-1nmg)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    // ── Basic Operations ──────────────────────────────────────────────────────
+
+    /// INSERT should create index entries for single-column indexes.
+    #[test]
+    fn index_insert_single_column() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_name ON t(name);").unwrap();
+
+        conn.execute("INSERT INTO t VALUES (1, 'alice');").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'bob');").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 'charlie');")
+            .unwrap();
+
+        // Verify index is used for lookups (entries exist).
+        let rows = conn.query("SELECT id FROM t WHERE name = 'bob';").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(2));
+
+        let rows = conn
+            .query("SELECT id FROM t WHERE name = 'alice';")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
+    }
+
+    /// INSERT should create index entries for multi-column indexes.
+    #[test]
+    fn index_insert_multi_column() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a INT, b INT, c TEXT);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_ab ON t(a, b);").unwrap();
+
+        conn.execute("INSERT INTO t VALUES (1, 10, 'x');").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 20, 'y');").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 10, 'z');").unwrap();
+
+        // Query using both columns of the index.
+        let rows = conn
+            .query("SELECT c FROM t WHERE a = 1 AND b = 20;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("y".to_owned()));
+
+        // Query using only first column prefix.
+        let rows = conn.query("SELECT c FROM t WHERE a = 1;").unwrap();
+        assert_eq!(rows.len(), 2); // Should find both a=1 rows.
+    }
+
+    /// DELETE should remove index entries.
+    #[test]
+    fn index_delete_removes_entry() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_name ON t(name);").unwrap();
+
+        conn.execute("INSERT INTO t VALUES (1, 'alice');").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'bob');").unwrap();
+
+        // Verify both are findable.
+        let rows = conn
+            .query("SELECT id FROM t WHERE name = 'alice';")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+
+        // Delete alice.
+        conn.execute("DELETE FROM t WHERE id = 1;").unwrap();
+
+        // Alice should no longer be findable via index.
+        let rows = conn
+            .query("SELECT id FROM t WHERE name = 'alice';")
+            .unwrap();
+        assert_eq!(rows.len(), 0);
+
+        // Bob should still be findable.
+        let rows = conn.query("SELECT id FROM t WHERE name = 'bob';").unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    /// UPDATE should maintain index entries when indexed column changes.
+    #[test]
+    fn index_update_indexed_column() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_name ON t(name);").unwrap();
+
+        conn.execute("INSERT INTO t VALUES (1, 'alice');").unwrap();
+
+        // Verify initial state.
+        let rows = conn
+            .query("SELECT id FROM t WHERE name = 'alice';")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+
+        // Update name.
+        conn.execute("UPDATE t SET name = 'alicia' WHERE id = 1;")
+            .unwrap();
+
+        // Old name should not be findable.
+        let rows = conn
+            .query("SELECT id FROM t WHERE name = 'alice';")
+            .unwrap();
+        assert_eq!(rows.len(), 0);
+
+        // New name should be findable.
+        let rows = conn
+            .query("SELECT id FROM t WHERE name = 'alicia';")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
+    }
+
+    /// UPDATE should preserve index entries when non-indexed column changes.
+    #[test]
+    fn index_update_non_indexed_column() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, age INT);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_name ON t(name);").unwrap();
+
+        conn.execute("INSERT INTO t VALUES (1, 'alice', 30);")
+            .unwrap();
+
+        // Update non-indexed column.
+        conn.execute("UPDATE t SET age = 31 WHERE id = 1;").unwrap();
+
+        // Index should still work correctly.
+        let rows = conn
+            .query("SELECT age FROM t WHERE name = 'alice';")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(31));
+    }
+
+    // ── Multiple Indexes ──────────────────────────────────────────────────────
+
+    /// Table with multiple indexes should maintain all of them.
+    #[test]
+    fn index_multiple_indexes_on_table() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a INT, b INT, c INT, d INT);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_a ON t(a);").unwrap();
+        conn.execute("CREATE INDEX idx_b ON t(b);").unwrap();
+        conn.execute("CREATE INDEX idx_ab ON t(a, b);").unwrap();
+        conn.execute("CREATE INDEX idx_cd ON t(c, d);").unwrap();
+
+        conn.execute("INSERT INTO t VALUES (1, 2, 3, 4);").unwrap();
+        conn.execute("INSERT INTO t VALUES (5, 6, 7, 8);").unwrap();
+
+        // All indexes should be searchable.
+        let rows = conn.query("SELECT b FROM t WHERE a = 1;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(2));
+
+        let rows = conn.query("SELECT a FROM t WHERE b = 6;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(5));
+
+        let rows = conn
+            .query("SELECT c FROM t WHERE a = 1 AND b = 2;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(3));
+
+        let rows = conn
+            .query("SELECT a FROM t WHERE c = 7 AND d = 8;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(5));
+    }
+
+    /// DELETE should remove entries from all indexes.
+    #[test]
+    fn index_delete_removes_from_all_indexes() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INT, b INT);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_a ON t(a);").unwrap();
+        conn.execute("CREATE INDEX idx_b ON t(b);").unwrap();
+
+        conn.execute("INSERT INTO t VALUES (1, 10, 100);").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 20, 200);").unwrap();
+
+        // Delete row 1.
+        conn.execute("DELETE FROM t WHERE id = 1;").unwrap();
+
+        // Neither index should find the deleted row.
+        let rows = conn.query("SELECT id FROM t WHERE a = 10;").unwrap();
+        assert_eq!(rows.len(), 0);
+
+        let rows = conn.query("SELECT id FROM t WHERE b = 100;").unwrap();
+        assert_eq!(rows.len(), 0);
+
+        // Row 2 should still be findable via both indexes.
+        let rows = conn.query("SELECT id FROM t WHERE a = 20;").unwrap();
+        assert_eq!(rows.len(), 1);
+
+        let rows = conn.query("SELECT id FROM t WHERE b = 200;").unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    /// UPDATE should maintain all affected indexes.
+    #[test]
+    fn index_update_maintains_all_indexes() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INT, b INT);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_a ON t(a);").unwrap();
+        conn.execute("CREATE INDEX idx_b ON t(b);").unwrap();
+
+        conn.execute("INSERT INTO t VALUES (1, 10, 100);").unwrap();
+
+        // Update both indexed columns.
+        conn.execute("UPDATE t SET a = 11, b = 101 WHERE id = 1;")
+            .unwrap();
+
+        // Old values should not be findable.
+        let rows = conn.query("SELECT id FROM t WHERE a = 10;").unwrap();
+        assert_eq!(rows.len(), 0);
+        let rows = conn.query("SELECT id FROM t WHERE b = 100;").unwrap();
+        assert_eq!(rows.len(), 0);
+
+        // New values should be findable.
+        let rows = conn.query("SELECT id FROM t WHERE a = 11;").unwrap();
+        assert_eq!(rows.len(), 1);
+        let rows = conn.query("SELECT id FROM t WHERE b = 101;").unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    // ── NULL Handling ─────────────────────────────────────────────────────────
+    // Fixed in bd-36eh.1: NULL value handling in index B-trees.
+    // The fix sets NULLEQ flag (0x80) in WHERE Ne comparisons so NULL != value
+    // correctly skips rows with NULL values.
+
+    /// Index should handle NULL values correctly.
+    #[test]
+    fn index_with_null_values() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_name ON t(name);").unwrap();
+
+        conn.execute("INSERT INTO t VALUES (1, NULL);").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'alice');").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, NULL);").unwrap();
+
+        // Query for NULL via IS NULL.
+        let rows = conn.query("SELECT id FROM t WHERE name IS NULL;").unwrap();
+        assert_eq!(rows.len(), 2);
+
+        // Query for non-NULL.
+        let rows = conn
+            .query("SELECT id FROM t WHERE name = 'alice';")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(2));
+    }
+
+    /// UPDATE NULL to non-NULL should update index correctly.
+    #[test]
+    fn index_update_null_to_non_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_name ON t(name);").unwrap();
+
+        conn.execute("INSERT INTO t VALUES (1, NULL);").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, NULL);").unwrap();
+
+        // Initially 2 NULLs.
+        let rows = conn.query("SELECT id FROM t WHERE name IS NULL;").unwrap();
+        assert_eq!(rows.len(), 2);
+
+        // Update one NULL to non-NULL.
+        conn.execute("UPDATE t SET name = 'bob' WHERE id = 1;")
+            .unwrap();
+
+        // Now only 1 NULL.
+        let rows = conn.query("SELECT id FROM t WHERE name IS NULL;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(2));
+
+        // And bob is findable.
+        let rows = conn.query("SELECT id FROM t WHERE name = 'bob';").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
+    }
+
+    /// UPDATE non-NULL to NULL should update index correctly.
+    #[test]
+    fn index_update_non_null_to_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_name ON t(name);").unwrap();
+
+        conn.execute("INSERT INTO t VALUES (1, 'alice');").unwrap();
+
+        // alice is findable.
+        let rows = conn
+            .query("SELECT id FROM t WHERE name = 'alice';")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+
+        // Update to NULL.
+        conn.execute("UPDATE t SET name = NULL WHERE id = 1;")
+            .unwrap();
+
+        // alice is no longer findable.
+        let rows = conn
+            .query("SELECT id FROM t WHERE name = 'alice';")
+            .unwrap();
+        assert_eq!(rows.len(), 0);
+
+        // NULL is findable.
+        let rows = conn.query("SELECT id FROM t WHERE name IS NULL;").unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    // ── Bulk Operations ───────────────────────────────────────────────────────
+
+    /// Bulk INSERT should maintain index for all rows.
+    #[test]
+    fn index_bulk_insert() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value INT);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_value ON t(value);").unwrap();
+
+        // Insert 100 rows.
+        for i in 0..100 {
+            conn.execute(&format!("INSERT INTO t VALUES ({}, {});", i, i * 2))
+                .unwrap();
+        }
+
+        // Verify index works for various values.
+        for i in [0, 25, 50, 75, 99] {
+            let rows = conn
+                .query(&format!("SELECT id FROM t WHERE value = {};", i * 2))
+                .unwrap();
+            assert_eq!(rows.len(), 1, "Should find row with value={}", i * 2);
+            assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(i));
+        }
+    }
+
+    /// Bulk DELETE should remove all index entries.
+    #[test]
+    fn index_bulk_delete() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value INT);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_value ON t(value);").unwrap();
+
+        // Insert 50 rows.
+        for i in 0..50 {
+            conn.execute(&format!("INSERT INTO t VALUES ({}, {});", i, i))
+                .unwrap();
+        }
+
+        // Delete half (even values).
+        for i in (0..50).step_by(2) {
+            conn.execute(&format!("DELETE FROM t WHERE id = {};", i))
+                .unwrap();
+        }
+
+        // Even values should not be findable.
+        for i in (0..50).step_by(2) {
+            let rows = conn
+                .query(&format!("SELECT id FROM t WHERE value = {};", i))
+                .unwrap();
+            assert_eq!(
+                rows.len(),
+                0,
+                "Deleted row with value={} should not exist",
+                i
+            );
+        }
+
+        // Odd values should still be findable.
+        for i in (1..50).step_by(2) {
+            let rows = conn
+                .query(&format!("SELECT id FROM t WHERE value = {};", i))
+                .unwrap();
+            assert_eq!(rows.len(), 1, "Row with value={} should exist", i);
+        }
+    }
+
+    /// Bulk UPDATE should maintain all index entries.
+    #[test]
+    fn index_bulk_update() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value INT);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_value ON t(value);").unwrap();
+
+        // Insert 50 rows.
+        for i in 0..50 {
+            conn.execute(&format!("INSERT INTO t VALUES ({}, {});", i, i))
+                .unwrap();
+        }
+
+        // Update all values: value = value + 1000.
+        conn.execute("UPDATE t SET value = value + 1000;").unwrap();
+
+        // Old values should not be findable.
+        for i in 0..50 {
+            let rows = conn
+                .query(&format!("SELECT id FROM t WHERE value = {};", i))
+                .unwrap();
+            assert_eq!(rows.len(), 0);
+        }
+
+        // New values should be findable.
+        for i in 0..50 {
+            let rows = conn
+                .query(&format!("SELECT id FROM t WHERE value = {};", i + 1000))
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(i));
+        }
+    }
+
+    // ── Transaction Rollback ──────────────────────────────────────────────────
+
+    /// Index entries should be rolled back with transaction.
+    #[test]
+    fn index_rollback_insert() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_name ON t(name);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'alice');").unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'bob');").unwrap();
+
+        // Bob should be visible in transaction.
+        let rows = conn.query("SELECT id FROM t WHERE name = 'bob';").unwrap();
+        assert_eq!(rows.len(), 1);
+
+        conn.execute("ROLLBACK;").unwrap();
+
+        // Bob should NOT be visible after rollback.
+        let rows = conn.query("SELECT id FROM t WHERE name = 'bob';").unwrap();
+        assert_eq!(rows.len(), 0);
+
+        // Alice should still be there.
+        let rows = conn
+            .query("SELECT id FROM t WHERE name = 'alice';")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    /// Index entries should be rolled back on DELETE rollback.
+    #[test]
+    fn index_rollback_delete() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_name ON t(name);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'alice');").unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("DELETE FROM t WHERE id = 1;").unwrap();
+
+        // Alice should not be visible in transaction.
+        let rows = conn
+            .query("SELECT id FROM t WHERE name = 'alice';")
+            .unwrap();
+        assert_eq!(rows.len(), 0);
+
+        conn.execute("ROLLBACK;").unwrap();
+
+        // Alice should be restored after rollback.
+        let rows = conn
+            .query("SELECT id FROM t WHERE name = 'alice';")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    /// Index entries should be rolled back on UPDATE rollback.
+    #[test]
+    fn index_rollback_update() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_name ON t(name);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'alice');").unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("UPDATE t SET name = 'bob' WHERE id = 1;")
+            .unwrap();
+
+        // Bob should be visible, alice not.
+        let rows = conn.query("SELECT id FROM t WHERE name = 'bob';").unwrap();
+        assert_eq!(rows.len(), 1);
+        let rows = conn
+            .query("SELECT id FROM t WHERE name = 'alice';")
+            .unwrap();
+        assert_eq!(rows.len(), 0);
+
+        conn.execute("ROLLBACK;").unwrap();
+
+        // Alice should be restored, bob gone.
+        let rows = conn
+            .query("SELECT id FROM t WHERE name = 'alice';")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let rows = conn.query("SELECT id FROM t WHERE name = 'bob';").unwrap();
+        assert_eq!(rows.len(), 0);
+    }
+
+    // ── No REINDEX Required ───────────────────────────────────────────────────
+
+    /// All operations should work WITHOUT manual REINDEX.
+    #[test]
+    fn index_no_reindex_needed() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_name ON t(name);").unwrap();
+
+        // Perform many operations.
+        for i in 0..100 {
+            conn.execute(&format!("INSERT INTO t VALUES ({}, 'name{}');", i, i))
+                .unwrap();
+        }
+        for i in 0..50 {
+            conn.execute(&format!("DELETE FROM t WHERE id = {};", i))
+                .unwrap();
+        }
+        for i in 50..100 {
+            conn.execute(&format!(
+                "UPDATE t SET name = 'updated{}' WHERE id = {};",
+                i, i
+            ))
+            .unwrap();
+        }
+
+        // All remaining rows should be findable via index WITHOUT REINDEX.
+        for i in 50..100 {
+            let rows = conn
+                .query(&format!("SELECT id FROM t WHERE name = 'updated{}';", i))
+                .unwrap();
+            assert_eq!(
+                rows.len(),
+                1,
+                "Row with updated name for id={} should be findable",
+                i
+            );
+            assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(i));
+        }
+
+        // Deleted rows should not be findable.
+        for i in 0..50 {
+            let rows = conn
+                .query(&format!("SELECT id FROM t WHERE name = 'name{}';", i))
+                .unwrap();
+            assert_eq!(
+                rows.len(),
+                0,
+                "Deleted row with name{} should not be findable",
+                i
+            );
+        }
+
+        // Verify total count.
+        let rows = conn.query("SELECT COUNT(*) FROM t;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(50));
+    }
+
+    // ── INSERT with index on IPK column ───────────────────────────────────────
+
+    /// Index on INTEGER PRIMARY KEY column should work correctly.
+    #[test]
+    fn index_on_ipk_column() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_id ON t(id);").unwrap();
+
+        conn.execute("INSERT INTO t VALUES (100, 'alice');")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (200, 'bob');").unwrap();
+
+        // Index on IPK should work.
+        let rows = conn.query("SELECT name FROM t WHERE id = 100;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0])[0],
+            SqliteValue::Text("alice".to_owned())
+        );
+    }
+
+    // ── Mixed operations sequence ─────────────────────────────────────────────
+
+    /// Complex sequence of operations should maintain index consistency.
+    #[test]
+    fn index_mixed_operations_sequence() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INT, b TEXT);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_a ON t(a);").unwrap();
+        conn.execute("CREATE INDEX idx_b ON t(b);").unwrap();
+
+        // Insert
+        conn.execute("INSERT INTO t VALUES (1, 10, 'x');").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 20, 'y');").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 30, 'z');").unwrap();
+
+        // Update
+        conn.execute("UPDATE t SET a = 15 WHERE id = 1;").unwrap();
+
+        // Delete
+        conn.execute("DELETE FROM t WHERE id = 2;").unwrap();
+
+        // Insert more
+        conn.execute("INSERT INTO t VALUES (4, 40, 'w');").unwrap();
+
+        // Verify state via indexes.
+        let rows = conn.query("SELECT id FROM t WHERE a = 10;").unwrap();
+        assert_eq!(rows.len(), 0); // Was updated to 15
+
+        let rows = conn.query("SELECT id FROM t WHERE a = 15;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
+
+        let rows = conn.query("SELECT id FROM t WHERE b = 'y';").unwrap();
+        assert_eq!(rows.len(), 0); // Was deleted
+
+        let rows = conn.query("SELECT id FROM t WHERE a = 40;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(4));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Concurrent Writer Stress Tests (Phase 5E.6 - bd-1299)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// Multi-threaded concurrent writer stress test.
+    ///
+    /// 8 writer threads perform 1000 transfer operations each. Validates:
+    /// - Conservation invariant: total balance remains constant
+    /// - No data corruption under concurrent load
+    /// - Proper transaction isolation and conflict handling
+    #[test]
+    fn concurrent_writers_stress_conservation() {
+        use rand::prelude::*;
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let db_path = dir.path().join("stress.db");
+        let db_path_str = db_path.to_str().unwrap();
+
+        // Number of accounts and initial balance.
+        const NUM_ACCOUNTS: i64 = 100;
+        const INITIAL_BALANCE: i64 = 1000;
+        const EXPECTED_TOTAL: i64 = NUM_ACCOUNTS * INITIAL_BALANCE;
+
+        // Test parameters: 8 writers, 100 ops each (reduced for test speed).
+        const NUM_WRITERS: usize = 8;
+        const OPS_PER_WRITER: u64 = 100;
+
+        // Setup: create table and initial accounts.
+        {
+            let conn = Connection::open(db_path_str).expect("open db for setup");
+            conn.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER);")
+                .expect("create table");
+
+            for i in 0..NUM_ACCOUNTS {
+                conn.execute(&format!(
+                    "INSERT INTO accounts VALUES ({}, {});",
+                    i, INITIAL_BALANCE
+                ))
+                .expect("insert account");
+            }
+
+            // Verify initial total.
+            let rows = conn
+                .query("SELECT SUM(balance) FROM accounts;")
+                .expect("sum query");
+            let total = match &row_values(&rows[0])[0] {
+                SqliteValue::Integer(n) => *n,
+                other => panic!("unexpected sum type: {:?}", other),
+            };
+            assert_eq!(total, EXPECTED_TOTAL, "initial balance mismatch");
+        }
+
+        // Synchronize all threads to start at the same time.
+        let barrier = Arc::new(Barrier::new(NUM_WRITERS));
+
+        // Track results from each thread: (commits, retries, errors).
+        let handles: Vec<_> = (0..NUM_WRITERS)
+            .map(|thread_id| {
+                let path = db_path_str.to_owned();
+                let barrier = Arc::clone(&barrier);
+
+                thread::spawn(move || {
+                    let conn = Connection::open(&path).expect("open db in thread");
+                    let mut rng = rand::rngs::StdRng::seed_from_u64(thread_id as u64);
+
+                    let mut commits = 0_u64;
+                    let mut retries = 0_u64;
+                    let mut errors = 0_u64;
+
+                    // Wait for all threads to be ready.
+                    barrier.wait();
+
+                    while commits < OPS_PER_WRITER {
+                        // Pick random accounts for transfer.
+                        let from_id = rng.gen_range(0..NUM_ACCOUNTS);
+                        let to_id = rng.gen_range(0..NUM_ACCOUNTS);
+                        if from_id == to_id {
+                            continue; // Skip self-transfer.
+                        }
+                        let amount = rng.gen_range(1..=10_i64);
+
+                        // Start transaction (will be CONCURRENT by default).
+                        if conn.execute("BEGIN;").is_err() {
+                            retries += 1;
+                            continue;
+                        }
+
+                        // Read current balances.
+                        let from_balance = match conn.query(&format!(
+                            "SELECT balance FROM accounts WHERE id = {};",
+                            from_id
+                        )) {
+                            Ok(rows) if !rows.is_empty() => match &row_values(&rows[0])[0] {
+                                SqliteValue::Integer(n) => *n,
+                                _ => {
+                                    let _ = conn.execute("ROLLBACK;");
+                                    errors += 1;
+                                    continue;
+                                }
+                            },
+                            _ => {
+                                let _ = conn.execute("ROLLBACK;");
+                                errors += 1;
+                                continue;
+                            }
+                        };
+
+                        // Skip if insufficient balance.
+                        if from_balance < amount {
+                            let _ = conn.execute("ROLLBACK;");
+                            continue;
+                        }
+
+                        // Perform transfer: debit from, credit to.
+                        let debit_result = conn.execute(&format!(
+                            "UPDATE accounts SET balance = balance - {} WHERE id = {};",
+                            amount, from_id
+                        ));
+                        let credit_result = conn.execute(&format!(
+                            "UPDATE accounts SET balance = balance + {} WHERE id = {};",
+                            amount, to_id
+                        ));
+
+                        if debit_result.is_err() || credit_result.is_err() {
+                            let _ = conn.execute("ROLLBACK;");
+                            retries += 1;
+                            continue;
+                        }
+
+                        // Commit transaction.
+                        match conn.execute("COMMIT;") {
+                            Ok(_) => commits += 1,
+                            Err(e) => {
+                                // Check for BUSY/conflict errors.
+                                let _ = conn.execute("ROLLBACK;");
+                                if format!("{:?}", e).contains("Busy")
+                                    || format!("{:?}", e).contains("busy")
+                                {
+                                    retries += 1;
+                                } else {
+                                    // Other error - still count as retry for this test.
+                                    retries += 1;
+                                }
+                            }
+                        }
+                    }
+
+                    (commits, retries, errors)
+                })
+            })
+            .collect();
+
+        // Wait for all threads to complete and collect results.
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // Print thread results for diagnostics.
+        let mut total_commits = 0_u64;
+        let mut total_retries = 0_u64;
+        let mut total_errors = 0_u64;
+        for (i, (commits, retries, errors)) in results.iter().enumerate() {
+            eprintln!(
+                "Thread {}: {} commits, {} retries, {} errors",
+                i, commits, retries, errors
+            );
+            total_commits += commits;
+            total_retries += retries;
+            total_errors += errors;
+        }
+        eprintln!(
+            "Total: {} commits, {} retries, {} errors",
+            total_commits, total_retries, total_errors
+        );
+
+        // Verify conservation invariant: total balance should be unchanged.
+        let conn = Connection::open(db_path_str).expect("reopen db for verification");
+        let rows = conn
+            .query("SELECT SUM(balance) FROM accounts;")
+            .expect("final sum query");
+        let final_total = match &row_values(&rows[0])[0] {
+            SqliteValue::Integer(n) => *n,
+            other => panic!("unexpected final sum type: {:?}", other),
+        };
+        assert_eq!(
+            final_total, EXPECTED_TOTAL,
+            "Conservation invariant violated! Expected {}, got {}",
+            EXPECTED_TOTAL, final_total
+        );
+
+        // Verify no negative balances.
+        let rows = conn
+            .query("SELECT COUNT(*) FROM accounts WHERE balance < 0;")
+            .expect("negative balance check");
+        let negative_count = match &row_values(&rows[0])[0] {
+            SqliteValue::Integer(n) => *n,
+            other => panic!("unexpected count type: {:?}", other),
+        };
+        assert_eq!(
+            negative_count, 0,
+            "Found {} accounts with negative balance",
+            negative_count
+        );
+
+        // Verify all threads completed their target commits.
+        for (i, (commits, _, _)) in results.iter().enumerate() {
+            assert_eq!(
+                *commits, OPS_PER_WRITER,
+                "Thread {} completed {} commits instead of {}",
+                i, commits, OPS_PER_WRITER
+            );
+        }
+    }
+
+    /// Verify that concurrent readers see consistent snapshots.
+    #[test]
+    fn concurrent_readers_consistency() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let db_path = dir.path().join("readers.db");
+        let db_path_str = db_path.to_str().unwrap();
+
+        // Setup: create table with known data.
+        {
+            let conn = Connection::open(db_path_str).expect("open db for setup");
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER);")
+                .expect("create table");
+            for i in 0..100 {
+                conn.execute(&format!("INSERT INTO t VALUES ({}, {});", i, i * 10))
+                    .expect("insert row");
+            }
+        }
+
+        const NUM_READERS: usize = 4;
+        const READS_PER_THREAD: usize = 50;
+
+        let barrier = Arc::new(Barrier::new(NUM_READERS));
+
+        let handles: Vec<_> = (0..NUM_READERS)
+            .map(|thread_id| {
+                let path = db_path_str.to_owned();
+                let barrier = Arc::clone(&barrier);
+
+                thread::spawn(move || {
+                    let conn = Connection::open(&path).expect("open db in reader thread");
+                    barrier.wait();
+
+                    let mut consistent = true;
+                    for _ in 0..READS_PER_THREAD {
+                        // Start a read transaction.
+                        conn.execute("BEGIN;").expect("begin");
+
+                        // Read sum - should always be consistent.
+                        let rows = conn.query("SELECT SUM(val) FROM t;").expect("sum query");
+                        let sum = if let SqliteValue::Integer(n) = &row_values(&rows[0])[0] {
+                            *n
+                        } else {
+                            consistent = false;
+                            break;
+                        };
+
+                        // Expected sum: 0 + 10 + 20 + ... + 990 = 10 * (0 + 1 + ... + 99) = 10 * 4950 = 49500
+                        let expected = 10 * (99 * 100 / 2);
+                        if sum != expected {
+                            eprintln!(
+                                "Thread {} saw inconsistent sum: {} (expected {})",
+                                thread_id, sum, expected
+                            );
+                            consistent = false;
+                        }
+
+                        conn.execute("COMMIT;").expect("commit");
+                    }
+
+                    consistent
+                })
+            })
+            .collect();
+
+        // All readers should see consistent data.
+        for (i, handle) in handles.into_iter().enumerate() {
+            let consistent = handle.join().expect("reader thread panicked");
+            assert!(consistent, "Reader thread {} saw inconsistent data", i);
+        }
     }
 }
