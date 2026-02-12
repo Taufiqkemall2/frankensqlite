@@ -519,6 +519,24 @@ impl MemDatabase {
         root_page
     }
 
+    /// Create a table at a specific root page number.
+    ///
+    /// Used by the storage layer (5A.3) when the root page is allocated
+    /// from the pager rather than auto-assigned.  Advances
+    /// `next_root_page` past `root_page` if necessary so that future
+    /// `create_table()` calls do not collide.
+    pub fn create_table_at(&mut self, root_page: i32, num_columns: usize) {
+        let prev_next_root_page = self.next_root_page;
+        if root_page >= self.next_root_page {
+            self.next_root_page = root_page + 1;
+        }
+        self.tables.insert(root_page, MemTable::new(num_columns));
+        self.push_undo(MemDbUndoOp::CreateTable {
+            root_page,
+            prev_next_root_page,
+        });
+    }
+
     /// Get a reference to a table by root page.
     pub fn get_table(&self, root_page: i32) -> Option<&MemTable> {
         self.tables.get(&root_page)
@@ -737,6 +755,10 @@ pub struct VdbeEngine {
     func_registry: Option<Arc<FunctionRegistry>>,
     /// Aggregate accumulators keyed by accumulator register.
     aggregates: HashMap<i32, AggregateContext>,
+    /// Schema cookie value provided by the Connection (bd-3mmj).
+    /// Used by `ReadCookie` (p3=1) and `SetCookie` opcodes, and
+    /// by `Transaction` for stale-schema detection.
+    schema_cookie: u32,
 }
 
 struct AggregateContext {
@@ -759,11 +781,12 @@ impl VdbeEngine {
             cursors: HashMap::new(),
             sorters: HashMap::new(),
             storage_cursors: HashMap::new(),
-            storage_cursors_enabled: false,
+            storage_cursors_enabled: true,
             txn_page_io: None,
             db: None,
             func_registry: None,
             aggregates: HashMap::new(),
+            schema_cookie: 0,
         }
     }
 
@@ -820,6 +843,17 @@ impl VdbeEngine {
     /// Values are 1-indexed at execution time (`?1` maps to `bindings[0]`).
     pub fn set_bindings(&mut self, bindings: Vec<SqliteValue>) {
         self.bindings = bindings;
+    }
+
+    /// Set the schema cookie that `ReadCookie` will return and
+    /// `Transaction` will use for stale-schema detection (bd-3mmj).
+    pub fn set_schema_cookie(&mut self, cookie: u32) {
+        self.schema_cookie = cookie;
+    }
+
+    /// Read the current schema cookie value (possibly updated by `SetCookie`).
+    pub fn schema_cookie(&self) -> u32 {
+        self.schema_cookie
     }
 
     /// Execute a VDBE program to completion.
@@ -1309,13 +1343,39 @@ impl VdbeEngine {
                 }
 
                 // ── Transaction (stub for expression eval) ──────────────
-                Opcode::Transaction
-                | Opcode::AutoCommit
-                | Opcode::ReadCookie
-                | Opcode::SetCookie
-                | Opcode::TableLock => {
-                    // No-op in expression-only mode. Will be wired to WAL
-                    // and lock manager in Phase 5.
+                Opcode::Transaction | Opcode::AutoCommit | Opcode::TableLock => {
+                    // No-op in expression-only mode. Transaction lifecycle
+                    // will be wired to WAL and lock manager in Phase 5.
+                    pc += 1;
+                }
+
+                // ── Cookie operations (bd-3mmj) ────────────────────────
+                //
+                // ReadCookie: P1=db, P2=dest register, P3=cookie number
+                //   cookie 1 = schema_cookie (offset 40 in header)
+                // SetCookie: P1=db, P2=cookie number, P3=new value
+                Opcode::ReadCookie => {
+                    let dest_reg = op.p2;
+                    let cookie_num = op.p3;
+                    let value = match cookie_num {
+                        // Cookie 1 = BTREE_SCHEMA_VERSION (schema cookie)
+                        1 => i64::from(self.schema_cookie),
+                        // Other cookies return 0 for now.
+                        _ => 0,
+                    };
+                    self.set_reg(dest_reg, SqliteValue::Integer(value));
+                    pc += 1;
+                }
+                Opcode::SetCookie => {
+                    let cookie_num = op.p2;
+                    let new_value = op.p3;
+                    if cookie_num == 1 {
+                        #[allow(clippy::cast_sign_loss)]
+                        {
+                            self.schema_cookie = new_value as u32;
+                        }
+                    }
+                    // Other cookie numbers are silently ignored for now.
                     pc += 1;
                 }
 
@@ -5851,12 +5911,19 @@ mod tests {
         let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
 
         let mut engine = VdbeEngine::new(8);
-        assert!(!engine.storage_cursors_enabled);
+        assert!(engine.storage_cursors_enabled);
 
         // set_transaction should auto-enable storage cursors.
         engine.set_transaction(Box::new(txn));
         assert!(engine.storage_cursors_enabled);
         assert!(engine.txn_page_io.is_some());
+    }
+
+    #[test]
+    fn test_storage_cursors_enabled_by_default() {
+        let engine = VdbeEngine::new(8);
+        assert!(engine.storage_cursors_enabled);
+        assert!(engine.txn_page_io.is_none());
     }
 
     #[test]

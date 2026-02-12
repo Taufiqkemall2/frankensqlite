@@ -19,16 +19,19 @@ use fsqlite_ast::{
     LimitClause, Literal, NullsOrder, OrderingTerm, PlaceholderType, ResultColumn, SelectBody,
     SelectCore, SelectStatement, SortDirection, Span, Statement, TableOrSubquery, UnaryOp,
 };
+use fsqlite_btree::BtreeCursorOps;
+use fsqlite_btree::cursor::TransactionPageIo;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::FunctionRegistry;
 use fsqlite_pager::traits::{MvccPager, TransactionHandle, TransactionMode};
 use fsqlite_pager::{JournalMode, SimplePager};
 use fsqlite_parser::Parser;
-use fsqlite_types::PageSize;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, VfsOpenFlags};
 use fsqlite_types::opcode::{Opcode, P4};
+use fsqlite_types::record::{parse_record, serialize_record};
 use fsqlite_types::value::SqliteValue;
+use fsqlite_types::{BTreePageHeader, PageNumber, PageSize};
 use fsqlite_vdbe::codegen::{
     CodegenContext, CodegenError, ColumnInfo, IndexSchema, TableSchema, codegen_delete,
     codegen_insert, codegen_select, codegen_update,
@@ -249,6 +252,9 @@ pub struct PreparedStatement {
     /// This mirrors `Connection::execute_statement`'s distinct+limit handling
     /// to avoid returning too few rows when LIMIT is applied before DISTINCT.
     post_distinct_limit: Option<LimitClause>,
+    /// Schema cookie captured at prepare time (bd-3mmj).  Used by the
+    /// engine's `ReadCookie` opcode and for future stale-schema detection.
+    schema_cookie: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -283,7 +289,15 @@ impl PreparedStatement {
                     "prepared statement missing function registry".to_owned(),
                 ));
             };
-            execute_table_program_with_db(&self.program, None, registry, db, None).0?
+            execute_table_program_with_db(
+                &self.program,
+                None,
+                registry,
+                db,
+                None,
+                self.schema_cookie,
+            )
+            .0?
         } else {
             execute_program_with_postprocess(
                 &self.program,
@@ -309,7 +323,15 @@ impl PreparedStatement {
                     "prepared statement missing function registry".to_owned(),
                 ));
             };
-            execute_table_program_with_db(&self.program, Some(params), registry, db, None).0?
+            execute_table_program_with_db(
+                &self.program,
+                Some(params),
+                registry,
+                db,
+                None,
+                self.schema_cookie,
+            )
+            .0?
         } else {
             execute_program_with_postprocess(
                 &self.program,
@@ -432,6 +454,19 @@ pub struct Connection {
     /// `INTEGER PRIMARY KEY` column, which is an alias for `rowid`.
     /// Used by fallback paths (GROUP BY, JOIN) to resolve rowid/\_rowid\_/oid.
     rowid_alias_columns: RefCell<HashMap<String, usize>>,
+    /// Next rowid to use when inserting into the sqlite_master B-tree on
+    /// page 1.  Starts at 1 for a fresh database; 5A.4 (schema loading)
+    /// will advance this past any existing entries.
+    next_master_rowid: RefCell<i64>,
+    /// Schema cookie (offset 40 in the database header).  Incremented on
+    /// every DDL operation (CREATE TABLE, DROP TABLE, ALTER TABLE, CREATE
+    /// INDEX, CREATE VIEW, etc.).  Prepared statements cache this value at
+    /// prepare time; the Transaction opcode compares the current cookie
+    /// against the cached value and returns `SchemaChanged` on mismatch.
+    schema_cookie: RefCell<u32>,
+    /// File change counter (offset 24 in the database header).  Incremented
+    /// on every transaction that modifies the database (DML or DDL).
+    change_counter: RefCell<u32>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -481,6 +516,9 @@ impl Connection {
             concurrent_mode_default: RefCell::new(true),
             pragma_state: RefCell::new(fsqlite_vdbe::pragma::ConnectionPragmaState::default()),
             rowid_alias_columns: RefCell::new(HashMap::new()),
+            next_master_rowid: RefCell::new(1),
+            schema_cookie: RefCell::new(0),
+            change_counter: RefCell::new(0),
         };
         conn.apply_current_journal_mode_to_pager()?;
         conn.load_persisted_state_if_present()?;
@@ -567,13 +605,43 @@ impl Connection {
 
     /// Execute a parsed statement, handling both DDL (CREATE TABLE) and
     /// DML (SELECT/INSERT/UPDATE/DELETE).
-    #[allow(clippy::too_many_lines)]
     fn execute_statement(
         &self,
         statement: Statement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
         let statement = self.rewrite_subquery_statement(statement)?;
+        // 5B.5: autocommit wrapping — ensure a pager transaction is active
+        // for write operations outside an explicit BEGIN.
+        let is_write = matches!(
+            &statement,
+            Statement::Insert(_)
+                | Statement::Update(_)
+                | Statement::Delete(_)
+                | Statement::CreateTable(_)
+                | Statement::Drop(_)
+                | Statement::AlterTable(_)
+                | Statement::CreateIndex(_)
+        );
+        let was_auto = if is_write {
+            self.ensure_autocommit_txn()?
+        } else {
+            false
+        };
+        let result = self.execute_statement_dispatch(statement, params);
+        let ok = result.is_ok();
+        self.resolve_autocommit_txn(was_auto, ok)?;
+        result
+    }
+
+    /// Inner dispatch for `execute_statement` — separated so that
+    /// autocommit wrapping can bracket the entire execution.
+    #[allow(clippy::too_many_lines)]
+    fn execute_statement_dispatch(
+        &self,
+        statement: Statement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<Row>> {
         match statement {
             Statement::CreateTable(create) => {
                 self.execute_create_table(&create)?;
@@ -1063,6 +1131,7 @@ impl Connection {
                     distinct: is_distinct_select(select),
                     db: None,
                     post_distinct_limit: None,
+                    schema_cookie: self.schema_cookie(),
                 })
             }
             Statement::Select(select) => {
@@ -1082,6 +1151,7 @@ impl Connection {
                     distinct,
                     db: Some(Rc::clone(&self.db)),
                     post_distinct_limit: if distinct { limit_clause } else { None },
+                    schema_cookie: self.schema_cookie(),
                 })
             }
             _ => Err(FrankenError::NotImplemented(
@@ -1113,8 +1183,163 @@ impl Connection {
         Ok(self.query(&sql)?.len())
     }
 
+    // ── autocommit pager transaction wrapping (bd-14dj / 5B.5) ──────────
+
+    /// Ensure a pager transaction is active.  If the connection is NOT
+    /// inside an explicit `BEGIN`, an implicit (autocommit) transaction is
+    /// created.  Returns `true` when an implicit transaction was started
+    /// (the caller must later call [`resolve_autocommit_txn`]).
+    fn ensure_autocommit_txn(&self) -> Result<bool> {
+        if *self.in_transaction.borrow() || self.active_txn.borrow().is_some() {
+            return Ok(false);
+        }
+        let cx = Cx::new();
+        let txn = self.pager.begin(&cx, TransactionMode::Immediate)?;
+        *self.active_txn.borrow_mut() = Some(txn);
+        Ok(true)
+    }
+
+    /// Finalize an implicit (autocommit) transaction: commit on success,
+    /// rollback on error.  No-op when `was_auto` is `false`.
+    fn resolve_autocommit_txn(&self, was_auto: bool, ok: bool) -> Result<()> {
+        if !was_auto {
+            return Ok(());
+        }
+        let cx = Cx::new();
+        let mut guard = self.active_txn.borrow_mut();
+        if let Some(txn) = guard.as_deref_mut() {
+            if ok {
+                txn.commit(&cx)?;
+            } else {
+                txn.rollback(&cx)?;
+            }
+        }
+        *guard = None;
+        Ok(())
+    }
+
+    // ── pager page allocation (bd-3ez5 / 5A.3) ───────────────────────────
+
+    /// Allocate a fresh page from the pager and initialize it as an empty
+    /// B-tree leaf table page (type 0x0D).  Returns the real `PageNumber`.
+    #[allow(clippy::cast_possible_wrap)]
+    fn allocate_root_page(&self) -> Result<i32> {
+        self.with_pager_write_txn(|cx, txn| {
+            let page_no = txn.allocate_page(cx)?;
+            let page_size = PageSize::DEFAULT.get();
+            let mut page = vec![0u8; page_size as usize];
+            BTreePageHeader::write_empty_leaf_table(&mut page, 0, page_size);
+            txn.write_page(cx, page_no, &page)?;
+            Ok(page_no.get() as i32)
+        })
+    }
+
+    // ── sqlite_master helpers (bd-1b5e / 5A.2) ─────────────────────────
+
+    /// Run a closure with a mutable pager transaction, auto-beginning and
+    /// committing when no explicit transaction is active.
+    fn with_pager_write_txn<R>(
+        &self,
+        f: impl FnOnce(&Cx, &mut dyn TransactionHandle) -> Result<R>,
+    ) -> Result<R> {
+        let cx = Cx::new();
+        let auto = self.active_txn.borrow().is_none();
+        if auto {
+            let txn = self.pager.begin(&cx, TransactionMode::Immediate)?;
+            *self.active_txn.borrow_mut() = Some(txn);
+        }
+        let result = {
+            let mut guard = self.active_txn.borrow_mut();
+            let txn = guard.as_deref_mut().expect("txn just ensured");
+            f(&cx, txn)
+        };
+        if auto {
+            let mut guard = self.active_txn.borrow_mut();
+            if let Some(txn) = guard.as_deref_mut() {
+                if result.is_ok() {
+                    txn.commit(&cx)?;
+                } else {
+                    txn.rollback(&cx)?;
+                }
+            }
+            *guard = None;
+        }
+        result
+    }
+
+    /// Insert a row into the sqlite_master B-tree on page 1.
+    fn insert_sqlite_master_row(
+        &self,
+        type_: &str,
+        name: &str,
+        tbl_name: &str,
+        rootpage: i32,
+        sql: &str,
+    ) -> Result<()> {
+        let rowid = {
+            let mut rid = self.next_master_rowid.borrow_mut();
+            let r = *rid;
+            *rid += 1;
+            r
+        };
+        self.with_pager_write_txn(|cx, txn| {
+            let usable_size = PageSize::DEFAULT.get();
+            let record = serialize_record(&[
+                SqliteValue::Text(type_.to_owned()),
+                SqliteValue::Text(name.to_owned()),
+                SqliteValue::Text(tbl_name.to_owned()),
+                SqliteValue::Integer(i64::from(rootpage)),
+                SqliteValue::Text(sql.to_owned()),
+            ]);
+            let mut cursor = fsqlite_btree::BtCursor::new(
+                TransactionPageIo::new(txn),
+                PageNumber::ONE,
+                usable_size,
+                true,
+            );
+            cursor.table_insert(cx, rowid, &record)
+        })
+    }
+
+    /// Delete the sqlite_master row whose `name` column matches the given
+    /// object name (case-insensitive scan of the page 1 B-tree).
+    fn delete_sqlite_master_row(&self, name: &str) -> Result<()> {
+        self.with_pager_write_txn(|cx, txn| {
+            let usable_size = PageSize::DEFAULT.get();
+            let mut cursor = fsqlite_btree::BtCursor::new(
+                TransactionPageIo::new(txn),
+                PageNumber::ONE,
+                usable_size,
+                true,
+            );
+            if !cursor.first(cx)? {
+                return Err(FrankenError::Internal(format!(
+                    "sqlite_master entry not found: {name}"
+                )));
+            }
+            loop {
+                let payload = cursor.payload(cx)?;
+                if let Some(values) = parse_record(&payload) {
+                    // Column index 1 is the `name` column.
+                    if let Some(SqliteValue::Text(row_name)) = values.get(1) {
+                        if row_name.eq_ignore_ascii_case(name) {
+                            return cursor.delete(cx);
+                        }
+                    }
+                }
+                if !cursor.next(cx)? {
+                    break;
+                }
+            }
+            Err(FrankenError::Internal(format!(
+                "sqlite_master entry not found: {name}"
+            )))
+        })
+    }
+
     /// Process a CREATE TABLE statement: register the schema and create the
-    /// in-memory table.
+    /// in-memory table, and insert a row into sqlite_master on page 1.
+    #[allow(clippy::too_many_lines)]
     fn execute_create_table(&self, create: &fsqlite_ast::CreateTableStatement) -> Result<()> {
         let table_name = create.name.name.clone();
 
@@ -1168,13 +1393,19 @@ impl Connection {
                         .insert(table_name.to_ascii_lowercase(), idx);
                 }
                 let num_columns = col_infos.len();
-                let root_page = self.db.borrow_mut().create_table(num_columns);
-                self.schema.borrow_mut().push(TableSchema {
+                let root_page = self.allocate_root_page()?;
+                self.db.borrow_mut().create_table_at(root_page, num_columns);
+                let table_schema = TableSchema {
                     name: table_name,
                     root_page,
                     columns: col_infos,
                     indexes: Vec::new(),
-                });
+                };
+                let create_sql = crate::compat_persist::build_create_table_sql(&table_schema);
+                let rp = table_schema.root_page;
+                let tbl_name = table_schema.name.clone();
+                self.schema.borrow_mut().push(table_schema);
+                self.insert_sqlite_master_row("table", &tbl_name, &tbl_name, rp, &create_sql)?;
             }
             CreateTableBody::AsSelect(select_stmt) => {
                 // Execute the SELECT to get result rows.
@@ -1199,62 +1430,67 @@ impl Connection {
                         is_ipk: false,
                     })
                     .collect();
-                let root_page = self.db.borrow_mut().create_table(width);
-                self.schema.borrow_mut().push(TableSchema {
+                let root_page = self.allocate_root_page()?;
+                self.db.borrow_mut().create_table_at(root_page, width);
+                let table_schema = TableSchema {
                     name: table_name,
                     root_page,
                     columns: col_infos,
                     indexes: Vec::new(),
-                });
+                };
+                let create_sql = crate::compat_persist::build_create_table_sql(&table_schema);
+                let rp = table_schema.root_page;
+                let tbl_name = table_schema.name.clone();
+                self.schema.borrow_mut().push(table_schema);
                 // Insert result rows into the new table.
                 for (i, row) in rows.iter().enumerate() {
                     let vals: Vec<SqliteValue> = row.values().to_vec();
                     #[allow(clippy::cast_possible_wrap)]
                     let rowid = (i + 1) as i64;
                     let mut db = self.db.borrow_mut();
-                    if let Some(table) = db.get_table_mut(root_page) {
+                    if let Some(table) = db.get_table_mut(rp) {
                         table.insert_row(rowid, vals);
                     }
                 }
+                self.insert_sqlite_master_row("table", &tbl_name, &tbl_name, rp, &create_sql)?;
             }
         }
 
+        self.increment_schema_cookie();
         Ok(())
     }
 
     /// Execute a DROP statement (TABLE, INDEX, VIEW).
     fn execute_drop(&self, drop_stmt: &fsqlite_ast::DropStatement) -> Result<()> {
         let obj_name = &drop_stmt.name.name;
-        match drop_stmt.object_type {
+        let dropped = match drop_stmt.object_type {
             DropObjectType::Table => {
                 let mut schema = self.schema.borrow_mut();
                 let table_idx = schema
                     .iter()
                     .position(|t| t.name.eq_ignore_ascii_case(obj_name));
-                match table_idx {
-                    Some(idx) => {
-                        let root_page = schema[idx].root_page;
-                        schema.remove(idx);
-                        drop(schema);
-                        self.db.borrow_mut().destroy_table(root_page);
-                        self.rowid_alias_columns
-                            .borrow_mut()
-                            .remove(&obj_name.to_ascii_lowercase());
-                        Ok(())
+                if let Some(idx) = table_idx {
+                    let root_page = schema[idx].root_page;
+                    schema.remove(idx);
+                    drop(schema);
+                    self.db.borrow_mut().destroy_table(root_page);
+                    self.rowid_alias_columns
+                        .borrow_mut()
+                        .remove(&obj_name.to_ascii_lowercase());
+                    self.delete_sqlite_master_row(obj_name)?;
+                    true
+                } else {
+                    if drop_stmt.if_exists {
+                        return Ok(());
                     }
-                    None => {
-                        if drop_stmt.if_exists {
-                            Ok(())
-                        } else {
-                            Err(FrankenError::NoSuchTable {
-                                name: obj_name.clone(),
-                            })
-                        }
-                    }
+                    return Err(FrankenError::NoSuchTable {
+                        name: obj_name.clone(),
+                    });
                 }
             }
             DropObjectType::Index => {
                 let mut schema = self.schema.borrow_mut();
+                let mut found = false;
                 for table in schema.iter_mut() {
                     if let Some(pos) = table
                         .indexes
@@ -1262,14 +1498,17 @@ impl Connection {
                         .position(|idx| idx.name.eq_ignore_ascii_case(obj_name))
                     {
                         table.indexes.remove(pos);
-                        return Ok(());
+                        found = true;
+                        break;
                     }
                 }
-                if drop_stmt.if_exists {
-                    Ok(())
-                } else {
-                    Err(FrankenError::Internal(format!("no such index: {obj_name}")))
+                if !found {
+                    if drop_stmt.if_exists {
+                        return Ok(());
+                    }
+                    return Err(FrankenError::Internal(format!("no such index: {obj_name}")));
                 }
+                true
             }
             DropObjectType::View => {
                 let mut views = self.views.borrow_mut();
@@ -1278,18 +1517,22 @@ impl Connection {
                     .position(|v| v.name.eq_ignore_ascii_case(obj_name))
                 {
                     views.remove(pos);
-                    Ok(())
+                    true
                 } else if drop_stmt.if_exists {
-                    Ok(())
+                    return Ok(());
                 } else {
-                    Err(FrankenError::Internal(format!("no such view: {obj_name}")))
+                    return Err(FrankenError::Internal(format!("no such view: {obj_name}")));
                 }
             }
             DropObjectType::Trigger => {
                 // Triggers are not implemented; silently succeed (nothing to drop).
-                Ok(())
+                false
             }
+        };
+        if dropped {
+            self.increment_schema_cookie();
         }
+        Ok(())
     }
 
     /// Execute an ALTER TABLE statement.
@@ -1305,7 +1548,6 @@ impl Connection {
                         name: table_name.clone(),
                     })?;
                 table.name.clone_from(new_name);
-                Ok(())
             }
             AlterTableAction::RenameColumn { old, new } => {
                 let mut schema = self.schema.borrow_mut();
@@ -1321,7 +1563,6 @@ impl Connection {
                     .find(|c| c.name.eq_ignore_ascii_case(old))
                     .ok_or_else(|| FrankenError::Internal(format!("no such column: {old}")))?;
                 col.name.clone_from(new);
-                Ok(())
             }
             AlterTableAction::AddColumn(col_def) => {
                 let affinity = col_def
@@ -1340,7 +1581,6 @@ impl Connection {
                     affinity,
                     is_ipk: false,
                 });
-                Ok(())
             }
             AlterTableAction::DropColumn(col_name) => {
                 let mut schema = self.schema.borrow_mut();
@@ -1356,9 +1596,10 @@ impl Connection {
                     .position(|c| c.name.eq_ignore_ascii_case(col_name))
                     .ok_or_else(|| FrankenError::Internal(format!("no such column: {col_name}")))?;
                 table.columns.remove(col_idx);
-                Ok(())
             }
         }
+        self.increment_schema_cookie();
+        Ok(())
     }
 
     /// Execute a CREATE INDEX statement (schema-only; no physical index yet).
@@ -1410,6 +1651,8 @@ impl Connection {
             columns: col_names,
             root_page: 0,
         });
+        drop(schema);
+        self.increment_schema_cookie();
         Ok(())
     }
 
@@ -1431,6 +1674,7 @@ impl Connection {
             columns: stmt.columns.clone(),
             query: stmt.query.clone(),
         });
+        self.increment_schema_cookie();
         Ok(())
     }
 
@@ -3182,8 +3426,15 @@ impl Connection {
         // Lend the active transaction to the VDBE engine so that storage
         // cursors route through the real pager/WAL stack (Phase 5, bd-2a3y).
         let txn = self.active_txn.borrow_mut().take();
-        let (result, txn_back) =
-            execute_table_program_with_db(program, params, &self.func_registry, &self.db, txn);
+        let cookie = *self.schema_cookie.borrow();
+        let (result, txn_back) = execute_table_program_with_db(
+            program,
+            params,
+            &self.func_registry,
+            &self.db,
+            txn,
+            cookie,
+        );
         // Always restore the transaction handle, even on error.
         if let Some(txn) = txn_back {
             *self.active_txn.borrow_mut() = Some(txn);
@@ -3203,8 +3454,24 @@ impl Connection {
         // Detect file format: real SQLite binary vs legacy SQL text dump.
         if crate::compat_persist::is_sqlite_format(path) {
             let loaded = crate::compat_persist::load_from_sqlite(path)?;
+            // 5A.4: populate rowid alias columns from loaded schema.
+            let mut alias_map = self.rowid_alias_columns.borrow_mut();
+            for ts in &loaded.schema {
+                if let Some(idx) = ts.columns.iter().position(|c| c.is_ipk) {
+                    alias_map.insert(ts.name.to_ascii_lowercase(), idx);
+                }
+            }
+            drop(alias_map);
             *self.schema.borrow_mut() = loaded.schema;
             *self.db.borrow_mut() = loaded.db;
+            // 5A.4: advance next_master_rowid past existing entries so
+            // future CREATE TABLE inserts don't collide with loaded rows.
+            *self.next_master_rowid.borrow_mut() = loaded.master_row_count + 1;
+            // 5A.5: restore schema cookie and change counter from the
+            // loaded database header so subsequent DDL/DML increments
+            // start from the correct baseline.
+            *self.schema_cookie.borrow_mut() = loaded.schema_cookie;
+            *self.change_counter.borrow_mut() = loaded.change_counter;
             return Ok(());
         }
 
@@ -3236,9 +3503,40 @@ impl Connection {
         if *self.persist_suspended.borrow() {
             return Ok(());
         }
+        // Increment the file change counter on every persist (=write transaction).
+        self.increment_change_counter();
         let schema = self.schema.borrow();
         let db = self.db.borrow();
-        crate::compat_persist::persist_to_sqlite(Path::new(path), &schema, &db)
+        let cookie = *self.schema_cookie.borrow();
+        let counter = *self.change_counter.borrow();
+        crate::compat_persist::persist_to_sqlite(Path::new(path), &schema, &db, cookie, counter)
+    }
+
+    // ── Schema cookie and change counter tracking (bd-3mmj) ─────────
+
+    /// Increment the schema cookie.  Must be called for every DDL
+    /// operation (CREATE TABLE, DROP TABLE, ALTER TABLE, CREATE INDEX,
+    /// CREATE VIEW, DROP INDEX, DROP VIEW, etc.).
+    fn increment_schema_cookie(&self) {
+        let mut cookie = self.schema_cookie.borrow_mut();
+        *cookie = cookie.wrapping_add(1);
+    }
+
+    /// Increment the file change counter.  Must be called for every
+    /// transaction that modifies the database (both DML and DDL).
+    fn increment_change_counter(&self) {
+        let mut counter = self.change_counter.borrow_mut();
+        *counter = counter.wrapping_add(1);
+    }
+
+    /// Read the current schema cookie value.
+    pub fn schema_cookie(&self) -> u32 {
+        *self.schema_cookie.borrow()
+    }
+
+    /// Read the current file change counter value.
+    pub fn change_counter(&self) -> u32 {
+        *self.change_counter.borrow()
     }
 }
 
@@ -4401,6 +4699,7 @@ fn execute_table_program_with_db(
     func_registry: &Arc<FunctionRegistry>,
     db: &Rc<RefCell<MemDatabase>>,
     txn: Option<Box<dyn TransactionHandle>>,
+    schema_cookie: u32,
 ) -> (Result<Vec<Row>>, Option<Box<dyn TransactionHandle>>) {
     let mut engine = VdbeEngine::new(program.register_count());
     if let Some(params) = params {
@@ -4411,6 +4710,7 @@ fn execute_table_program_with_db(
     }
 
     engine.set_function_registry(Arc::clone(func_registry));
+    engine.set_schema_cookie(schema_cookie);
 
     // Phase 5 (bd-2a3y): if a transaction handle is available, lend it to
     // the engine so storage cursors route through the real pager/WAL stack.
@@ -11729,5 +12029,877 @@ mod transaction_lifecycle_tests {
         assert_eq!(rows[2].get(0).unwrap(), &SqliteValue::Integer(2));
         assert_eq!(rows[3].get(0).unwrap(), &SqliteValue::Integer(3));
         assert_eq!(rows[4].get(0).unwrap(), &SqliteValue::Integer(3));
+    }
+}
+
+// =========================================================================
+// 5A.2 – sqlite_master row insert / delete tests (bd-1b5e)
+// =========================================================================
+#[cfg(test)]
+mod sqlite_master_btree_tests {
+    use super::*;
+    use fsqlite_btree::BtreeCursorOps;
+    use fsqlite_btree::cursor::TransactionPageIo;
+    use fsqlite_pager::traits::TransactionMode;
+    use fsqlite_types::PageNumber;
+    use fsqlite_types::record::parse_record;
+
+    /// Helper: read all sqlite_master rows from the page 1 B-tree.
+    /// Returns Vec<(rowid, Vec<SqliteValue>)>.
+    fn read_master_rows(conn: &Connection) -> Vec<(i64, Vec<SqliteValue>)> {
+        let cx = Cx::new();
+        let mut txn = conn.pager.begin(&cx, TransactionMode::Deferred).unwrap();
+        let usable_size = fsqlite_types::PageSize::DEFAULT.get();
+        let mut cursor = fsqlite_btree::BtCursor::new(
+            TransactionPageIo::new(txn.as_mut()),
+            PageNumber::ONE,
+            usable_size,
+            false, // read-only
+        );
+        let mut rows = Vec::new();
+        if cursor.first(&cx).unwrap() {
+            loop {
+                let rowid = cursor.rowid(&cx).unwrap();
+                let payload = cursor.payload(&cx).unwrap();
+                if let Some(values) = parse_record(&payload) {
+                    rows.push((rowid, values));
+                }
+                if !cursor.next(&cx).unwrap() {
+                    break;
+                }
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn test_create_table_inserts_sqlite_master_row() {
+        let conn = Connection::open(":memory:").unwrap();
+
+        // Before any DDL, page 1 B-tree should be empty.
+        let before = read_master_rows(&conn);
+        eprintln!(
+            "[5A2][test=create_inserts][step=before] master_rows={}",
+            before.len()
+        );
+        assert!(
+            before.is_empty(),
+            "fresh db should have empty sqlite_master"
+        );
+
+        // CREATE TABLE should insert a row.
+        conn.execute("CREATE TABLE t1 (x INTEGER, y TEXT)").unwrap();
+        let after = read_master_rows(&conn);
+        eprintln!(
+            "[5A2][test=create_inserts][step=after_create] master_rows={}",
+            after.len()
+        );
+        assert_eq!(after.len(), 1, "one row after one CREATE TABLE");
+
+        // Verify record columns: type, name, tbl_name, rootpage, sql.
+        let (rowid, ref cols) = after[0];
+        eprintln!("[5A2][test=create_inserts][step=verify] rowid={rowid} cols={cols:?}");
+        assert_eq!(rowid, 1);
+        assert_eq!(cols.len(), 5, "sqlite_master has 5 columns");
+        assert_eq!(cols[0], SqliteValue::Text("table".to_owned()));
+        assert_eq!(cols[1], SqliteValue::Text("t1".to_owned()));
+        assert_eq!(cols[2], SqliteValue::Text("t1".to_owned()));
+        // rootpage should be a positive integer
+        if let SqliteValue::Integer(rp) = &cols[3] {
+            assert!(*rp > 0, "rootpage should be > 0, got {rp}");
+        } else {
+            panic!("rootpage should be Integer, got {:?}", cols[3]);
+        }
+        // sql should contain CREATE TABLE
+        if let SqliteValue::Text(sql) = &cols[4] {
+            assert!(
+                sql.to_ascii_uppercase().contains("CREATE TABLE"),
+                "sql should contain CREATE TABLE, got: {sql}"
+            );
+        } else {
+            panic!("sql should be Text, got {:?}", cols[4]);
+        }
+    }
+
+    #[test]
+    fn test_create_multiple_tables_inserts_multiple_rows() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE alpha (a INTEGER)").unwrap();
+        conn.execute("CREATE TABLE beta (b TEXT)").unwrap();
+        conn.execute("CREATE TABLE gamma (c REAL)").unwrap();
+
+        let rows = read_master_rows(&conn);
+        eprintln!(
+            "[5A2][test=create_multiple][step=verify] master_rows={}",
+            rows.len()
+        );
+        assert_eq!(
+            rows.len(),
+            3,
+            "three CREATE TABLEs should produce three rows"
+        );
+
+        // Verify names are in insertion order (rowid 1, 2, 3).
+        let names: Vec<&str> = rows
+            .iter()
+            .filter_map(|(_, cols)| {
+                if let SqliteValue::Text(n) = &cols[1] {
+                    Some(n.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(names, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn test_drop_table_deletes_sqlite_master_row() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (x INTEGER)").unwrap();
+        conn.execute("CREATE TABLE t2 (y TEXT)").unwrap();
+
+        let before = read_master_rows(&conn);
+        eprintln!(
+            "[5A2][test=drop_deletes][step=before] master_rows={}",
+            before.len()
+        );
+        assert_eq!(before.len(), 2);
+
+        // Drop t1 — only t2 should remain.
+        conn.execute("DROP TABLE t1").unwrap();
+        let after = read_master_rows(&conn);
+        eprintln!(
+            "[5A2][test=drop_deletes][step=after_drop] master_rows={}",
+            after.len()
+        );
+        assert_eq!(after.len(), 1, "one row should remain after DROP TABLE");
+        assert_eq!(after[0].1[1], SqliteValue::Text("t2".to_owned()));
+    }
+
+    #[test]
+    fn test_create_drop_create_reinserts() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+        assert_eq!(read_master_rows(&conn).len(), 1);
+
+        conn.execute("DROP TABLE t").unwrap();
+        assert!(
+            read_master_rows(&conn).is_empty(),
+            "drop should clear master"
+        );
+
+        // Re-create same table — should get a new row.
+        conn.execute("CREATE TABLE t (x INTEGER, y TEXT)").unwrap();
+        let rows = read_master_rows(&conn);
+        eprintln!(
+            "[5A2][test=create_drop_create][step=verify] master_rows={}",
+            rows.len()
+        );
+        assert_eq!(rows.len(), 1);
+        // The SQL should reflect the new schema.
+        if let SqliteValue::Text(sql) = &rows[0].1[4] {
+            assert!(
+                sql.contains('y'),
+                "recreated table SQL should mention column y: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sqlite_master_record_format() {
+        // Verify that the record format matches the canonical
+        // sqlite_master schema: (type TEXT, name TEXT, tbl_name TEXT,
+        // rootpage INTEGER, sql TEXT).
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE fmt_test (a INTEGER PRIMARY KEY, b TEXT NOT NULL)")
+            .unwrap();
+
+        let rows = read_master_rows(&conn);
+        assert_eq!(rows.len(), 1);
+        let (_, ref cols) = rows[0];
+
+        // All five columns should be present and of the correct type.
+        assert!(
+            matches!(&cols[0], SqliteValue::Text(t) if t == "table"),
+            "col 0 (type) should be 'table'"
+        );
+        assert!(
+            matches!(&cols[1], SqliteValue::Text(n) if n == "fmt_test"),
+            "col 1 (name) should be 'fmt_test'"
+        );
+        assert!(
+            matches!(&cols[2], SqliteValue::Text(t) if t == "fmt_test"),
+            "col 2 (tbl_name) should be 'fmt_test'"
+        );
+        assert!(
+            matches!(&cols[3], SqliteValue::Integer(rp) if *rp > 0),
+            "col 3 (rootpage) should be positive integer"
+        );
+        assert!(
+            matches!(&cols[4], SqliteValue::Text(_)),
+            "col 4 (sql) should be text"
+        );
+
+        eprintln!("[5A2][test=record_format][step=verify] cols={cols:?} ✓");
+    }
+}
+
+// =========================================================================
+// 5A.3 – real root page allocation tests (bd-3ez5)
+// =========================================================================
+#[cfg(test)]
+mod root_page_allocation_tests {
+    use super::*;
+    use fsqlite_btree::BtreeCursorOps;
+    use fsqlite_btree::cursor::TransactionPageIo;
+    use fsqlite_pager::traits::TransactionMode;
+
+    #[test]
+    fn test_create_table_allocates_real_page() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (x INTEGER)").unwrap();
+
+        // Root page should be > 1 (page 1 = sqlite_master).
+        let schema = conn.schema.borrow();
+        let rp = schema[0].root_page;
+        eprintln!("[5A3][test=allocates_real_page][step=verify] root_page={rp}");
+        assert!(
+            rp > 1,
+            "root page should be > 1 (page 1 = master), got {rp}"
+        );
+
+        // Verify the page exists in the pager and is readable.
+        let cx = Cx::new();
+        let txn = conn.pager.begin(&cx, TransactionMode::Deferred).unwrap();
+        #[allow(clippy::cast_sign_loss)]
+        let page_no = PageNumber::new(rp as u32).unwrap();
+        let page_data = txn.get_page(&cx, page_no).unwrap();
+        let page_data: &[u8] = page_data.as_ref();
+        // First byte should be 0x0D (leaf table).
+        assert_eq!(
+            page_data[0], 0x0D,
+            "allocated root page should be leaf table (0x0D)"
+        );
+        eprintln!(
+            "[5A3][test=allocates_real_page][step=verify] page_type=0x{:02X} ✓",
+            page_data[0]
+        );
+    }
+
+    #[test]
+    fn test_multiple_tables_get_different_pages() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER)").unwrap();
+        conn.execute("CREATE TABLE t2 (b TEXT)").unwrap();
+        conn.execute("CREATE TABLE t3 (c REAL)").unwrap();
+
+        let schema = conn.schema.borrow();
+        let pages: Vec<i32> = schema.iter().map(|s| s.root_page).collect();
+        eprintln!("[5A3][test=different_pages][step=verify] pages={pages:?}");
+
+        // All root pages should be distinct.
+        let mut unique = pages.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            pages.len(),
+            "all root pages should be unique: {pages:?}"
+        );
+
+        // All should be > 1.
+        for &p in &pages {
+            assert!(p > 1, "root page should be > 1, got {p}");
+        }
+    }
+
+    #[test]
+    fn test_created_root_page_is_valid_btree() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (x INTEGER)").unwrap();
+
+        let schema = conn.schema.borrow();
+        let rp = schema[0].root_page;
+
+        // Open the page and verify B-tree header structure.
+        let cx = Cx::new();
+        let txn = conn.pager.begin(&cx, TransactionMode::Deferred).unwrap();
+        #[allow(clippy::cast_sign_loss)]
+        let page_no = PageNumber::new(rp as u32).unwrap();
+        let page_data = txn.get_page(&cx, page_no).unwrap();
+        let page_data: &[u8] = page_data.as_ref();
+
+        // Byte 0: page type = 0x0D (leaf table)
+        assert_eq!(page_data[0], 0x0D);
+        // Bytes 1-2: first freeblock = 0
+        assert_eq!(u16::from_be_bytes([page_data[1], page_data[2]]), 0);
+        // Bytes 3-4: cell count = 0
+        assert_eq!(u16::from_be_bytes([page_data[3], page_data[4]]), 0);
+        // Byte 7: fragmented free bytes = 0
+        assert_eq!(page_data[7], 0);
+
+        eprintln!("[5A3][test=valid_btree][step=verify] page={rp} type=0x0D cells=0 ✓");
+    }
+
+    #[test]
+    fn test_root_page_survives_commit_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_str = db_path.to_str().unwrap();
+
+        let original_root_page;
+        {
+            let conn = Connection::open(db_str).unwrap();
+            conn.execute("CREATE TABLE t1 (x INTEGER)").unwrap();
+            original_root_page = conn.schema.borrow()[0].root_page;
+            eprintln!("[5A3][test=survives_commit][step=create] root_page={original_root_page}");
+        }
+
+        // Reopen and verify the page is readable with correct B-tree header.
+        {
+            let conn = Connection::open(db_str).unwrap();
+            let cx = Cx::new();
+            let txn = conn.pager.begin(&cx, TransactionMode::Deferred).unwrap();
+            #[allow(clippy::cast_sign_loss)]
+            let page_no = PageNumber::new(original_root_page as u32).unwrap();
+            let page_data = txn.get_page(&cx, page_no).unwrap();
+            let page_data: &[u8] = page_data.as_ref();
+            assert_eq!(
+                page_data[0], 0x0D,
+                "root page should still be leaf table after reopen"
+            );
+            eprintln!(
+                "[5A3][test=survives_commit][step=reopen] page_type=0x{:02X} ✓",
+                page_data[0]
+            );
+        }
+    }
+
+    #[test]
+    fn test_root_page_matches_sqlite_master_entry() {
+        // The root page in the schema should match what's stored in sqlite_master.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (x INTEGER)").unwrap();
+
+        let schema_rp = conn.schema.borrow()[0].root_page;
+
+        // Read sqlite_master from page 1 B-tree.
+        let cx = Cx::new();
+        let mut txn = conn.pager.begin(&cx, TransactionMode::Deferred).unwrap();
+        let usable_size = PageSize::DEFAULT.get();
+        let mut cursor = fsqlite_btree::BtCursor::new(
+            TransactionPageIo::new(txn.as_mut()),
+            PageNumber::ONE,
+            usable_size,
+            false,
+        );
+        assert!(
+            cursor.first(&cx).unwrap(),
+            "sqlite_master should have a row"
+        );
+        let payload = cursor.payload(&cx).unwrap();
+        let values = fsqlite_types::record::parse_record(&payload).unwrap();
+        // Column 3 = rootpage.
+        if let SqliteValue::Integer(master_rp) = &values[3] {
+            #[allow(clippy::cast_possible_truncation)]
+            let master_rp_i32 = *master_rp as i32;
+            assert_eq!(
+                schema_rp, master_rp_i32,
+                "schema root_page should match sqlite_master rootpage"
+            );
+            eprintln!(
+                "[5A3][test=matches_master][step=verify] schema={schema_rp} master={master_rp_i32} ✓"
+            );
+        } else {
+            panic!("rootpage should be Integer, got {:?}", values[3]);
+        }
+    }
+}
+
+// =========================================================================
+// 5B.5 – autocommit pager transaction wrapping tests (bd-14dj)
+// =========================================================================
+#[cfg(test)]
+mod autocommit_txn_tests {
+    use super::*;
+
+    #[test]
+    fn test_autocommit_insert_commits() {
+        // INSERT outside an explicit BEGIN should auto-wrap in a pager txn.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+        conn.execute("INSERT INTO t VALUES (42)").unwrap();
+
+        // After autocommit, no active txn should remain.
+        assert!(
+            conn.active_txn.borrow().is_none(),
+            "autocommit should clear active_txn after INSERT"
+        );
+
+        // Data should be visible.
+        let rows = conn.query("SELECT x FROM t").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(42));
+        eprintln!("[5B5][test=autocommit_insert][step=verify] data_persisted=true ✓");
+    }
+
+    #[test]
+    fn test_autocommit_ddl_wraps_in_txn() {
+        // CREATE TABLE outside BEGIN should auto-wrap.
+        let conn = Connection::open(":memory:").unwrap();
+        assert!(conn.active_txn.borrow().is_none(), "no txn before DDL");
+
+        conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+
+        // After DDL, autocommit should have cleaned up.
+        assert!(
+            conn.active_txn.borrow().is_none(),
+            "autocommit should clear active_txn after DDL"
+        );
+
+        // Table should exist.
+        let schema = conn.schema.borrow();
+        assert_eq!(schema.len(), 1);
+        assert_eq!(schema[0].name, "t");
+        eprintln!("[5B5][test=autocommit_ddl][step=verify] table_created=true ✓");
+    }
+
+    #[test]
+    fn test_explicit_txn_bypasses_autocommit() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+
+        // Start explicit transaction.
+        conn.execute("BEGIN").unwrap();
+        assert!(*conn.in_transaction.borrow());
+        assert!(conn.active_txn.borrow().is_some());
+
+        // INSERT inside explicit txn should NOT create a new autocommit txn.
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+        // Txn should still be active (not auto-committed).
+        assert!(
+            *conn.in_transaction.borrow(),
+            "explicit txn should remain active after INSERT"
+        );
+        assert!(
+            conn.active_txn.borrow().is_some(),
+            "active_txn should persist through explicit txn"
+        );
+
+        conn.execute("COMMIT").unwrap();
+        assert!(!*conn.in_transaction.borrow());
+        eprintln!("[5B5][test=explicit_bypasses][step=verify] ✓");
+    }
+
+    #[test]
+    fn test_autocommit_multiple_inserts_independent() {
+        // Each INSERT outside BEGIN gets its own implicit txn.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        assert!(
+            conn.active_txn.borrow().is_none(),
+            "auto-committed after first INSERT"
+        );
+
+        conn.execute("INSERT INTO t VALUES (2)").unwrap();
+        assert!(
+            conn.active_txn.borrow().is_none(),
+            "auto-committed after second INSERT"
+        );
+
+        let rows = conn.query("SELECT x FROM t ORDER BY x").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(1));
+        assert_eq!(rows[1].get(0).unwrap(), &SqliteValue::Integer(2));
+        eprintln!("[5B5][test=multiple_inserts][step=verify] count=2 ✓");
+    }
+
+    #[test]
+    fn test_autocommit_file_backed_persists() {
+        // Autocommit should persist data to file-backed databases.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db_str = db_path.to_str().unwrap();
+
+        {
+            let conn = Connection::open(db_str).unwrap();
+            conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+            conn.execute("INSERT INTO t VALUES (99)").unwrap();
+            // No explicit COMMIT — autocommit should have done it.
+        }
+
+        // Reopen and verify data persisted.
+        {
+            let conn = Connection::open(db_str).unwrap();
+            let rows = conn.query("SELECT x FROM t").unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(99));
+        }
+        eprintln!("[5B5][test=file_backed_persists][step=verify] ✓");
+    }
+}
+
+// ── Schema cookie and change counter tests (bd-3mmj) ────────────────────
+#[cfg(test)]
+mod schema_cookie_tests {
+    use super::*;
+
+    #[test]
+    fn test_schema_cookie_starts_at_zero() {
+        let conn = Connection::open(":memory:").unwrap();
+        assert_eq!(conn.schema_cookie(), 0);
+        assert_eq!(conn.change_counter(), 0);
+    }
+
+    #[test]
+    fn test_create_table_increments_cookie() {
+        let conn = Connection::open(":memory:").unwrap();
+        assert_eq!(conn.schema_cookie(), 0);
+
+        conn.execute("CREATE TABLE t1 (a INTEGER, b TEXT);")
+            .unwrap();
+        assert_eq!(conn.schema_cookie(), 1);
+    }
+
+    #[test]
+    fn test_multiple_ddl_increments_multiple_times() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (b TEXT);").unwrap();
+        conn.execute("CREATE TABLE t3 (c REAL);").unwrap();
+
+        // 3 CREATE TABLE operations = cookie incremented 3 times.
+        assert_eq!(conn.schema_cookie(), 3);
+    }
+
+    #[test]
+    fn test_drop_table_increments_cookie() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        assert_eq!(conn.schema_cookie(), 1);
+
+        conn.execute("DROP TABLE t1;").unwrap();
+        assert_eq!(conn.schema_cookie(), 2);
+    }
+
+    #[test]
+    fn test_alter_table_increments_cookie() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        assert_eq!(conn.schema_cookie(), 1);
+
+        conn.execute("ALTER TABLE t1 ADD COLUMN b TEXT;").unwrap();
+        assert_eq!(conn.schema_cookie(), 2);
+
+        conn.execute("ALTER TABLE t1 RENAME TO t1_renamed;")
+            .unwrap();
+        assert_eq!(conn.schema_cookie(), 3);
+    }
+
+    #[test]
+    fn test_create_index_increments_cookie() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER, b TEXT);")
+            .unwrap();
+        assert_eq!(conn.schema_cookie(), 1);
+
+        conn.execute("CREATE INDEX idx_a ON t1 (a);").unwrap();
+        assert_eq!(conn.schema_cookie(), 2);
+    }
+
+    #[test]
+    fn test_create_view_increments_cookie() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        assert_eq!(conn.schema_cookie(), 1);
+
+        conn.execute("CREATE VIEW v1 AS SELECT a FROM t1;").unwrap();
+        assert_eq!(conn.schema_cookie(), 2);
+    }
+
+    #[test]
+    fn test_drop_view_increments_cookie() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        conn.execute("CREATE VIEW v1 AS SELECT a FROM t1;").unwrap();
+        assert_eq!(conn.schema_cookie(), 2);
+
+        conn.execute("DROP VIEW v1;").unwrap();
+        assert_eq!(conn.schema_cookie(), 3);
+    }
+
+    #[test]
+    fn test_if_not_exists_no_double_increment() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        assert_eq!(conn.schema_cookie(), 1);
+
+        // IF NOT EXISTS on an existing table should NOT increment cookie.
+        conn.execute("CREATE TABLE IF NOT EXISTS t1 (a INTEGER);")
+            .unwrap();
+        assert_eq!(conn.schema_cookie(), 1);
+    }
+
+    #[test]
+    fn test_drop_if_exists_no_increment_when_missing() {
+        let conn = Connection::open(":memory:").unwrap();
+        assert_eq!(conn.schema_cookie(), 0);
+
+        // DROP IF EXISTS on a non-existent table should NOT increment.
+        conn.execute("DROP TABLE IF EXISTS nonexistent;").unwrap();
+        assert_eq!(conn.schema_cookie(), 0);
+    }
+
+    #[test]
+    fn test_dml_does_not_increment_schema_cookie() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        let cookie_after_ddl = conn.schema_cookie();
+
+        conn.execute("INSERT INTO t1 VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (2);").unwrap();
+        conn.execute("UPDATE t1 SET a = 10 WHERE a = 1;").unwrap();
+        conn.execute("DELETE FROM t1 WHERE a = 2;").unwrap();
+
+        // DML should not affect schema_cookie.
+        assert_eq!(conn.schema_cookie(), cookie_after_ddl);
+    }
+
+    #[test]
+    fn test_change_counter_increments_on_persist() {
+        // Use a temp file to trigger actual persistence.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_counter.db");
+        let db_str = db_path.to_str().unwrap();
+
+        let conn = Connection::open(db_str).unwrap();
+        assert_eq!(conn.change_counter(), 0);
+
+        // CREATE TABLE triggers persist → counter goes to 1.
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        assert!(conn.change_counter() >= 1);
+
+        let counter_after_create = conn.change_counter();
+
+        // INSERT triggers persist → counter increases again.
+        conn.execute("INSERT INTO t1 VALUES (42);").unwrap();
+        assert!(conn.change_counter() > counter_after_create);
+    }
+
+    #[test]
+    fn test_schema_cookie_persists_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cookie_rt.db");
+        let db_str = db_path.to_str().unwrap();
+
+        // Create database with several DDL operations.
+        {
+            let conn = Connection::open(db_str).unwrap();
+            conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+            conn.execute("CREATE TABLE t2 (b TEXT);").unwrap();
+            conn.execute("INSERT INTO t1 VALUES (1);").unwrap();
+        }
+
+        // Reopen and check that schema_cookie was preserved.
+        {
+            let conn = Connection::open(db_str).unwrap();
+            // schema_cookie should be >= 2 (two CREATE TABLE operations).
+            assert!(
+                conn.schema_cookie() >= 2,
+                "expected schema_cookie >= 2 after round-trip, got {}",
+                conn.schema_cookie()
+            );
+        }
+    }
+
+    #[test]
+    fn test_schema_cookie_continues_from_loaded_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cookie_continue.db");
+        let db_str = db_path.to_str().unwrap();
+
+        // Create database with one table.
+        {
+            let conn = Connection::open(db_str).unwrap();
+            conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        }
+
+        // Reopen and add another table — cookie should continue from loaded value.
+        {
+            let conn = Connection::open(db_str).unwrap();
+            let cookie_on_open = conn.schema_cookie();
+            conn.execute("CREATE TABLE t2 (b TEXT);").unwrap();
+            assert_eq!(conn.schema_cookie(), cookie_on_open + 1);
+        }
+    }
+}
+
+// ── Schema loading from sqlite_master tests (bd-1soh) ───────────────────
+#[cfg(test)]
+mod schema_loading_tests {
+    use super::*;
+
+    #[test]
+    fn test_open_existing_database_loads_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("schema_load.db");
+        let db_str = db_path.to_str().unwrap();
+
+        // Create database with tables.
+        {
+            let conn = Connection::open(db_str).unwrap();
+            conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);")
+                .unwrap();
+            conn.execute("CREATE TABLE orders (id INTEGER, amount REAL);")
+                .unwrap();
+        }
+
+        // Reopen — schema should be loaded from sqlite_master.
+        {
+            let conn = Connection::open(db_str).unwrap();
+            let schema = conn.schema.borrow();
+            assert_eq!(schema.len(), 2, "should load 2 tables from sqlite_master");
+            assert_eq!(schema[0].name, "users");
+            assert_eq!(schema[1].name, "orders");
+            assert_eq!(schema[0].columns.len(), 2);
+            assert_eq!(schema[1].columns.len(), 2);
+        }
+    }
+
+    #[test]
+    fn test_schema_survives_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("roundtrip.db");
+        let db_str = db_path.to_str().unwrap();
+
+        // Create database, insert data, close.
+        {
+            let conn = Connection::open(db_str).unwrap();
+            conn.execute("CREATE TABLE t1 (val INTEGER);").unwrap();
+            conn.execute("INSERT INTO t1 VALUES (42);").unwrap();
+            conn.execute("INSERT INTO t1 VALUES (99);").unwrap();
+        }
+
+        // Reopen — data should survive the round trip.
+        {
+            let conn = Connection::open(db_str).unwrap();
+            let rows = conn.query("SELECT val FROM t1 ORDER BY val;").unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].values()[0], SqliteValue::Integer(42));
+            assert_eq!(rows[1].values()[0], SqliteValue::Integer(99));
+        }
+    }
+
+    #[test]
+    fn test_open_empty_database_starts_empty() {
+        let conn = Connection::open(":memory:").unwrap();
+        let schema = conn.schema.borrow();
+        assert!(
+            schema.is_empty(),
+            "memory database should have empty schema"
+        );
+    }
+
+    #[test]
+    fn test_open_c_sqlite_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("from_c.db");
+        let db_str = db_path.to_str().unwrap();
+
+        // Create with C SQLite via rusqlite.
+        {
+            let rconn = rusqlite::Connection::open(&db_path).unwrap();
+            rconn
+                .execute_batch(
+                    "CREATE TABLE items (val INTEGER, label TEXT);
+                     INSERT INTO items VALUES (10, 'alpha');
+                     INSERT INTO items VALUES (20, 'beta');",
+                )
+                .unwrap();
+        }
+
+        // Open with FrankenSQLite — should load schema and data.
+        {
+            let conn = Connection::open(db_str).unwrap();
+            let schema = conn.schema.borrow();
+            assert_eq!(schema.len(), 1);
+            assert_eq!(schema[0].name, "items");
+            drop(schema);
+
+            let rows = conn
+                .query("SELECT val, label FROM items ORDER BY val;")
+                .unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].values()[0], SqliteValue::Integer(10));
+            assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".to_owned()));
+            assert_eq!(rows[1].values()[0], SqliteValue::Integer(20));
+            assert_eq!(rows[1].values()[1], SqliteValue::Text("beta".to_owned()));
+        }
+    }
+
+    #[test]
+    fn test_rowid_alias_loaded_from_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ipk.db");
+        let db_str = db_path.to_str().unwrap();
+
+        // Create a table with an INTEGER PRIMARY KEY (rowid alias).
+        {
+            let conn = Connection::open(db_str).unwrap();
+            conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);")
+                .unwrap();
+            conn.execute("INSERT INTO t1 VALUES (1, 'hello');").unwrap();
+        }
+
+        // Reopen — rowid alias mapping should be restored.
+        {
+            let conn = Connection::open(db_str).unwrap();
+            let alias_map = conn.rowid_alias_columns.borrow();
+            assert!(
+                alias_map.contains_key("t1"),
+                "rowid alias for t1 should be loaded"
+            );
+            drop(alias_map);
+
+            // INSERT with NULL id should autoincrement via rowid alias.
+            conn.execute("INSERT INTO t1 VALUES (NULL, 'world');")
+                .unwrap();
+            let rows = conn.query("SELECT id, val FROM t1 ORDER BY id;").unwrap();
+            assert_eq!(rows.len(), 2);
+        }
+    }
+
+    #[test]
+    fn test_next_master_rowid_advanced_past_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("master_rowid.db");
+        let db_str = db_path.to_str().unwrap();
+
+        // Create 3 tables.
+        {
+            let conn = Connection::open(db_str).unwrap();
+            conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+            conn.execute("CREATE TABLE t2 (b TEXT);").unwrap();
+            conn.execute("CREATE TABLE t3 (c REAL);").unwrap();
+        }
+
+        // Reopen — next_master_rowid should be > 3.
+        {
+            let conn = Connection::open(db_str).unwrap();
+            let next = *conn.next_master_rowid.borrow();
+            assert!(
+                next > 3,
+                "next_master_rowid should be past the 3 loaded entries, got {next}"
+            );
+
+            // Creating another table should work without rowid collision.
+            conn.execute("CREATE TABLE t4 (d BLOB);").unwrap();
+            let schema = conn.schema.borrow();
+            assert_eq!(schema.len(), 4);
+        }
     }
 }

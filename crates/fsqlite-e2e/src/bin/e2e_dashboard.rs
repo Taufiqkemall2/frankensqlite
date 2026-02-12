@@ -1882,7 +1882,7 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 /// corpus, correctness, performance, and recovery.
 #[derive(Debug, Clone, Serialize)]
 struct SummaryReport {
-    /// ISO-8601 timestamp of when this report was generated.
+    /// Unix epoch timestamp in seconds (string) when this report was generated.
     timestamp: String,
     /// Database corpus metadata.
     corpus: CorpusSummary,
@@ -2105,7 +2105,7 @@ fn write_headless(out: &SummaryReport, path: Option<&Path>) -> std::io::Result<(
     Ok(())
 }
 
-fn iso8601_now() -> String {
+fn epoch_seconds_now() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or(Duration::from_secs(0));
@@ -2176,7 +2176,7 @@ fn run_real_suite(
     });
 
     SummaryReport {
-        timestamp: iso8601_now(),
+        timestamp: epoch_seconds_now(),
         corpus,
         correctness,
         performance,
@@ -2542,6 +2542,15 @@ fn run_performance_phase(
     let mut grouped: PerfPairMap = BTreeMap::new();
 
     for cell in &showcase.perf.cells {
+        if let Some(err) = &cell.error {
+            emit(DashboardEvent::StatusMessage {
+                message: format!(
+                    "perf cell error {}:{}:{}:c{}: {err}",
+                    cell.engine, cell.fixture_id, cell.workload, cell.concurrency
+                ),
+            });
+            continue;
+        }
         let Some(summary) = cell.summary.as_ref() else {
             continue;
         };

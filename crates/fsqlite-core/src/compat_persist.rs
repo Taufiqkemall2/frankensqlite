@@ -38,6 +38,13 @@ pub struct LoadedState {
     pub schema: Vec<TableSchema>,
     /// In-memory database populated with all rows.
     pub db: MemDatabase,
+    /// Number of sqlite_master entries loaded (the next available rowid
+    /// for sqlite_master is `master_row_count + 1`).
+    pub master_row_count: i64,
+    /// Schema cookie read from the database header (offset 40).
+    pub schema_cookie: u32,
+    /// File change counter read from the database header (offset 24).
+    pub change_counter: u32,
 }
 
 /// Detect whether a file starts with the SQLite magic header.
@@ -59,7 +66,13 @@ pub fn is_sqlite_format(path: &Path) -> bool {
 /// Returns an error on I/O failure or if the B-tree layer rejects an
 /// insertion (e.g. duplicate rowid in sqlite_master).
 #[allow(clippy::too_many_lines)]
-pub fn persist_to_sqlite(path: &Path, schema: &[TableSchema], db: &MemDatabase) -> Result<()> {
+pub fn persist_to_sqlite(
+    path: &Path,
+    schema: &[TableSchema],
+    db: &MemDatabase,
+    schema_cookie: u32,
+    change_counter: u32,
+) -> Result<()> {
     // Remove existing file so the pager creates a fresh one.
     if path.exists() {
         // Truncate to empty so the pager treats it as a fresh DB, without
@@ -150,16 +163,18 @@ pub fn persist_to_sqlite(path: &Path, schema: &[TableSchema], db: &MemDatabase) 
         // page_count at offset 28 (4 bytes, big-endian)
         hdr_page[28..32].copy_from_slice(&max_page.to_be_bytes());
 
-        // change_counter at offset 24 (must be non-zero; increment from 0)
-        let change_counter: u32 = 1;
-        hdr_page[24..28].copy_from_slice(&change_counter.to_be_bytes());
+        // change_counter at offset 24 — tracked by Connection, must be
+        // non-zero for sqlite3 to trust the header.  Use at least 1.
+        let effective_counter = change_counter.max(1);
+        hdr_page[24..28].copy_from_slice(&effective_counter.to_be_bytes());
 
-        // schema_cookie at offset 40 (non-zero so sqlite3 re-reads schema)
-        let schema_cookie: u32 = 1;
-        hdr_page[40..44].copy_from_slice(&schema_cookie.to_be_bytes());
+        // schema_cookie at offset 40 — tracked by Connection, incremented
+        // on every DDL operation.  Non-zero so sqlite3 re-reads schema.
+        let effective_cookie = schema_cookie.max(1);
+        hdr_page[40..44].copy_from_slice(&effective_cookie.to_be_bytes());
 
         // version-valid-for at offset 92 (must match change_counter)
-        hdr_page[92..96].copy_from_slice(&change_counter.to_be_bytes());
+        hdr_page[92..96].copy_from_slice(&effective_counter.to_be_bytes());
 
         txn.write_page(&cx, PageNumber::ONE, &hdr_page)?;
     }
@@ -177,7 +192,7 @@ pub fn persist_to_sqlite(path: &Path, schema: &[TableSchema], db: &MemDatabase) 
 ///
 /// Returns an error if the file is not a valid SQLite database, or on
 /// I/O / B-tree navigation failures.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::similar_names)]
 pub fn load_from_sqlite(path: &Path) -> Result<LoadedState> {
     let cx = Cx::new();
     let vfs = UnixVfs::new();
@@ -247,13 +262,14 @@ pub fn load_from_sqlite(path: &Path) -> Result<LoadedState> {
         let columns = parse_columns_from_create_sql(&create_sql);
         let num_columns = columns.len();
 
-        // Create the table in MemDatabase with the root page number.
-        // We need the root page to match what the schema expects.
-        let mem_root_page = db.create_table(num_columns);
+        // Use the REAL root page from sqlite_master (5A.4: bd-1soh).
+        #[allow(clippy::cast_possible_truncation)]
+        let real_root_page = root_page_num as i32;
+        db.create_table_at(real_root_page, num_columns);
 
         schema.push(TableSchema {
             name,
-            root_page: mem_root_page,
+            root_page: real_root_page,
             columns,
             indexes: Vec::new(),
         });
@@ -269,7 +285,7 @@ pub fn load_from_sqlite(path: &Path) -> Result<LoadedState> {
             true,
         );
 
-        if let Some(mem_table) = db.tables.get_mut(&mem_root_page) {
+        if let Some(mem_table) = db.tables.get_mut(&real_root_page) {
             if cursor.first(&cx)? {
                 loop {
                     let rowid = cursor.rowid(&cx)?;
@@ -285,7 +301,32 @@ pub fn load_from_sqlite(path: &Path) -> Result<LoadedState> {
         }
     }
 
-    Ok(LoadedState { schema, db })
+    // Read schema_cookie and change_counter from the database header (page 1).
+    let (schema_cookie, change_counter) = {
+        let header_buf = txn.get_page(&cx, PageNumber::ONE)?;
+        let hdr = header_buf.as_ref();
+        let cookie = if hdr.len() >= 44 {
+            u32::from_be_bytes([hdr[40], hdr[41], hdr[42], hdr[43]])
+        } else {
+            0
+        };
+        let counter = if hdr.len() >= 28 {
+            u32::from_be_bytes([hdr[24], hdr[25], hdr[26], hdr[27]])
+        } else {
+            0
+        };
+        (cookie, counter)
+    };
+
+    #[allow(clippy::cast_possible_wrap)]
+    let master_row_count = master_entries.len() as i64;
+    Ok(LoadedState {
+        schema,
+        db,
+        master_row_count,
+        schema_cookie,
+        change_counter,
+    })
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -309,7 +350,7 @@ fn init_leaf_table_page(
 }
 
 /// Reconstruct a `CREATE TABLE` statement from a `TableSchema`.
-fn build_create_table_sql(table: &TableSchema) -> String {
+pub(crate) fn build_create_table_sql(table: &TableSchema) -> String {
     use std::fmt::Write as _;
     let mut sql = format!("CREATE TABLE \"{}\" (", table.name);
     for (i, col) in table.columns.iter().enumerate() {
@@ -318,6 +359,9 @@ fn build_create_table_sql(table: &TableSchema) -> String {
         }
         let type_kw = affinity_char_to_type(col.affinity);
         let _ = write!(sql, "\"{}\" {type_kw}", col.name);
+        if col.is_ipk {
+            sql.push_str(" PRIMARY KEY");
+        }
     }
     sql.push(')');
     sql
@@ -449,7 +493,7 @@ mod tests {
         let db_path = dir.path().join("test.db");
 
         let (schema, db) = make_test_schema_and_db();
-        persist_to_sqlite(&db_path, &schema, &db).unwrap();
+        persist_to_sqlite(&db_path, &schema, &db, 0, 0).unwrap();
 
         assert!(db_path.exists(), "db file should exist");
         assert!(is_sqlite_format(&db_path), "should have SQLite magic");
@@ -477,7 +521,7 @@ mod tests {
 
         let schema: Vec<TableSchema> = Vec::new();
         let db = MemDatabase::new();
-        persist_to_sqlite(&db_path, &schema, &db).unwrap();
+        persist_to_sqlite(&db_path, &schema, &db, 0, 0).unwrap();
 
         assert!(is_sqlite_format(&db_path));
 
@@ -491,7 +535,7 @@ mod tests {
         let db_path = dir.path().join("readable.db");
 
         let (schema, db) = make_test_schema_and_db();
-        persist_to_sqlite(&db_path, &schema, &db).unwrap();
+        persist_to_sqlite(&db_path, &schema, &db, 0, 0).unwrap();
 
         // Verify with rusqlite (C SQLite) that the file is valid.
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -595,7 +639,7 @@ mod tests {
             },
         ];
 
-        persist_to_sqlite(&db_path, &schema, &db).unwrap();
+        persist_to_sqlite(&db_path, &schema, &db, 0, 0).unwrap();
         let loaded = load_from_sqlite(&db_path).unwrap();
 
         assert_eq!(loaded.schema.len(), 2);
@@ -643,10 +687,10 @@ mod tests {
 
         // Write once.
         let (schema, db) = make_test_schema_and_db();
-        persist_to_sqlite(&db_path, &schema, &db).unwrap();
+        persist_to_sqlite(&db_path, &schema, &db, 0, 0).unwrap();
 
         // Overwrite with empty.
-        persist_to_sqlite(&db_path, &[], &MemDatabase::new()).unwrap();
+        persist_to_sqlite(&db_path, &[], &MemDatabase::new(), 0, 0).unwrap();
 
         let loaded = load_from_sqlite(&db_path).unwrap();
         assert!(loaded.schema.is_empty());
