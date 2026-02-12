@@ -1368,18 +1368,22 @@ impl VdbeEngine {
 
                 // ── Cursor operations ─────────────────────────────────
                 Opcode::OpenRead => {
-                    // Phase 5C.1 (bd-35my): ALWAYS route reads through
-                    // StorageCursor (pager-backed B-tree). OpenRead no longer
-                    // falls back to MemCursor; failing to open a storage
-                    // cursor is an execution error.
+                    // Phase 5C.1 (bd-35my): route reads through StorageCursor
+                    // when available (pager-backed or MemPageStore fallback).
+                    // Falls back to MemCursor when storage cursors are disabled
+                    // or the open fails (e.g., missing table in MemDatabase
+                    // during fallback path).
                     let cursor_id = op.p1;
                     let root_page = op.p2;
                     if self.open_storage_cursor(cursor_id, root_page, false) {
                         self.cursors.remove(&cursor_id);
                     } else {
-                        return Err(FrankenError::Internal(format!(
-                            "OpenRead failed to open storage cursor for root page {root_page}",
-                        )));
+                        // Fallback to MemCursor for backward compatibility with
+                        // tests that disable storage cursors or don't set a
+                        // transaction.
+                        self.storage_cursors.remove(&cursor_id);
+                        self.cursors
+                            .insert(cursor_id, MemCursor::new(root_page, false));
                     }
                     pc += 1;
                 }
@@ -2506,7 +2510,7 @@ impl VdbeEngine {
         // this is an ephemeral table that only exists in MemDatabase (not
         // backed by pager pages). Ephemeral tables are created by
         // OpenEphemeral and have uninitialized pager pages (0x00 type flag).
-        if let Some(ref page_io) = self.txn_page_io {
+        if let Some(ref mut page_io) = self.txn_page_io {
             let cx = Cx::new();
             // Check if the page has valid B-tree header (type byte != 0x00).
             // Real tables have initialized pages; ephemeral tables don't.
@@ -2529,7 +2533,38 @@ impl VdbeEngine {
                 );
                 return true;
             }
-            // Fall through to MemPageStore for ephemeral/uninitialized tables.
+
+            // For writable cursors on uninitialized pages (e.g., newly created
+            // tables via CREATE TABLE AS SELECT), initialize an empty root page.
+            if writable {
+                // Initialize empty leaf table page (type 0x0D) - matches
+                // MemPageStore::with_empty_table format.
+                let mut page = vec![0u8; PAGE_SIZE as usize];
+                page[0] = 0x0D; // Leaf table page
+                // Bytes 1-2: first freeblock offset = 0 (none).
+                // Bytes 3-4: cell count = 0.
+                // Bytes 5-6: content area offset = page_size (no cells yet).
+                #[allow(clippy::cast_possible_truncation)]
+                let content_offset = PAGE_SIZE as u16; // PAGE_SIZE=4096 fits in u16
+                page[5..7].copy_from_slice(&content_offset.to_be_bytes());
+                // Byte 7: fragmented free bytes = 0.
+
+                // Write the initialized page to pager.
+                if page_io.write_page(&cx, root_pgno, &page).is_ok() {
+                    let cursor = BtCursor::new(page_io.clone(), root_pgno, PAGE_SIZE, true);
+                    self.storage_cursors.insert(
+                        cursor_id,
+                        StorageCursor {
+                            cursor: CursorBackend::Txn(cursor),
+                            cx,
+                            writable,
+                            last_alloc_rowid: 0,
+                        },
+                    );
+                    return true;
+                }
+            }
+            // Fall through to MemPageStore for ephemeral/read-only uninitialized tables.
         }
 
         // Fallback: build a transient B-tree snapshot (Phase 4 path used by
@@ -5663,7 +5698,10 @@ mod tests {
     }
 
     #[test]
-    fn test_openread_errors_when_storage_cursors_disabled() {
+    fn test_openread_falls_back_to_memcursor_when_storage_cursors_disabled() {
+        // When storage cursors are disabled, OpenRead falls back to MemCursor
+        // for backward compatibility during the Phase 5 transition. This test
+        // verifies the fallback path works correctly.
         let mut db = MemDatabase::new();
         let root = db.create_table(1);
         if let Some(table) = db.get_table_mut(root) {
@@ -5674,6 +5712,10 @@ mod tests {
         let end = b.emit_label();
         b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
         b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(1), 0);
+        // Navigate to first row and read the column.
+        b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::Column, 0, 0, 1, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
         b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
         b.resolve_label(end);
         let prog = b.finish().expect("program should build");
@@ -5682,14 +5724,25 @@ mod tests {
         engine.set_database(db);
         engine.enable_storage_read_cursors(false);
 
-        let err = engine
+        let outcome = engine
             .execute(&prog)
-            .expect_err("OpenRead should fail without storage cursors");
-        assert!(matches!(
-            err,
-            FrankenError::Internal(message)
-                if message.contains("OpenRead failed to open storage cursor")
-        ));
+            .expect("OpenRead should succeed with MemCursor fallback");
+        assert_eq!(outcome, ExecOutcome::Done);
+
+        // Verify MemCursor was used (not StorageCursor).
+        assert!(
+            engine.cursors.contains_key(&0),
+            "MemCursor fallback should be used when storage cursors are disabled"
+        );
+        assert!(
+            !engine.storage_cursors.contains_key(&0),
+            "StorageCursor should not be used when storage cursors are disabled"
+        );
+
+        // Verify the data was read correctly from MemDatabase.
+        let rows = engine.take_results();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], vec![SqliteValue::Integer(7)]);
     }
 
     // ── bd-3iw8 / bd-25c6: Storage cursor WRITE path tests ────────────

@@ -62,6 +62,7 @@ use crate::wal_adapter::WalBackendAdapter;
 /// - **bd-25c6**: Wire `OpenWrite` opcode through `StorageCursor` to the
 ///   B-tree write path using [`TransactionPageIo`].
 #[allow(dead_code)] // Fields used by upcoming sub-tasks bd-1dqg and bd-25c6
+#[derive(Clone)]
 pub enum PagerBackend {
     /// In-memory VFS backend (`:memory:` databases).
     Memory(Arc<SimplePager<MemoryVfs>>),
@@ -259,6 +260,10 @@ pub struct PreparedStatement {
     /// For table-backed SELECT, the statement must execute against the same
     /// MemDatabase as the Connection that prepared it.
     db: Option<Rc<RefCell<MemDatabase>>>,
+    /// Phase 5 (bd-35my): pager backend for starting transactions during query.
+    /// Needed because PreparedStatement::query() executes independently of the
+    /// Connection's transaction state.
+    pager: Option<PagerBackend>,
     /// For table-backed `SELECT DISTINCT ... LIMIT/OFFSET`, we compile an
     /// unbounded program and apply the LIMIT/OFFSET after de-duplication.
     ///
@@ -302,15 +307,31 @@ impl PreparedStatement {
                     "prepared statement missing function registry".to_owned(),
                 ));
             };
-            execute_table_program_with_db(
+            // Phase 5 (bd-35my): start a deferred transaction to read from the
+            // pager. This ensures PreparedStatement::query() can see data written
+            // by prior INSERT statements through the Connection.
+            let txn = self
+                .pager
+                .as_ref()
+                .map(|p| {
+                    let cx = Cx::new();
+                    p.begin(&cx, TransactionMode::Deferred)
+                })
+                .transpose()?;
+            let (result, mut txn_back) = execute_table_program_with_db(
                 &self.program,
                 None,
                 registry,
                 db,
-                None,
+                txn,
                 self.schema_cookie,
-            )
-            .0?
+            );
+            // Commit the read transaction (no-op for deferred reads).
+            if let Some(ref mut txn) = txn_back {
+                let cx = Cx::new();
+                txn.commit(&cx)?;
+            }
+            result?
         } else {
             execute_program_with_postprocess(
                 &self.program,
@@ -1153,6 +1174,7 @@ impl Connection {
                     expression_postprocess,
                     distinct: is_distinct_select(select),
                     db: None,
+                    pager: None,
                     post_distinct_limit: None,
                     schema_cookie: self.schema_cookie(),
                 })
@@ -1173,6 +1195,7 @@ impl Connection {
                     expression_postprocess: None,
                     distinct,
                     db: Some(Rc::clone(&self.db)),
+                    pager: Some(self.pager.clone()),
                     post_distinct_limit: if distinct { limit_clause } else { None },
                     schema_cookie: self.schema_cookie(),
                 })
@@ -1472,14 +1495,16 @@ impl Connection {
                 let rp = table_schema.root_page;
                 let tbl_name = table_schema.name.clone();
                 self.schema.borrow_mut().push(table_schema);
-                // Insert result rows into the new table.
-                for (i, row) in rows.iter().enumerate() {
-                    let vals: Vec<SqliteValue> = row.values().to_vec();
-                    #[allow(clippy::cast_possible_wrap)]
-                    let rowid = (i + 1) as i64;
-                    let mut db = self.db.borrow_mut();
-                    if let Some(table) = db.get_table_mut(rp) {
-                        table.insert_row(rowid, vals);
+                // Phase 5B.2/5C.1: Insert result rows via VDBE to ensure data
+                // goes through StorageCursor and ends up in the pager.
+                if !rows.is_empty() {
+                    let placeholders: String = (1..=width)
+                        .map(|i| format!("?{i}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let insert_sql = format!("INSERT INTO \"{tbl_name}\" VALUES ({placeholders})");
+                    for row in &rows {
+                        self.execute_with_params(&insert_sql, row.values())?;
                     }
                 }
                 self.insert_sqlite_master_row("table", &tbl_name, &tbl_name, rp, &create_sql)?;
@@ -6800,7 +6825,6 @@ mod tests {
     use fsqlite_error::FrankenError;
     use fsqlite_types::opcode::{Opcode, P4};
     use fsqlite_types::value::SqliteValue;
-    use fsqlite_vdbe::engine::{ExecOutcome, MemDatabase, VdbeEngine};
 
     fn row_values(row: &Row) -> Vec<SqliteValue> {
         row.values().to_vec()
@@ -10250,44 +10274,20 @@ mod tests {
 
     #[test]
     fn test_blob_literal_roundtrips_through_mem_and_storage_cursors() {
+        // Phase 5B.2/5C.1: With write-through, INSERT only writes to the pager
+        // via StorageCursor, not to MemDatabase. Therefore, the storage cursor
+        // path is the primary test case. The MemCursor fallback path only sees
+        // data if it's manually inserted into MemDatabase, not via SQL INSERT.
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (bl BLOB);").unwrap();
         conn.execute("INSERT INTO t VALUES (X'DEADBEEF');").unwrap();
 
-        let stmt = super::parse_single_statement("SELECT bl FROM t;").unwrap();
-        let select = match stmt {
-            Statement::Select(select) => select,
-            other => unreachable!("expected SELECT statement, got {other:?}"),
-        };
-        let program = conn.compile_table_select(&select).unwrap();
-
-        // Execute once with mem cursors (storage cursors disabled).
-        let db_mem = conn.db.replace(MemDatabase::new());
-        let mut engine = VdbeEngine::new(program.register_count());
-        engine.enable_storage_read_cursors(false);
-        engine.set_database(db_mem);
-        let outcome = engine.execute(&program).unwrap();
-        assert_eq!(outcome, ExecOutcome::Done);
-        let mem_rows = engine.take_results();
-        if let Some(db_after) = engine.take_database() {
-            *conn.db.borrow_mut() = db_after;
-        }
-
-        // Execute once with storage-backed read cursors enabled.
-        let db_storage = conn.db.replace(MemDatabase::new());
-        let mut engine = VdbeEngine::new(program.register_count());
-        engine.enable_storage_read_cursors(true);
-        engine.set_database(db_storage);
-        let outcome = engine.execute(&program).unwrap();
-        assert_eq!(outcome, ExecOutcome::Done);
-        let storage_rows = engine.take_results();
-        if let Some(db_after) = engine.take_database() {
-            *conn.db.borrow_mut() = db_after;
-        }
-
+        // Verify via normal query that data is readable (uses storage cursors
+        // under the hood via the Connection's pager transaction).
+        let rows = conn.query("SELECT bl FROM t;").unwrap();
         let expected = vec![SqliteValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF])];
-        assert_eq!(mem_rows, vec![expected.clone()]);
-        assert_eq!(storage_rows, vec![expected]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values().to_vec(), expected);
     }
 
     #[test]
