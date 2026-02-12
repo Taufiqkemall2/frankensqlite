@@ -19,12 +19,16 @@ use std::sync::Arc;
 use fsqlite_btree::{BtCursor, BtreeCursorOps, MemPageStore, PageReader, PageWriter, SeekResult};
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::{ErasedAggregateFunction, FunctionRegistry};
+use fsqlite_mvcc::{
+    ConcurrentRegistry, InProcessPageLockTable, MvccError, concurrent_read_page,
+    concurrent_write_page,
+};
 use fsqlite_pager::TransactionHandle;
-use fsqlite_types::PageNumber;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
 use fsqlite_types::record::{parse_record, serialize_record};
 use fsqlite_types::value::SqliteValue;
+use fsqlite_types::{PageData, PageNumber};
 
 use crate::VdbeProgram;
 
@@ -208,17 +212,44 @@ impl SorterCursor {
 // `PageReader`/`PageWriter` impls delegate through the `RefCell` borrow
 // so that cursors can read/write pages on the real MVCC stack.
 
+// ── MVCC Concurrent Context (bd-kivg / 5E.2) ────────────────────────────
+//
+// When concurrent mode is enabled, page-level locks must be acquired
+// before writes, and reads must check the local write set first.
+
+/// MVCC concurrent mode context for page-level locking (bd-kivg / 5E.2).
+///
+/// When a transaction is in concurrent mode, this context enables:
+/// - Acquiring page-level locks before writes via [`concurrent_write_page`]
+/// - Checking the local write set before reads via [`concurrent_read_page`]
+#[derive(Clone)]
+struct ConcurrentContext {
+    /// Session ID for this concurrent transaction.
+    session_id: u64,
+    /// Shared reference to the concurrent writer registry.
+    registry: Rc<RefCell<ConcurrentRegistry>>,
+    /// Shared reference to the page-level lock table.
+    lock_table: Rc<InProcessPageLockTable>,
+}
+
 /// Shared wrapper around a boxed [`TransactionHandle`] so multiple
 /// storage cursors can share one transaction.
+///
+/// Optionally includes [`ConcurrentContext`] for MVCC page-level locking
+/// (bd-kivg / 5E.2).
 #[derive(Clone)]
 struct SharedTxnPageIo {
     txn: Rc<RefCell<Box<dyn TransactionHandle>>>,
+    /// MVCC concurrent context (bd-kivg / 5E.2). When present, enables
+    /// page-level locking for write operations.
+    concurrent: Option<ConcurrentContext>,
 }
 
 impl std::fmt::Debug for SharedTxnPageIo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SharedTxnPageIo")
             .field("rc_count", &Rc::strong_count(&self.txn))
+            .field("concurrent", &self.concurrent.is_some())
             .finish()
     }
 }
@@ -227,6 +258,24 @@ impl SharedTxnPageIo {
     fn new(txn: Box<dyn TransactionHandle>) -> Self {
         Self {
             txn: Rc::new(RefCell::new(txn)),
+            concurrent: None,
+        }
+    }
+
+    /// Create with MVCC concurrent context (bd-kivg / 5E.2).
+    fn with_concurrent(
+        txn: Box<dyn TransactionHandle>,
+        session_id: u64,
+        registry: Rc<RefCell<ConcurrentRegistry>>,
+        lock_table: Rc<InProcessPageLockTable>,
+    ) -> Self {
+        Self {
+            txn: Rc::new(RefCell::new(txn)),
+            concurrent: Some(ConcurrentContext {
+                session_id,
+                registry,
+                lock_table,
+            }),
         }
     }
 
@@ -245,12 +294,36 @@ impl SharedTxnPageIo {
 
 impl PageReader for SharedTxnPageIo {
     fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
+        // bd-kivg / 5E.2: Check local write set first if in concurrent mode.
+        if let Some(ref ctx) = self.concurrent {
+            let registry = ctx.registry.borrow();
+            if let Some(handle) = registry.get(ctx.session_id) {
+                if let Some(page_data) = concurrent_read_page(handle, page_no) {
+                    // Return the locally modified page from write set.
+                    return Ok(page_data.as_bytes().to_vec());
+                }
+            }
+        }
+        // Fall through to underlying transaction's page read.
         Ok(self.txn.borrow().get_page(cx, page_no)?.into_vec())
     }
 }
 
 impl PageWriter for SharedTxnPageIo {
     fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
+        // bd-kivg / 5E.2: Acquire page-level lock and record in write set if concurrent.
+        if let Some(ref ctx) = self.concurrent {
+            let page_data = PageData::from_vec(data.to_vec());
+            let mut registry = ctx.registry.borrow_mut();
+            if let Some(handle) = registry.get_mut(ctx.session_id) {
+                concurrent_write_page(handle, &ctx.lock_table, ctx.session_id, page_no, page_data)
+                    .map_err(|e| match e {
+                        MvccError::Busy => FrankenError::Busy,
+                        _ => FrankenError::Internal(format!("MVCC write_page failed: {e}")),
+                    })?;
+            }
+        }
+        // Persist to the underlying transaction.
         self.txn.borrow_mut().write_page(cx, page_no, data)
     }
 
@@ -804,6 +877,26 @@ impl VdbeEngine {
     /// snapshots. Also enables storage cursors automatically.
     pub fn set_transaction(&mut self, txn: Box<dyn TransactionHandle>) {
         self.txn_page_io = Some(SharedTxnPageIo::new(txn));
+        self.storage_cursors_enabled = true;
+    }
+
+    /// Lend a pager transaction with MVCC concurrent context (bd-kivg / 5E.2).
+    ///
+    /// Like [`set_transaction`](Self::set_transaction), but also enables
+    /// MVCC page-level locking for concurrent writers. When the concurrent
+    /// context is present:
+    /// - Write operations acquire page-level locks via [`concurrent_write_page`]
+    /// - Read operations check the local write set via [`concurrent_read_page`]
+    pub fn set_transaction_concurrent(
+        &mut self,
+        txn: Box<dyn TransactionHandle>,
+        session_id: u64,
+        registry: Rc<RefCell<ConcurrentRegistry>>,
+        lock_table: Rc<InProcessPageLockTable>,
+    ) {
+        self.txn_page_io = Some(SharedTxnPageIo::with_concurrent(
+            txn, session_id, registry, lock_table,
+        ));
         self.storage_cursors_enabled = true;
     }
 

@@ -44,14 +44,94 @@ use fsqlite_vfs::UnixVfs;
 use fsqlite_vfs::traits::Vfs;
 use fsqlite_wal::{WalFile, WalSalts};
 
-// MVCC concurrent-writer support (bd-14zc / 5E.1)
+// MVCC concurrent-writer support (bd-14zc / 5E.1, bd-kivg / 5E.2)
 use fsqlite_mvcc::{
-    CommitIndex, ConcurrentRegistry, FcwResult, InProcessPageLockTable, MvccError,
-    concurrent_abort, concurrent_commit,
+    CommitIndex, ConcurrentHandle, ConcurrentRegistry, FcwResult, InProcessPageLockTable,
+    MvccError, concurrent_abort, concurrent_commit, concurrent_read_page, concurrent_write_page,
 };
-use fsqlite_types::{CommitSeq, SchemaEpoch, Snapshot};
+use fsqlite_types::{CommitSeq, PageData, SchemaEpoch, Snapshot};
 
 use crate::wal_adapter::WalBackendAdapter;
+
+// ---------------------------------------------------------------------------
+// MVCC Page I/O Wrapper (bd-kivg / 5E.2)
+// ---------------------------------------------------------------------------
+
+/// Page I/O wrapper that adds MVCC page-level locking for concurrent transactions.
+///
+/// Implements [`fsqlite_btree::cursor::PageReader`] and [`PageWriter`] by:
+/// 1. Intercepting writes to acquire page locks via `concurrent_write_page()`
+/// 2. Intercepting reads to check the local write set via `concurrent_read_page()`
+/// 3. Delegating to the underlying pager transaction for physical I/O
+///
+/// This wrapper is used when in `BEGIN CONCURRENT` mode to enable MVCC
+/// page-level conflict detection.
+pub struct MvccPageIo<'a, 'b> {
+    /// The underlying pager transaction.
+    txn: &'a mut dyn TransactionHandle,
+    /// The concurrent handle for this session (from ConcurrentRegistry).
+    handle: &'b mut ConcurrentHandle,
+    /// Page-level lock table for concurrent writers.
+    lock_table: &'b InProcessPageLockTable,
+    /// Session ID for this concurrent transaction.
+    session_id: u64,
+}
+
+impl<'a, 'b> MvccPageIo<'a, 'b> {
+    /// Create a new MVCC page I/O wrapper.
+    #[must_use]
+    pub fn new(
+        txn: &'a mut dyn TransactionHandle,
+        handle: &'b mut ConcurrentHandle,
+        lock_table: &'b InProcessPageLockTable,
+        session_id: u64,
+    ) -> Self {
+        Self {
+            txn,
+            handle,
+            lock_table,
+            session_id,
+        }
+    }
+}
+
+impl fsqlite_btree::cursor::PageReader for MvccPageIo<'_, '_> {
+    fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
+        // Check the local write set first (read-your-own-writes).
+        if let Some(page_data) = concurrent_read_page(self.handle, page_no) {
+            return Ok(page_data.as_bytes().to_vec());
+        }
+        // Not in write set, delegate to pager transaction.
+        Ok(self.txn.get_page(cx, page_no)?.into_vec())
+    }
+}
+
+impl fsqlite_btree::cursor::PageWriter for MvccPageIo<'_, '_> {
+    fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
+        // Acquire page lock and record in write set.
+        concurrent_write_page(
+            self.handle,
+            self.lock_table,
+            self.session_id,
+            page_no,
+            PageData::from_vec(data.to_vec()),
+        )
+        .map_err(|e| match e {
+            MvccError::Busy => FrankenError::Busy,
+            _ => FrankenError::Internal(format!("MVCC write_page failed: {e}")),
+        })?;
+        // Delegate to pager transaction for physical durability.
+        self.txn.write_page(cx, page_no, data)
+    }
+
+    fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
+        self.txn.allocate_page(cx)
+    }
+
+    fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
+        self.txn.free_page(cx, page_no)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Phase 5: Pager backend abstraction (bd-3iw8)
@@ -325,6 +405,7 @@ impl PreparedStatement {
                     p.begin(&cx, TransactionMode::Deferred)
                 })
                 .transpose()?;
+            // PreparedStatement doesn't have concurrent context (it manages its own txns).
             let (result, mut txn_back) = execute_table_program_with_db(
                 &self.program,
                 None,
@@ -332,6 +413,7 @@ impl PreparedStatement {
                 db,
                 txn,
                 self.schema_cookie,
+                None,
             );
             // Commit the read transaction (no-op for deferred reads).
             if let Some(ref mut txn) = txn_back {
@@ -364,6 +446,7 @@ impl PreparedStatement {
                     "prepared statement missing function registry".to_owned(),
                 ));
             };
+            // PreparedStatement doesn't have concurrent context (no active txn here).
             execute_table_program_with_db(
                 &self.program,
                 Some(params),
@@ -371,6 +454,7 @@ impl PreparedStatement {
                 db,
                 None,
                 self.schema_cookie,
+                None,
             )
             .0?
         } else {
@@ -541,14 +625,16 @@ pub struct Connection {
     /// File change counter (offset 24 in the database header).  Incremented
     /// on every transaction that modifies the database (DML or DDL).
     change_counter: RefCell<u32>,
-    // ── MVCC concurrent-writer state (bd-14zc / 5E.1) ─────────────────────
+    // ── MVCC concurrent-writer state (bd-14zc / 5E.1, bd-kivg / 5E.2) ─────
     /// Registry of active concurrent-writer sessions.
-    concurrent_registry: RefCell<ConcurrentRegistry>,
+    /// Wrapped in Rc for sharing with VdbeEngine during execution (bd-kivg).
+    concurrent_registry: Rc<RefCell<ConcurrentRegistry>>,
     /// Session ID for the current concurrent transaction (if any).
     /// Set by execute_begin() when mode is Concurrent.
     concurrent_session_id: RefCell<Option<u64>>,
     /// Page-level lock table for concurrent writers.
-    concurrent_lock_table: InProcessPageLockTable,
+    /// Wrapped in Rc for sharing with VdbeEngine during execution (bd-kivg).
+    concurrent_lock_table: Rc<InProcessPageLockTable>,
     /// Commit index mapping pages to their latest committed sequence.
     concurrent_commit_index: CommitIndex,
     /// Next commit sequence to assign (simple in-process monotonic counter).
@@ -605,10 +691,10 @@ impl Connection {
             next_master_rowid: RefCell::new(1),
             schema_cookie: RefCell::new(0),
             change_counter: RefCell::new(0),
-            // MVCC concurrent-writer state (bd-14zc / 5E.1)
-            concurrent_registry: RefCell::new(ConcurrentRegistry::new()),
+            // MVCC concurrent-writer state (bd-14zc / 5E.1, bd-kivg / 5E.2)
+            concurrent_registry: Rc::new(RefCell::new(ConcurrentRegistry::new())),
             concurrent_session_id: RefCell::new(None),
-            concurrent_lock_table: InProcessPageLockTable::new(),
+            concurrent_lock_table: Rc::new(InProcessPageLockTable::new()),
             concurrent_commit_index: CommitIndex::new(),
             next_commit_seq: RefCell::new(1),
             closed: RefCell::new(false),
@@ -3783,6 +3869,20 @@ impl Connection {
         // cursors route through the real pager/WAL stack (Phase 5, bd-2a3y).
         let txn = self.active_txn.borrow_mut().take();
         let cookie = *self.schema_cookie.borrow();
+
+        // bd-kivg / 5E.2: Build concurrent context if in concurrent mode.
+        let concurrent_ctx = if *self.concurrent_txn.borrow() {
+            self.concurrent_session_id
+                .borrow()
+                .map(|session_id| ConcurrentExecContext {
+                    session_id,
+                    registry: Rc::clone(&self.concurrent_registry),
+                    lock_table: Rc::clone(&self.concurrent_lock_table),
+                })
+        } else {
+            None
+        };
+
         let (result, txn_back) = execute_table_program_with_db(
             program,
             params,
@@ -3790,6 +3890,7 @@ impl Connection {
             &self.db,
             txn,
             cookie,
+            concurrent_ctx,
         );
         // Always restore the transaction handle, even on error.
         if let Some(txn) = txn_back {
@@ -5176,6 +5277,14 @@ fn execute_program_with_postprocess(
     Ok(rows)
 }
 
+/// MVCC concurrent context for page-level locking (bd-kivg / 5E.2).
+/// Passed to `execute_table_program_with_db` when in concurrent mode.
+struct ConcurrentExecContext {
+    session_id: u64,
+    registry: Rc<RefCell<ConcurrentRegistry>>,
+    lock_table: Rc<InProcessPageLockTable>,
+}
+
 fn execute_table_program_with_db(
     program: &VdbeProgram,
     params: Option<&[SqliteValue]>,
@@ -5183,6 +5292,7 @@ fn execute_table_program_with_db(
     db: &Rc<RefCell<MemDatabase>>,
     txn: Option<Box<dyn TransactionHandle>>,
     schema_cookie: u32,
+    concurrent_ctx: Option<ConcurrentExecContext>,
 ) -> (Result<Vec<Row>>, Option<Box<dyn TransactionHandle>>) {
     let mut engine = VdbeEngine::new(program.register_count());
     if let Some(params) = params {
@@ -5197,9 +5307,14 @@ fn execute_table_program_with_db(
 
     // Phase 5 (bd-2a3y): if a transaction handle is available, lend it to
     // the engine so storage cursors route through the real pager/WAL stack.
-    // This also enables storage cursors automatically.
+    // bd-kivg / 5E.2: if concurrent context is provided, use set_transaction_concurrent
+    // to enable MVCC page-level locking.
     if let Some(txn) = txn {
-        engine.set_transaction(txn);
+        if let Some(ctx) = concurrent_ctx {
+            engine.set_transaction_concurrent(txn, ctx.session_id, ctx.registry, ctx.lock_table);
+        } else {
+            engine.set_transaction(txn);
+        }
     } else {
         engine.enable_storage_read_cursors(true);
     }
@@ -7222,9 +7337,11 @@ fn project_join_column(
 
 #[cfg(test)]
 mod tests {
-    use super::{Connection, Row};
+    use super::{CommitSeq, Connection, InProcessPageLockTable, MvccPageIo, Row, SchemaEpoch};
     use fsqlite_ast::Statement;
     use fsqlite_error::FrankenError;
+    use fsqlite_types::PageNumber;
+    use fsqlite_types::cx::Cx;
     use fsqlite_types::opcode::{Opcode, P4};
     use fsqlite_types::value::SqliteValue;
 
@@ -11294,6 +11411,127 @@ mod tests {
         // Verify the insert was rolled back.
         let rows = conn.query("SELECT COUNT(*) FROM t;").unwrap();
         assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(0));
+    }
+
+    // ── MVCC page-level locking tests (bd-kivg / 5E.2) ────────────────────
+
+    #[test]
+    fn test_mvcc_page_io_write_acquires_lock() {
+        // Test that writing through MvccPageIo acquires page locks.
+        use fsqlite_btree::cursor::PageWriter;
+        use fsqlite_mvcc::ConcurrentHandle;
+        use fsqlite_pager::traits::TransactionMode;
+        use fsqlite_types::Snapshot;
+
+        let conn = Connection::open(":memory:").unwrap();
+        let cx = Cx::new();
+
+        // Begin a pager transaction.
+        let mut txn = conn.pager.begin(&cx, TransactionMode::Deferred).unwrap();
+
+        // Create MVCC state.
+        let snapshot = Snapshot::new(CommitSeq::ZERO, SchemaEpoch::new(0));
+        let mut handle = ConcurrentHandle::new(snapshot);
+        let lock_table = InProcessPageLockTable::new();
+        let session_id = 1;
+
+        // Create MvccPageIo wrapper.
+        let mut mvcc_io = MvccPageIo::new(&mut *txn, &mut handle, &lock_table, session_id);
+
+        // Write to a page.
+        let page_no = PageNumber::new(2).unwrap();
+        let data = vec![0u8; 4096];
+        mvcc_io.write_page(&cx, page_no, &data).unwrap();
+
+        // Verify page lock is held.
+        assert!(handle.held_locks().contains(&page_no));
+
+        // Verify page is in write set.
+        assert_eq!(handle.write_set_len(), 1);
+        assert!(handle.write_set_pages().contains(&page_no));
+    }
+
+    #[test]
+    fn test_mvcc_page_io_read_own_writes() {
+        // Test that reading through MvccPageIo sees own writes.
+        use fsqlite_btree::cursor::{PageReader, PageWriter};
+        use fsqlite_mvcc::ConcurrentHandle;
+        use fsqlite_pager::traits::TransactionMode;
+        use fsqlite_types::Snapshot;
+
+        let conn = Connection::open(":memory:").unwrap();
+        let cx = Cx::new();
+
+        let mut txn = conn.pager.begin(&cx, TransactionMode::Deferred).unwrap();
+
+        let snapshot = Snapshot::new(CommitSeq::ZERO, SchemaEpoch::new(0));
+        let mut handle = ConcurrentHandle::new(snapshot);
+        let lock_table = InProcessPageLockTable::new();
+        let session_id = 1;
+
+        let mut mvcc_io = MvccPageIo::new(&mut *txn, &mut handle, &lock_table, session_id);
+
+        // Write distinctive data to a page.
+        let page_no = PageNumber::new(2).unwrap();
+        let mut data = vec![0u8; 4096];
+        data[0..4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        mvcc_io.write_page(&cx, page_no, &data).unwrap();
+
+        // Read the same page - should see our write.
+        let read_data = mvcc_io.read_page(&cx, page_no).unwrap();
+        assert_eq!(&read_data[0..4], &[0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn test_mvcc_page_io_write_conflict_returns_busy() {
+        // Test that two concurrent sessions writing same page conflicts.
+        // Use two separate connections since the simple pager is single-writer.
+        use fsqlite_btree::cursor::PageWriter;
+        use fsqlite_mvcc::ConcurrentHandle;
+        use fsqlite_pager::traits::TransactionMode;
+        use fsqlite_types::Snapshot;
+
+        let conn1 = Connection::open(":memory:").unwrap();
+        let conn2 = Connection::open(":memory:").unwrap();
+        let cx = Cx::new();
+
+        // Single shared lock table for both sessions - this is the key for testing.
+        let lock_table = InProcessPageLockTable::new();
+
+        // Session 1 writes to page 2.
+        let mut txn1 = conn1.pager.begin(&cx, TransactionMode::Deferred).unwrap();
+        let snapshot1 = Snapshot::new(CommitSeq::ZERO, SchemaEpoch::new(0));
+        let mut handle1 = ConcurrentHandle::new(snapshot1);
+        let session_id_1 = 1;
+
+        {
+            let mut mvcc_io1 = MvccPageIo::new(&mut *txn1, &mut handle1, &lock_table, session_id_1);
+            let page_no = PageNumber::new(2).unwrap();
+            let data = vec![0u8; 4096];
+            mvcc_io1.write_page(&cx, page_no, &data).unwrap();
+        }
+
+        // Session 2 tries to write to the same page - should fail with Busy.
+        let mut txn2 = conn2.pager.begin(&cx, TransactionMode::Deferred).unwrap();
+        let snapshot2 = Snapshot::new(CommitSeq::ZERO, SchemaEpoch::new(0));
+        let mut handle2 = ConcurrentHandle::new(snapshot2);
+        let session_id_2 = 2;
+
+        {
+            let mut mvcc_io2 = MvccPageIo::new(&mut *txn2, &mut handle2, &lock_table, session_id_2);
+            let page_no = PageNumber::new(2).unwrap();
+            let data = vec![0u8; 4096];
+            let result = mvcc_io2.write_page(&cx, page_no, &data);
+            assert!(matches!(result, Err(FrankenError::Busy)));
+        }
+
+        // Session 2 can write to a different page.
+        {
+            let mut mvcc_io2 = MvccPageIo::new(&mut *txn2, &mut handle2, &lock_table, session_id_2);
+            let page_no = PageNumber::new(3).unwrap();
+            let data = vec![0u8; 4096];
+            mvcc_io2.write_page(&cx, page_no, &data).unwrap();
+        }
     }
 
     #[test]
