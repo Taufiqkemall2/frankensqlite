@@ -8,6 +8,8 @@
 //! under concurrent launches.
 
 use std::fmt::Write as _;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -171,6 +173,7 @@ fn create_workspace_inner(
             .expect("golden path should have a filename");
         let dest_path = run_dir.join(dest_name);
         std::fs::copy(golden_path, &dest_path)?;
+        ensure_writable(&dest_path)?;
 
         let mut sidecars = Vec::new();
         for ext in SIDECAR_EXTENSIONS {
@@ -185,6 +188,7 @@ fn create_workspace_inner(
                     .expect("sidecar should have a filename");
                 let sidecar_dest = run_dir.join(sidecar_name);
                 std::fs::copy(&sidecar_src, &sidecar_dest)?;
+                ensure_writable(&sidecar_dest)?;
                 sidecars.push(sidecar_dest);
             }
         }
@@ -259,6 +263,31 @@ fn discover_golden_dbs(golden_dir: &Path) -> E2eResult<Vec<(String, PathBuf)>> {
 
     dbs.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(dbs)
+}
+
+fn ensure_writable(path: &Path) -> E2eResult<()> {
+    let metadata = std::fs::metadata(path)?;
+
+    #[cfg(unix)]
+    {
+        let mut mode = metadata.permissions().mode();
+        let user_write = 0o200;
+        if mode & user_write == 0 {
+            mode |= user_write;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let mut perms = metadata.permissions();
+        if perms.readonly() {
+            perms.set_readonly(false);
+            std::fs::set_permissions(path, perms)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn sanitize_run_label(label: &str) -> String {
@@ -538,5 +567,53 @@ mod tests {
             run_name.contains("_wal_bitrot_frame_1"),
             "run name should include sanitized label, got: {run_name}"
         );
+    }
+
+    #[test]
+    fn test_workspace_copy_is_writable_even_if_golden_is_read_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let golden = setup_fake_golden(tmp.path());
+        let working = tmp.path().join("working");
+        std::fs::create_dir_all(&working).unwrap();
+
+        let golden_db = golden.join("alpha.db");
+        let mut db_perms = std::fs::metadata(&golden_db).unwrap().permissions();
+        db_perms.set_readonly(true);
+        std::fs::set_permissions(&golden_db, db_perms).unwrap();
+
+        let golden_wal = golden.join("alpha.db-wal");
+        let mut wal_perms = std::fs::metadata(&golden_wal).unwrap().permissions();
+        wal_perms.set_readonly(true);
+        std::fs::set_permissions(&golden_wal, wal_perms).unwrap();
+
+        let config = WorkspaceConfig {
+            golden_dir: golden,
+            working_base: working,
+        };
+        let ws = create_workspace(&config, &["alpha"]).unwrap();
+
+        let copied_db = &ws.databases[0].db_path;
+        assert!(
+            !std::fs::metadata(copied_db)
+                .unwrap()
+                .permissions()
+                .readonly(),
+            "workspace DB copy must be writable"
+        );
+        std::fs::write(copied_db, b"workspace-write-ok").unwrap();
+
+        let copied_wal = ws.databases[0]
+            .sidecars
+            .iter()
+            .find(|p| p.ends_with("alpha.db-wal"))
+            .unwrap();
+        assert!(
+            !std::fs::metadata(copied_wal)
+                .unwrap()
+                .permissions()
+                .readonly(),
+            "workspace sidecar copy must be writable"
+        );
+        std::fs::write(copied_wal, b"workspace-sidecar-write-ok").unwrap();
     }
 }
