@@ -371,8 +371,6 @@ struct StorageCursor {
     cx: Cx,
     /// Whether this cursor was opened for writing (`OpenWrite`).
     writable: bool,
-    /// Root page number (MemDatabase key), used for MemDatabase sync.
-    root_page: i32,
     /// Highest rowid allocated by `NewRowid` on this cursor (bd-1yi8).
     /// Ensures consecutive allocations return unique values even when
     /// no Insert has been issued between them.
@@ -652,21 +650,6 @@ impl MemDatabase {
                 prev_next_rowid,
                 old_values,
             });
-        }
-    }
-
-    fn delete_by_rowid(&mut self, root_page: i32, rowid: i64) {
-        if let Some(table) = self.tables.get_mut(&root_page) {
-            if let Some(index) = table.rows.iter().position(|r| r.rowid == rowid) {
-                let prev_next_rowid = table.next_rowid;
-                let row = table.rows.remove(index);
-                self.push_undo(MemDbUndoOp::DeleteRow {
-                    root_page,
-                    index,
-                    row,
-                    prev_next_rowid,
-                });
-            }
         }
     }
 
@@ -2525,68 +2508,22 @@ impl VdbeEngine {
         if let Some(ref page_io) = self.txn_page_io {
             let cx = Cx::new();
 
-            if writable {
-                // Write path: initialize the root page as an empty leaf table
-                // B-tree page (type 0x0D) in the pager's write-set, then
-                // hydrate from MemTable rows (dual-source during Phase 5
-                // transition).
-                let mut root_data = vec![0u8; PAGE_SIZE as usize];
-                root_data[0] = 0x0D; // leaf table
-                // bytes 3-4: cell count = 0
-                // bytes 5-6: content area offset = page_size
-                #[allow(clippy::cast_possible_truncation)]
-                let content_offset = PAGE_SIZE as u16;
-                root_data[5..7].copy_from_slice(&content_offset.to_be_bytes());
-                {
-                    let mut io = page_io.clone();
-                    if io.write_page(&cx, root_pgno, &root_data).is_err() {
-                        return false;
-                    }
-                }
-
-                let mut cursor = BtCursor::new(page_io.clone(), root_pgno, PAGE_SIZE, true);
-
-                // Hydrate from MemTable rows (dual-source during Phase 5
-                // transition).
-                if let Some(db) = self.db.as_ref() {
-                    if let Some(table) = db.get_table(root_page) {
-                        for row in &table.rows {
-                            let payload = encode_record(&row.values);
-                            if cursor.table_insert(&cx, row.rowid, &payload).is_err() {
-                                return false;
-                            }
-                        }
-                    }
-                }
-
-                self.storage_cursors.insert(
-                    cursor_id,
-                    StorageCursor {
-                        cursor: CursorBackend::Txn(cursor),
-                        cx,
-                        writable,
-                        root_page,
-                        last_alloc_rowid: 0,
-                    },
-                );
-            } else {
-                // Read path (bd-35my): open a cursor on the EXISTING B-tree
-                // page data. Do NOT reinitialize the root page or hydrate
-                // from MemTable — the data should already be in the pager's
-                // write-set (from prior writes) or on disk.
-                let cursor = BtCursor::new(page_io.clone(), root_pgno, PAGE_SIZE, true);
-
-                self.storage_cursors.insert(
-                    cursor_id,
-                    StorageCursor {
-                        cursor: CursorBackend::Txn(cursor),
-                        cx,
-                        writable,
-                        root_page,
-                        last_alloc_rowid: 0,
-                    },
-                );
-            }
+            // Phase 5B.2 (bd-1yi8): open cursor on the EXISTING B-tree
+            // page data for BOTH reads and writes. The pager is the
+            // source of truth — do NOT reinitialize the root page or
+            // hydrate from MemTable.  Prior transactions' committed
+            // data is visible via the pager's cache/VFS.
+            let cursor = BtCursor::new(page_io.clone(), root_pgno, PAGE_SIZE, writable);
+            self.storage_cursors.insert(
+                cursor_id,
+                StorageCursor {
+                    cursor: CursorBackend::Txn(cursor),
+                    cx,
+                    writable,
+                    root_page,
+                    last_alloc_rowid: 0,
+                },
+            );
             return true;
         }
 
@@ -2616,7 +2553,6 @@ impl VdbeEngine {
                 cursor: CursorBackend::Mem(cursor),
                 cx,
                 writable,
-                root_page,
                 last_alloc_rowid: 0,
             },
         );
