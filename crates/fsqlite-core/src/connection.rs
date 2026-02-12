@@ -968,8 +968,8 @@ impl Connection {
                     // GROUP BY + JOIN: materialize the join as a temp table,
                     // then GROUP BY on that temp table.
                     let rewritten = self.rewrite_in_subqueries_select(select)?;
-                    let mut rows =
-                        self.execute_group_by_join_select(&rewritten, params)?;
+                    let bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
+                    let mut rows = self.execute_group_by_join_select(&bound, None)?;
                     if distinct {
                         dedup_rows(&mut rows);
                     }
@@ -977,7 +977,8 @@ impl Connection {
                 } else if has_group_by(select) {
                     // Fallback path: eagerly rewrite IN subqueries.
                     let rewritten = self.rewrite_in_subqueries_select(select)?;
-                    let mut rows = self.execute_group_by_select(&rewritten, params)?;
+                    let bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
+                    let mut rows = self.execute_group_by_select(&bound, None)?;
                     if distinct {
                         dedup_rows(&mut rows);
                     }
@@ -987,7 +988,8 @@ impl Connection {
                     // Also handles subquery in FROM (derived tables) even
                     // without explicit JOINs.
                     let rewritten = self.rewrite_in_subqueries_select(select)?;
-                    let mut rows = self.execute_join_select(&rewritten, params)?;
+                    let bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
+                    let mut rows = self.execute_join_select(&bound, None)?;
                     if distinct {
                         dedup_rows(&mut rows);
                     }
@@ -6939,6 +6941,311 @@ fn placeholder_to_index(
     }
 }
 
+/// Bind SELECT placeholders to literal values for fallback evaluators.
+///
+/// Fallback JOIN/GROUP BY paths interpret expressions directly instead of
+/// executing VDBE `Variable` opcodes, so bind parameters must be substituted
+/// into the AST beforehand.
+fn bind_placeholders_in_select_for_fallback(
+    select: &SelectStatement,
+    params: Option<&[SqliteValue]>,
+) -> Result<SelectStatement> {
+    let Some(params) = params else {
+        return Ok(select.clone());
+    };
+    let mut bound = select.clone();
+    let mut bind_state = BindParamState::default();
+    bind_placeholders_in_select_statement(&mut bound, &mut bind_state, params)?;
+    Ok(bound)
+}
+
+fn bind_placeholders_in_select_statement(
+    select: &mut SelectStatement,
+    bind_state: &mut BindParamState,
+    params: &[SqliteValue],
+) -> Result<()> {
+    if let Some(with_clause) = &mut select.with {
+        for cte in &mut with_clause.ctes {
+            bind_placeholders_in_select_statement(&mut cte.query, bind_state, params)?;
+        }
+    }
+
+    bind_placeholders_in_select_core(&mut select.body.select, bind_state, params)?;
+    for (_, core) in &mut select.body.compounds {
+        bind_placeholders_in_select_core(core, bind_state, params)?;
+    }
+
+    for ordering in &mut select.order_by {
+        bind_placeholders_in_expr(&mut ordering.expr, bind_state, params)?;
+    }
+    if let Some(limit_clause) = &mut select.limit {
+        bind_placeholders_in_expr(&mut limit_clause.limit, bind_state, params)?;
+        if let Some(offset) = &mut limit_clause.offset {
+            bind_placeholders_in_expr(offset, bind_state, params)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn bind_placeholders_in_select_core(
+    core: &mut SelectCore,
+    bind_state: &mut BindParamState,
+    params: &[SqliteValue],
+) -> Result<()> {
+    match core {
+        SelectCore::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            having,
+            windows,
+            ..
+        } => {
+            for column in columns {
+                if let ResultColumn::Expr { expr, .. } = column {
+                    bind_placeholders_in_expr(expr, bind_state, params)?;
+                }
+            }
+            if let Some(from_clause) = from {
+                bind_placeholders_in_from_clause(from_clause, bind_state, params)?;
+            }
+            if let Some(predicate) = where_clause {
+                bind_placeholders_in_expr(predicate, bind_state, params)?;
+            }
+            for expr in group_by {
+                bind_placeholders_in_expr(expr, bind_state, params)?;
+            }
+            if let Some(predicate) = having {
+                bind_placeholders_in_expr(predicate, bind_state, params)?;
+            }
+            for window in windows {
+                bind_placeholders_in_window_spec(&mut window.spec, bind_state, params)?;
+            }
+        }
+        SelectCore::Values(rows) => {
+            for row in rows {
+                for expr in row {
+                    bind_placeholders_in_expr(expr, bind_state, params)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn bind_placeholders_in_from_clause(
+    from: &mut fsqlite_ast::FromClause,
+    bind_state: &mut BindParamState,
+    params: &[SqliteValue],
+) -> Result<()> {
+    bind_placeholders_in_table_or_subquery(&mut from.source, bind_state, params)?;
+    for join in &mut from.joins {
+        bind_placeholders_in_table_or_subquery(&mut join.table, bind_state, params)?;
+        if let Some(JoinConstraint::On(expr)) = &mut join.constraint {
+            bind_placeholders_in_expr(expr, bind_state, params)?;
+        }
+    }
+    Ok(())
+}
+
+fn bind_placeholders_in_table_or_subquery(
+    source: &mut TableOrSubquery,
+    bind_state: &mut BindParamState,
+    params: &[SqliteValue],
+) -> Result<()> {
+    match source {
+        TableOrSubquery::Table { .. } => {}
+        TableOrSubquery::Subquery { query, .. } => {
+            bind_placeholders_in_select_statement(query, bind_state, params)?;
+        }
+        TableOrSubquery::TableFunction { args, .. } => {
+            for arg in args {
+                bind_placeholders_in_expr(arg, bind_state, params)?;
+            }
+        }
+        TableOrSubquery::ParenJoin(from_clause) => {
+            bind_placeholders_in_from_clause(from_clause, bind_state, params)?;
+        }
+    }
+    Ok(())
+}
+
+fn bind_placeholders_in_window_spec(
+    spec: &mut fsqlite_ast::WindowSpec,
+    bind_state: &mut BindParamState,
+    params: &[SqliteValue],
+) -> Result<()> {
+    for expr in &mut spec.partition_by {
+        bind_placeholders_in_expr(expr, bind_state, params)?;
+    }
+    for ordering in &mut spec.order_by {
+        bind_placeholders_in_expr(&mut ordering.expr, bind_state, params)?;
+    }
+    if let Some(frame) = &mut spec.frame {
+        bind_placeholders_in_frame_bound(&mut frame.start, bind_state, params)?;
+        if let Some(end) = &mut frame.end {
+            bind_placeholders_in_frame_bound(end, bind_state, params)?;
+        }
+    }
+    Ok(())
+}
+
+fn bind_placeholders_in_frame_bound(
+    bound: &mut fsqlite_ast::FrameBound,
+    bind_state: &mut BindParamState,
+    params: &[SqliteValue],
+) -> Result<()> {
+    match bound {
+        fsqlite_ast::FrameBound::Preceding(expr) | fsqlite_ast::FrameBound::Following(expr) => {
+            bind_placeholders_in_expr(expr, bind_state, params)?;
+        }
+        fsqlite_ast::FrameBound::UnboundedPreceding
+        | fsqlite_ast::FrameBound::CurrentRow
+        | fsqlite_ast::FrameBound::UnboundedFollowing => {}
+    }
+    Ok(())
+}
+
+fn bind_placeholder_to_literal(
+    placeholder: &PlaceholderType,
+    bind_state: &mut BindParamState,
+    params: &[SqliteValue],
+) -> Result<Literal> {
+    let param_index = placeholder_to_index(placeholder, bind_state)?;
+    let one_based = usize::try_from(param_index).map_err(|_| FrankenError::OutOfRange {
+        what: "bind parameter index".to_owned(),
+        value: param_index.to_string(),
+    })?;
+    if one_based == 0 || one_based > params.len() {
+        return Err(FrankenError::OutOfRange {
+            what: "bind parameter index".to_owned(),
+            value: param_index.to_string(),
+        });
+    }
+    Ok(sqlite_value_to_literal(&params[one_based - 1]))
+}
+
+fn sqlite_value_to_literal(value: &SqliteValue) -> Literal {
+    match value {
+        SqliteValue::Null => Literal::Null,
+        SqliteValue::Integer(v) => Literal::Integer(*v),
+        SqliteValue::Float(v) => Literal::Float(*v),
+        SqliteValue::Text(v) => Literal::String(v.clone()),
+        SqliteValue::Blob(v) => Literal::Blob(v.clone()),
+    }
+}
+
+fn bind_placeholders_in_expr(
+    expr: &mut Expr,
+    bind_state: &mut BindParamState,
+    params: &[SqliteValue],
+) -> Result<()> {
+    match expr {
+        Expr::Literal(_, _) | Expr::Column(_, _) | Expr::Raise { .. } => {}
+        Expr::BinaryOp { left, right, .. } => {
+            bind_placeholders_in_expr(left, bind_state, params)?;
+            bind_placeholders_in_expr(right, bind_state, params)?;
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. } => {
+            bind_placeholders_in_expr(inner, bind_state, params)?;
+        }
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            bind_placeholders_in_expr(inner, bind_state, params)?;
+            bind_placeholders_in_expr(low, bind_state, params)?;
+            bind_placeholders_in_expr(high, bind_state, params)?;
+        }
+        Expr::In {
+            expr: inner, set, ..
+        } => {
+            bind_placeholders_in_expr(inner, bind_state, params)?;
+            match set {
+                InSet::List(values) => {
+                    for value in values {
+                        bind_placeholders_in_expr(value, bind_state, params)?;
+                    }
+                }
+                InSet::Subquery(query) => {
+                    bind_placeholders_in_select_statement(query, bind_state, params)?;
+                }
+                InSet::Table(_) => {}
+            }
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            ..
+        } => {
+            bind_placeholders_in_expr(inner, bind_state, params)?;
+            bind_placeholders_in_expr(pattern, bind_state, params)?;
+            if let Some(escape_expr) = escape {
+                bind_placeholders_in_expr(escape_expr, bind_state, params)?;
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(base) = operand {
+                bind_placeholders_in_expr(base, bind_state, params)?;
+            }
+            for (when_expr, then_expr) in whens {
+                bind_placeholders_in_expr(when_expr, bind_state, params)?;
+                bind_placeholders_in_expr(then_expr, bind_state, params)?;
+            }
+            if let Some(else_branch) = else_expr {
+                bind_placeholders_in_expr(else_branch, bind_state, params)?;
+            }
+        }
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery, _) => {
+            bind_placeholders_in_select_statement(subquery, bind_state, params)?;
+        }
+        Expr::FunctionCall {
+            args, filter, over, ..
+        } => {
+            if let FunctionArgs::List(arguments) = args {
+                for arg in arguments {
+                    bind_placeholders_in_expr(arg, bind_state, params)?;
+                }
+            }
+            if let Some(filter_expr) = filter {
+                bind_placeholders_in_expr(filter_expr, bind_state, params)?;
+            }
+            if let Some(window_spec) = over {
+                bind_placeholders_in_window_spec(window_spec, bind_state, params)?;
+            }
+        }
+        Expr::JsonAccess {
+            expr: inner, path, ..
+        } => {
+            bind_placeholders_in_expr(inner, bind_state, params)?;
+            bind_placeholders_in_expr(path, bind_state, params)?;
+        }
+        Expr::RowValue(values, _) => {
+            for value in values {
+                bind_placeholders_in_expr(value, bind_state, params)?;
+            }
+        }
+        Expr::Placeholder(placeholder, span) => {
+            let literal = bind_placeholder_to_literal(placeholder, bind_state, params)?;
+            *expr = Expr::Literal(literal, *span);
+        }
+    }
+    Ok(())
+}
+
 fn emit_case_expr(
     builder: &mut ProgramBuilder,
     operand: Option<&Expr>,
@@ -12766,6 +13073,23 @@ mod tests {
     }
 
     #[test]
+    fn test_join_with_where_clause_anonymous_placeholder() {
+        let conn = Connection::open(":memory:").unwrap();
+        setup_join_tables(&conn);
+        let rows = conn
+            .query_with_params(
+                "SELECT users.name, orders.amount \
+                 FROM users INNER JOIN orders ON users.id = orders.user_id \
+                 WHERE orders.amount > ? ORDER BY orders.amount;",
+                &[SqliteValue::Integer(75)],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(100));
+        assert_eq!(rows[1].values()[1], SqliteValue::Integer(200));
+    }
+
+    #[test]
     fn test_join_select_star() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t1 (a INTEGER, b TEXT);")
@@ -13965,6 +14289,25 @@ mod transaction_lifecycle_tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(2));
+    }
+
+    #[test]
+    fn test_group_by_join_having_named_placeholder() {
+        let conn = Connection::open(":memory:").unwrap();
+        setup_join_tables(&conn);
+        let rows = conn
+            .query_with_params(
+                "SELECT users.name, COUNT(*) \
+                 FROM users INNER JOIN orders ON users.id = orders.user_id \
+                 GROUP BY users.name \
+                 HAVING COUNT(*) > :min_count \
+                 ORDER BY users.name;",
+                &[SqliteValue::Integer(1)],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(2));
     }
 
     #[test]

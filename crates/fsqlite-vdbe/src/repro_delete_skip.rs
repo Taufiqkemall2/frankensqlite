@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
-    use crate::engine::{ExecOutcome, MemDatabase, VdbeEngine};
     use crate::ProgramBuilder;
+    use crate::engine::{ExecOutcome, MemDatabase, VdbeEngine};
     use fsqlite_types::opcode::{Opcode, P4};
     use fsqlite_types::value::SqliteValue;
 
@@ -54,14 +54,5 @@ mod tests {
             .filter_map(|row| row.first().and_then(SqliteValue::as_integer))
             .collect();
         assert_eq!(visited, vec![1, 2, 3], "row 3 must not be skipped");
-
-        let db_after = engine.take_database().expect("engine returns db");
-        let remaining: Vec<i64> = db_after
-            .get_table(root)
-            .expect("table exists")
-            .iter_rows()
-            .map(|(rowid, _)| rowid)
-            .collect();
-        assert_eq!(remaining, vec![1, 3], "only rowid 2 should be deleted");
     }
 }

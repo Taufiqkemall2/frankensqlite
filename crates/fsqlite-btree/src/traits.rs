@@ -458,8 +458,15 @@ mod tests {
         // Seek for rowid 15 (not found) should position at successor (rowid 20).
         let result = cursor.table_move_to(&cx, 15).unwrap();
         assert!(!result.is_found());
-        assert!(!cursor.eof(), "cursor should not be at EOF when successor exists");
-        assert_eq!(cursor.rowid(&cx).unwrap(), 20, "cursor should be at successor");
+        assert!(
+            !cursor.eof(),
+            "cursor should not be at EOF when successor exists"
+        );
+        assert_eq!(
+            cursor.rowid(&cx).unwrap(),
+            20,
+            "cursor should be at successor"
+        );
 
         // Seek for rowid 5 (not found) should position at successor (rowid 10).
         let result = cursor.table_move_to(&cx, 5).unwrap();
@@ -470,7 +477,10 @@ mod tests {
         // Seek for rowid 35 (not found, no successor) should position at EOF.
         let result = cursor.table_move_to(&cx, 35).unwrap();
         assert!(!result.is_found());
-        assert!(cursor.eof(), "cursor should be at EOF when no successor exists");
+        assert!(
+            cursor.eof(),
+            "cursor should be at EOF when no successor exists"
+        );
     }
 
     /// bd-hpa5: Verify index_move_to positions at successor on NotFound.
