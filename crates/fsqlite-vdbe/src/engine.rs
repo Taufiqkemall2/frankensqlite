@@ -1368,35 +1368,29 @@ impl VdbeEngine {
 
                 // ── Cursor operations ─────────────────────────────────
                 Opcode::OpenRead => {
-                    // Phase 5C.1 (bd-35my): route reads through StorageCursor
-                    // when available (pager-backed or MemPageStore fallback).
-                    // Falls back to MemCursor when storage cursors are disabled
-                    // or the open fails (e.g., missing table in MemDatabase
-                    // during fallback path).
+                    // bd-1xrs: StorageCursor is now the ONLY cursor path.
+                    // No MemCursor fallback - open_storage_cursor must succeed.
                     let cursor_id = op.p1;
                     let root_page = op.p2;
-                    if self.open_storage_cursor(cursor_id, root_page, false) {
-                        self.cursors.remove(&cursor_id);
-                    } else {
-                        // Fallback to MemCursor for backward compatibility with
-                        // tests that disable storage cursors or don't set a
-                        // transaction.
-                        self.storage_cursors.remove(&cursor_id);
-                        self.cursors
-                            .insert(cursor_id, MemCursor::new(root_page, false));
+                    if !self.open_storage_cursor(cursor_id, root_page, false) {
+                        return Err(FrankenError::Internal(format!(
+                            "OpenRead failed: could not open storage cursor on root page {root_page}"
+                        )));
                     }
+                    self.cursors.remove(&cursor_id);
                     pc += 1;
                 }
                 Opcode::OpenWrite => {
+                    // bd-1xrs: StorageCursor is now the ONLY cursor path.
+                    // No MemCursor fallback - open_storage_cursor must succeed.
                     let cursor_id = op.p1;
                     let root_page = op.p2;
-                    if self.open_storage_cursor(cursor_id, root_page, true) {
-                        self.cursors.remove(&cursor_id);
-                    } else {
-                        self.storage_cursors.remove(&cursor_id);
-                        self.cursors
-                            .insert(cursor_id, MemCursor::new(root_page, true));
+                    if !self.open_storage_cursor(cursor_id, root_page, true) {
+                        return Err(FrankenError::Internal(format!(
+                            "OpenWrite failed: could not open storage cursor on root page {root_page}"
+                        )));
                     }
+                    self.cursors.remove(&cursor_id);
                     pc += 1;
                 }
 
@@ -1701,30 +1695,126 @@ impl VdbeEngine {
                 }
 
                 Opcode::SeekGE | Opcode::SeekGT | Opcode::SeekLE | Opcode::SeekLT => {
-                    // Simplified seek: position at first/last row.
-                    // Full index seeks require B-tree; for in-memory mode,
-                    // position at the start (GE/GT) or end (LE/LT).
+                    // bd-3pti: Route seek opcodes through B-tree cursor.
+                    //
+                    // Seek operations position the cursor relative to a key:
+                    // - SeekGE: Position at first row >= key
+                    // - SeekGT: Position at first row > key
+                    // - SeekLE: Position at last row <= key
+                    // - SeekLT: Position at last row < key
+                    //
+                    // Jump to p2 if no matching row exists.
                     let cursor_id = op.p1;
+                    let key = self.get_reg(op.p3).to_integer();
+
                     let found = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
+                        // Route through B-tree cursor (Phase 5 path).
+                        //
+                        // table_move_to semantics:
+                        // - Found: cursor positioned at exact key
+                        // - NotFound: cursor positioned at entry that would follow
+                        //   key in sort order (or EOF if no such entry)
+                        let seek_result = cursor.cursor.table_move_to(&cursor.cx, key)?;
+
                         match op.opcode {
-                            Opcode::SeekLE | Opcode::SeekLT => cursor.cursor.last(&cursor.cx)?,
-                            _ => cursor.cursor.first(&cursor.cx)?,
+                            Opcode::SeekGE => {
+                                // Need first row >= key.
+                                // table_move_to already positions at key (Found) or
+                                // at next larger (NotFound). Check for EOF.
+                                !cursor.cursor.eof()
+                            }
+                            Opcode::SeekGT => {
+                                // Need first row > key.
+                                // If Found (at exact key), advance past it.
+                                // If NotFound, already past key.
+                                if seek_result.is_found() {
+                                    cursor.cursor.next(&cursor.cx)?
+                                } else {
+                                    !cursor.cursor.eof()
+                                }
+                            }
+                            Opcode::SeekLE => {
+                                // Need last row <= key.
+                                // If Found, we're at the exact key - done.
+                                // If NotFound, cursor is at entry > key, so prev().
+                                if seek_result.is_found() {
+                                    true
+                                } else if cursor.cursor.eof() {
+                                    // All entries < key, position at last.
+                                    cursor.cursor.last(&cursor.cx)?
+                                } else {
+                                    // Cursor at entry > key, move to previous.
+                                    cursor.cursor.prev(&cursor.cx)?
+                                }
+                            }
+                            Opcode::SeekLT => {
+                                // Need last row < key.
+                                // Cursor is either at key (Found) or past key (NotFound).
+                                // Either way, we need to go to the previous entry.
+                                if cursor.cursor.eof() {
+                                    // All entries < key, position at last.
+                                    cursor.cursor.last(&cursor.cx)?
+                                } else {
+                                    // Go to previous entry (which will be < key).
+                                    cursor.cursor.prev(&cursor.cx)?
+                                }
+                            }
+                            _ => unreachable!(),
                         }
                     } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
+                        // MemCursor fallback (Phase 4 path).
+                        // Implement proper seeking via linear scan for correctness.
                         if let Some(db) = self.db.as_ref() {
                             if let Some(table) = db.get_table(cursor.root_page) {
                                 if table.rows.is_empty() {
                                     false
                                 } else {
                                     match op.opcode {
-                                        Opcode::SeekLE | Opcode::SeekLT => {
-                                            cursor.position = Some(table.rows.len() - 1);
+                                        Opcode::SeekGE => {
+                                            // Find first row with rowid >= key.
+                                            let pos =
+                                                table.rows.iter().position(|r| r.rowid >= key);
+                                            if let Some(idx) = pos {
+                                                cursor.position = Some(idx);
+                                                true
+                                            } else {
+                                                false
+                                            }
                                         }
-                                        _ => {
-                                            cursor.position = Some(0);
+                                        Opcode::SeekGT => {
+                                            // Find first row with rowid > key.
+                                            let pos = table.rows.iter().position(|r| r.rowid > key);
+                                            if let Some(idx) = pos {
+                                                cursor.position = Some(idx);
+                                                true
+                                            } else {
+                                                false
+                                            }
                                         }
+                                        Opcode::SeekLE => {
+                                            // Find last row with rowid <= key.
+                                            let pos =
+                                                table.rows.iter().rposition(|r| r.rowid <= key);
+                                            if let Some(idx) = pos {
+                                                cursor.position = Some(idx);
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        }
+                                        Opcode::SeekLT => {
+                                            // Find last row with rowid < key.
+                                            let pos =
+                                                table.rows.iter().rposition(|r| r.rowid < key);
+                                            if let Some(idx) = pos {
+                                                cursor.position = Some(idx);
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        }
+                                        _ => unreachable!(),
                                     }
-                                    true
                                 }
                             } else {
                                 false
@@ -2498,9 +2588,8 @@ impl VdbeEngine {
     #[allow(clippy::cast_sign_loss)]
     fn open_storage_cursor(&mut self, cursor_id: i32, root_page: i32, writable: bool) -> bool {
         const PAGE_SIZE: u32 = 4096;
-        if !self.storage_cursors_enabled {
-            return false;
-        }
+        // bd-1xrs: storage_cursors_enabled check removed.
+        // StorageCursor is now the ONLY cursor path.
 
         let Some(root_pgno) = PageNumber::new(root_page as u32) else {
             return false;
@@ -2568,22 +2657,17 @@ impl VdbeEngine {
         }
 
         // Fallback: build a transient B-tree snapshot (Phase 4 path used by
-        // tests without a real pager). For read-only opens we allow missing
-        // MemDatabase tables and expose an empty table view.
+        // tests without a real pager). Both read and write cursors can operate
+        // on empty tables (INSERT needs to work on new tables).
         let store = MemPageStore::with_empty_table(root_pgno, PAGE_SIZE);
         let cx = Cx::new();
         let mut cursor = BtCursor::new(store, root_pgno, PAGE_SIZE, writable);
-        {
-            let maybe_table = self.db.as_ref().and_then(|db| db.get_table(root_page));
-            if writable && maybe_table.is_none() {
-                return false;
-            }
-            if let Some(table) = maybe_table {
-                for row in &table.rows {
-                    let payload = encode_record(&row.values);
-                    if cursor.table_insert(&cx, row.rowid, &payload).is_err() {
-                        return false;
-                    }
+        // Populate cursor from MemDatabase if available.
+        if let Some(table) = self.db.as_ref().and_then(|db| db.get_table(root_page)) {
+            for row in &table.rows {
+                let payload = encode_record(&row.values);
+                if cursor.table_insert(&cx, row.rowid, &payload).is_err() {
+                    return false;
                 }
             }
         }
@@ -5697,54 +5781,6 @@ mod tests {
         assert_eq!(rows[0], vec![SqliteValue::Integer(42)]);
     }
 
-    #[test]
-    fn test_openread_falls_back_to_memcursor_when_storage_cursors_disabled() {
-        // When storage cursors are disabled, OpenRead falls back to MemCursor
-        // for backward compatibility during the Phase 5 transition. This test
-        // verifies the fallback path works correctly.
-        let mut db = MemDatabase::new();
-        let root = db.create_table(1);
-        if let Some(table) = db.get_table_mut(root) {
-            table.insert(1, vec![SqliteValue::Integer(7)]);
-        }
-
-        let mut b = ProgramBuilder::new();
-        let end = b.emit_label();
-        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
-        b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(1), 0);
-        // Navigate to first row and read the column.
-        b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
-        b.emit_op(Opcode::Column, 0, 0, 1, P4::None, 0);
-        b.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
-        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
-        b.resolve_label(end);
-        let prog = b.finish().expect("program should build");
-
-        let mut engine = VdbeEngine::new(prog.register_count());
-        engine.set_database(db);
-        engine.enable_storage_read_cursors(false);
-
-        let outcome = engine
-            .execute(&prog)
-            .expect("OpenRead should succeed with MemCursor fallback");
-        assert_eq!(outcome, ExecOutcome::Done);
-
-        // Verify MemCursor was used (not StorageCursor).
-        assert!(
-            engine.cursors.contains_key(&0),
-            "MemCursor fallback should be used when storage cursors are disabled"
-        );
-        assert!(
-            !engine.storage_cursors.contains_key(&0),
-            "StorageCursor should not be used when storage cursors are disabled"
-        );
-
-        // Verify the data was read correctly from MemDatabase.
-        let rows = engine.take_results();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0], vec![SqliteValue::Integer(7)]);
-    }
-
     // ── bd-3iw8 / bd-25c6: Storage cursor WRITE path tests ────────────
 
     /// Build and execute a write program with storage cursors enabled.
@@ -6132,81 +6168,6 @@ mod tests {
         assert_eq!(rows[0][0], SqliteValue::Integer(99));
     }
 
-    #[test]
-    fn test_insert_memdb_fallback_without_storage_cursor() {
-        // Verify that INSERT still works via MemDatabase when no
-        // storage cursor is active (Phase 4 legacy path).
-        let mut db = MemDatabase::new();
-        let root = db.create_table(1);
-
-        let mut b = ProgramBuilder::new();
-        let end = b.emit_label();
-        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
-
-        // Open a regular MemCursor (not a storage cursor).
-        b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
-        b.emit_op(Opcode::NewRowid, 0, 1, 0, P4::None, 0);
-        b.emit_op(Opcode::Integer, 42, 2, 0, P4::None, 0);
-        b.emit_op(Opcode::MakeRecord, 2, 1, 3, P4::None, 0);
-        b.emit_op(Opcode::Insert, 0, 3, 1, P4::None, 0);
-        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
-        b.resolve_label(end);
-
-        let prog = b.finish().expect("program should build");
-        let mut engine = VdbeEngine::new(prog.register_count());
-        // Disable storage cursors to force MemDatabase path.
-        engine.enable_storage_cursors(false);
-        engine.set_database(db);
-        let outcome = engine.execute(&prog).expect("execution should succeed");
-        assert_eq!(outcome, ExecOutcome::Done);
-
-        let final_db = engine.take_database().expect("database should exist");
-        let table = final_db.get_table(root).expect("table should exist");
-        assert_eq!(
-            table.rows.len(),
-            1,
-            "MemDatabase fallback must insert the row"
-        );
-        assert_eq!(table.rows[0].values[0], SqliteValue::Integer(42));
-    }
-
-    #[test]
-    fn test_delete_memdb_fallback_without_storage_cursor() {
-        // Verify DELETE still works via MemDatabase when storage cursors are disabled.
-        let mut db = MemDatabase::new();
-        let root = db.create_table(1);
-        let table = db.get_table_mut(root).unwrap();
-        table.insert(1, vec![SqliteValue::Integer(10)]);
-        table.insert(2, vec![SqliteValue::Integer(20)]);
-        table.insert(3, vec![SqliteValue::Integer(30)]);
-
-        let mut b = ProgramBuilder::new();
-        let end = b.emit_label();
-        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
-        b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
-        b.emit_op(Opcode::Integer, 2, 1, 0, P4::None, 0);
-        b.emit_jump_to_label(Opcode::SeekRowid, 0, 1, end, P4::None, 0);
-        b.emit_op(Opcode::Delete, 0, 0, 0, P4::None, 0);
-        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
-        b.resolve_label(end);
-
-        let prog = b.finish().expect("program should build");
-        let mut engine = VdbeEngine::new(prog.register_count());
-        engine.enable_storage_cursors(false);
-        engine.set_database(db);
-        let outcome = engine.execute(&prog).expect("execution should succeed");
-        assert_eq!(outcome, ExecOutcome::Done);
-
-        let final_db = engine.take_database().expect("database should exist");
-        let table = final_db.get_table(root).expect("table should exist");
-        let rowids: Vec<i64> = table.rows.iter().map(|r| r.rowid).collect();
-        assert_eq!(
-            rowids,
-            vec![1, 3],
-            "MemDatabase fallback should delete rowid=2"
-        );
-    }
-
     // ── bd-2a3y: TransactionPageIo / SharedTxnPageIo integration tests ──
 
     #[test]
@@ -6341,5 +6302,274 @@ mod tests {
                 .expect("take_transaction should succeed")
                 .is_some()
         );
+    }
+
+    // ── bd-3pti: Seek opcode tests ───────────────────────────────────────
+
+    #[test]
+    fn test_seek_ge_with_storage_cursor() {
+        // SeekGE(key=5): should position at first row with rowid >= 5.
+        // Table has rows: 3, 5, 7, 9
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).unwrap();
+        table.insert(3, vec![SqliteValue::Integer(30)]);
+        table.insert(5, vec![SqliteValue::Integer(50)]);
+        table.insert(7, vec![SqliteValue::Integer(70)]);
+        table.insert(9, vec![SqliteValue::Integer(90)]);
+
+        let rows = run_with_storage_cursors(db, |b| {
+            let end = b.emit_label();
+            let not_found = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(1), 0);
+
+            // Seek to rowid >= 5 (should land on rowid 5)
+            b.emit_op(Opcode::Integer, 5, 1, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SeekGE, 0, 1, not_found, P4::None, 0);
+
+            // Read the column value at current position.
+            b.emit_op(Opcode::Column, 0, 0, 2, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 2, 1, 0, P4::None, 0);
+
+            b.resolve_label(not_found);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], vec![SqliteValue::Integer(50)]); // rowid 5, value 50
+    }
+
+    #[test]
+    fn test_seek_ge_not_exact_match() {
+        // SeekGE(key=4): should position at first row with rowid >= 4.
+        // Table has rows: 3, 5, 7, 9 → should land on rowid 5
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).unwrap();
+        table.insert(3, vec![SqliteValue::Integer(30)]);
+        table.insert(5, vec![SqliteValue::Integer(50)]);
+        table.insert(7, vec![SqliteValue::Integer(70)]);
+        table.insert(9, vec![SqliteValue::Integer(90)]);
+
+        let rows = run_with_storage_cursors(db, |b| {
+            let end = b.emit_label();
+            let not_found = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(1), 0);
+
+            // Seek to rowid >= 4 (should land on rowid 5, the next larger)
+            b.emit_op(Opcode::Integer, 4, 1, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SeekGE, 0, 1, not_found, P4::None, 0);
+
+            b.emit_op(Opcode::Column, 0, 0, 2, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 2, 1, 0, P4::None, 0);
+
+            b.resolve_label(not_found);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], vec![SqliteValue::Integer(50)]); // rowid 5, value 50
+    }
+
+    #[test]
+    fn test_seek_gt_with_storage_cursor() {
+        // SeekGT(key=5): should position at first row with rowid > 5.
+        // Table has rows: 3, 5, 7, 9 → should land on rowid 7
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).unwrap();
+        table.insert(3, vec![SqliteValue::Integer(30)]);
+        table.insert(5, vec![SqliteValue::Integer(50)]);
+        table.insert(7, vec![SqliteValue::Integer(70)]);
+        table.insert(9, vec![SqliteValue::Integer(90)]);
+
+        let rows = run_with_storage_cursors(db, |b| {
+            let end = b.emit_label();
+            let not_found = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(1), 0);
+
+            // Seek to rowid > 5 (should land on rowid 7)
+            b.emit_op(Opcode::Integer, 5, 1, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SeekGT, 0, 1, not_found, P4::None, 0);
+
+            b.emit_op(Opcode::Column, 0, 0, 2, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 2, 1, 0, P4::None, 0);
+
+            b.resolve_label(not_found);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], vec![SqliteValue::Integer(70)]); // rowid 7, value 70
+    }
+
+    #[test]
+    fn test_seek_le_with_storage_cursor() {
+        // SeekLE(key=5): should position at last row with rowid <= 5.
+        // Table has rows: 3, 5, 7, 9 → should land on rowid 5
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).unwrap();
+        table.insert(3, vec![SqliteValue::Integer(30)]);
+        table.insert(5, vec![SqliteValue::Integer(50)]);
+        table.insert(7, vec![SqliteValue::Integer(70)]);
+        table.insert(9, vec![SqliteValue::Integer(90)]);
+
+        let rows = run_with_storage_cursors(db, |b| {
+            let end = b.emit_label();
+            let not_found = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(1), 0);
+
+            // Seek to rowid <= 5 (should land on rowid 5)
+            b.emit_op(Opcode::Integer, 5, 1, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SeekLE, 0, 1, not_found, P4::None, 0);
+
+            b.emit_op(Opcode::Column, 0, 0, 2, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 2, 1, 0, P4::None, 0);
+
+            b.resolve_label(not_found);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], vec![SqliteValue::Integer(50)]); // rowid 5, value 50
+    }
+
+    #[test]
+    fn test_seek_le_not_exact_match() {
+        // SeekLE(key=6): should position at last row with rowid <= 6.
+        // Table has rows: 3, 5, 7, 9 → should land on rowid 5
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).unwrap();
+        table.insert(3, vec![SqliteValue::Integer(30)]);
+        table.insert(5, vec![SqliteValue::Integer(50)]);
+        table.insert(7, vec![SqliteValue::Integer(70)]);
+        table.insert(9, vec![SqliteValue::Integer(90)]);
+
+        let rows = run_with_storage_cursors(db, |b| {
+            let end = b.emit_label();
+            let not_found = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(1), 0);
+
+            // Seek to rowid <= 6 (should land on rowid 5)
+            b.emit_op(Opcode::Integer, 6, 1, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SeekLE, 0, 1, not_found, P4::None, 0);
+
+            b.emit_op(Opcode::Column, 0, 0, 2, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 2, 1, 0, P4::None, 0);
+
+            b.resolve_label(not_found);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], vec![SqliteValue::Integer(50)]); // rowid 5, value 50
+    }
+
+    #[test]
+    fn test_seek_lt_with_storage_cursor() {
+        // SeekLT(key=5): should position at last row with rowid < 5.
+        // Table has rows: 3, 5, 7, 9 → should land on rowid 3
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).unwrap();
+        table.insert(3, vec![SqliteValue::Integer(30)]);
+        table.insert(5, vec![SqliteValue::Integer(50)]);
+        table.insert(7, vec![SqliteValue::Integer(70)]);
+        table.insert(9, vec![SqliteValue::Integer(90)]);
+
+        let rows = run_with_storage_cursors(db, |b| {
+            let end = b.emit_label();
+            let not_found = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(1), 0);
+
+            // Seek to rowid < 5 (should land on rowid 3)
+            b.emit_op(Opcode::Integer, 5, 1, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SeekLT, 0, 1, not_found, P4::None, 0);
+
+            b.emit_op(Opcode::Column, 0, 0, 2, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 2, 1, 0, P4::None, 0);
+
+            b.resolve_label(not_found);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], vec![SqliteValue::Integer(30)]); // rowid 3, value 30
+    }
+
+    #[test]
+    fn test_seek_ge_empty_table_jumps() {
+        // SeekGE on empty table should jump to p2.
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        // Table is empty.
+
+        let rows = run_with_storage_cursors(db, |b| {
+            let end = b.emit_label();
+            let not_found = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(1), 0);
+
+            b.emit_op(Opcode::Integer, 5, 1, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SeekGE, 0, 1, not_found, P4::None, 0);
+
+            // This should NOT be reached.
+            b.emit_op(Opcode::Integer, 999, 2, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 2, 1, 0, P4::None, 0);
+
+            b.resolve_label(not_found);
+            // Jump target - we output nothing to indicate the jump was taken.
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        // Empty table → no rows returned, jump to p2.
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_seek_lt_no_smaller_row_jumps() {
+        // SeekLT(key=3) when smallest rowid is 3 should jump to p2.
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).unwrap();
+        table.insert(3, vec![SqliteValue::Integer(30)]);
+        table.insert(5, vec![SqliteValue::Integer(50)]);
+
+        let rows = run_with_storage_cursors(db, |b| {
+            let end = b.emit_label();
+            let not_found = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(1), 0);
+
+            // Seek to rowid < 3 (no such row → should jump)
+            b.emit_op(Opcode::Integer, 3, 1, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SeekLT, 0, 1, not_found, P4::None, 0);
+
+            // This should NOT be reached.
+            b.emit_op(Opcode::Integer, 999, 2, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 2, 1, 0, P4::None, 0);
+
+            b.resolve_label(not_found);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        // No row < 3 → jump taken, no results.
+        assert_eq!(rows.len(), 0);
     }
 }

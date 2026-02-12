@@ -497,6 +497,9 @@ pub struct Connection {
     /// File change counter (offset 24 in the database header).  Incremented
     /// on every transaction that modifies the database (DML or DDL).
     change_counter: RefCell<u32>,
+    /// Guards idempotent shutdown so explicit `close()` and `Drop` do not
+    /// double-run rollback/checkpoint logic.
+    closed: RefCell<bool>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -545,6 +548,7 @@ impl Connection {
             next_master_rowid: RefCell::new(1),
             schema_cookie: RefCell::new(0),
             change_counter: RefCell::new(0),
+            closed: RefCell::new(false),
         };
         conn.apply_current_journal_mode_to_pager()?;
         // 5D.4 (bd-3bsn): Load initial state from pager instead of compat_persist.
@@ -556,6 +560,52 @@ impl Connection {
     /// Returns the configured database path.
     pub fn path(&self) -> &str {
         &self.path
+    }
+
+    /// Close the connection and perform pager/WAL shutdown steps.
+    ///
+    /// On close:
+    /// 1. Roll back any active transaction.
+    /// 2. Run a passive checkpoint (WAL -> DB).
+    /// 3. Mark the connection as closed so `Drop` doesn't repeat cleanup.
+    pub fn close(mut self) -> Result<()> {
+        self.close_internal(false)
+    }
+
+    fn close_internal(&mut self, best_effort: bool) -> Result<()> {
+        if *self.closed.get_mut() {
+            return Ok(());
+        }
+
+        let cx = Cx::new();
+        let active_txn = self.active_txn.get_mut();
+        let txn_was_open = *self.in_transaction.get_mut() || active_txn.is_some();
+
+        if txn_was_open {
+            if let Some(mut txn) = active_txn.take() {
+                if best_effort {
+                    let _ = txn.rollback(&cx);
+                } else {
+                    txn.rollback(&cx)?;
+                }
+            }
+
+            *self.in_transaction.get_mut() = false;
+            *self.implicit_txn.get_mut() = false;
+            *self.concurrent_txn.get_mut() = false;
+            *self.txn_snapshot.get_mut() = None;
+            self.savepoints.get_mut().clear();
+            self.db.borrow_mut().commit_undo();
+        }
+
+        if best_effort {
+            let _ = self.pager.checkpoint(&cx, CheckpointMode::Passive);
+        } else {
+            let _ = self.pager.checkpoint(&cx, CheckpointMode::Passive)?;
+        }
+
+        *self.closed.get_mut() = true;
+        Ok(())
     }
 
     /// Prepare SQL into a statement.
@@ -3587,6 +3637,7 @@ impl Connection {
         if page1_bytes.iter().all(|&b| b == 0) || page1_bytes.len() < 100 {
             *self.db.borrow_mut() = MemDatabase::new();
             self.schema.borrow_mut().clear();
+            self.views.borrow_mut().clear();
             self.rowid_alias_columns.borrow_mut().clear();
             *self.next_master_rowid.borrow_mut() = 1;
             *self.schema_cookie.borrow_mut() = 0;
@@ -3714,8 +3765,12 @@ impl Connection {
         };
 
         // Apply the reloaded state.
+        // NOTE: Views are cleared here. View loading from sqlite_master (type='view')
+        // is not yet implemented; views created during a rolled-back transaction
+        // will be discarded.
         *self.db.borrow_mut() = new_db;
         *self.schema.borrow_mut() = new_schema;
+        self.views.borrow_mut().clear();
         *self.rowid_alias_columns.borrow_mut() = new_alias_map;
         #[allow(clippy::cast_possible_wrap)]
         {
@@ -3725,6 +3780,12 @@ impl Connection {
         *self.change_counter.borrow_mut() = change_counter;
 
         Ok(())
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        let _ = self.close_internal(true);
     }
 }
 
@@ -11624,6 +11685,85 @@ mod transaction_lifecycle_tests {
         conn.execute("ROLLBACK").unwrap();
         assert!(!conn.in_transaction());
         assert!(conn.active_txn.borrow().is_none());
+    }
+
+    #[test]
+    fn test_close_rollbacks_active_txn() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("close_rollbacks_active_txn.db");
+        let db_str = db_path.to_str().unwrap();
+
+        {
+            let conn = Connection::open(db_str).unwrap();
+            conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+            conn.execute("BEGIN").unwrap();
+            conn.execute("INSERT INTO t VALUES (7)").unwrap();
+            conn.close().unwrap();
+        }
+
+        let conn = Connection::open(db_str).unwrap();
+        let rows = conn.query("SELECT x FROM t").unwrap();
+        assert!(
+            rows.is_empty(),
+            "close() should rollback active transaction"
+        );
+    }
+
+    #[test]
+    fn test_close_checkpoints_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("close_checkpoints_wal.db");
+        let db_str = db_path.to_str().unwrap();
+
+        {
+            let conn = Connection::open(db_str).unwrap();
+            conn.execute("PRAGMA journal_mode = WAL").unwrap();
+            conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+            conn.execute("INSERT INTO t VALUES (123)").unwrap();
+            conn.close().unwrap();
+        }
+
+        let wal_path = format!("{db_str}-wal");
+        if std::path::Path::new(&wal_path).exists() {
+            std::fs::remove_file(&wal_path).unwrap();
+        }
+
+        let conn = Connection::open(db_str).unwrap();
+        let rows = conn.query("SELECT x FROM t").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get(0).unwrap(),
+            &fsqlite_types::value::SqliteValue::Integer(123)
+        );
+    }
+
+    #[test]
+    fn test_drop_does_not_panic() {
+        let result = std::panic::catch_unwind(|| {
+            let conn = Connection::open(":memory:").unwrap();
+            conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+            conn.execute("BEGIN").unwrap();
+            conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        });
+        assert!(result.is_ok(), "dropping connection should not panic");
+    }
+
+    #[test]
+    fn test_close_releases_file_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("close_releases_file_lock.db");
+        let db_str = db_path.to_str().unwrap();
+
+        {
+            let conn = Connection::open(db_str).unwrap();
+            conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+            conn.execute("BEGIN IMMEDIATE").unwrap();
+            conn.close().unwrap();
+        }
+
+        let conn = Connection::open(db_str).unwrap();
+        conn.execute("BEGIN IMMEDIATE").unwrap();
+        conn.execute("COMMIT").unwrap();
     }
 
     #[test]
