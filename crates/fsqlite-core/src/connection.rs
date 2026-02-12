@@ -12410,7 +12410,9 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(7));
 
-        let rows = conn.query("PRAGMA fsqlite.raptorq_repair_symbols;").unwrap();
+        let rows = conn
+            .query("PRAGMA fsqlite.raptorq_repair_symbols;")
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(7));
     }

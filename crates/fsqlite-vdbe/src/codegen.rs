@@ -32,9 +32,8 @@ const OE_REPLACE: u16 = 5;
 /// Convert AST `ConflictAction` to p5 OE_* flag value.
 fn conflict_action_to_oe(action: Option<&ConflictAction>) -> u16 {
     match action {
-        None => OE_ABORT,
         Some(ConflictAction::Rollback) => OE_ROLLBACK,
-        Some(ConflictAction::Abort) => OE_ABORT,
+        None | Some(ConflictAction::Abort) => OE_ABORT,
         Some(ConflictAction::Fail) => OE_FAIL,
         Some(ConflictAction::Ignore) => OE_IGNORE,
         Some(ConflictAction::Replace) => OE_REPLACE,
@@ -3813,8 +3812,7 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
         Expr::Placeholder(pt, _) => {
             let idx = match pt {
                 fsqlite_ast::PlaceholderType::Numbered(n) => *n as i32,
-                fsqlite_ast::PlaceholderType::Anonymous => b.next_anon_placeholder_idx() as i32,
-                // Named placeholders: convert to sequential numbers for now
+                // Anonymous and named placeholders are assigned sequentially.
                 _ => b.next_anon_placeholder_idx() as i32,
             };
             b.emit_op(Opcode::Variable, idx, reg, 0, P4::None, 0);

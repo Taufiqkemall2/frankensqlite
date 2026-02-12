@@ -2413,7 +2413,19 @@ impl VdbeEngine {
                     pc = op.p2 as usize;
                 }
 
-                Opcode::DeferredSeek | Opcode::IdxRowid | Opcode::FinishSeek => {
+                Opcode::IdxRowid => {
+                    // Extract rowid from index cursor p1 into register p2.
+                    // For storage cursors this delegates to B-tree cursor
+                    // rowid(), which decodes the trailing rowid field from the
+                    // index key record.
+                    let cursor_id = op.p1;
+                    let target = op.p2;
+                    let val = self.cursor_rowid(cursor_id)?;
+                    self.set_reg(target, val);
+                    pc += 1;
+                }
+
+                Opcode::DeferredSeek | Opcode::FinishSeek => {
                     pc += 1;
                 }
 

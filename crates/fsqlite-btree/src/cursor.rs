@@ -29,6 +29,7 @@ use fsqlite_error::{FrankenError, Result};
 use fsqlite_pager::TransactionHandle;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::limits::BTREE_MAX_DEPTH;
+use fsqlite_types::record::parse_record;
 use fsqlite_types::serial_type::write_varint;
 use fsqlite_types::{PageNumber, WitnessKey};
 use tracing::{debug, warn};
@@ -1397,12 +1398,22 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
         }
         let top = self.stack.last().unwrap();
         let cell = self.parse_cell_at(top, top.cell_idx)?;
-        cell.rowid.ok_or_else(|| {
-            // For index cursors, rowid is extracted from the payload.
-            // For now, return error if no rowid in cell.
-            let _ = cx; // suppress unused warning
-            FrankenError::internal("cell has no rowid (index cursor?)")
-        })
+        if let Some(rowid) = cell.rowid {
+            return Ok(rowid);
+        }
+
+        // Index cursor: rowid is stored as the trailing field in the
+        // serialized key record.
+        let key = self.read_cell_payload(cx, top, &cell)?;
+        let key_values = parse_record(&key).ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: "malformed index key record while extracting rowid".to_owned(),
+        })?;
+        key_values
+            .last()
+            .and_then(fsqlite_types::SqliteValue::as_integer)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "index key record missing trailing integer rowid".to_owned(),
+            })
     }
 
     fn eof(&self) -> bool {
@@ -1419,7 +1430,9 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
 mod tests {
     use super::*;
     use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
+    use fsqlite_types::record::serialize_record;
     use fsqlite_types::serial_type::write_varint;
+    use fsqlite_types::SqliteValue;
     use proptest::strategy::Strategy as _;
     use std::cell::RefCell;
     use std::collections::{BTreeMap, BTreeSet};
@@ -1903,6 +1916,56 @@ mod tests {
 
         assert!(cursor.index_move_to(&cx, b"banana").unwrap().is_found());
         assert_eq!(cursor.payload(&cx).unwrap(), b"banana");
+    }
+
+    #[test]
+    fn test_cursor_index_rowid_extracted_from_trailing_record_field() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, build_leaf_index(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+        let key = serialize_record(&[
+            SqliteValue::Text("beacon".to_owned()),
+            SqliteValue::Integer(73),
+        ]);
+
+        cursor.index_insert(&cx, &key).unwrap();
+        assert!(cursor.index_move_to(&cx, &key).unwrap().is_found());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 73);
+    }
+
+    #[test]
+    fn test_cursor_index_rowid_with_overflow_key_payload() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, build_leaf_index(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+        let key = serialize_record(&[
+            SqliteValue::Blob(vec![0xAB; 2_500]),
+            SqliteValue::Integer(901),
+        ]);
+
+        cursor.index_insert(&cx, &key).unwrap();
+        assert!(cursor.index_move_to(&cx, &key).unwrap().is_found());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 901);
+    }
+
+    #[test]
+    fn test_cursor_index_rowid_rejects_record_without_trailing_integer() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, build_leaf_index(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+        let key = serialize_record(&[SqliteValue::Text("missing-rowid".to_owned())]);
+
+        cursor.index_insert(&cx, &key).unwrap();
+        assert!(cursor.index_move_to(&cx, &key).unwrap().is_found());
+
+        let err = cursor.rowid(&cx).unwrap_err();
+        assert!(matches!(err, FrankenError::DatabaseCorrupt { .. }));
     }
 
     #[test]
