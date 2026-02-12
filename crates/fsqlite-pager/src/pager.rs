@@ -12,8 +12,8 @@ use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 use fsqlite_types::{
-    CommitSeq, DATABASE_HEADER_SIZE, DatabaseHeader, FRANKENSQLITE_SQLITE_VERSION_NUMBER, PageData,
-    PageNumber, PageSize,
+    BTreePageHeader, CommitSeq, DATABASE_HEADER_SIZE, DatabaseHeader,
+    FRANKENSQLITE_SQLITE_VERSION_NUMBER, PageData, PageNumber, PageSize,
 };
 use fsqlite_vfs::{Vfs, VfsFile};
 
@@ -253,19 +253,8 @@ where
 
             // Initialize sqlite_master root page as an empty leaf table B-tree
             // page (type 0x0D) with zero cells.
-            let header_offset = DATABASE_HEADER_SIZE;
-            page1[header_offset] = 0x0D; // LeafTable
-
-            let content_offset_raw = if page_size.get() == 65_536 {
-                0u16 // 0 encodes 65536 for B-tree cell content area offsets.
-            } else {
-                u16::try_from(page_size.get()).map_err(|_| FrankenError::OutOfRange {
-                    what: "page size for sqlite_master header".to_owned(),
-                    value: page_size.get().to_string(),
-                })?
-            };
-            page1[header_offset + 5..header_offset + 7]
-                .copy_from_slice(&content_offset_raw.to_be_bytes());
+            let usable = page_size.usable(header.reserved_per_page);
+            BTreePageHeader::write_empty_leaf_table(&mut page1, DATABASE_HEADER_SIZE, usable);
 
             db_file.write(&cx, &page1, 0)?;
             db_file.sync(&cx, SyncFlags::NORMAL)?;
@@ -2057,6 +2046,298 @@ mod tests {
             frames.lock().unwrap().len(),
             0,
             "bead_id={BEAD_ID} case=wal_rollback_no_frames"
+        );
+    }
+
+    // ── 5A.1: Page 1 initialization tests (bd-2yy6) ───────────────────
+
+    const BEAD_5A1: &str = "bd-2yy6";
+
+    #[test]
+    fn test_page1_database_header_all_fields() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let raw = txn.get_page(&cx, PageNumber::ONE).unwrap().into_vec();
+
+        eprintln!(
+            "[5A1][test=page1_database_header_all_fields][step=parse] page_len={}",
+            raw.len()
+        );
+
+        let hdr_bytes: [u8; DATABASE_HEADER_SIZE] = raw[..DATABASE_HEADER_SIZE]
+            .try_into()
+            .expect("page 1 must have 100-byte header");
+        let hdr = DatabaseHeader::from_bytes(&hdr_bytes).expect("header must parse");
+
+        // Verify each field matches the expected new-database defaults.
+        assert_eq!(
+            hdr.page_size,
+            PageSize::DEFAULT,
+            "bead_id={BEAD_5A1} case=page_size"
+        );
+        assert_eq!(hdr.page_count, 1, "bead_id={BEAD_5A1} case=page_count");
+        assert_eq!(
+            hdr.sqlite_version, FRANKENSQLITE_SQLITE_VERSION_NUMBER,
+            "bead_id={BEAD_5A1} case=sqlite_version"
+        );
+        assert_eq!(
+            hdr.schema_format, 4,
+            "bead_id={BEAD_5A1} case=schema_format"
+        );
+        assert_eq!(
+            hdr.freelist_trunk, 0,
+            "bead_id={BEAD_5A1} case=freelist_trunk"
+        );
+        assert_eq!(
+            hdr.freelist_count, 0,
+            "bead_id={BEAD_5A1} case=freelist_count"
+        );
+        assert_eq!(
+            hdr.schema_cookie, 0,
+            "bead_id={BEAD_5A1} case=schema_cookie"
+        );
+        assert_eq!(
+            hdr.text_encoding,
+            fsqlite_types::TextEncoding::Utf8,
+            "bead_id={BEAD_5A1} case=text_encoding"
+        );
+        assert_eq!(hdr.user_version, 0, "bead_id={BEAD_5A1} case=user_version");
+        assert_eq!(
+            hdr.application_id, 0,
+            "bead_id={BEAD_5A1} case=application_id"
+        );
+        assert_eq!(
+            hdr.change_counter, 0,
+            "bead_id={BEAD_5A1} case=change_counter"
+        );
+
+        // Magic string bytes 0..16.
+        assert_eq!(
+            &raw[..16],
+            b"SQLite format 3\0",
+            "bead_id={BEAD_5A1} case=magic_string"
+        );
+        // Payload fractions at bytes 21/22/23.
+        assert_eq!(raw[21], 64, "bead_id={BEAD_5A1} case=max_payload_fraction");
+        assert_eq!(raw[22], 32, "bead_id={BEAD_5A1} case=min_payload_fraction");
+        assert_eq!(raw[23], 32, "bead_id={BEAD_5A1} case=leaf_payload_fraction");
+
+        eprintln!(
+            "[5A1][test=page1_database_header_all_fields][step=verify] \
+             page_size={} page_count={} schema_format={} encoding=UTF8 \u{2713}",
+            hdr.page_size.get(),
+            hdr.page_count,
+            hdr.schema_format
+        );
+    }
+
+    #[test]
+    fn test_page1_btree_header_is_valid_empty_leaf_table() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let raw = txn.get_page(&cx, PageNumber::ONE).unwrap().into_vec();
+
+        let btree = BTreePageHeader::parse(&raw, PageSize::DEFAULT, 0, true)
+            .expect("page 1 must parse as B-tree page");
+
+        eprintln!(
+            "[5A1][test=page1_btree_header][step=parse] \
+             page_type={:?} cell_count={} content_start={} freeblock={} frag={}",
+            btree.page_type,
+            btree.cell_count,
+            btree.cell_content_start,
+            btree.first_freeblock,
+            btree.fragmented_free_bytes
+        );
+
+        assert_eq!(
+            btree.page_type,
+            fsqlite_types::BTreePageType::LeafTable,
+            "bead_id={BEAD_5A1} case=btree_page_type"
+        );
+        assert_eq!(
+            btree.cell_count, 0,
+            "bead_id={BEAD_5A1} case=btree_cell_count"
+        );
+        assert_eq!(
+            btree.cell_content_start,
+            PageSize::DEFAULT.get(),
+            "bead_id={BEAD_5A1} case=btree_content_start"
+        );
+        assert_eq!(
+            btree.first_freeblock, 0,
+            "bead_id={BEAD_5A1} case=btree_first_freeblock"
+        );
+        assert_eq!(
+            btree.fragmented_free_bytes, 0,
+            "bead_id={BEAD_5A1} case=btree_fragmented_free"
+        );
+        assert_eq!(
+            btree.header_offset, DATABASE_HEADER_SIZE,
+            "bead_id={BEAD_5A1} case=btree_header_offset"
+        );
+        assert!(
+            btree.right_most_child.is_none(),
+            "bead_id={BEAD_5A1} case=leaf_no_child"
+        );
+
+        eprintln!("[5A1][test=page1_btree_header][step=verify] empty_leaf_table valid \u{2713}");
+    }
+
+    #[test]
+    fn test_page1_rest_is_zeroed() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let raw = txn.get_page(&cx, PageNumber::ONE).unwrap().into_vec();
+
+        // After the B-tree header (8 bytes starting at offset 100), the rest of
+        // the page should be all zeros (no cells, no cell pointers, no data).
+        let btree_header_end = DATABASE_HEADER_SIZE + 8;
+        let trailing = &raw[btree_header_end..];
+        let non_zero_count = trailing.iter().filter(|&&b| b != 0).count();
+        assert_eq!(
+            non_zero_count, 0,
+            "bead_id={BEAD_5A1} case=trailing_bytes_zeroed non_zero_count={non_zero_count}"
+        );
+
+        eprintln!(
+            "[5A1][test=page1_rest_is_zeroed][step=verify] \
+             trailing_bytes={} all_zero=true \u{2713}",
+            trailing.len()
+        );
+    }
+
+    #[test]
+    fn test_page1_various_page_sizes() {
+        for &ps_val in &[512u32, 1024, 2048, 4096, 8192, 16384, 32768, 65536] {
+            let page_size = PageSize::new(ps_val).unwrap();
+            let vfs = MemoryVfs::new();
+            let path = PathBuf::from(format!("/test_{ps_val}.db"));
+            let pager = SimplePager::open(vfs, &path, page_size).unwrap();
+            let cx = Cx::new();
+
+            let txn = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+            let raw = txn.get_page(&cx, PageNumber::ONE).unwrap().into_vec();
+
+            eprintln!(
+                "[5A1][test=page1_various_page_sizes][step=open] page_size={ps_val} page_len={}",
+                raw.len()
+            );
+
+            assert_eq!(
+                raw.len(),
+                ps_val as usize,
+                "bead_id={BEAD_5A1} case=page_len ps={ps_val}"
+            );
+
+            // Verify database header parses.
+            let hdr_bytes: [u8; DATABASE_HEADER_SIZE] =
+                raw[..DATABASE_HEADER_SIZE].try_into().unwrap();
+            let hdr = DatabaseHeader::from_bytes(&hdr_bytes).unwrap_or_else(|e| {
+                panic!("bead_id={BEAD_5A1} case=hdr_parse ps={ps_val} err={e}")
+            });
+            assert_eq!(
+                hdr.page_size, page_size,
+                "bead_id={BEAD_5A1} case=hdr_page_size ps={ps_val}"
+            );
+
+            // Verify B-tree header parses.
+            let btree = BTreePageHeader::parse(&raw, page_size, 0, true).unwrap_or_else(|e| {
+                panic!("bead_id={BEAD_5A1} case=btree_parse ps={ps_val} err={e}")
+            });
+            assert_eq!(
+                btree.cell_count, 0,
+                "bead_id={BEAD_5A1} case=empty_cells ps={ps_val}"
+            );
+
+            // Content offset should be usable_size (= page_size when reserved=0).
+            let expected_content = ps_val;
+            assert_eq!(
+                btree.cell_content_start, expected_content,
+                "bead_id={BEAD_5A1} case=content_start ps={ps_val}"
+            );
+
+            eprintln!(
+                "[5A1][test=page1_various_page_sizes][step=verify] \
+                 page_size={ps_val} content_start={} \u{2713}",
+                btree.cell_content_start
+            );
+        }
+    }
+
+    #[test]
+    fn test_write_empty_leaf_table_roundtrip() {
+        // Verify that write_empty_leaf_table produces bytes that parse back
+        // correctly via BTreePageHeader::parse().
+        let page_size = PageSize::DEFAULT;
+        let mut page = vec![0u8; page_size.as_usize()];
+
+        // Write at offset 0 (non-page-1 case).
+        BTreePageHeader::write_empty_leaf_table(&mut page, 0, page_size.get());
+
+        let parsed = BTreePageHeader::parse(&page, page_size, 0, false)
+            .expect("bead_id=bd-2yy6 written page must parse");
+
+        assert_eq!(parsed.page_type, fsqlite_types::BTreePageType::LeafTable);
+        assert_eq!(parsed.cell_count, 0);
+        assert_eq!(parsed.first_freeblock, 0);
+        assert_eq!(parsed.fragmented_free_bytes, 0);
+        assert_eq!(parsed.cell_content_start, page_size.get());
+        assert_eq!(parsed.header_offset, 0);
+
+        eprintln!(
+            "[5A1][test=write_empty_leaf_roundtrip][step=verify] \
+             non_page1 roundtrip \u{2713}"
+        );
+
+        // Write at offset 100 (page-1 case).
+        let mut page1 = vec![0u8; page_size.as_usize()];
+        BTreePageHeader::write_empty_leaf_table(&mut page1, DATABASE_HEADER_SIZE, page_size.get());
+
+        // Need to also write a valid database header for parse to succeed.
+        let hdr = DatabaseHeader {
+            page_size,
+            page_count: 1,
+            sqlite_version: FRANKENSQLITE_SQLITE_VERSION_NUMBER,
+            ..DatabaseHeader::default()
+        };
+        let hdr_bytes = hdr.to_bytes().unwrap();
+        page1[..DATABASE_HEADER_SIZE].copy_from_slice(&hdr_bytes);
+
+        let parsed1 = BTreePageHeader::parse(&page1, page_size, 0, true)
+            .expect("bead_id=bd-2yy6 page1 written page must parse");
+
+        assert_eq!(parsed1.page_type, fsqlite_types::BTreePageType::LeafTable);
+        assert_eq!(parsed1.cell_count, 0);
+        assert_eq!(parsed1.header_offset, DATABASE_HEADER_SIZE);
+
+        eprintln!(
+            "[5A1][test=write_empty_leaf_roundtrip][step=verify] \
+             page1 roundtrip \u{2713}"
+        );
+    }
+
+    #[test]
+    fn test_write_empty_leaf_table_65536_page_size() {
+        let page_size = PageSize::new(65536).unwrap();
+        let mut page = vec![0u8; page_size.as_usize()];
+
+        BTreePageHeader::write_empty_leaf_table(&mut page, 0, page_size.get());
+
+        // The raw content offset bytes should be 0x00 0x00 (0 encodes 65536).
+        assert_eq!(page[5], 0x00);
+        assert_eq!(page[6], 0x00);
+
+        let parsed =
+            BTreePageHeader::parse(&page, page_size, 0, false).expect("65536 page must parse");
+        assert_eq!(parsed.cell_content_start, 65536);
+
+        eprintln!(
+            "[5A1][test=write_empty_leaf_65536][step=verify] \
+             content_start=65536 encoding=0x0000 \u{2713}"
         );
     }
 }

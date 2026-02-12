@@ -1313,6 +1313,39 @@ impl BTreePageHeader {
 
         Ok(blocks)
     }
+
+    /// Write an empty leaf-table B-tree page header into a buffer.
+    ///
+    /// Sets up the 8-byte B-tree page header for an empty leaf table page
+    /// (type `0x0D`) with zero cells, suitable for `sqlite_master` or any
+    /// newly created table root page.
+    ///
+    /// `header_offset` is the byte offset of the B-tree header within the
+    /// page buffer.  For page 1 this must be [`DATABASE_HEADER_SIZE`] (100);
+    /// for every other page it should be 0.
+    ///
+    /// `usable_size` equals `page_size − reserved_per_page`.  The cell
+    /// content area offset is set to this value so that all usable space is
+    /// available for future cell insertions.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn write_empty_leaf_table(page: &mut [u8], header_offset: usize, usable_size: u32) {
+        page[header_offset] = BTreePageType::LeafTable as u8; // 0x0D
+        // first_freeblock = 0 (no freeblocks)
+        page[header_offset + 1] = 0;
+        page[header_offset + 2] = 0;
+        // cell_count = 0
+        page[header_offset + 3] = 0;
+        page[header_offset + 4] = 0;
+        // cell content area offset (0 encodes 65536)
+        let content_raw = if usable_size >= 65_536 {
+            0u16
+        } else {
+            usable_size as u16
+        };
+        page[header_offset + 5..header_offset + 7].copy_from_slice(&content_raw.to_be_bytes());
+        // fragmented_free_bytes = 0
+        page[header_offset + 7] = 0;
+    }
 }
 
 /// A freeblock entry in a B-tree page freeblock list.
@@ -2312,5 +2345,57 @@ mod tests {
             TypeAffinity::comparison_affinity(TypeAffinity::Real, TypeAffinity::Numeric),
             None
         );
+    }
+
+    // ── 5A.1: BTreePageHeader::write_empty_leaf_table tests (bd-2yy6) ──
+
+    #[test]
+    fn test_write_empty_leaf_table_basic() {
+        let ps = PageSize::DEFAULT;
+        let mut buf = vec![0u8; ps.as_usize()];
+        BTreePageHeader::write_empty_leaf_table(&mut buf, 0, ps.get());
+
+        assert_eq!(buf[0], 0x0D, "page type LeafTable");
+        assert_eq!(buf[1], 0, "first_freeblock hi");
+        assert_eq!(buf[2], 0, "first_freeblock lo");
+        assert_eq!(buf[3], 0, "cell_count hi");
+        assert_eq!(buf[4], 0, "cell_count lo");
+        // 4096 = 0x1000
+        assert_eq!(buf[5], 0x10, "content_offset hi");
+        assert_eq!(buf[6], 0x00, "content_offset lo");
+        assert_eq!(buf[7], 0, "fragmented_free_bytes");
+    }
+
+    #[test]
+    fn test_write_empty_leaf_table_page1_offset() {
+        let ps = PageSize::DEFAULT;
+        let mut buf = vec![0u8; ps.as_usize()];
+        BTreePageHeader::write_empty_leaf_table(&mut buf, DATABASE_HEADER_SIZE, ps.get());
+
+        assert_eq!(buf[DATABASE_HEADER_SIZE], 0x0D, "page type at offset 100");
+        // Bytes before offset 100 should be untouched.
+        assert!(buf[..DATABASE_HEADER_SIZE].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_write_empty_leaf_table_65536_encoding() {
+        let ps = PageSize::new(65536).unwrap();
+        let mut buf = vec![0u8; ps.as_usize()];
+        BTreePageHeader::write_empty_leaf_table(&mut buf, 0, ps.get());
+
+        // 65536 is encoded as 0 in the B-tree header.
+        assert_eq!(buf[5], 0x00, "65536 encoded as 0 hi");
+        assert_eq!(buf[6], 0x00, "65536 encoded as 0 lo");
+    }
+
+    #[test]
+    fn test_write_empty_leaf_table_512_page_size() {
+        let ps = PageSize::new(512).unwrap();
+        let mut buf = vec![0u8; ps.as_usize()];
+        BTreePageHeader::write_empty_leaf_table(&mut buf, 0, ps.get());
+
+        // 512 = 0x0200
+        assert_eq!(buf[5], 0x02, "512 hi byte");
+        assert_eq!(buf[6], 0x00, "512 lo byte");
     }
 }
