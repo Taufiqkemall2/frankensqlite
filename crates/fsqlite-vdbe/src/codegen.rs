@@ -3671,6 +3671,11 @@ fn resolve_column_ref(
             return None;
         }
         if let Some(idx) = table.column_index(&col_ref.column) {
+            // INTEGER PRIMARY KEY columns are stored as rowid, not in the record payload.
+            // Return Rowid so callers emit the Rowid opcode instead of Column.
+            if table.columns[idx].is_ipk {
+                return Some(SortKeySource::Rowid);
+            }
             return Some(SortKeySource::Column(idx));
         }
         if is_rowid_alias(&col_ref.column) {
