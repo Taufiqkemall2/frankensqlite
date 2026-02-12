@@ -202,6 +202,24 @@ impl ConcurrentRegistry {
     pub fn remove(&mut self, session_id: u64) -> Option<ConcurrentHandle> {
         self.active.remove(&session_id)
     }
+
+    /// Compute the GC horizon: the minimum `snapshot.high` across all active
+    /// concurrent transactions.
+    ///
+    /// Versions with `commit_seq <= horizon` that are superseded by a newer
+    /// version are safe to reclaim (no active snapshot can see them).
+    ///
+    /// Returns `None` if no active transactions exist (caller should use the
+    /// current commit_seq as the horizon, meaning all old versions can be pruned
+    /// except the latest).
+    #[must_use]
+    pub fn gc_horizon(&self) -> Option<CommitSeq> {
+        self.active
+            .values()
+            .filter(|h| h.is_active())
+            .map(|h| h.snapshot.high)
+            .min()
+    }
 }
 
 impl Default for ConcurrentRegistry {

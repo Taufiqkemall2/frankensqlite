@@ -44,10 +44,11 @@ use fsqlite_vfs::UnixVfs;
 use fsqlite_vfs::traits::Vfs;
 use fsqlite_wal::{WalFile, WalSalts};
 
-// MVCC concurrent-writer support (bd-14zc / 5E.1, bd-kivg / 5E.2)
+// MVCC concurrent-writer support (bd-14zc / 5E.1, bd-kivg / 5E.2, bd-3bql / 5E.5)
 use fsqlite_mvcc::{
-    CommitIndex, ConcurrentHandle, ConcurrentRegistry, FcwResult, InProcessPageLockTable,
-    MvccError, concurrent_abort, concurrent_commit, concurrent_read_page, concurrent_write_page,
+    CommitIndex, ConcurrentHandle, ConcurrentRegistry, FcwResult, GcScheduler, GcTickResult,
+    GcTodo, InProcessPageLockTable, MvccError, VersionStore, concurrent_abort, concurrent_commit,
+    concurrent_read_page, concurrent_write_page,
 };
 use fsqlite_types::{CommitSeq, PageData, SchemaEpoch, Snapshot};
 
@@ -642,6 +643,14 @@ pub struct Connection {
     /// Guards idempotent shutdown so explicit `close()` and `Drop` do not
     /// double-run rollback/checkpoint logic.
     closed: RefCell<bool>,
+    // ── MVCC garbage collection (bd-3bql / 5E.5) ─────────────────────────────
+    /// Version store for MVCC page versioning.  Stores committed page versions
+    /// in an arena with version chains for snapshot resolution.
+    version_store: Rc<RefCell<VersionStore>>,
+    /// GC scheduler that derives tick frequency from version chain pressure.
+    gc_scheduler: RefCell<GcScheduler>,
+    /// Per-process touched-page queue for incremental GC pruning.
+    gc_todo: RefCell<GcTodo>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -698,6 +707,10 @@ impl Connection {
             concurrent_commit_index: CommitIndex::new(),
             next_commit_seq: RefCell::new(1),
             closed: RefCell::new(false),
+            // MVCC garbage collection (bd-3bql / 5E.5)
+            version_store: Rc::new(RefCell::new(VersionStore::new(PageSize::DEFAULT))),
+            gc_scheduler: RefCell::new(GcScheduler::new()),
+            gc_todo: RefCell::new(GcTodo::new()),
         };
         conn.apply_current_journal_mode_to_pager()?;
         // 5D.4 (bd-3bsn): Load initial state from pager instead of compat_persist.
@@ -2291,6 +2304,11 @@ impl Connection {
         *self.implicit_txn.borrow_mut() = false;
         *self.concurrent_txn.borrow_mut() = false;
         self.db.borrow_mut().commit_undo();
+
+        // MVCC GC (bd-3bql / 5E.5): After commit, trigger GC if scheduler permits.
+        // Commit makes new versions visible, potentially making old ones prunable.
+        self.maybe_gc_tick();
+
         Ok(())
     }
 
@@ -2354,8 +2372,104 @@ impl Connection {
             *self.concurrent_txn.borrow_mut() = false;
             // End undo tracking (no longer needed since we reload from pager).
             self.db.borrow_mut().commit_undo();
+
+            // MVCC GC (bd-3bql / 5E.5): After full rollback, trigger GC if scheduler permits.
+            // Rollback discards the write set and releases page locks, good time for cleanup.
+            self.maybe_gc_tick();
         }
         Ok(())
+    }
+
+    // ── MVCC garbage collection (bd-3bql / 5E.5) ─────────────────────────────
+
+    /// Compute the GC horizon: the minimum `begin_seq` across all active snapshots.
+    ///
+    /// The GC horizon determines which page versions can be safely pruned.
+    /// A version is reclaimable only if a newer version exists with `commit_seq`
+    /// at or below the horizon. This ensures no active transaction can see a
+    /// version that gets pruned.
+    ///
+    /// Returns the highest possible `CommitSeq` if no active transactions
+    /// (meaning all old versions except the latest per page can be pruned).
+    fn compute_gc_horizon(&self) -> CommitSeq {
+        // Use ConcurrentRegistry::gc_horizon() to find the minimum snapshot.high
+        // across all active concurrent transactions.
+        self.concurrent_registry
+            .borrow()
+            .gc_horizon()
+            .unwrap_or_else(|| {
+                // No active transactions: use the current commit sequence as horizon.
+                // This allows pruning everything except the latest version.
+                CommitSeq::new(*self.next_commit_seq.borrow())
+            })
+    }
+
+    /// Conditionally trigger a GC tick if the scheduler determines it's time.
+    ///
+    /// Uses the `GcScheduler` to determine if enough time has elapsed since
+    /// the last tick based on version chain pressure. If so, runs `gc_tick`
+    /// to prune old page versions from the `VersionStore`.
+    fn maybe_gc_tick(&self) -> Option<GcTickResult> {
+        let now = std::time::Instant::now();
+
+        // Estimate version chain pressure from the GcTodo queue length.
+        // This is a proxy for actual chain length sampling - a fuller
+        // implementation would sample actual chain lengths from the arena.
+        let pressure = {
+            let todo = self.gc_todo.borrow();
+            #[allow(clippy::cast_precision_loss)]
+            (todo.len() as f64).max(1.0) // minimum pressure of 1.0
+        };
+
+        let should_tick = self.gc_scheduler.borrow_mut().should_tick(pressure, now);
+        if !should_tick {
+            return None;
+        }
+
+        Some(self.gc_tick_now())
+    }
+
+    /// Force a GC tick immediately, bypassing the scheduler check.
+    ///
+    /// Useful for testing or when immediate cleanup is needed.
+    fn gc_tick_now(&self) -> GcTickResult {
+        let horizon = self.compute_gc_horizon();
+
+        // If the GC todo queue is empty, nothing to prune.
+        if self.gc_todo.borrow().is_empty() {
+            return GcTickResult {
+                pages_pruned: 0,
+                versions_freed: 0,
+                versions_budget_exhausted: false,
+                pages_budget_exhausted: false,
+                queue_remaining: 0,
+                pruned_keys: Vec::new(),
+            };
+        }
+
+        // Run GC via the VersionStore's gc_tick method which handles
+        // internal locking of arena and chain_heads.
+        let mut gc_todo = self.gc_todo.borrow_mut();
+        let result = self.version_store.borrow().gc_tick(&mut gc_todo, horizon);
+
+        if result.pages_pruned > 0 {
+            tracing::info!(
+                pages_pruned = result.pages_pruned,
+                versions_freed = result.versions_freed,
+                horizon = horizon.get(),
+                "MVCC GC tick completed (bd-3bql)"
+            );
+        }
+
+        result
+    }
+
+    /// Enqueue a page for GC consideration after a version is published.
+    ///
+    /// Called when a new version of a page is committed, making older versions
+    /// potentially eligible for pruning.
+    pub fn gc_enqueue_page(&self, pgno: PageNumber) {
+        self.gc_todo.borrow_mut().enqueue(pgno);
     }
 
     /// Handle SAVEPOINT name.

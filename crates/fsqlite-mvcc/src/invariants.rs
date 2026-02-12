@@ -19,6 +19,7 @@ use fsqlite_types::{
 };
 
 use crate::core_types::{Transaction, VersionArena, VersionIdx};
+use crate::gc::{GcTickResult, GcTodo, gc_tick};
 
 // ---------------------------------------------------------------------------
 // TxnManager — INV-1 (Monotonicity)
@@ -270,6 +271,69 @@ impl VersionStore {
     #[must_use]
     pub fn page_size(&self) -> PageSize {
         self.page_size
+    }
+
+    /// Run one incremental GC pass: prune version chains for pages in the todo queue.
+    ///
+    /// This method acquires write locks on the arena and chain heads, then delegates
+    /// to [`crate::gc::gc_tick`] for the actual pruning work.
+    ///
+    /// # Arguments
+    ///
+    /// * `todo` — The per-process GC todo queue with pages to prune.
+    /// * `horizon` — The GC horizon: versions with `commit_seq <= horizon` that are
+    ///   superseded by a newer version are reclaimable.
+    ///
+    /// # Returns
+    ///
+    /// A [`GcTickResult`] summarizing what was pruned and whether budgets were exhausted.
+    pub fn gc_tick(&self, todo: &mut GcTodo, horizon: CommitSeq) -> GcTickResult {
+        let mut arena = self.arena.write();
+        let mut chain_heads = self.chain_heads.write();
+        gc_tick(todo, horizon, &mut arena, &mut chain_heads)
+    }
+
+    /// Compute the average version chain length for GC pressure estimation.
+    ///
+    /// Samples up to `sample_limit` pages from the chain heads and returns the
+    /// mean chain length. This is used by [`GcScheduler`] to derive the GC
+    /// invocation frequency.
+    ///
+    /// Returns 0.0 if no pages exist.
+    #[must_use]
+    pub fn sample_chain_pressure(&self, sample_limit: usize) -> f64 {
+        let arena = self.arena.read();
+        let heads = self.chain_heads.read();
+
+        if heads.is_empty() {
+            return 0.0;
+        }
+
+        let mut total_length = 0_usize;
+        let mut sampled = 0_usize;
+
+        for (&_pgno, &head_idx) in heads.iter().take(sample_limit) {
+            let mut current_idx = head_idx;
+            let mut chain_len = 0_usize;
+
+            while let Some(version) = arena.get(current_idx) {
+                chain_len += 1;
+                match version.prev {
+                    Some(ptr) => current_idx = version_pointer_to_idx(ptr),
+                    None => break,
+                }
+            }
+
+            total_length += chain_len;
+            sampled += 1;
+        }
+        drop(heads);
+
+        if sampled == 0 {
+            0.0
+        } else {
+            total_length as f64 / sampled as f64
+        }
     }
 }
 
