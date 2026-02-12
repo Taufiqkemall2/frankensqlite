@@ -1575,6 +1575,8 @@ impl VdbeEngine {
                 Opcode::Rewind | Opcode::Sort | Opcode::SorterSort => {
                     // Position cursor at the first row. Jump to p2 if empty.
                     let cursor_id = op.p1;
+                    // Rewind repositions the cursor, so clear any pending delete state.
+                    self.pending_next_after_delete.remove(&cursor_id);
                     let is_empty = if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
                         if matches!(op.opcode, Opcode::Sort | Opcode::SorterSort) {
                             sorter.sort();
@@ -1618,6 +1620,8 @@ impl VdbeEngine {
                 Opcode::Last => {
                     // Position cursor at the last row. Jump to p2 if empty.
                     let cursor_id = op.p1;
+                    // Last repositions the cursor, so clear any pending delete state.
+                    self.pending_next_after_delete.remove(&cursor_id);
                     let is_empty = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
                         !cursor.cursor.last(&cursor.cx)?
                     } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
@@ -1807,6 +1811,8 @@ impl VdbeEngine {
                     // Seek cursor p1 to the row with rowid in register p3.
                     // If not found, jump to p2.
                     let cursor_id = op.p1;
+                    // Seek repositions the cursor, so clear any pending delete state.
+                    self.pending_next_after_delete.remove(&cursor_id);
                     let rowid_val = self.get_reg(op.p3).to_integer();
                     let found = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
                         cursor
@@ -1849,6 +1855,8 @@ impl VdbeEngine {
                     //
                     // Jump to p2 if no matching row exists.
                     let cursor_id = op.p1;
+                    // Seek repositions the cursor, so clear any pending delete state.
+                    self.pending_next_after_delete.remove(&cursor_id);
                     let key = self.get_reg(op.p3).to_integer();
 
                     let found = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
