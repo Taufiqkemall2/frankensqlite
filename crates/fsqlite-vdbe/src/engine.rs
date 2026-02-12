@@ -212,13 +212,13 @@ impl SorterCursor {
 // ── MVCC Concurrent Context (bd-kivg / 5E.2) ────────────────────────────
 //
 // When concurrent mode is enabled, page-level locks must be acquired
-// before writes, and reads must check the local write set first.
+// before writes. The write set is used for FCW validation at commit time.
 
 /// MVCC concurrent mode context for page-level locking (bd-kivg / 5E.2).
 ///
 /// When a transaction is in concurrent mode, this context enables:
 /// - Acquiring page-level locks before writes via [`concurrent_write_page`]
-/// - Checking the local write set before reads via [`concurrent_read_page`]
+/// - Recording written pages in the write set for FCW validation at commit
 #[derive(Clone)]
 struct ConcurrentContext {
     /// Session ID for this concurrent transaction.
@@ -307,15 +307,19 @@ impl PageWriter for SharedTxnPageIo {
     fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
         // bd-kivg / 5E.2: Acquire page-level lock and record in write set if concurrent.
         if let Some(ref ctx) = self.concurrent {
-            let page_data = PageData::from_vec(data.to_vec());
             let mut registry = ctx.registry.borrow_mut();
-            if let Some(handle) = registry.get_mut(ctx.session_id) {
-                concurrent_write_page(handle, &ctx.lock_table, ctx.session_id, page_no, page_data)
-                    .map_err(|e| match e {
-                        MvccError::Busy => FrankenError::Busy,
-                        _ => FrankenError::Internal(format!("MVCC write_page failed: {e}")),
-                    })?;
-            }
+            let handle = registry.get_mut(ctx.session_id).ok_or_else(|| {
+                FrankenError::Internal(format!(
+                    "MVCC session {} not found in registry during write",
+                    ctx.session_id
+                ))
+            })?;
+            let page_data = PageData::from_vec(data.to_vec());
+            concurrent_write_page(handle, &ctx.lock_table, ctx.session_id, page_no, page_data)
+                .map_err(|e| match e {
+                    MvccError::Busy => FrankenError::Busy,
+                    _ => FrankenError::Internal(format!("MVCC write_page failed: {e}")),
+                })?;
         }
         // Persist to the underlying transaction.
         self.txn.borrow_mut().write_page(cx, page_no, data)
@@ -880,7 +884,7 @@ impl VdbeEngine {
     /// MVCC page-level locking for concurrent writers. When the concurrent
     /// context is present:
     /// - Write operations acquire page-level locks via [`concurrent_write_page`]
-    /// - Read operations check the local write set via [`concurrent_read_page`]
+    /// - Written pages are recorded in the write set for FCW validation at commit
     pub fn set_transaction_concurrent(
         &mut self,
         txn: Box<dyn TransactionHandle>,
