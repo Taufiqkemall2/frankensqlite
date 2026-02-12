@@ -1,0 +1,8 @@
+{
+  "as_of_phase": "checkpoint_1",
+  "total_tests": 5319,
+  "passed": 5319,
+  "failed": 0,
+  "ignored": 0,
+  "baseline_commit": "ee508e3faf28"
+}
