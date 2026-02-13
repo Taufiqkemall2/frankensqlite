@@ -959,7 +959,10 @@
 <script type="module">
     import { animate, stagger, spring } from "https://cdn.jsdelivr.net/npm/motion@10.18.0/+esm";
 
-    const DB_URL = "spec_evolution_v1.sqlite3";
+    const CANONICAL_ORIGIN = "https://frankensqlite.com";
+    const DB_FILENAME = "spec_evolution_v1.sqlite3";
+    const DB_URL = `${CANONICAL_ORIGIN}/${DB_FILENAME}`;
+    const CANONICAL_HOSTS = new Set(["frankensqlite.com", "www.frankensqlite.com", "frankensqlite-spec-evolution.pages.dev"]);
     const BUCKETS = [
         { id: 1, name: "Logic/Math", color: "#39ff14", desc: "Fixing outright mistakes in logic, math, or reasoning." },
         { id: 2, name: "Legacy SQLite", color: "#adff2f", desc: "Fixing inaccurate statements about the existing sqlite legacy codebase." },
@@ -1271,6 +1274,71 @@
         });
     }
 
+    function enforceCanonicalHost() {
+        const host = window.location.hostname.toLowerCase();
+        if (!CANONICAL_HOSTS.has(host)) return false;
+        if (window.location.origin === CANONICAL_ORIGIN) return false;
+        const target = new URL(window.location.href);
+        target.protocol = "https:";
+        target.host = "frankensqlite.com";
+        window.location.replace(target.toString());
+        return true;
+    }
+
+    function sqliteMagicPrefix(bytes) {
+        return new TextDecoder().decode(bytes.slice(0, 15));
+    }
+
+    function buildDbCandidates() {
+        const candidates = [];
+        const seen = new Set();
+        const push = (value) => {
+            let parsed;
+            try {
+                parsed = new URL(value, window.location.origin);
+            } catch {
+                return;
+            }
+            const href = parsed.toString();
+            if (seen.has(href)) return;
+            seen.add(href);
+            candidates.push(href);
+        };
+
+        push(DB_URL);
+        push(`/${DB_FILENAME}`);
+        push(DB_FILENAME);
+        push(`${CANONICAL_ORIGIN}/${DB_FILENAME}`);
+
+        // Some stale clients cached a query-string DB URL; always retry stripped variants.
+        for (const href of [...candidates]) {
+            const stripped = new URL(href);
+            stripped.search = "";
+            stripped.hash = "";
+            push(stripped.toString());
+        }
+        return candidates;
+    }
+
+    async function loadSqliteBytes() {
+        const candidates = buildDbCandidates();
+        const failures = [];
+        for (const candidate of candidates) {
+            try {
+                const buf = await fetchAsArrayBuffer(candidate);
+                const bytes = new Uint8Array(buf);
+                const magic = sqliteMagicPrefix(bytes);
+                if (magic === "SQLite format 3") {
+                    return bytes;
+                }
+                failures.push(`${candidate} -> not SQLite (${bytes.byteLength} bytes, starts with "${magic.slice(0,12)}...")`);
+            } catch (e) {
+                failures.push(`${candidate} -> ${e.message || String(e)}`);
+            }
+        }
+        throw new Error(`Could not load SQLite database after trying ${candidates.length} URL(s): ${failures.join(" | ")}`);
+    }
+
     const PREFERS_REDUCED_MOTION =
         typeof window !== "undefined" &&
         typeof window.matchMedia === "function" &&
@@ -1402,21 +1470,7 @@
     async function init() {
         try {
             const SQL = await window.initSqlJs({ locateFile: file => `https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/${file}` });
-            const buf = await fetchAsArrayBuffer(DB_URL);
-            const bytes = new Uint8Array(buf);
-            // Validate SQLite magic header: "SQLite format 3\0"
-            const magic = new TextDecoder().decode(bytes.slice(0, 15));
-            if (magic !== "SQLite format 3") {
-                // Stale cached HTML served instead of the DB file — force reload to get fresh page
-                if (!sessionStorage.getItem("_db_reload")) {
-                    sessionStorage.setItem("_db_reload", "1");
-                    window.location.reload();
-                    return;
-                }
-                sessionStorage.removeItem("_db_reload");
-                throw new Error(`Not a SQLite file (${bytes.byteLength} bytes, starts with "${magic.slice(0,12)}...")`);
-            }
-            sessionStorage.removeItem("_db_reload");
+            const bytes = await loadSqliteBytes();
             DB = new SQL.Database(bytes);
             
             const baseRes = DB.exec("SELECT text FROM base_doc LIMIT 1");
@@ -2190,8 +2244,13 @@
         return res;
     }
 
-    if (isSelftestMode()) runSelftest();
-    else init();
+    if (enforceCanonicalHost()) {
+        // Redirect in progress.
+    } else if (isSelftestMode()) {
+        runSelftest();
+    } else {
+        init();
+    }
 </script>
 </body>
 </html>
