@@ -17,6 +17,7 @@ pub mod explain;
 pub mod inter_object_coding;
 pub mod native_index;
 pub mod permeation_map;
+pub mod por;
 pub mod raptorq_integration;
 pub mod region;
 pub mod remote_effects;
