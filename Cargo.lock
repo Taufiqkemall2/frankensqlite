@@ -852,6 +852,7 @@ version = "0.1.0"
 dependencies = [
  "asupersync",
  "fsqlite",
+ "fsqlite-ast",
  "fsqlite-btree",
  "fsqlite-core",
  "fsqlite-error",
@@ -864,7 +865,9 @@ dependencies = [
  "fsqlite-func",
  "fsqlite-mvcc",
  "fsqlite-pager",
+ "fsqlite-parser",
  "fsqlite-types",
+ "fsqlite-vdbe",
  "fsqlite-vfs",
  "fsqlite-wal",
  "parking_lot",
