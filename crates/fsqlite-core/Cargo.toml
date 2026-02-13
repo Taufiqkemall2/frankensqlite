@@ -21,6 +21,8 @@ fsqlite-parser = { workspace = true }
 fsqlite-planner = { workspace = true }
 fsqlite-vdbe = { workspace = true }
 fsqlite-func = { workspace = true }
+fsqlite-ext-json = { workspace = true }
+fsqlite-ext-fts5 = { workspace = true }
 tracing = { workspace = true }
 xxhash-rust = { workspace = true }
 blake3 = { workspace = true }

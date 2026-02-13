@@ -575,3 +575,201 @@ fn txn_wal_checkpoint_journal_mode_transitions_file_backed() {
         "row visibility mismatch after non-WAL checkpoint"
     );
 }
+
+// ─── Scenario L: Journal mode PRAGMA response parity for all modes ────
+//
+// SQLite supports 6 journal modes: delete, truncate, persist, memory, wal, off.
+// This test verifies that both engines return the same PRAGMA response string
+// for each mode transition on a file-backed database.
+
+#[test]
+fn txn_journal_mode_all_modes_response_parity() {
+    const BEAD_ID: &str = "bd-1dp9.4.1";
+    const SEED: u64 = 0x1D94_0402;
+    let run_id = format!("bd-1dp9.4.1-seed-{SEED}-journal-mode-all-modes");
+
+    let tmp = tempdir().expect("tempdir");
+    let c_path = tmp.path().join("oracle_csqlite_L.db");
+    let f_path = tmp.path().join("candidate_fsqlite_L.db");
+
+    let c_conn = rusqlite::Connection::open(&c_path).expect("open csqlite db");
+    let f_conn =
+        fsqlite::Connection::open(f_path.to_string_lossy().as_ref()).expect("open fsqlite db");
+
+    eprintln!("bead_id={BEAD_ID} run_id={run_id} seed={SEED} phase=start");
+
+    // Test each journal_mode transition. SQLite echoes back the mode that was
+    // actually set (which may differ from the requested mode on some backends).
+    let modes = [
+        "wal", "delete", "truncate", "persist", "memory", "off", "wal",
+    ];
+
+    for mode in modes {
+        let sql = format!("PRAGMA journal_mode='{mode}';");
+        let c_resp = csqlite_query_values(&c_conn, &sql);
+        let f_resp = fsqlite_query_values(&f_conn, &sql);
+        eprintln!(
+            "bead_id={BEAD_ID} run_id={run_id} seed={SEED} phase=mode_set mode={mode} c={c_resp:?} f={f_resp:?}"
+        );
+        assert_eq!(
+            c_resp, f_resp,
+            "journal_mode response mismatch for mode='{mode}'"
+        );
+
+        // Query should also match.
+        let c_query = csqlite_query_values(&c_conn, "PRAGMA journal_mode;");
+        let f_query = fsqlite_query_values(&f_conn, "PRAGMA journal_mode;");
+        assert_eq!(
+            c_query, f_query,
+            "journal_mode query mismatch after setting mode='{mode}'"
+        );
+    }
+
+    // Verify data integrity is maintained through mode transitions.
+    c_conn
+        .execute("CREATE TABLE t_L(id INTEGER PRIMARY KEY, v TEXT)", [])
+        .expect("csqlite create");
+    f_conn
+        .execute("CREATE TABLE t_L(id INTEGER PRIMARY KEY, v TEXT)")
+        .expect("fsqlite create");
+    c_conn
+        .execute("INSERT INTO t_L VALUES (1, 'mode_test')", [])
+        .expect("csqlite insert");
+    f_conn
+        .execute("INSERT INTO t_L VALUES (1, 'mode_test')")
+        .expect("fsqlite insert");
+
+    let c_count = csqlite_query_values(&c_conn, "SELECT COUNT(*) FROM t_L;");
+    let f_count = fsqlite_query_values(&f_conn, "SELECT COUNT(*) FROM t_L;");
+    eprintln!(
+        "bead_id={BEAD_ID} run_id={run_id} seed={SEED} phase=data_integrity c={c_count:?} f={f_count:?}"
+    );
+    assert_eq!(
+        c_count, f_count,
+        "data integrity mismatch after mode transitions"
+    );
+}
+
+// ─── Scenario M: Checkpoint modes with WAL data ──────────────────────
+//
+// Verifies that all 4 checkpoint modes (PASSIVE, FULL, RESTART, TRUNCATE)
+// return parity results when WAL contains actual data.
+
+#[test]
+fn txn_checkpoint_all_modes_with_data() {
+    const BEAD_ID: &str = "bd-1dp9.4.1";
+    const SEED: u64 = 0x1D94_0403;
+    let run_id = format!("bd-1dp9.4.1-seed-{SEED}-checkpoint-all-modes");
+
+    let tmp = tempdir().expect("tempdir");
+    let c_path = tmp.path().join("oracle_csqlite_M.db");
+    let f_path = tmp.path().join("candidate_fsqlite_M.db");
+
+    let c_conn = rusqlite::Connection::open(&c_path).expect("open csqlite db");
+    let f_conn =
+        fsqlite::Connection::open(f_path.to_string_lossy().as_ref()).expect("open fsqlite db");
+
+    // Ensure both in WAL mode.
+    csqlite_query_values(&c_conn, "PRAGMA journal_mode=WAL;");
+    fsqlite_query_values(&f_conn, "PRAGMA journal_mode=WAL;");
+
+    // Disable auto-checkpoint so we can control when it happens.
+    csqlite_query_values(&c_conn, "PRAGMA wal_autocheckpoint=0;");
+    fsqlite_query_values(&f_conn, "PRAGMA wal_autocheckpoint=0;");
+
+    eprintln!("bead_id={BEAD_ID} run_id={run_id} seed={SEED} phase=start");
+
+    // Insert data to populate the WAL.
+    let setup_sql = [
+        "CREATE TABLE t_M(id INTEGER PRIMARY KEY, v TEXT);",
+        "INSERT INTO t_M VALUES (1, 'alpha');",
+        "INSERT INTO t_M VALUES (2, 'beta');",
+        "INSERT INTO t_M VALUES (3, 'gamma');",
+    ];
+    for sql in setup_sql {
+        c_conn.execute(sql, []).expect("csqlite setup");
+        f_conn.execute(sql).expect("fsqlite setup");
+    }
+
+    // Test PASSIVE checkpoint with data in WAL.
+    let c_passive = csqlite_query_values(&c_conn, "PRAGMA wal_checkpoint(PASSIVE);");
+    let f_passive = fsqlite_query_values(&f_conn, "PRAGMA wal_checkpoint(PASSIVE);");
+    let c_trip = checkpoint_triplet(&c_passive, "csqlite passive");
+    let f_trip = checkpoint_triplet(&f_passive, "fsqlite passive");
+    eprintln!(
+        "bead_id={BEAD_ID} run_id={run_id} seed={SEED} phase=checkpoint_passive c={c_trip:?} f={f_trip:?}"
+    );
+    // busy=0 for both (no concurrent readers in single-connection test).
+    assert_eq!(c_trip.0, 0, "csqlite passive busy");
+    assert_eq!(f_trip.0, 0, "fsqlite passive busy");
+
+    // Add more data for next checkpoint.
+    for i in 4..=6 {
+        let sql = format!("INSERT INTO t_M VALUES ({i}, 'row_{i}');");
+        c_conn.execute(&sql, []).expect("csqlite insert");
+        f_conn.execute(&sql).expect("fsqlite insert");
+    }
+
+    // Test FULL checkpoint.
+    let c_full = csqlite_query_values(&c_conn, "PRAGMA wal_checkpoint(FULL);");
+    let f_full = fsqlite_query_values(&f_conn, "PRAGMA wal_checkpoint(FULL);");
+    let c_trip = checkpoint_triplet(&c_full, "csqlite full");
+    let f_trip = checkpoint_triplet(&f_full, "fsqlite full");
+    eprintln!(
+        "bead_id={BEAD_ID} run_id={run_id} seed={SEED} phase=checkpoint_full c={c_trip:?} f={f_trip:?}"
+    );
+    assert_eq!(c_trip.0, 0, "csqlite full busy");
+    assert_eq!(f_trip.0, 0, "fsqlite full busy");
+
+    // Add more data for RESTART checkpoint.
+    for i in 7..=9 {
+        let sql = format!("INSERT INTO t_M VALUES ({i}, 'row_{i}');");
+        c_conn.execute(&sql, []).expect("csqlite insert");
+        f_conn.execute(&sql).expect("fsqlite insert");
+    }
+
+    // Test RESTART checkpoint (resets WAL after checkpoint).
+    let c_restart = csqlite_query_values(&c_conn, "PRAGMA wal_checkpoint(RESTART);");
+    let f_restart = fsqlite_query_values(&f_conn, "PRAGMA wal_checkpoint(RESTART);");
+    let c_trip = checkpoint_triplet(&c_restart, "csqlite restart");
+    let f_trip = checkpoint_triplet(&f_restart, "fsqlite restart");
+    eprintln!(
+        "bead_id={BEAD_ID} run_id={run_id} seed={SEED} phase=checkpoint_restart c={c_trip:?} f={f_trip:?}"
+    );
+    assert_eq!(c_trip.0, 0, "csqlite restart busy");
+    assert_eq!(f_trip.0, 0, "fsqlite restart busy");
+
+    // Add more data for TRUNCATE checkpoint.
+    for i in 10..=12 {
+        let sql = format!("INSERT INTO t_M VALUES ({i}, 'row_{i}');");
+        c_conn.execute(&sql, []).expect("csqlite insert");
+        f_conn.execute(&sql).expect("fsqlite insert");
+    }
+
+    // Test TRUNCATE checkpoint (truncates WAL to zero after checkpoint).
+    let c_truncate = csqlite_query_values(&c_conn, "PRAGMA wal_checkpoint(TRUNCATE);");
+    let f_truncate = fsqlite_query_values(&f_conn, "PRAGMA wal_checkpoint(TRUNCATE);");
+    let c_trip = checkpoint_triplet(&c_truncate, "csqlite truncate");
+    let f_trip = checkpoint_triplet(&f_truncate, "fsqlite truncate");
+    eprintln!(
+        "bead_id={BEAD_ID} run_id={run_id} seed={SEED} phase=checkpoint_truncate c={c_trip:?} f={f_trip:?}"
+    );
+    assert_eq!(c_trip.0, 0, "csqlite truncate busy");
+    assert_eq!(f_trip.0, 0, "fsqlite truncate busy");
+
+    // Verify all data is accessible after all checkpoint modes.
+    let c_count = csqlite_query_values(&c_conn, "SELECT COUNT(*) FROM t_M;");
+    let f_count = fsqlite_query_values(&f_conn, "SELECT COUNT(*) FROM t_M;");
+    eprintln!(
+        "bead_id={BEAD_ID} run_id={run_id} seed={SEED} phase=final_data_check c={c_count:?} f={f_count:?}"
+    );
+    assert_eq!(
+        c_count, f_count,
+        "row count mismatch after all checkpoint modes"
+    );
+    assert_eq!(
+        f_count,
+        vec![vec![SqlValue::Integer(12)]],
+        "expected 12 rows after all inserts"
+    );
+}

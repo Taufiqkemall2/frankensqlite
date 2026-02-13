@@ -33,6 +33,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 [dev-dependencies]
 criterion = { workspace = true }
 jsonschema = { version = "0.41.0", default-features = false }
+fsqlite-ext-session = { workspace = true }
 
 [[bin]]
 name = "realdb-e2e"

@@ -1351,4 +1351,371 @@ mod tests {
         assert_eq!(read_keys.len(), 2);
         assert_eq!(write_keys.len(), 2);
     }
+
+    // -----------------------------------------------------------------------
+    // bd-mblr.6.7: Critical-path no-mock unit assertions
+    //
+    // The tests below exercise critical SSI invariants using ONLY real
+    // components (ConcurrentHandle, ConcurrentRegistry, InProcessPageLockTable,
+    // CommitIndex) — no MockActiveTxn, no manual flag setting.
+    // -----------------------------------------------------------------------
+
+    // Test 21 (bd-mblr.6.7): Three-transaction SSI marked-for-abort
+    // propagation via real edge detection through concurrent_commit_with_ssi.
+    //
+    // Scenario:
+    //   T1: reads D, writes C      (T1 will commit second)
+    //   T2: reads C, writes D      (T2 will get marked_for_abort)
+    //   T3: reads A, writes B      (T3 commits first, no overlap)
+    //
+    // When T3 commits first (disjoint pages → clean):
+    //   - No edges, T3 commits cleanly.
+    //
+    // When T1 commits second:
+    //   - Scans T2: T2 reads C, T1 writes C → incoming edge for T1.
+    //     T2.has_out_rw = true.
+    //   - Scans T2: T2 writes D, T1 reads D → outgoing edge for T1.
+    //     T2.has_in_rw = true.
+    //   - T1 has both in+out → T1 is pivot → T1 aborts.
+    //   - T2 has both flags set, but was NOT marked_for_abort because
+    //     has_in_rw was set in the outgoing-check AFTER the incoming-check
+    //     tested it (false at that point).
+    //
+    // After T1 aborts, T2 can commit because the pivot (T1) is gone.
+    //
+    // This test exercises the full real-component SSI path without any
+    // mock objects or manual flag manipulation.
+    #[test]
+    fn test_ssi_three_txn_pivot_abort_real_components() {
+        use super::concurrent_commit_with_ssi;
+
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        // T1: reads D (page 40), writes C (page 30).
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        // T2: reads C (page 30), writes D (page 40).
+        let s2 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        // T3: reads A (page 5), writes B (page 10) — disjoint.
+        let s3 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+
+        // T1 operations.
+        {
+            let h1 = registry.get_mut(s1).unwrap();
+            h1.record_read(test_page(40)); // reads D
+            concurrent_write_page(h1, &lock_table, s1, test_page(30), test_data()).unwrap(); // writes C
+        }
+        // T2 operations.
+        {
+            let h2 = registry.get_mut(s2).unwrap();
+            h2.record_read(test_page(30)); // reads C
+            concurrent_write_page(h2, &lock_table, s2, test_page(40), test_data()).unwrap(); // writes D
+        }
+        // T3 operations (disjoint).
+        {
+            let h3 = registry.get_mut(s3).unwrap();
+            h3.record_read(test_page(5)); // reads A
+            concurrent_write_page(h3, &lock_table, s3, test_page(10), test_data()).unwrap(); // writes B
+        }
+
+        // T3 commits first (disjoint, no edges).
+        let result3 = concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s3,
+            CommitSeq::new(11),
+        );
+        assert!(result3.is_ok(), "T3 disjoint commit must succeed");
+
+        // T1 commits second: classic write-skew with T2, T1 is pivot.
+        let result1 = concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s1,
+            CommitSeq::new(12),
+        );
+        assert!(
+            result1.is_err(),
+            "T1 must abort as pivot (both in+out edges with T2)"
+        );
+        let (err, _) = result1.unwrap_err();
+        assert_eq!(err, MvccError::BusySnapshot);
+
+        // After T1 aborted, T2 can now commit (only remaining active handle).
+        let result2 = concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s2,
+            CommitSeq::new(12),
+        );
+        assert!(result2.is_ok(), "T2 must commit after pivot T1 aborted");
+    }
+
+    // Test 22 (bd-mblr.6.7): SSI marked-for-abort propagation through
+    // real edge detection — three transactions where sequential commits
+    // progressively set SSI flags on T1 until T1 is marked_for_abort.
+    //
+    // The marked_for_abort path fires when the INCOMING edge check finds
+    // that the other handle already has has_in_rw set. The incoming check
+    // runs before the outgoing check, so has_in_rw must be set by a PRIOR
+    // commit's scan.
+    //
+    // T1: reads pages {10, 20}, writes page 30
+    // T2: reads page 50, writes page 10
+    // T3: reads page 30, writes page 40
+    //
+    // Step 1: T3 commits. Scans T1:
+    //   Outgoing check: T1 writes 30, T3 reads 30. Match!
+    //   T1.has_in_rw = true. T3 commits (only outgoing, safe).
+    //
+    // Step 2: T2 commits. Scans T1:
+    //   Incoming check: T2 writes 10, T1 reads {10,20}. Match on 10!
+    //   T1.has_out_rw = true. T1.has_in_rw already true => T1 marked_for_abort!
+    //   T2 has only incoming edge => T2 commits.
+    //
+    // Step 3: T1 tries to commit => fails (marked_for_abort).
+    #[test]
+    fn test_ssi_marked_for_abort_via_real_edge_detection() {
+        use super::concurrent_commit_with_ssi;
+
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        // T1: reads pages 10+20, writes page 30.
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        // T2: reads page 50, writes page 10.
+        let s2 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        // T3: reads page 30, writes page 40.
+        let s3 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+
+        // T1 operations.
+        {
+            let h1 = registry.get_mut(s1).unwrap();
+            h1.record_read(test_page(10));
+            h1.record_read(test_page(20));
+            concurrent_write_page(h1, &lock_table, s1, test_page(30), test_data()).unwrap();
+        }
+        // T2 operations.
+        {
+            let h2 = registry.get_mut(s2).unwrap();
+            h2.record_read(test_page(50));
+            concurrent_write_page(h2, &lock_table, s2, test_page(10), test_data()).unwrap();
+        }
+        // T3 operations.
+        {
+            let h3 = registry.get_mut(s3).unwrap();
+            h3.record_read(test_page(30));
+            concurrent_write_page(h3, &lock_table, s3, test_page(40), test_data()).unwrap();
+        }
+
+        // Step 1: T3 commits. T1 writes page 30, T3 reads page 30
+        // (outgoing check: T1 wrote what T3 read). T1.has_in_rw = true.
+        let result3 = concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s3,
+            CommitSeq::new(11),
+        );
+        assert!(result3.is_ok(), "T3 commits (only outgoing edge)");
+
+        // Verify T1's has_in_rw was set by T3's outgoing edge detection.
+        {
+            let h1 = registry.get(s1).unwrap();
+            assert!(
+                h1.has_in_rw(),
+                "T1 must have has_in_rw: T1 writes 30, T3 reads 30"
+            );
+            assert!(!h1.has_out_rw(), "T1 must NOT have has_out_rw yet");
+            assert!(
+                !h1.is_marked_for_abort(),
+                "T1 must NOT be marked_for_abort yet"
+            );
+        }
+
+        // Step 2: T2 commits. T2 writes page 10, T1 reads page 10
+        // (incoming check: T1 read what T2 writes). T1.has_out_rw = true.
+        // T1.has_in_rw is already true (from step 1) => T1 marked_for_abort!
+        let result2 = concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s2,
+            CommitSeq::new(12),
+        );
+        assert!(
+            result2.is_ok(),
+            "T2 commits (only incoming edge, not pivot)"
+        );
+
+        // Verify T1 is now marked_for_abort.
+        {
+            let h1 = registry.get(s1).unwrap();
+            assert!(h1.has_in_rw(), "T1 still has has_in_rw (from T3's commit)");
+            assert!(
+                h1.has_out_rw(),
+                "T1 now has has_out_rw (T2's incoming edge scan set it)"
+            );
+            assert!(
+                h1.is_marked_for_abort(),
+                "T1 must be marked_for_abort: T2 found incoming edge from T1, \
+                 and T1 already had has_in_rw from T3's commit"
+            );
+        }
+
+        // Step 3: T1 tries to commit → fails with BusySnapshot
+        // (marked_for_abort).
+        let result1 = concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s1,
+            CommitSeq::new(13),
+        );
+        assert!(
+            result1.is_err(),
+            "T1 must abort: marked_for_abort by T2's commit scan"
+        );
+        let (err, _) = result1.unwrap_err();
+        assert_eq!(err, MvccError::BusySnapshot);
+    }
+
+    // Test 23 (bd-mblr.6.7): SSI edge propagation — verify that a
+    // commit's edge scan correctly sets other transactions' SSI flags
+    // without any manual flag manipulation.
+    #[test]
+    fn test_ssi_edge_propagation_sets_flags_automatically() {
+        use super::concurrent_commit_with_ssi;
+
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        // T1: reads page 100, writes page 200.
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        // T2: reads page 200, writes page 300.
+        let s2 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+
+        {
+            let h1 = registry.get_mut(s1).unwrap();
+            h1.record_read(test_page(100));
+            concurrent_write_page(h1, &lock_table, s1, test_page(200), test_data()).unwrap();
+        }
+        {
+            let h2 = registry.get_mut(s2).unwrap();
+            h2.record_read(test_page(200));
+            concurrent_write_page(h2, &lock_table, s2, test_page(300), test_data()).unwrap();
+        }
+
+        // Before any commit: both T1 and T2 have no SSI flags.
+        {
+            let h1 = registry.get(s1).unwrap();
+            let h2 = registry.get(s2).unwrap();
+            assert!(!h1.has_in_rw());
+            assert!(!h1.has_out_rw());
+            assert!(!h2.has_in_rw());
+            assert!(!h2.has_out_rw());
+        }
+
+        // T1 commits: T2 reads page 200, T1 writes page 200 →
+        // incoming edge from T2→T1. T2.has_out_rw = true.
+        // No outgoing edge (T1 reads 100, T2 writes 300 → no overlap).
+        let result1 = concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s1,
+            CommitSeq::new(11),
+        );
+        assert!(result1.is_ok(), "T1 commits (only incoming edge)");
+
+        // Verify T2's flags were set by the edge scan.
+        {
+            let h2 = registry.get(s2).unwrap();
+            assert!(
+                h2.has_out_rw(),
+                "T2.has_out_rw must be set: T2 read page 200 that T1 wrote"
+            );
+            assert!(
+                !h2.has_in_rw(),
+                "T2.has_in_rw must NOT be set: no outgoing edge from T1 to T2"
+            );
+        }
+
+        // T2 can commit (only has outgoing edge, not pivot).
+        let result2 = concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s2,
+            CommitSeq::new(12),
+        );
+        assert!(
+            result2.is_ok(),
+            "T2 commits (only outgoing edge, not pivot)"
+        );
+    }
+
+    // Test 24 (bd-mblr.6.7): FCW conflict detection with real CommitIndex
+    // — verifies first-committer-wins uses real commit_index state.
+    //
+    // T1 and T2 both start with snapshot at seq 10.
+    // T1 writes page 42, commits at seq 11 → commit_index[page42] = 11.
+    // After T1 commits, the page lock is released.
+    // T2 then writes page 42 (lock now available), and tries to commit.
+    // FCW detects: commit_index[page42] = 11 > snapshot.high = 10 → conflict.
+    #[test]
+    fn test_fcw_real_commit_index_conflict() {
+        use super::concurrent_commit_with_ssi;
+
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let s2 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+
+        // T1 writes page 42 and commits first.
+        {
+            let h1 = registry.get_mut(s1).unwrap();
+            concurrent_write_page(h1, &lock_table, s1, test_page(42), test_data()).unwrap();
+        }
+        let result1 = concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s1,
+            CommitSeq::new(11),
+        );
+        assert!(result1.is_ok(), "T1 first-committer wins");
+
+        // After T1 committed, the page lock on page 42 is released.
+        // T2 now writes the same page.
+        {
+            let h2 = registry.get_mut(s2).unwrap();
+            concurrent_write_page(h2, &lock_table, s2, test_page(42), test_data()).unwrap();
+        }
+
+        // T2 commits second — FCW detects page 42 was modified after
+        // T2's snapshot (commit_seq 11 > snapshot high 10).
+        let result2 = concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s2,
+            CommitSeq::new(12),
+        );
+        assert!(result2.is_err(), "T2 must fail: FCW conflict on page 42");
+        let (err, fcw) = result2.unwrap_err();
+        assert_eq!(err, MvccError::BusySnapshot);
+        assert!(
+            matches!(fcw, FcwResult::Conflict { .. }),
+            "FCW must report conflict"
+        );
+    }
 }

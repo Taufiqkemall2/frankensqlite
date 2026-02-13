@@ -302,6 +302,8 @@ fn default_function_registry() -> Arc<FunctionRegistry> {
     fsqlite_func::register_math_builtins(&mut registry);
     fsqlite_func::register_aggregate_builtins(&mut registry);
     fsqlite_func::register_window_builtins(&mut registry);
+    fsqlite_ext_json::register_json_scalars(&mut registry);
+    fsqlite_ext_fts5::register_fts5_scalars(&mut registry);
     Arc::new(registry)
 }
 
@@ -3336,36 +3338,37 @@ impl Connection {
             }
             // ── MVCC conflict observability PRAGMAs (bd-t6sv2.1) ──────────
             "fsqlite.conflict_stats" | "conflict_stats" => {
+                let to_i64 = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
                 let snap = self.conflict_observer.metrics().snapshot();
                 Ok(vec![
                     Row {
                         values: vec![
                             SqliteValue::Text("conflicts_total".into()),
-                            SqliteValue::Integer(snap.conflicts_total as i64),
+                            SqliteValue::Integer(to_i64(snap.conflicts_total)),
                         ],
                     },
                     Row {
                         values: vec![
                             SqliteValue::Text("page_contentions".into()),
-                            SqliteValue::Integer(snap.page_contentions as i64),
+                            SqliteValue::Integer(to_i64(snap.page_contentions)),
                         ],
                     },
                     Row {
                         values: vec![
                             SqliteValue::Text("fcw_drifts".into()),
-                            SqliteValue::Integer(snap.fcw_drifts as i64),
+                            SqliteValue::Integer(to_i64(snap.fcw_drifts)),
                         ],
                     },
                     Row {
                         values: vec![
                             SqliteValue::Text("ssi_aborts".into()),
-                            SqliteValue::Integer(snap.ssi_aborts as i64),
+                            SqliteValue::Integer(to_i64(snap.ssi_aborts)),
                         ],
                     },
                     Row {
                         values: vec![
                             SqliteValue::Text("conflicts_resolved".into()),
-                            SqliteValue::Integer(snap.conflicts_resolved as i64),
+                            SqliteValue::Integer(to_i64(snap.conflicts_resolved)),
                         ],
                     },
                 ])
@@ -3379,8 +3382,10 @@ impl Connection {
                         let desc = format!("{e:?}");
                         Row {
                             values: vec![
-                                SqliteValue::Integer(i as i64),
-                                SqliteValue::Integer(e.timestamp_ns() as i64),
+                                SqliteValue::Integer(i64::try_from(i).unwrap_or(i64::MAX)),
+                                SqliteValue::Integer(
+                                    i64::try_from(e.timestamp_ns()).unwrap_or(i64::MAX),
+                                ),
                                 SqliteValue::Text(desc),
                             ],
                         }
@@ -11856,6 +11861,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_json_scalar_function_extract_via_registry() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query(r#"SELECT json_extract('{"a":[1,2,3]}', '$.a[1]');"#)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(2)]);
+    }
+
+    #[test]
+    fn test_json_scalar_function_set_via_registry() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query(r#"SELECT json_set('{"a":1}', '$.b', 2);"#)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Text(r#"{"a":1,"b":2}"#.to_owned())]
+        );
+    }
+
+    #[test]
+    fn test_fts5_source_id_function_available() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("SELECT fts5_source_id();").unwrap();
+        assert_eq!(rows.len(), 1);
+        let values = row_values(&rows[0]);
+        let SqliteValue::Text(source_id) = &values[0] else {
+            panic!("fts5_source_id() should return TEXT");
+        };
+        assert!(
+            source_id.to_ascii_lowercase().contains("fts5"),
+            "unexpected fts5_source_id payload: {source_id}"
+        );
+    }
+
     // ── BETWEEN expression tests ────────────────────────────────────────
 
     #[test]
@@ -13632,6 +13675,122 @@ mod tests {
         assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(0));
         assert_eq!(*rows[0].get(1).unwrap(), SqliteValue::Integer(-1));
         assert_eq!(*rows[0].get(2).unwrap(), SqliteValue::Integer(-1));
+    }
+
+    // ─── bd-1dp9.4.1: Journal mode transition + checkpoint parity tests ──
+
+    #[test]
+    fn test_pragma_journal_mode_all_modes_accepted() {
+        let conn = Connection::open(":memory:").unwrap();
+        // All 6 standard SQLite journal modes must be accepted.
+        for mode in ["delete", "truncate", "persist", "memory", "wal", "off"] {
+            let sql = format!("PRAGMA journal_mode='{mode}';");
+            let rows = conn.query(&sql).unwrap();
+            assert_eq!(rows.len(), 1, "mode={mode} should return 1 row");
+            assert_eq!(
+                *rows[0].get(0).unwrap(),
+                SqliteValue::Text(mode.to_owned()),
+                "mode={mode} response should echo back the mode"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pragma_journal_mode_state_tracks_current_mode() {
+        let conn = Connection::open(":memory:").unwrap();
+        // Default is WAL.
+        assert_eq!(conn.pragma_state().journal_mode, "wal");
+
+        // Switch to each mode and verify state tracks it.
+        let transitions = [
+            ("delete", fsqlite_pager::JournalMode::Delete),
+            ("truncate", fsqlite_pager::JournalMode::Delete), // Pager maps to Delete
+            ("persist", fsqlite_pager::JournalMode::Delete),  // Pager maps to Delete
+            ("wal", fsqlite_pager::JournalMode::Wal),
+        ];
+        for (mode, expected_pager_mode) in transitions {
+            conn.execute(&format!("PRAGMA journal_mode='{mode}';"))
+                .unwrap();
+            assert_eq!(
+                conn.pragma_state().journal_mode,
+                mode,
+                "state.journal_mode should track '{mode}'"
+            );
+            assert_eq!(
+                conn.pager.journal_mode(),
+                expected_pager_mode,
+                "pager should reflect expected mode for '{mode}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pragma_wal_checkpoint_sentinel_for_all_non_wal_modes() {
+        let conn = Connection::open(":memory:").unwrap();
+        // Switch to each non-WAL mode and verify checkpoint returns sentinel.
+        for mode in ["delete", "truncate", "persist"] {
+            conn.execute(&format!("PRAGMA journal_mode='{mode}';"))
+                .unwrap();
+            let rows = conn.query("PRAGMA wal_checkpoint;").unwrap();
+            assert_eq!(rows.len(), 1, "mode={mode}: expected 1 row");
+            assert_eq!(
+                *rows[0].get(0).unwrap(),
+                SqliteValue::Integer(0),
+                "mode={mode}: busy should be 0"
+            );
+            assert_eq!(
+                *rows[0].get(1).unwrap(),
+                SqliteValue::Integer(-1),
+                "mode={mode}: log should be -1"
+            );
+            assert_eq!(
+                *rows[0].get(2).unwrap(),
+                SqliteValue::Integer(-1),
+                "mode={mode}: checkpointed should be -1"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pragma_wal_checkpoint_all_modes_after_writes() {
+        // Test each checkpoint mode with actual WAL data.
+        let modes = ["PASSIVE", "FULL", "RESTART", "TRUNCATE"];
+        for mode in modes {
+            let conn = Connection::open(":memory:").unwrap();
+            assert_eq!(conn.pager.journal_mode(), fsqlite_pager::JournalMode::Wal);
+
+            conn.execute("CREATE TABLE t_ckpt (id INTEGER, val TEXT);")
+                .unwrap();
+            conn.execute("INSERT INTO t_ckpt VALUES (1, 'a');").unwrap();
+            conn.execute("INSERT INTO t_ckpt VALUES (2, 'b');").unwrap();
+
+            let sql = format!("PRAGMA wal_checkpoint({mode});");
+            let rows = conn.query(&sql).unwrap();
+            assert_eq!(rows.len(), 1, "mode={mode}: expected 1 row");
+            // busy=0
+            assert_eq!(
+                *rows[0].get(0).unwrap(),
+                SqliteValue::Integer(0),
+                "mode={mode}: busy should be 0"
+            );
+            // total_frames > 0
+            let total_frames = match rows[0].get(1).unwrap() {
+                SqliteValue::Integer(n) => *n,
+                other => panic!("mode={mode}: expected integer for total_frames, got {other:?}"),
+            };
+            assert!(
+                total_frames > 0,
+                "mode={mode}: expected frames > 0, got {total_frames}"
+            );
+
+            // Data still accessible after checkpoint.
+            let data = conn.query("SELECT COUNT(*) FROM t_ckpt;").unwrap();
+            assert_eq!(
+                *data[0].get(0).unwrap(),
+                SqliteValue::Integer(2),
+                "mode={mode}: data should survive checkpoint"
+            );
+        }
     }
 
     // ─── JOIN tests ─────────────────────────────────────────────

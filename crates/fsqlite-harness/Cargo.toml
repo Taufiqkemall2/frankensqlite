@@ -35,6 +35,7 @@ fsqlite-ext-fts5 = { workspace = true }
 fsqlite-ext-fts3 = { workspace = true }
 fsqlite-ext-rtree = { workspace = true }
 fsqlite-ext-session = { workspace = true }
+fsqlite-ext-icu = { workspace = true }
 fsqlite-ext-misc = { workspace = true }
 fsqlite-func = { workspace = true }
 fsqlite-mvcc = { workspace = true }

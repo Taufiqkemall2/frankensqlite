@@ -19,7 +19,9 @@
 //! - `$[#-N]` reverse array index
 
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_func::{ColumnContext, IndexInfo, VirtualTable, VirtualTableCursor};
+use fsqlite_func::{
+    ColumnContext, FunctionRegistry, IndexInfo, ScalarFunction, VirtualTable, VirtualTableCursor,
+};
 use fsqlite_types::{SqliteValue, cx::Cx};
 use serde_json::{Map, Number, Value};
 
@@ -1696,9 +1698,526 @@ fn merge_patch(target: Value, patch: Value) -> Value {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Scalar function registration
+// ---------------------------------------------------------------------------
+
+fn invalid_arity(name: &str, expected: &str, got: usize) -> FrankenError {
+    FrankenError::function_error(format!("{name} expects {expected}; got {got} argument(s)"))
+}
+
+fn text_arg<'a>(name: &str, args: &'a [SqliteValue], index: usize) -> Result<&'a str> {
+    match args.get(index) {
+        Some(SqliteValue::Text(text)) => Ok(text.as_str()),
+        Some(other) => Err(FrankenError::function_error(format!(
+            "{name} argument {} must be TEXT, got {}",
+            index + 1,
+            other.typeof_str()
+        ))),
+        None => Err(FrankenError::function_error(format!(
+            "{name} missing argument {}",
+            index + 1
+        ))),
+    }
+}
+
+fn optional_flags_arg(name: &str, args: &[SqliteValue], index: usize) -> Result<Option<u8>> {
+    let Some(value) = args.get(index) else {
+        return Ok(None);
+    };
+    let raw = value.to_integer();
+    let flags = u8::try_from(raw).map_err(|_| {
+        FrankenError::function_error(format!("{name} flags out of range for u8: {raw}"))
+    })?;
+    Ok(Some(flags))
+}
+
+fn usize_to_i64(name: &str, value: usize) -> Result<i64> {
+    i64::try_from(value).map_err(|_| {
+        FrankenError::function_error(format!("{name} result does not fit in i64: {value}"))
+    })
+}
+
+fn collect_path_args<'a>(
+    name: &str,
+    args: &'a [SqliteValue],
+    start: usize,
+) -> Result<Vec<&'a str>> {
+    let mut out = Vec::with_capacity(args.len().saturating_sub(start));
+    for idx in start..args.len() {
+        out.push(text_arg(name, args, idx)?);
+    }
+    Ok(out)
+}
+
+fn collect_path_value_pairs(
+    name: &str,
+    args: &[SqliteValue],
+    start: usize,
+) -> Result<Vec<(String, SqliteValue)>> {
+    let mut pairs = Vec::with_capacity((args.len().saturating_sub(start)) / 2);
+    let mut idx = start;
+    while idx < args.len() {
+        let path = text_arg(name, args, idx)?.to_owned();
+        let value = args[idx + 1].clone();
+        pairs.push((path, value));
+        idx += 2;
+    }
+    Ok(pairs)
+}
+
+pub struct JsonFunc;
+
+impl ScalarFunction for JsonFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        if args.len() != 1 {
+            return Err(invalid_arity(self.name(), "exactly 1 argument", args.len()));
+        }
+        let input = text_arg(self.name(), args, 0)?;
+        Ok(SqliteValue::Text(json(input)?))
+    }
+
+    fn num_args(&self) -> i32 {
+        1
+    }
+
+    fn name(&self) -> &'static str {
+        "json"
+    }
+}
+
+pub struct JsonValidFunc;
+
+impl ScalarFunction for JsonValidFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        if !(1..=2).contains(&args.len()) {
+            return Err(invalid_arity(self.name(), "1 or 2 arguments", args.len()));
+        }
+        let flags = optional_flags_arg(self.name(), args, 1)?;
+        let value = match &args[0] {
+            SqliteValue::Text(text) => json_valid(text, flags),
+            SqliteValue::Blob(bytes) => json_valid_blob(bytes, flags),
+            _ => 0,
+        };
+        Ok(SqliteValue::Integer(value))
+    }
+
+    fn num_args(&self) -> i32 {
+        -1
+    }
+
+    fn name(&self) -> &'static str {
+        "json_valid"
+    }
+}
+
+pub struct JsonTypeFunc;
+
+impl ScalarFunction for JsonTypeFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        if !(1..=2).contains(&args.len()) {
+            return Err(invalid_arity(self.name(), "1 or 2 arguments", args.len()));
+        }
+        let input = text_arg(self.name(), args, 0)?;
+        let path = if args.len() == 2 {
+            if matches!(args[1], SqliteValue::Null) {
+                return Ok(SqliteValue::Null);
+            }
+            Some(text_arg(self.name(), args, 1)?)
+        } else {
+            None
+        };
+        Ok(match json_type(input, path)? {
+            Some(kind) => SqliteValue::Text(kind.to_owned()),
+            None => SqliteValue::Null,
+        })
+    }
+
+    fn num_args(&self) -> i32 {
+        -1
+    }
+
+    fn name(&self) -> &'static str {
+        "json_type"
+    }
+}
+
+pub struct JsonExtractFunc;
+
+impl ScalarFunction for JsonExtractFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        if args.len() < 2 {
+            return Err(invalid_arity(
+                self.name(),
+                "at least 2 arguments (json, path...)",
+                args.len(),
+            ));
+        }
+        let input = text_arg(self.name(), args, 0)?;
+        let paths = collect_path_args(self.name(), args, 1)?;
+        json_extract(input, &paths)
+    }
+
+    fn num_args(&self) -> i32 {
+        -1
+    }
+
+    fn name(&self) -> &'static str {
+        "json_extract"
+    }
+}
+
+pub struct JsonArrayFunc;
+
+impl ScalarFunction for JsonArrayFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        Ok(SqliteValue::Text(json_array(args)?))
+    }
+
+    fn num_args(&self) -> i32 {
+        -1
+    }
+
+    fn name(&self) -> &'static str {
+        "json_array"
+    }
+}
+
+pub struct JsonObjectFunc;
+
+impl ScalarFunction for JsonObjectFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        Ok(SqliteValue::Text(json_object(args)?))
+    }
+
+    fn num_args(&self) -> i32 {
+        -1
+    }
+
+    fn name(&self) -> &'static str {
+        "json_object"
+    }
+}
+
+pub struct JsonQuoteFunc;
+
+impl ScalarFunction for JsonQuoteFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        if args.len() != 1 {
+            return Err(invalid_arity(self.name(), "exactly 1 argument", args.len()));
+        }
+        Ok(SqliteValue::Text(json_quote(&args[0])))
+    }
+
+    fn num_args(&self) -> i32 {
+        1
+    }
+
+    fn name(&self) -> &'static str {
+        "json_quote"
+    }
+}
+
+pub struct JsonSetFunc;
+
+impl ScalarFunction for JsonSetFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        if args.len() < 3 || args.len() % 2 == 0 {
+            return Err(invalid_arity(
+                self.name(),
+                "an odd argument count >= 3 (json, path, value, ...)",
+                args.len(),
+            ));
+        }
+        let input = text_arg(self.name(), args, 0)?;
+        let pairs_owned = collect_path_value_pairs(self.name(), args, 1)?;
+        let pairs = pairs_owned
+            .iter()
+            .map(|(path, value)| (path.as_str(), value.clone()))
+            .collect::<Vec<_>>();
+        Ok(SqliteValue::Text(json_set(input, &pairs)?))
+    }
+
+    fn num_args(&self) -> i32 {
+        -1
+    }
+
+    fn name(&self) -> &'static str {
+        "json_set"
+    }
+}
+
+pub struct JsonInsertFunc;
+
+impl ScalarFunction for JsonInsertFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        if args.len() < 3 || args.len() % 2 == 0 {
+            return Err(invalid_arity(
+                self.name(),
+                "an odd argument count >= 3 (json, path, value, ...)",
+                args.len(),
+            ));
+        }
+        let input = text_arg(self.name(), args, 0)?;
+        let pairs_owned = collect_path_value_pairs(self.name(), args, 1)?;
+        let pairs = pairs_owned
+            .iter()
+            .map(|(path, value)| (path.as_str(), value.clone()))
+            .collect::<Vec<_>>();
+        Ok(SqliteValue::Text(json_insert(input, &pairs)?))
+    }
+
+    fn num_args(&self) -> i32 {
+        -1
+    }
+
+    fn name(&self) -> &'static str {
+        "json_insert"
+    }
+}
+
+pub struct JsonReplaceFunc;
+
+impl ScalarFunction for JsonReplaceFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        if args.len() < 3 || args.len() % 2 == 0 {
+            return Err(invalid_arity(
+                self.name(),
+                "an odd argument count >= 3 (json, path, value, ...)",
+                args.len(),
+            ));
+        }
+        let input = text_arg(self.name(), args, 0)?;
+        let pairs_owned = collect_path_value_pairs(self.name(), args, 1)?;
+        let pairs = pairs_owned
+            .iter()
+            .map(|(path, value)| (path.as_str(), value.clone()))
+            .collect::<Vec<_>>();
+        Ok(SqliteValue::Text(json_replace(input, &pairs)?))
+    }
+
+    fn num_args(&self) -> i32 {
+        -1
+    }
+
+    fn name(&self) -> &'static str {
+        "json_replace"
+    }
+}
+
+pub struct JsonRemoveFunc;
+
+impl ScalarFunction for JsonRemoveFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        if args.len() < 2 {
+            return Err(invalid_arity(
+                self.name(),
+                "at least 2 arguments (json, path...)",
+                args.len(),
+            ));
+        }
+        let input = text_arg(self.name(), args, 0)?;
+        let paths = collect_path_args(self.name(), args, 1)?;
+        Ok(SqliteValue::Text(json_remove(input, &paths)?))
+    }
+
+    fn num_args(&self) -> i32 {
+        -1
+    }
+
+    fn name(&self) -> &'static str {
+        "json_remove"
+    }
+}
+
+pub struct JsonPatchFunc;
+
+impl ScalarFunction for JsonPatchFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        if args.len() != 2 {
+            return Err(invalid_arity(
+                self.name(),
+                "exactly 2 arguments",
+                args.len(),
+            ));
+        }
+        let input = text_arg(self.name(), args, 0)?;
+        let patch = text_arg(self.name(), args, 1)?;
+        Ok(SqliteValue::Text(json_patch(input, patch)?))
+    }
+
+    fn num_args(&self) -> i32 {
+        2
+    }
+
+    fn name(&self) -> &'static str {
+        "json_patch"
+    }
+}
+
+pub struct JsonArrayLengthFunc;
+
+impl ScalarFunction for JsonArrayLengthFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        if !(1..=2).contains(&args.len()) {
+            return Err(invalid_arity(self.name(), "1 or 2 arguments", args.len()));
+        }
+        let input = text_arg(self.name(), args, 0)?;
+        let path = if args.len() == 2 {
+            if matches!(args[1], SqliteValue::Null) {
+                return Ok(SqliteValue::Null);
+            }
+            Some(text_arg(self.name(), args, 1)?)
+        } else {
+            None
+        };
+        Ok(match json_array_length(input, path)? {
+            Some(len) => SqliteValue::Integer(usize_to_i64(self.name(), len)?),
+            None => SqliteValue::Null,
+        })
+    }
+
+    fn num_args(&self) -> i32 {
+        -1
+    }
+
+    fn name(&self) -> &'static str {
+        "json_array_length"
+    }
+}
+
+pub struct JsonErrorPositionFunc;
+
+impl ScalarFunction for JsonErrorPositionFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        if args.len() != 1 {
+            return Err(invalid_arity(self.name(), "exactly 1 argument", args.len()));
+        }
+        let input = text_arg(self.name(), args, 0)?;
+        Ok(SqliteValue::Integer(usize_to_i64(
+            self.name(),
+            json_error_position(input),
+        )?))
+    }
+
+    fn num_args(&self) -> i32 {
+        1
+    }
+
+    fn name(&self) -> &'static str {
+        "json_error_position"
+    }
+}
+
+pub struct JsonPrettyFunc;
+
+impl ScalarFunction for JsonPrettyFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        if !(1..=2).contains(&args.len()) {
+            return Err(invalid_arity(self.name(), "1 or 2 arguments", args.len()));
+        }
+        let input = text_arg(self.name(), args, 0)?;
+        let indent = if args.len() == 2 {
+            if matches!(args[1], SqliteValue::Null) {
+                None
+            } else {
+                Some(text_arg(self.name(), args, 1)?)
+            }
+        } else {
+            None
+        };
+        Ok(SqliteValue::Text(json_pretty(input, indent)?))
+    }
+
+    fn num_args(&self) -> i32 {
+        -1
+    }
+
+    fn name(&self) -> &'static str {
+        "json_pretty"
+    }
+}
+
+/// Register JSON1 scalar functions into a `FunctionRegistry`.
+pub fn register_json_scalars(registry: &mut FunctionRegistry) {
+    registry.register_scalar(JsonFunc);
+    registry.register_scalar(JsonValidFunc);
+    registry.register_scalar(JsonTypeFunc);
+    registry.register_scalar(JsonExtractFunc);
+    registry.register_scalar(JsonArrayFunc);
+    registry.register_scalar(JsonObjectFunc);
+    registry.register_scalar(JsonQuoteFunc);
+    registry.register_scalar(JsonSetFunc);
+    registry.register_scalar(JsonInsertFunc);
+    registry.register_scalar(JsonReplaceFunc);
+    registry.register_scalar(JsonRemoveFunc);
+    registry.register_scalar(JsonPatchFunc);
+    registry.register_scalar(JsonArrayLengthFunc);
+    registry.register_scalar(JsonErrorPositionFunc);
+    registry.register_scalar(JsonPrettyFunc);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fsqlite_func::FunctionRegistry;
+
+    #[test]
+    fn test_register_json_scalars_registers_core_functions() {
+        let mut registry = FunctionRegistry::new();
+        register_json_scalars(&mut registry);
+
+        for name in [
+            "json",
+            "json_valid",
+            "json_type",
+            "json_extract",
+            "json_set",
+            "json_remove",
+            "json_array",
+            "json_object",
+            "json_quote",
+            "json_patch",
+        ] {
+            assert!(
+                registry.contains_scalar(name),
+                "missing registration for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_registered_json_extract_scalar_executes() {
+        let mut registry = FunctionRegistry::new();
+        register_json_scalars(&mut registry);
+        let func = registry
+            .find_scalar("json_extract", 2)
+            .expect("json_extract should be registered");
+        let out = func
+            .invoke(&[
+                SqliteValue::Text(r#"{"a":1,"b":[2,3]}"#.to_owned()),
+                SqliteValue::Text("$.b[1]".to_owned()),
+            ])
+            .unwrap();
+        assert_eq!(out, SqliteValue::Integer(3));
+    }
+
+    #[test]
+    fn test_registered_json_set_scalar_executes() {
+        let mut registry = FunctionRegistry::new();
+        register_json_scalars(&mut registry);
+        let func = registry
+            .find_scalar("json_set", 3)
+            .expect("json_set should be registered");
+        let out = func
+            .invoke(&[
+                SqliteValue::Text(r#"{"a":1}"#.to_owned()),
+                SqliteValue::Text("$.b".to_owned()),
+                SqliteValue::Integer(2),
+            ])
+            .unwrap();
+        assert_eq!(out, SqliteValue::Text(r#"{"a":1,"b":2}"#.to_owned()));
+    }
 
     #[test]
     fn test_json_valid_text() {
