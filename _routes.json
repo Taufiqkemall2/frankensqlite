@@ -1,5 +1,5 @@
 {
   "version": 1,
   "include": ["/*"],
-  "exclude": ["/*.bin", "/*.sqlite3", "/*.json", "/*.png", "/*.webp", "/_headers", "/healthz"]
+  "exclude": ["/*.sqlite3", "/*.json", "/*.png", "/*.webp", "/_headers", "/healthz"]
 }
