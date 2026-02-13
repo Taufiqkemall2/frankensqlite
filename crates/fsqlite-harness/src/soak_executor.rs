@@ -663,7 +663,6 @@ impl SoakExecutor {
         // Simulate normal execution: small chance of contention error
         let contention_chance = rand % 1000;
         match action {
-            StepAction::Read => (true, None), // reads always succeed
             StepAction::Write => {
                 if contention_chance < 5 {
                     // 0.5% chance of write conflict
@@ -672,8 +671,7 @@ impl SoakExecutor {
                     (true, None)
                 }
             }
-            StepAction::SchemaMutation => (true, None),
-            StepAction::Checkpoint => (true, None),
+            StepAction::Read | StepAction::SchemaMutation | StepAction::Checkpoint => (true, None),
         }
     }
 
@@ -1097,6 +1095,7 @@ fn evaluate_resource_series(
     })
 }
 
+#[allow(clippy::similar_names)]
 fn linear_slope(samples: &[f64]) -> f64 {
     if samples.len() < 2 {
         return 0.0;

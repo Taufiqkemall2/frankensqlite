@@ -454,7 +454,7 @@ impl TransformRegistry {
         self.transforms
             .iter()
             .find(|t| t.name() == name)
-            .map(|b| b.as_ref())
+            .map(AsRef::as_ref)
     }
 }
 
@@ -555,8 +555,8 @@ pub fn generate_metamorphic_corpus(
                 family: entry.family,
                 feature_tags: transform
                     .feature_tags()
-                    .iter()
-                    .map(|s| (*s).to_owned())
+                    .into_iter()
+                    .map(ToOwned::to_owned)
                     .collect(),
                 source_entry_id: entry.id.clone(),
                 transform_family: transform.family(),
@@ -2031,8 +2031,8 @@ mod tests {
 
     #[test]
     fn seed_contract_deterministic() {
-        let c1 = SeedContract::new(0x4652_414E_4B45_4E, 0, 0);
-        let c2 = SeedContract::new(0x4652_414E_4B45_4E, 0, 0);
+        let c1 = SeedContract::new(0x0046_5241_4E4B_454E, 0, 0);
+        let c2 = SeedContract::new(0x0046_5241_4E4B_454E, 0, 0);
         assert_eq!(c1.case_seed, c2.case_seed);
     }
 
