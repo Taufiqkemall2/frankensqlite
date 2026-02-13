@@ -11,25 +11,35 @@ pub mod e2e_log_schema;
 pub mod e2e_traceability;
 pub mod eprocess;
 pub mod failure_bundle;
+pub mod fault_profiles;
 pub mod fault_vfs;
 pub mod fixture_discovery;
 pub mod fslab;
+pub mod impact_graph;
 pub mod log;
 pub mod metamorphic;
+pub mod mismatch_minimizer;
 pub mod oracle;
 pub mod parity_taxonomy;
 pub mod perf_loop;
 pub mod ratchet_policy;
+pub mod replay_harness;
 pub mod scheduler;
 pub mod score_engine;
 pub mod seed_taxonomy;
+pub mod semantic_gap_map;
+pub mod soak_profiles;
 pub mod spec_to_beads_audit;
 pub mod supervision;
 pub mod test_diagnostics;
 pub mod tla;
+pub mod toolchain_determinism;
 pub mod unit_fixtures;
 pub mod unit_matrix;
 pub mod verification_gates;
+
+#[cfg(test)]
+mod storage_unit_suites;
 
 #[cfg(test)]
 mod gf256_verification {
