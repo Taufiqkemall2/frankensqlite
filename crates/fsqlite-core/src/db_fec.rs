@@ -7,7 +7,9 @@
 //! Note: the sidecar generation and group-read helpers are intentionally public so
 //! the `fsqlite-e2e` recovery demos can validate end-to-end repair flows.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_vfs::host_fs;
@@ -47,6 +49,85 @@ pub const GROUP_OBJECT_ID_DOMAIN: &str = "fsqlite:compat:db-fec-group:v1";
 /// + 4 (default_group_size) + 4 (default_r_repair) + 4 (header_page_r_repair)
 /// + 16 (db_gen_digest) + 8 (checksum) = 52 bytes.
 pub const DB_FEC_HEADER_SIZE: usize = 52;
+
+// ---------------------------------------------------------------------------
+// Snapshot FEC metrics
+// ---------------------------------------------------------------------------
+
+/// Global snapshot FEC metrics singleton.
+pub static GLOBAL_SNAPSHOT_FEC_METRICS: SnapshotFecMetrics = SnapshotFecMetrics::new();
+
+/// Atomic counters for snapshot page FEC encoding.
+pub struct SnapshotFecMetrics {
+    /// Total pages encoded into FEC repair symbols.
+    pub encoded_pages_total: AtomicU64,
+    /// Total bytes of sidecar data generated.
+    pub sidecar_bytes_total: AtomicU64,
+    /// Total encoding operations.
+    pub encode_ops: AtomicU64,
+}
+
+impl SnapshotFecMetrics {
+    /// Create a zeroed metrics instance.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            encoded_pages_total: AtomicU64::new(0),
+            sidecar_bytes_total: AtomicU64::new(0),
+            encode_ops: AtomicU64::new(0),
+        }
+    }
+
+    /// Record a snapshot FEC encoding operation.
+    pub fn record_encode(&self, pages_encoded: u64, sidecar_bytes: u64) {
+        self.encode_ops.fetch_add(1, Ordering::Relaxed);
+        self.encoded_pages_total
+            .fetch_add(pages_encoded, Ordering::Relaxed);
+        self.sidecar_bytes_total
+            .fetch_add(sidecar_bytes, Ordering::Relaxed);
+    }
+
+    /// Take a snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> SnapshotFecMetricsSnapshot {
+        SnapshotFecMetricsSnapshot {
+            encoded_pages_total: self.encoded_pages_total.load(Ordering::Relaxed),
+            sidecar_bytes_total: self.sidecar_bytes_total.load(Ordering::Relaxed),
+            encode_ops: self.encode_ops.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Reset all counters to zero.
+    pub fn reset(&self) {
+        self.encoded_pages_total.store(0, Ordering::Relaxed);
+        self.sidecar_bytes_total.store(0, Ordering::Relaxed);
+        self.encode_ops.store(0, Ordering::Relaxed);
+    }
+}
+
+impl Default for SnapshotFecMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Point-in-time snapshot of snapshot FEC metrics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotFecMetricsSnapshot {
+    pub encoded_pages_total: u64,
+    pub sidecar_bytes_total: u64,
+    pub encode_ops: u64,
+}
+
+impl fmt::Display for SnapshotFecMetricsSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "snapshot_fec_pages_encoded={} sidecar_bytes={} encode_ops={}",
+            self.encoded_pages_total, self.sidecar_bytes_total, self.encode_ops,
+        )
+    }
+}
 
 // ---------------------------------------------------------------------------
 // PageGroup — partition of database pages into repair groups
@@ -834,6 +915,15 @@ pub fn compute_raptorq_repair_symbols(
     source_pages: &[&[u8]],
     page_size: usize,
 ) -> Result<Vec<Vec<u8>>> {
+    if source_pages.len() != meta.group_size as usize {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "source_pages.len()={} != meta.group_size={}; encoder/decoder seed mismatch would corrupt data",
+                source_pages.len(),
+                meta.group_size,
+            ),
+        });
+    }
     let seed = derive_db_fec_repair_seed(meta);
     let source_vecs: Vec<Vec<u8>> = source_pages.iter().map(|s| s.to_vec()).collect();
     let encoder =

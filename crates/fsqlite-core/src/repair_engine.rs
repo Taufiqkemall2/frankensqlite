@@ -112,6 +112,7 @@ pub enum RepairOutcome {
 /// - `group_meta`: db-fec group metadata for this page's group.
 /// - `all_page_data`: closure to read any page in the group by pgno.
 /// - `repair_symbols`: `(esi, data)` pairs from the `.db-fec` sidecar.
+#[allow(clippy::too_many_lines)]
 pub fn detect_and_repair_page(
     target_pgno: u32,
     page_data: &[u8],
@@ -120,6 +121,19 @@ pub fn detect_and_repair_page(
     all_page_data: &dyn Fn(u32) -> Vec<u8>,
     repair_symbols: &[(u32, Vec<u8>)],
 ) -> RepairOutcome {
+    // Validate target_pgno is within the group range.
+    let group_end = group_meta.start_pgno + group_meta.group_size;
+    if target_pgno < group_meta.start_pgno || target_pgno >= group_end {
+        return RepairOutcome::Unrecoverable {
+            pgno: target_pgno,
+            witness: None,
+            detail: format!(
+                "page {target_pgno} is outside group range [{}, {})",
+                group_meta.start_pgno, group_end,
+            ),
+        };
+    }
+
     let actual_hash = blake3_page_checksum(page_data);
 
     // Fast path: page is intact.
@@ -164,10 +178,18 @@ pub fn detect_and_repair_page(
             let repaired_hash = blake3_page_checksum(&repaired_data);
             let verified = repaired_hash == *expected_blake3;
 
-            let symbols_used = match &repair_result {
-                RepairResult::Repaired { symbols_used, .. } => *symbols_used,
-                _ => 0,
+            let RepairResult::Repaired { symbols_used, .. } = &repair_result else {
+                // attempt_page_repair only returns Ok with RepairResult::Repaired;
+                // other variants are returned via Err.  Defensive fallback.
+                return RepairOutcome::Unrecoverable {
+                    pgno: target_pgno,
+                    witness: None,
+                    detail: format!(
+                        "page {target_pgno}: unexpected repair result variant: {repair_result:?}"
+                    ),
+                };
             };
+            let symbols_used = *symbols_used;
 
             let witness = RepairWitness {
                 pgno: target_pgno,
