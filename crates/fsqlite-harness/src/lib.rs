@@ -5,12 +5,16 @@
 //! that other crates can call into from their own tests.
 
 pub mod commit_pipeline;
+pub mod corpus_ingest;
+pub mod differential_v2;
+pub mod e2e_traceability;
 pub mod eprocess;
 pub mod fault_vfs;
 pub mod fixture_discovery;
 pub mod fslab;
 pub mod log;
 pub mod oracle;
+pub mod parity_taxonomy;
 pub mod perf_loop;
 pub mod scheduler;
 pub mod seed_taxonomy;

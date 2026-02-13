@@ -193,6 +193,9 @@ pub struct InProcessPageLockTable {
     /// During rolling rebuild: the old shards being drained. Protected by
     /// `Mutex` for synchronization. `None` when no rebuild is in progress.
     draining: Mutex<Option<DrainingState>>,
+    /// Optional conflict observer for MVCC analytics (bd-t6sv2.1).
+    /// When `None`, conflict emission is a no-op branch (zero cost).
+    observer: Option<std::sync::Arc<dyn fsqlite_observability::ConflictObserver>>,
 }
 
 /// State tracking for the draining table during a rolling rebuild.
@@ -261,7 +264,7 @@ pub enum RebuildError {
 }
 
 impl InProcessPageLockTable {
-    /// Create a new empty lock table.
+    /// Create a new empty lock table with no observer.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -271,7 +274,38 @@ impl InProcessPageLockTable {
                 )))
             })),
             draining: Mutex::new(None),
+            observer: None,
         }
+    }
+
+    /// Create a lock table with a conflict observer for analytics (bd-t6sv2.1).
+    #[must_use]
+    pub fn with_observer(
+        observer: std::sync::Arc<dyn fsqlite_observability::ConflictObserver>,
+    ) -> Self {
+        Self {
+            shards: Box::new(std::array::from_fn(|_| {
+                CacheAligned::new(Mutex::new(HashMap::with_hasher(
+                    PageNumberBuildHasher::default(),
+                )))
+            })),
+            draining: Mutex::new(None),
+            observer: Some(observer),
+        }
+    }
+
+    /// Set or replace the conflict observer.
+    pub fn set_observer(
+        &mut self,
+        observer: Option<std::sync::Arc<dyn fsqlite_observability::ConflictObserver>>,
+    ) {
+        self.observer = observer;
+    }
+
+    /// Access the shared observer (for passing to emit helpers).
+    #[must_use]
+    pub fn observer(&self) -> &crate::observability::SharedObserver {
+        &self.observer
     }
 
     /// Try to acquire an exclusive lock on `page` for `txn`.
@@ -295,6 +329,9 @@ impl InProcessPageLockTable {
                         drop(draining_guard);
                         return Ok(()); // already held by this txn in draining table
                     }
+                    crate::observability::emit_page_lock_contention(
+                        &self.observer, page, txn, holder,
+                    );
                     return Err(holder);
                 }
             }
@@ -307,6 +344,9 @@ impl InProcessPageLockTable {
             if holder == txn {
                 return Ok(()); // already held by this txn
             }
+            crate::observability::emit_page_lock_contention(
+                &self.observer, page, txn, holder,
+            );
             return Err(holder);
         }
         map.insert(page, txn);
@@ -688,10 +728,10 @@ impl std::fmt::Debug for InProcessPageLockTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let draining_count = self.draining_lock_count();
         let mut dbg = f.debug_struct("InProcessPageLockTable");
+        dbg.field("shard_count", &self.shards.len());
         dbg.field("lock_count", &self.lock_count());
-        if draining_count > 0 {
-            dbg.field("draining_lock_count", &draining_count);
-        }
+        dbg.field("draining", &draining_count);
+        dbg.field("observer_enabled", &self.observer.is_some());
         dbg.finish()
     }
 }

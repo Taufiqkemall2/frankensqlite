@@ -6,8 +6,10 @@ set -euo pipefail
 
 CANONICAL_DOMAIN="https://frankensqlite.com"
 MIRROR_DOMAINS=("https://www.frankensqlite.com" "https://frankensqlite-spec-evolution.pages.dev")
-SQLITE_FILE="spec_evolution_v1.sqlite3"
-EXPECTED_DB_URL="$CANONICAL_DOMAIN/$SQLITE_FILE"
+SQLITE_SOURCE="spec_evolution_v1.sqlite3"
+# Deploy as .bin — Cloudflare Pages silently drops .sqlite3 uploads (WAF/API filtering)
+DEPLOY_DB_NAME="spec_evolution_v1.bin"
+EXPECTED_DB_URL="$CANONICAL_DOMAIN/$DEPLOY_DB_NAME"
 PROJECT_NAME="frankensqlite-spec-evolution"
 DEPLOY_BRANCH="main"
 HEALTH_PATH="healthz"
@@ -22,16 +24,16 @@ build_health_payload() {
     local db_hash
 
     generated_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-    db_magic=$(head -c 15 "$SQLITE_FILE")
-    db_sha256=$(sha256sum "$SQLITE_FILE" | awk '{print $1}')
-    schema_version=$(jq -r '.schema_version' "${SQLITE_FILE}.config.json")
-    dataset_hash=$(jq -r '.dataset_hash' "${SQLITE_FILE}.config.json")
-    db_hash=$(jq -r '.hash' "${SQLITE_FILE}.config.json")
+    db_magic=$(head -c 15 "$SQLITE_SOURCE")
+    db_sha256=$(sha256sum "$SQLITE_SOURCE" | awk '{print $1}')
+    schema_version=$(jq -r '.schema_version' "${SQLITE_SOURCE}.config.json")
+    dataset_hash=$(jq -r '.dataset_hash' "${SQLITE_SOURCE}.config.json")
+    db_hash=$(jq -r '.hash' "${SQLITE_SOURCE}.config.json")
 
     jq -n \
         --arg status "ok" \
         --arg generated_at "$generated_at" \
-        --arg db_file "$SQLITE_FILE" \
+        --arg db_file "$SQLITE_SOURCE" \
         --arg db_magic "$db_magic" \
         --arg db_sha256 "$db_sha256" \
         --arg db_hash "$db_hash" \
@@ -57,7 +59,7 @@ build_health_payload() {
 mkdir -p dist
 cp visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html dist/index.html
 cp visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html dist/spec_evolution.html
-cp spec_evolution_v1.sqlite3 dist/
+cp spec_evolution_v1.sqlite3 "dist/$DEPLOY_DB_NAME"
 cp spec_evolution_v1.sqlite3.config.json dist/
 cp og-image.png dist/
 cp twitter-image.png dist/
@@ -84,8 +86,8 @@ assert_local_contract() {
         echo "  ERROR: $page_file is missing CANONICAL_ORIGIN pin to $CANONICAL_DOMAIN"
         return 1
     fi
-    if ! rg -q 'const DB_FILENAME = "spec_evolution_v1.sqlite3";' "$page_file"; then
-        echo "  ERROR: $page_file is missing DB filename pin to $SQLITE_FILE"
+    if ! rg -q 'const DB_FILENAME = "spec_evolution_v1.bin";' "$page_file"; then
+        echo "  ERROR: $page_file is missing DB filename pin to $DEPLOY_DB_NAME"
         return 1
     fi
     if ! rg -q 'const DB_URL = `\$\{CANONICAL_ORIGIN\}/\$\{DB_FILENAME\}`;' "$page_file"; then

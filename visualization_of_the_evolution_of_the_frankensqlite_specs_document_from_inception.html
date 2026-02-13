@@ -960,7 +960,8 @@
     import { animate, stagger, spring } from "https://cdn.jsdelivr.net/npm/motion@10.18.0/+esm";
 
     const CANONICAL_ORIGIN = "https://frankensqlite.com";
-    const DB_FILENAME = "spec_evolution_v1.sqlite3";
+    // Deploy as .bin — Cloudflare Pages silently drops .sqlite3 uploads
+    const DB_FILENAME = "spec_evolution_v1.bin";
     const DB_URL = `${CANONICAL_ORIGIN}/${DB_FILENAME}`;
     const CANONICAL_HOSTS = new Set(["frankensqlite.com", "www.frankensqlite.com", "frankensqlite-spec-evolution.pages.dev"]);
     const BUCKETS = [

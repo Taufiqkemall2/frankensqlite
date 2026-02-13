@@ -1,0 +1,1271 @@
+# FrankenSQLite Parity Taxonomy v1.0.0
+#
+# Canonical feature universe and weighted parity scoring for PARITY-100 program.
+# Reference: bd-1dp9.1.1 — T1.1 Canonical feature universe and weighted parity taxonomy
+#
+# Schema version: deterministic — same content always produces same parity score.
+# Weights are normalized so that sum(w_i) across all non-excluded features = 1000.
+# Score S = sum(w_i * p_i) / sum(w_i) where p_i in {0, 1}.
+#
+# Feature ID convention: F-{family}.{ordinal}
+#   family codes: SQL (SQL grammar), PLN (planner), VDB (VDBE opcodes),
+#                 TXN (transaction/storage), PGM (PRAGMA), EXT (extensions),
+#                 CLI (CLI/API), FUN (built-in functions), TYP (type system)
+#
+# Status values: "pass" | "fail" | "partial" | "excluded"
+# Observability: test ID(s) that validate this feature
+
+[meta]
+version = "1.0.0"
+sqlite_target = "3.52.0"
+generated_by = "SandySpring (claude-opus-4-6)"
+generated_at = "2026-02-13"
+total_weight = 947
+bead_id = "bd-1dp9.1.1"
+
+# ============================================================================
+# FAMILY: SQL — SQL Grammar Coverage (weight pool: 300)
+# ============================================================================
+
+[[features]]
+id = "F-SQL.01"
+family = "SQL"
+title = "SELECT — basic column selection, FROM, WHERE"
+weight = 20
+status = "pass"
+observability = ["test_select_basic", "e2e_dml_select"]
+notes = "Core SELECT with expressions, table references, WHERE filtering"
+
+[[features]]
+id = "F-SQL.02"
+family = "SQL"
+title = "SELECT — JOIN types (INNER, LEFT, RIGHT, FULL, CROSS, NATURAL)"
+weight = 15
+status = "pass"
+observability = ["test_join_types", "e2e_join_coverage"]
+notes = "All six join types plus USING and ON clause variants"
+
+[[features]]
+id = "F-SQL.03"
+family = "SQL"
+title = "SELECT — compound operators (UNION, UNION ALL, INTERSECT, EXCEPT)"
+weight = 10
+status = "pass"
+observability = ["test_compound_select", "e2e_compound_ops"]
+notes = "Compound operators with correct left-to-right binding"
+
+[[features]]
+id = "F-SQL.04"
+family = "SQL"
+title = "SELECT — CTEs (WITH, WITH RECURSIVE)"
+weight = 12
+status = "pass"
+observability = ["test_cte_basic", "test_cte_recursive"]
+notes = "Common table expressions including MATERIALIZED/NOT MATERIALIZED hints"
+
+[[features]]
+id = "F-SQL.05"
+family = "SQL"
+title = "SELECT — window functions (OVER, PARTITION BY, frame spec)"
+weight = 12
+status = "pass"
+observability = ["test_window_functions", "e2e_window_coverage"]
+notes = "ROWS/RANGE/GROUPS frames, EXCLUDE clause, FILTER clause"
+
+[[features]]
+id = "F-SQL.06"
+family = "SQL"
+title = "SELECT — subqueries (scalar, IN, EXISTS, FROM)"
+weight = 10
+status = "pass"
+observability = ["test_subqueries", "e2e_subquery_coverage"]
+notes = "Correlated and uncorrelated subqueries in all positions"
+
+[[features]]
+id = "F-SQL.07"
+family = "SQL"
+title = "SELECT — ORDER BY, LIMIT, OFFSET"
+weight = 8
+status = "pass"
+observability = ["test_order_limit", "e2e_order_limit"]
+notes = "Including NULLS FIRST/LAST, negative LIMIT/OFFSET behavior"
+
+[[features]]
+id = "F-SQL.08"
+family = "SQL"
+title = "SELECT — GROUP BY, HAVING"
+weight = 8
+status = "pass"
+observability = ["test_group_by", "e2e_aggregation"]
+notes = "GROUP BY with HAVING clause, aggregation semantics"
+
+[[features]]
+id = "F-SQL.09"
+family = "SQL"
+title = "SELECT — DISTINCT processing"
+weight = 5
+status = "pass"
+observability = ["test_distinct"]
+notes = "DISTINCT via temporary B-tree deduplication"
+
+[[features]]
+id = "F-SQL.10"
+family = "SQL"
+title = "INSERT — basic, multi-row VALUES, INSERT from SELECT"
+weight = 12
+status = "pass"
+observability = ["test_insert_basic", "e2e_dml_insert"]
+notes = "INSERT with VALUES lists, DEFAULT VALUES, INSERT...SELECT"
+
+[[features]]
+id = "F-SQL.11"
+family = "SQL"
+title = "INSERT — conflict resolution (OR ABORT/ROLLBACK/FAIL/IGNORE/REPLACE)"
+weight = 8
+status = "pass"
+observability = ["test_conflict_resolution"]
+notes = "All five conflict resolution strategies"
+
+[[features]]
+id = "F-SQL.12"
+family = "SQL"
+title = "INSERT — UPSERT (ON CONFLICT DO UPDATE/NOTHING)"
+weight = 8
+status = "pass"
+observability = ["test_upsert", "e2e_upsert"]
+notes = "ON CONFLICT with conflict target, excluded pseudo-table, multiple clauses"
+
+[[features]]
+id = "F-SQL.13"
+family = "SQL"
+title = "INSERT/UPDATE/DELETE — RETURNING clause"
+weight = 6
+status = "pass"
+observability = ["test_returning"]
+notes = "RETURNING with result columns, interaction with triggers"
+
+[[features]]
+id = "F-SQL.14"
+family = "SQL"
+title = "UPDATE — basic SET, WHERE, FROM (UPDATE-with-JOIN)"
+weight = 10
+status = "pass"
+observability = ["test_update_basic", "e2e_dml_update"]
+notes = "UPDATE FROM (SQLite 3.33+), ORDER BY + LIMIT on UPDATE"
+
+[[features]]
+id = "F-SQL.15"
+family = "SQL"
+title = "DELETE — basic WHERE, ORDER BY + LIMIT, truncate optimization"
+weight = 8
+status = "pass"
+observability = ["test_delete_basic", "e2e_dml_delete"]
+notes = "DELETE with ORDER BY + LIMIT, truncate optimization"
+
+[[features]]
+id = "F-SQL.16"
+family = "SQL"
+title = "CREATE TABLE — column defs, constraints, type affinity"
+weight = 12
+status = "pass"
+observability = ["test_create_table", "e2e_ddl"]
+notes = "Column constraints, table constraints, conflict clauses"
+
+[[features]]
+id = "F-SQL.17"
+family = "SQL"
+title = "CREATE TABLE — WITHOUT ROWID"
+weight = 6
+status = "fail"
+observability = ["test_without_rowid"]
+notes = "Clustered index B-tree, no rowid pseudo-column"
+
+[[features]]
+id = "F-SQL.18"
+family = "SQL"
+title = "CREATE TABLE — STRICT mode"
+weight = 4
+status = "fail"
+observability = ["test_strict_tables"]
+notes = "Type enforcement on INSERT/UPDATE (SQLite 3.37+)"
+
+[[features]]
+id = "F-SQL.19"
+family = "SQL"
+title = "CREATE TABLE — generated columns (VIRTUAL, STORED)"
+weight = 5
+status = "fail"
+observability = ["test_generated_columns"]
+notes = "Computed on read (VIRTUAL) or write (STORED), SQLite 3.31+"
+
+[[features]]
+id = "F-SQL.20"
+family = "SQL"
+title = "CREATE TABLE — foreign keys"
+weight = 6
+status = "partial"
+observability = ["test_foreign_keys"]
+notes = "Parsing complete; enforcement requires PRAGMA foreign_keys=ON path"
+
+[[features]]
+id = "F-SQL.21"
+family = "SQL"
+title = "CREATE TABLE AS SELECT"
+weight = 4
+status = "pass"
+observability = ["test_create_as_select"]
+notes = "CREATE TABLE from query result"
+
+[[features]]
+id = "F-SQL.22"
+family = "SQL"
+title = "CREATE INDEX — basic, UNIQUE, partial, expression indexes"
+weight = 8
+status = "pass"
+observability = ["test_create_index", "e2e_indexes"]
+notes = "Partial indexes (WHERE), expression indexes"
+
+[[features]]
+id = "F-SQL.23"
+family = "SQL"
+title = "CREATE VIEW"
+weight = 4
+status = "pass"
+observability = ["test_create_view"]
+notes = "View expansion, column aliases, read-only semantics"
+
+[[features]]
+id = "F-SQL.24"
+family = "SQL"
+title = "CREATE TRIGGER (BEFORE, AFTER, INSTEAD OF)"
+weight = 8
+status = "partial"
+observability = ["test_create_trigger"]
+notes = "Parsing complete; VDBE subprogram execution in progress"
+
+[[features]]
+id = "F-SQL.25"
+family = "SQL"
+title = "CREATE VIRTUAL TABLE"
+weight = 4
+status = "partial"
+observability = ["test_virtual_table"]
+notes = "Parsing complete; vtab module wiring in progress"
+
+[[features]]
+id = "F-SQL.26"
+family = "SQL"
+title = "ALTER TABLE (RENAME, ADD COLUMN, DROP COLUMN, RENAME COLUMN)"
+weight = 6
+status = "pass"
+observability = ["test_alter_table"]
+notes = "DROP COLUMN (3.35+) rewrites table; all variants parsed"
+
+[[features]]
+id = "F-SQL.27"
+family = "SQL"
+title = "DROP TABLE/INDEX/VIEW/TRIGGER (with IF EXISTS)"
+weight = 4
+status = "pass"
+observability = ["test_drop_statements"]
+notes = "All four DROP variants with IF EXISTS"
+
+[[features]]
+id = "F-SQL.28"
+family = "SQL"
+title = "ATTACH/DETACH DATABASE"
+weight = 5
+status = "partial"
+observability = ["test_attach_detach"]
+notes = "Parsing complete; cross-database query support partial"
+
+[[features]]
+id = "F-SQL.29"
+family = "SQL"
+title = "EXPLAIN and EXPLAIN QUERY PLAN"
+weight = 4
+status = "pass"
+observability = ["test_explain"]
+notes = "VDBE bytecode dump and query plan tree"
+
+[[features]]
+id = "F-SQL.30"
+family = "SQL"
+title = "VACUUM and VACUUM INTO"
+weight = 4
+status = "partial"
+observability = ["test_vacuum"]
+notes = "VACUUM INTO for compact backup; full VACUUM needs pager wiring"
+
+[[features]]
+id = "F-SQL.31"
+family = "SQL"
+title = "REINDEX and ANALYZE"
+weight = 4
+status = "partial"
+observability = ["test_reindex_analyze"]
+notes = "ANALYZE populates sqlite_stat1; REINDEX rebuilds indexes"
+
+[[features]]
+id = "F-SQL.32"
+family = "SQL"
+title = "Expression syntax — operators, CAST, CASE, BETWEEN, IN, LIKE, GLOB"
+weight = 14
+status = "pass"
+observability = ["test_expressions", "e2e_expr_coverage"]
+notes = "Full Pratt precedence, all special expression forms including -> / ->>"
+
+[[features]]
+id = "F-SQL.33"
+family = "SQL"
+title = "Type affinity rules — comparison, storage, coercion"
+weight = 8
+status = "pass"
+observability = ["test_type_affinity", "e2e_type_coercion"]
+notes = "Five affinities, comparison affinity rules, serial type encoding"
+
+[[features]]
+id = "F-SQL.34"
+family = "SQL"
+title = "AUTOINCREMENT and sqlite_sequence table"
+weight = 4
+status = "partial"
+observability = ["test_autoincrement"]
+notes = "Parsing complete; sqlite_sequence tracking needs storage wiring"
+
+[[features]]
+id = "F-SQL.35"
+family = "SQL"
+title = "Time travel queries (FOR SYSTEM_TIME AS OF) — Native mode extension"
+weight = 3
+status = "fail"
+observability = ["test_time_travel"]
+notes = "FrankenSQLite-specific extension, requires Native mode commit stream"
+
+# ============================================================================
+# FAMILY: TXN — Transaction and Storage Behavior (weight pool: 150)
+# ============================================================================
+
+[[features]]
+id = "F-TXN.01"
+family = "TXN"
+title = "BEGIN DEFERRED/IMMEDIATE/EXCLUSIVE transactions"
+weight = 12
+status = "pass"
+observability = ["test_txn_modes", "e2e_txn_lifecycle"]
+notes = "Standard SQLite transaction modes"
+
+[[features]]
+id = "F-TXN.02"
+family = "TXN"
+title = "BEGIN CONCURRENT — MVCC concurrent writer mode"
+weight = 15
+status = "pass"
+observability = ["test_concurrent_mode", "e2e_concurrent_writers"]
+notes = "FrankenSQLite core innovation — concurrent_mode_default=true"
+
+[[features]]
+id = "F-TXN.03"
+family = "TXN"
+title = "COMMIT/ROLLBACK semantics"
+weight = 10
+status = "pass"
+observability = ["test_commit_rollback"]
+notes = "Atomic commit, transaction isolation"
+
+[[features]]
+id = "F-TXN.04"
+family = "TXN"
+title = "SAVEPOINT/RELEASE/ROLLBACK TO"
+weight = 8
+status = "pass"
+observability = ["test_savepoints"]
+notes = "Nested savepoint stack, partial rollback"
+
+[[features]]
+id = "F-TXN.05"
+family = "TXN"
+title = "Autocommit mode"
+weight = 5
+status = "pass"
+observability = ["test_autocommit"]
+notes = "Default autocommit for statements outside explicit transactions"
+
+[[features]]
+id = "F-TXN.06"
+family = "TXN"
+title = "Snapshot isolation — readers see consistent frozen view"
+weight = 12
+status = "pass"
+observability = ["test_snapshot_isolation", "e2e_snapshot_consistency"]
+notes = "MVCC visibility rules: V.commit_seq <= S.high"
+
+[[features]]
+id = "F-TXN.07"
+family = "TXN"
+title = "SSI — serializable snapshot isolation (write skew prevention)"
+weight = 12
+status = "pass"
+observability = ["test_ssi_validation", "e2e_ssi_write_skew"]
+notes = "Cahill/Fekete rw-antidependency tracking via SireadTable"
+
+[[features]]
+id = "F-TXN.08"
+family = "TXN"
+title = "First-Committer-Wins (FCW) conflict detection"
+weight = 10
+status = "pass"
+observability = ["test_fcw", "e2e_fcw_conflict"]
+notes = "Page-level FCW with safe merge ladder"
+
+[[features]]
+id = "F-TXN.09"
+family = "TXN"
+title = "WAL mode — write-ahead log with checkpoint"
+weight = 12
+status = "partial"
+observability = ["test_wal_mode"]
+notes = "WAL infrastructure exists; not yet wired as default backend"
+
+[[features]]
+id = "F-TXN.10"
+family = "TXN"
+title = "Rollback journal mode"
+weight = 6
+status = "partial"
+observability = ["test_rollback_journal"]
+notes = "Journal format implemented; hot journal recovery partial"
+
+[[features]]
+id = "F-TXN.11"
+family = "TXN"
+title = "Crash recovery — WAL replay and self-healing"
+weight = 10
+status = "partial"
+observability = ["test_crash_recovery"]
+notes = "WAL frame replay implemented; RaptorQ repair in progress"
+
+[[features]]
+id = "F-TXN.12"
+family = "TXN"
+title = "Page-level MVCC garbage collection"
+weight = 8
+status = "pass"
+observability = ["test_gc_scheduler", "e2e_gc_under_load"]
+notes = "Epoch-based reclamation, GC horizon tracking"
+
+[[features]]
+id = "F-TXN.13"
+family = "TXN"
+title = "ARC buffer pool cache"
+weight = 8
+status = "pass"
+observability = ["test_arc_cache"]
+notes = "Adaptive Replacement Cache with ghost entries"
+
+[[features]]
+id = "F-TXN.14"
+family = "TXN"
+title = "File format compatibility (100-byte header, B-tree pages)"
+weight = 10
+status = "pass"
+observability = ["test_file_format", "e2e_compat_roundtrip"]
+notes = "SQLite 3.x format read/write in Compatibility mode"
+
+[[features]]
+id = "F-TXN.15"
+family = "TXN"
+title = "Safe write merge ladder (intent replay + structured patches)"
+weight = 8
+status = "pass"
+observability = ["test_merge_ladder"]
+notes = "Deterministic rebase, XOR merge forbidden for structured pages"
+
+[[features]]
+id = "F-TXN.16"
+family = "TXN"
+title = "Multi-process MVCC via shared memory"
+weight = 4
+status = "fail"
+observability = ["test_shm_interop"]
+notes = "Shared memory layout designed; cross-process coordination pending"
+
+# ============================================================================
+# FAMILY: FUN — Built-in Functions (weight pool: 180)
+# ============================================================================
+
+[[features]]
+id = "F-FUN.01"
+family = "FUN"
+title = "Core scalar functions (abs, length, substr, replace, upper, lower, trim, etc.)"
+weight = 20
+status = "pass"
+observability = ["test_scalar_functions"]
+notes = "~30 core scalar functions including coalesce, nullif, typeof, quote"
+
+[[features]]
+id = "F-FUN.02"
+family = "FUN"
+title = "String functions (instr, replace, substr, printf/format, hex, unhex)"
+weight = 12
+status = "pass"
+observability = ["test_string_functions"]
+notes = "Including concat/concat_ws (3.44+), unistr (3.45+)"
+
+[[features]]
+id = "F-FUN.03"
+family = "FUN"
+title = "Math functions (trig, log, pow, sqrt, ceil, floor, etc.)"
+weight = 12
+status = "pass"
+observability = ["test_math_functions"]
+notes = "All 25+ math functions, NaN/Inf handling"
+
+[[features]]
+id = "F-FUN.04"
+family = "FUN"
+title = "Date/time functions (date, time, datetime, julianday, unixepoch, strftime)"
+weight = 15
+status = "pass"
+observability = ["test_datetime_functions"]
+notes = "All modifiers, all strftime specifiers including 3.44+ additions"
+
+[[features]]
+id = "F-FUN.05"
+family = "FUN"
+title = "Aggregate functions (count, sum, total, avg, min, max, group_concat)"
+weight = 15
+status = "pass"
+observability = ["test_aggregate_functions"]
+notes = "Including string_agg (3.44+), median/percentile (3.51+)"
+
+[[features]]
+id = "F-FUN.06"
+family = "FUN"
+title = "Window functions (row_number, rank, dense_rank, ntile, lag, lead, etc.)"
+weight = 15
+status = "pass"
+observability = ["test_window_functions_impl"]
+notes = "All 11 window-only functions plus aggregates-as-window"
+
+[[features]]
+id = "F-FUN.07"
+family = "FUN"
+title = "FILTER clause on aggregate/window functions"
+weight = 6
+status = "pass"
+observability = ["test_filter_clause"]
+notes = "FILTER (WHERE expr) on both aggregate and window calls"
+
+[[features]]
+id = "F-FUN.08"
+family = "FUN"
+title = "Collation functions (BINARY, NOCASE, RTRIM)"
+weight = 6
+status = "pass"
+observability = ["test_collation"]
+notes = "Built-in collation sequences, collation selection rules"
+
+[[features]]
+id = "F-FUN.09"
+family = "FUN"
+title = "System functions (sqlite_version, changes, total_changes, last_insert_rowid)"
+weight = 8
+status = "pass"
+observability = ["test_system_functions"]
+notes = "Connection-scoped state tracking functions"
+
+[[features]]
+id = "F-FUN.10"
+family = "FUN"
+title = "Randomness functions (random, randomblob, zeroblob)"
+weight = 4
+status = "pass"
+observability = ["test_random_functions"]
+notes = "PRNG functions"
+
+[[features]]
+id = "F-FUN.11"
+family = "FUN"
+title = "Pattern matching (like, glob with custom escape)"
+weight = 8
+status = "pass"
+observability = ["test_pattern_matching"]
+notes = "LIKE/GLOB function forms, case sensitivity rules"
+
+[[features]]
+id = "F-FUN.12"
+family = "FUN"
+title = "Planner hint functions (likelihood, likely, unlikely)"
+weight = 3
+status = "pass"
+observability = ["test_planner_hints"]
+notes = "No-op at runtime, passed to planner for cost estimation"
+
+[[features]]
+id = "F-FUN.13"
+family = "FUN"
+title = "Type inspection (typeof, subtype, octet_length)"
+weight = 4
+status = "pass"
+observability = ["test_type_inspection"]
+notes = "Including octet_length (3.43+), subtype"
+
+[[features]]
+id = "F-FUN.14"
+family = "FUN"
+title = "Soundex function"
+weight = 2
+status = "pass"
+observability = ["test_soundex"]
+notes = "Phonetic encoding"
+
+[[features]]
+id = "F-FUN.15"
+family = "FUN"
+title = "iif/if function (multi-condition form, 3.48+)"
+weight = 4
+status = "pass"
+observability = ["test_iif_function"]
+notes = "Inline conditional with short-circuit evaluation"
+
+[[features]]
+id = "F-FUN.16"
+family = "FUN"
+title = "Date/time keyword constants (current_time, current_date, current_timestamp)"
+weight = 3
+status = "pass"
+observability = ["test_datetime_constants"]
+notes = "Keyword tokens evaluated once per statement"
+
+[[features]]
+id = "F-FUN.17"
+family = "FUN"
+title = "Compile-time option functions (sqlite_compileoption_used/get)"
+weight = 3
+status = "pass"
+observability = ["test_compileoption"]
+notes = "Feature detection API"
+
+[[features]]
+id = "F-FUN.18"
+family = "FUN"
+title = "percentile_cont/percentile_disc/median/percentile (3.51+)"
+weight = 6
+status = "pass"
+observability = ["test_percentile_functions"]
+notes = "Statistical aggregate functions with interpolation"
+
+[[features]]
+id = "F-FUN.19"
+family = "FUN"
+title = "In-aggregate ORDER BY (group_concat/string_agg ORDER BY, 3.44+)"
+weight = 4
+status = "partial"
+observability = ["test_agg_order_by"]
+notes = "ORDER BY clause within aggregate function calls"
+
+# ============================================================================
+# FAMILY: VDB — VDBE Opcodes (weight pool: 100)
+# ============================================================================
+
+[[features]]
+id = "F-VDB.01"
+family = "VDB"
+title = "Control flow opcodes (Goto, Gosub, Return, Halt, InitCoroutine, Yield)"
+weight = 10
+status = "pass"
+observability = ["test_control_flow_opcodes"]
+notes = "8 control flow opcodes"
+
+[[features]]
+id = "F-VDB.02"
+family = "VDB"
+title = "Constant/value opcodes (Integer, Int64, Real, String8, Null, Blob, Variable)"
+weight = 8
+status = "pass"
+observability = ["test_constant_opcodes"]
+notes = "10 constant loading opcodes"
+
+[[features]]
+id = "F-VDB.03"
+family = "VDB"
+title = "Register ops (Move, Copy, SCopy, IntCopy)"
+weight = 5
+status = "pass"
+observability = ["test_register_ops"]
+notes = "Register manipulation opcodes"
+
+[[features]]
+id = "F-VDB.04"
+family = "VDB"
+title = "Arithmetic opcodes (Add, Subtract, Multiply, Divide, Remainder, Concat)"
+weight = 8
+status = "pass"
+observability = ["test_arithmetic_opcodes"]
+notes = "7 arithmetic/string opcodes"
+
+[[features]]
+id = "F-VDB.05"
+family = "VDB"
+title = "Comparison opcodes (Eq, Ne, Lt, Le, Gt, Ge, Compare)"
+weight = 8
+status = "pass"
+observability = ["test_comparison_opcodes"]
+notes = "7 comparison opcodes with collation support"
+
+[[features]]
+id = "F-VDB.06"
+family = "VDB"
+title = "Branching opcodes (Jump, If, IfNot, IsNull, IsType, Once, And, Or, Not)"
+weight = 8
+status = "pass"
+observability = ["test_branching_opcodes"]
+notes = "11 conditional branching opcodes"
+
+[[features]]
+id = "F-VDB.07"
+family = "VDB"
+title = "Cursor opcodes (OpenRead, OpenWrite, OpenEphemeral, SorterOpen, Close)"
+weight = 10
+status = "pass"
+observability = ["test_cursor_opcodes"]
+notes = "16 cursor management opcodes"
+
+[[features]]
+id = "F-VDB.08"
+family = "VDB"
+title = "Seek opcodes (SeekLT, SeekLE, SeekGE, SeekGT, SeekRowid, SeekScan)"
+weight = 8
+status = "pass"
+observability = ["test_seek_opcodes"]
+notes = "8 cursor positioning opcodes"
+
+[[features]]
+id = "F-VDB.09"
+family = "VDB"
+title = "Row ops (NewRowid, Insert, Delete, RowData, Rowid)"
+weight = 8
+status = "pass"
+observability = ["test_row_opcodes"]
+notes = "5 row manipulation opcodes"
+
+[[features]]
+id = "F-VDB.10"
+family = "VDB"
+title = "Transaction opcodes (Transaction, Savepoint, AutoCommit, Checkpoint)"
+weight = 6
+status = "pass"
+observability = ["test_txn_opcodes"]
+notes = "6 transaction control opcodes"
+
+[[features]]
+id = "F-VDB.11"
+family = "VDB"
+title = "Sorting opcodes (SorterInsert, SorterSort, SorterData, SorterNext)"
+weight = 6
+status = "pass"
+observability = ["test_sorting_opcodes"]
+notes = "5 sorter opcodes"
+
+[[features]]
+id = "F-VDB.12"
+family = "VDB"
+title = "Aggregation opcodes (AggStep, AggFinal, AggValue, AggInverse)"
+weight = 6
+status = "pass"
+observability = ["test_aggregation_opcodes"]
+notes = "4 aggregation opcodes for both regular and window aggregation"
+
+[[features]]
+id = "F-VDB.13"
+family = "VDB"
+title = "Function call opcodes (Function, PureFunc, BuiltinFunc)"
+weight = 5
+status = "pass"
+observability = ["test_function_opcodes"]
+notes = "3 function dispatch opcodes"
+
+[[features]]
+id = "F-VDB.14"
+family = "VDB"
+title = "Index opcodes (NoConflict, NotFound, Found, IdxInsert)"
+weight = 5
+status = "pass"
+observability = ["test_index_opcodes"]
+notes = "4 index lookup/insert opcodes"
+
+[[features]]
+id = "F-VDB.15"
+family = "VDB"
+title = "Remaining ~100 opcodes (Schema, Cookie, Trace, Column, etc.)"
+weight = 7
+status = "partial"
+observability = ["test_remaining_opcodes"]
+notes = "Includes FkCheck, ResultRow, Affinity, TypeCheck, and ~90 more"
+
+# ============================================================================
+# FAMILY: PLN — Query Planner (weight pool: 80)
+# ============================================================================
+
+[[features]]
+id = "F-PLN.01"
+family = "PLN"
+title = "Full table scan"
+weight = 8
+status = "pass"
+observability = ["test_full_scan"]
+notes = "Default scan when no index is usable"
+
+[[features]]
+id = "F-PLN.02"
+family = "PLN"
+title = "Index scan selection (cost-based)"
+weight = 12
+status = "pass"
+observability = ["test_index_selection"]
+notes = "Selectivity estimation via sqlite_stat1, cost model"
+
+[[features]]
+id = "F-PLN.03"
+family = "PLN"
+title = "Covering index scan"
+weight = 6
+status = "partial"
+observability = ["test_covering_index"]
+notes = "Skip table access when all columns are in the index"
+
+[[features]]
+id = "F-PLN.04"
+family = "PLN"
+title = "Join ordering (exhaustive for N<=8, greedy for N>8)"
+weight = 10
+status = "partial"
+observability = ["test_join_ordering"]
+notes = "N! enumeration with pruning for small join counts"
+
+[[features]]
+id = "F-PLN.05"
+family = "PLN"
+title = "Index-assisted ORDER BY (skip sort)"
+weight = 6
+status = "partial"
+observability = ["test_index_order_by"]
+notes = "Avoid sort when index delivers rows in requested order"
+
+[[features]]
+id = "F-PLN.06"
+family = "PLN"
+title = "LIKE/GLOB prefix optimization"
+weight = 4
+status = "fail"
+observability = ["test_like_prefix"]
+notes = "Convert LIKE 'abc%' into range scan"
+
+[[features]]
+id = "F-PLN.07"
+family = "PLN"
+title = "Subquery flattening"
+weight = 6
+status = "partial"
+observability = ["test_subquery_flatten"]
+notes = "Inline simple subqueries to avoid materialization"
+
+[[features]]
+id = "F-PLN.08"
+family = "PLN"
+title = "Skip-scan optimization"
+weight = 5
+status = "fail"
+observability = ["test_skip_scan"]
+notes = "Use multi-column index without leading column equality"
+
+[[features]]
+id = "F-PLN.09"
+family = "PLN"
+title = "Partial index awareness"
+weight = 5
+status = "partial"
+observability = ["test_partial_index"]
+notes = "Consider partial indexes when query WHERE implies index predicate"
+
+[[features]]
+id = "F-PLN.10"
+family = "PLN"
+title = "OR optimization (union of index lookups)"
+weight = 4
+status = "fail"
+observability = ["test_or_optimization"]
+notes = "Convert OR to union of index scans"
+
+[[features]]
+id = "F-PLN.11"
+family = "PLN"
+title = "Name resolution and schema lookup"
+weight = 8
+status = "pass"
+observability = ["test_name_resolution"]
+notes = "Table/column resolution, schema.table.column qualification"
+
+[[features]]
+id = "F-PLN.12"
+family = "PLN"
+title = "WHERE clause analysis and index matching"
+weight = 6
+status = "pass"
+observability = ["test_where_analysis"]
+notes = "Extract terms, match against available indexes"
+
+# ============================================================================
+# FAMILY: PGM — PRAGMA Support (weight pool: 60)
+# ============================================================================
+
+[[features]]
+id = "F-PGM.01"
+family = "PGM"
+title = "PRAGMA journal_mode (DELETE, TRUNCATE, PERSIST, MEMORY, WAL, OFF)"
+weight = 8
+status = "pass"
+observability = ["test_pragma_journal_mode"]
+notes = "All six journal modes, WAL mode switching"
+
+[[features]]
+id = "F-PGM.02"
+family = "PGM"
+title = "PRAGMA synchronous (OFF, NORMAL, FULL, EXTRA)"
+weight = 6
+status = "pass"
+observability = ["test_pragma_synchronous"]
+notes = "Durability control"
+
+[[features]]
+id = "F-PGM.03"
+family = "PGM"
+title = "PRAGMA cache_size"
+weight = 4
+status = "pass"
+observability = ["test_pragma_cache_size"]
+notes = "Buffer pool size control"
+
+[[features]]
+id = "F-PGM.04"
+family = "PGM"
+title = "PRAGMA page_size"
+weight = 4
+status = "pass"
+observability = ["test_pragma_page_size"]
+notes = "Database page size (512-65536, power of two)"
+
+[[features]]
+id = "F-PGM.05"
+family = "PGM"
+title = "PRAGMA foreign_keys"
+weight = 4
+status = "pass"
+observability = ["test_pragma_foreign_keys"]
+notes = "Foreign key enforcement toggle"
+
+[[features]]
+id = "F-PGM.06"
+family = "PGM"
+title = "PRAGMA integrity_check / quick_check"
+weight = 5
+status = "partial"
+observability = ["test_pragma_integrity"]
+notes = "Database integrity verification"
+
+[[features]]
+id = "F-PGM.07"
+family = "PGM"
+title = "PRAGMA wal_checkpoint (PASSIVE, FULL, RESTART, TRUNCATE)"
+weight = 5
+status = "partial"
+observability = ["test_pragma_checkpoint"]
+notes = "WAL checkpoint modes"
+
+[[features]]
+id = "F-PGM.08"
+family = "PGM"
+title = "PRAGMA table_info / table_xinfo"
+weight = 4
+status = "pass"
+observability = ["test_pragma_table_info"]
+notes = "Schema introspection"
+
+[[features]]
+id = "F-PGM.09"
+family = "PGM"
+title = "PRAGMA user_version / application_id / schema_version"
+weight = 3
+status = "pass"
+observability = ["test_pragma_versions"]
+notes = "Header field access"
+
+[[features]]
+id = "F-PGM.10"
+family = "PGM"
+title = "PRAGMA auto_vacuum (NONE, FULL, INCREMENTAL)"
+weight = 4
+status = "fail"
+observability = ["test_pragma_auto_vacuum"]
+notes = "Auto-vacuum with pointer map"
+
+[[features]]
+id = "F-PGM.11"
+family = "PGM"
+title = "PRAGMA recursive_triggers"
+weight = 3
+status = "fail"
+observability = ["test_pragma_recursive_triggers"]
+notes = "Enable trigger self-firing"
+
+[[features]]
+id = "F-PGM.12"
+family = "PGM"
+title = "FrankenSQLite-specific PRAGMAs (concurrent_mode, serializable, write_merge)"
+weight = 6
+status = "pass"
+observability = ["test_fsqlite_pragmas"]
+notes = "MVCC-specific configuration PRAGMAs"
+
+[[features]]
+id = "F-PGM.13"
+family = "PGM"
+title = "PRAGMA encoding (UTF-8, UTF-16le, UTF-16be)"
+weight = 4
+status = "partial"
+observability = ["test_pragma_encoding"]
+notes = "Text encoding selection"
+
+# ============================================================================
+# FAMILY: EXT — Extensions (weight pool: 80)
+# ============================================================================
+
+[[features]]
+id = "F-EXT.01"
+family = "EXT"
+title = "JSON1 — json_extract, json_set, json_remove, json_each, json_tree"
+weight = 15
+status = "partial"
+observability = ["test_json1", "e2e_json_functions"]
+notes = "Core JSON functions implemented; table-valued functions partial"
+
+[[features]]
+id = "F-EXT.02"
+family = "EXT"
+title = "JSON1 — json_group_array, json_group_object, json_patch, JSONB"
+weight = 8
+status = "partial"
+observability = ["test_json1_aggregates"]
+notes = "JSON aggregate functions and binary JSON"
+
+[[features]]
+id = "F-EXT.03"
+family = "EXT"
+title = "FTS3/FTS4 — full-text search"
+weight = 10
+status = "partial"
+observability = ["test_fts3"]
+notes = "Tokenizers, query syntax, ranking; virtual table wiring in progress"
+
+[[features]]
+id = "F-EXT.04"
+family = "EXT"
+title = "FTS5 — full-text search v5 with BM25"
+weight = 10
+status = "partial"
+observability = ["test_fts5"]
+notes = "BM25 ranking, highlight/snippet, content modes"
+
+[[features]]
+id = "F-EXT.05"
+family = "EXT"
+title = "R-tree — spatial indexing"
+weight = 8
+status = "partial"
+observability = ["test_rtree"]
+notes = "N-dimensional bounding box queries, geopoly"
+
+[[features]]
+id = "F-EXT.06"
+family = "EXT"
+title = "Session — changeset/patchset tracking"
+weight = 6
+status = "partial"
+observability = ["test_session"]
+notes = "Change tracking, conflict resolution, changeset inversion"
+
+[[features]]
+id = "F-EXT.07"
+family = "EXT"
+title = "ICU — Unicode collation and case folding"
+weight = 5
+status = "partial"
+observability = ["test_icu"]
+notes = "Unicode-aware collation sequences"
+
+[[features]]
+id = "F-EXT.08"
+family = "EXT"
+title = "Misc extensions — generate_series, carray, dbstat, dbpage"
+weight = 6
+status = "partial"
+observability = ["test_misc_ext"]
+notes = "Utility table-valued functions"
+
+[[features]]
+id = "F-EXT.09"
+family = "EXT"
+title = "Page-level encryption (XChaCha20-Poly1305, DEK/KEK envelope)"
+weight = 8
+status = "fail"
+observability = ["test_encryption"]
+notes = "FrankenSQLite-specific replacement for commercial SEE extension"
+
+[[features]]
+id = "F-EXT.10"
+family = "EXT"
+title = "RaptorQ self-healing (WAL repair symbols, ECS objects)"
+weight = 4
+status = "partial"
+observability = ["test_raptorq_healing"]
+notes = "Fountain code integration for torn write recovery"
+
+# ============================================================================
+# FAMILY: CLI — CLI Shell and Public API (weight pool: 50)
+# ============================================================================
+
+[[features]]
+id = "F-CLI.01"
+family = "CLI"
+title = "Interactive REPL with multi-line detection"
+weight = 6
+status = "pass"
+observability = ["test_cli_repl"]
+notes = "Statement continuation until semicolon"
+
+[[features]]
+id = "F-CLI.02"
+family = "CLI"
+title = "Output modes (column, table, csv, json, markdown, etc.)"
+weight = 5
+status = "pass"
+observability = ["test_cli_output_modes"]
+notes = "14 output modes matching sqlite3 CLI"
+
+[[features]]
+id = "F-CLI.03"
+family = "CLI"
+title = "Dot-commands (.open, .tables, .schema, .dump, .import, etc.)"
+weight = 6
+status = "partial"
+observability = ["test_cli_dot_commands"]
+notes = "Core dot-commands implemented; full set in progress"
+
+[[features]]
+id = "F-CLI.04"
+family = "CLI"
+title = "Public API — Connection::open, execute, query, prepare"
+weight = 10
+status = "pass"
+observability = ["test_public_api"]
+notes = "User-facing library interface"
+
+[[features]]
+id = "F-CLI.05"
+family = "CLI"
+title = "Public API — Transaction API (transaction, commit)"
+weight = 6
+status = "pass"
+observability = ["test_transaction_api"]
+notes = "Transaction object with automatic rollback on drop"
+
+[[features]]
+id = "F-CLI.06"
+family = "CLI"
+title = "Public API — Prepared statements with parameter binding"
+weight = 6
+status = "pass"
+observability = ["test_prepared_statements"]
+notes = "Named and positional parameters"
+
+[[features]]
+id = "F-CLI.07"
+family = "CLI"
+title = "Public API — Row iteration and column access"
+weight = 5
+status = "pass"
+observability = ["test_row_access"]
+notes = "Type-safe column extraction"
+
+[[features]]
+id = "F-CLI.08"
+family = "CLI"
+title = "Batch mode (stdin/file input)"
+weight = 3
+status = "partial"
+observability = ["test_batch_mode"]
+notes = "Pipe SQL from file or stdin"
+
+[[features]]
+id = "F-CLI.09"
+family = "CLI"
+title = "SQL syntax highlighting and tab completion"
+weight = 3
+status = "partial"
+observability = ["test_syntax_highlight"]
+notes = "Interactive shell UX features"
+
+# ============================================================================
+# EXCLUSIONS — Features deliberately NOT in scope
+# ============================================================================
+
+[[exclusions]]
+id = "X.01"
+title = "Amalgamation build system"
+rationale = "Cargo workspace provides superior modularity. No analog in Rust."
+
+[[exclusions]]
+id = "X.02"
+title = "TCL test harness"
+rationale = "Replaced by native Rust tests, proptest, conformance harness, and lab reactor."
+
+[[exclusions]]
+id = "X.03"
+title = "LEMON parser generator"
+rationale = "Replaced by hand-written recursive descent with better error messages."
+
+[[exclusions]]
+id = "X.04"
+title = "Loadable extension API (.so/.dll)"
+rationale = "All extensions compiled in. Eliminates arbitrary code loading vulnerabilities."
+
+[[exclusions]]
+id = "X.05"
+title = "Legacy schema format < 4"
+rationale = "Format 4 has been default since SQLite 3.3.0 (2006). No active databases use older formats."
+
+[[exclusions]]
+id = "X.06"
+title = "Obsolete VFS (OS/2, VxWorks, Windows CE)"
+rationale = "Only UnixVfs, WindowsVfs, and MemoryVfs needed. Others via Vfs trait."
+
+[[exclusions]]
+id = "X.07"
+title = "Shared-cache mode"
+rationale = "Deprecated since SQLite 3.41.0. MVCC supersedes it with superior page-level concurrency."
+
+[[exclusions]]
+id = "X.08"
+title = "PRAGMA read_uncommitted (dirty reads)"
+rationale = "Tied to deprecated shared-cache. MVCC snapshots are always consistent."
+
+[[exclusions]]
+id = "X.09"
+title = "Multiplexor VFS"
+rationale = "Works around FAT32 4GB limit. Modern filesystems have no such limitation."
+
+[[exclusions]]
+id = "X.10"
+title = "SEE (SQLite Encryption Extension)"
+rationale = "Replaced by built-in XChaCha20-Poly1305 page-level encryption (F-EXT.09)."

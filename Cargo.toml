@@ -26,6 +26,7 @@ members = [
     "crates/fsqlite-cli",
     "crates/fsqlite-harness",
     "crates/fsqlite-e2e",
+    "crates/fsqlite-observability",
 ]
 
 [workspace.package]
@@ -76,6 +77,7 @@ fsqlite = { path = "crates/fsqlite" }
 fsqlite-cli = { path = "crates/fsqlite-cli" }
 fsqlite-harness = { path = "crates/fsqlite-harness" }
 fsqlite-e2e = { path = "crates/fsqlite-e2e" }
+fsqlite-observability = { path = "crates/fsqlite-observability" }
 
 # External dependencies
 ftui = { path = "/dp/frankentui/crates/ftui" }
@@ -104,6 +106,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1.6"
 insta = { version = "1.42", features = ["json", "yaml"] }
 tempfile = "3.17"
+toml = "0.8"
 
 [profile.release]
 opt-level = "z"

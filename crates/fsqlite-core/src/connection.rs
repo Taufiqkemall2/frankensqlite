@@ -51,6 +51,8 @@ use fsqlite_mvcc::{
     GcTodo, InProcessPageLockTable, MvccError, VersionStore, concurrent_abort,
     concurrent_read_page, concurrent_write_page, validate_first_committer_wins,
 };
+// MVCC conflict observability (bd-t6sv2.1)
+use fsqlite_observability::MetricsObserver;
 use fsqlite_types::{CommitSeq, PageData, SchemaEpoch, Snapshot, TxnId};
 
 use crate::wal_adapter::WalBackendAdapter;
@@ -678,6 +680,11 @@ pub struct Connection {
     /// File change counter (offset 24 in the database header).  Incremented
     /// on every transaction that modifies the database (DML or DDL).
     change_counter: RefCell<u32>,
+    // ── MVCC conflict observability (bd-t6sv2.1) ──────────────────────────
+    /// Observer for MVCC conflict analytics.  Records metrics (contention,
+    /// FCW drift, SSI aborts) and a ring-buffer of recent conflict events.
+    /// Exposed via PRAGMA fsqlite.conflict_stats / conflict_log / conflict_reset.
+    conflict_observer: Rc<MetricsObserver>,
     // ── MVCC concurrent-writer state (bd-14zc / 5E.1, bd-kivg / 5E.2) ─────
     /// Registry of active concurrent-writer sessions.
     /// Wrapped in Rc for sharing with VdbeEngine during execution (bd-kivg).
@@ -756,6 +763,8 @@ impl Connection {
             next_master_rowid: RefCell::new(1),
             schema_cookie: RefCell::new(0),
             change_counter: RefCell::new(0),
+            // MVCC conflict observability (bd-t6sv2.1)
+            conflict_observer: Rc::new(MetricsObserver::new(1024)),
             // MVCC concurrent-writer state (bd-14zc / 5E.1, bd-kivg / 5E.2)
             concurrent_registry: Rc::new(RefCell::new(ConcurrentRegistry::new())),
             concurrent_session_id: RefCell::new(None),
@@ -3324,6 +3333,54 @@ impl Connection {
                         values: vec![SqliteValue::Integer(i64::from(enabled))],
                     }])
                 }
+            }
+            // ── MVCC conflict observability PRAGMAs (bd-t6sv2.1) ──────────
+            "fsqlite.conflict_stats" | "conflict_stats" => {
+                let snap = self.conflict_observer.metrics().snapshot();
+                Ok(vec![
+                    Row { values: vec![
+                        SqliteValue::Text("conflicts_total".into()),
+                        SqliteValue::Integer(snap.conflicts_total as i64),
+                    ]},
+                    Row { values: vec![
+                        SqliteValue::Text("page_contentions".into()),
+                        SqliteValue::Integer(snap.page_contentions as i64),
+                    ]},
+                    Row { values: vec![
+                        SqliteValue::Text("fcw_drifts".into()),
+                        SqliteValue::Integer(snap.fcw_drifts as i64),
+                    ]},
+                    Row { values: vec![
+                        SqliteValue::Text("ssi_aborts".into()),
+                        SqliteValue::Integer(snap.ssi_aborts as i64),
+                    ]},
+                    Row { values: vec![
+                        SqliteValue::Text("conflicts_resolved".into()),
+                        SqliteValue::Integer(snap.conflicts_resolved as i64),
+                    ]},
+                ])
+            }
+            "fsqlite.conflict_log" | "conflict_log" => {
+                let events = self.conflict_observer.log().snapshot();
+                let rows: Vec<Row> = events
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| {
+                        let desc = format!("{e:?}");
+                        Row { values: vec![
+                            SqliteValue::Integer(i as i64),
+                            SqliteValue::Integer(e.timestamp_ns() as i64),
+                            SqliteValue::Text(desc),
+                        ]}
+                    })
+                    .collect();
+                Ok(rows)
+            }
+            "fsqlite.conflict_reset" | "conflict_reset" => {
+                self.conflict_observer.reset();
+                Ok(vec![Row {
+                    values: vec![SqliteValue::Text("ok".into())],
+                }])
             }
             "wal_checkpoint" => {
                 // Parse checkpoint mode from the value (PASSIVE, FULL, RESTART, TRUNCATE).

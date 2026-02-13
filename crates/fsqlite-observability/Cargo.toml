@@ -1,0 +1,21 @@
+[package]
+name = "fsqlite-observability"
+version = "0.1.0"
+description = "Conflict analytics and observability infrastructure for FrankenSQLite MVCC"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fsqlite-types = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

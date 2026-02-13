@@ -12,6 +12,7 @@
   Content-Type: application/json; charset=utf-8
   Cache-Control: no-store
 
-/*.sqlite3
+/*.bin
   Content-Type: application/octet-stream
   X-Content-Type-Options: nosniff
+  Access-Control-Allow-Origin: *

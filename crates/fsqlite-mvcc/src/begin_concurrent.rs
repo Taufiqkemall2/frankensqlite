@@ -424,10 +424,21 @@ pub fn validate_first_committer_wins(
     }
 
     if conflicting_pages.is_empty() {
+        tracing::debug!(
+            write_set_size = handle.write_set.len(),
+            snapshot_seq = snapshot_seq.get(),
+            "fcw_validation: clean (no base drift)"
+        );
         FcwResult::Clean
     } else {
         // Sort for deterministic output.
         conflicting_pages.sort();
+        tracing::warn!(
+            conflicting_page_count = conflicting_pages.len(),
+            max_conflicting_seq = max_conflicting_seq.get(),
+            snapshot_seq = snapshot_seq.get(),
+            "fcw_validation: base drift detected"
+        );
         FcwResult::Conflict {
             conflicting_pages,
             conflicting_commit_seq: max_conflicting_seq,
@@ -473,6 +484,10 @@ pub fn concurrent_commit(
 
             // Check if marked for abort by another committer.
             if handle.is_marked_for_abort() {
+                tracing::warn!(
+                    txn = %txn_id,
+                    "concurrent_commit: SSI marked_for_abort"
+                );
                 lock_table.release_all(txn_id);
                 handle.mark_aborted();
                 return Err((MvccError::BusySnapshot, FcwResult::Clean));
@@ -480,6 +495,10 @@ pub fn concurrent_commit(
 
             // Check for dangerous structure (both in + out rw edges).
             if handle.has_in_rw() && handle.has_out_rw() {
+                tracing::warn!(
+                    txn = %txn_id,
+                    "concurrent_commit: SSI pivot (in+out rw edges)"
+                );
                 lock_table.release_all(txn_id);
                 handle.mark_aborted();
                 return Err((MvccError::BusySnapshot, FcwResult::Clean));
@@ -606,6 +625,19 @@ pub fn concurrent_commit_with_ssi(
 
     // Check abort conditions.
     if is_marked_for_abort || (has_in_rw && has_out_rw) {
+        let reason = if is_marked_for_abort {
+            "marked_for_abort"
+        } else {
+            "pivot (in+out rw edges)"
+        };
+        tracing::warn!(
+            txn = %txn_id,
+            has_in_rw,
+            has_out_rw,
+            is_marked_for_abort,
+            reason,
+            "concurrent_commit_with_ssi: SSI abort"
+        );
         lock_table.release_all(txn_id);
         let handle = registry.get_mut(session_id).unwrap();
         handle.mark_aborted();

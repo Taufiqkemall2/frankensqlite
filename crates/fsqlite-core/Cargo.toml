@@ -14,6 +14,7 @@ fsqlite-vfs = { workspace = true }
 fsqlite-pager = { workspace = true }
 fsqlite-wal = { workspace = true }
 fsqlite-mvcc = { workspace = true }
+fsqlite-observability = { workspace = true }
 fsqlite-btree = { workspace = true }
 fsqlite-ast = { workspace = true }
 fsqlite-parser = { workspace = true }

@@ -11,6 +11,7 @@ rust-version.workspace = true
 blake3 = { workspace = true }
 fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
+fsqlite-observability = { workspace = true }
 fsqlite-pager = { workspace = true }
 fsqlite-wal = { workspace = true }
 nix = { workspace = true }

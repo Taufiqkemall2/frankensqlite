@@ -20,6 +20,7 @@ pub mod hot_witness_index;
 pub mod index_regen;
 pub mod invariants;
 pub mod lifecycle;
+pub mod observability;
 pub mod physical_merge;
 pub mod retry_policy;
 pub mod rowid_alloc;
@@ -105,6 +106,10 @@ pub use invariants::{
     SerializedWriteMutex, TxnManager, VersionStore, idx_to_version_pointer, visible,
 };
 pub use lifecycle::{BeginKind, CommitResponse, MvccError, Savepoint, TransactionManager};
+pub use observability::{
+    SharedObserver, emit_conflict_resolved, emit_fcw_base_drift, emit_page_lock_contention,
+    emit_ssi_abort,
+};
 pub use physical_merge::{
     CellOp, CellOpKind, FreeSpaceOp, HeaderOp, MergeError, MergeLadderResult, ParsedCell,
     ParsedPage, RangeXorPatch, StructuredPagePatch, apply_patch, diff_parsed_pages,
