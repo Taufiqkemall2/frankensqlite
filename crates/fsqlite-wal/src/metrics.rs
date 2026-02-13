@@ -257,6 +257,96 @@ impl fmt::Display for WalFecRepairCountersSnapshot {
 }
 
 // ---------------------------------------------------------------------------
+// WAL recovery counters
+// ---------------------------------------------------------------------------
+
+/// Global WAL recovery metrics singleton.
+pub static GLOBAL_WAL_RECOVERY_METRICS: WalRecoveryCounters = WalRecoveryCounters::new();
+
+/// Atomic counters tracking WAL crash recovery operations.
+pub struct WalRecoveryCounters {
+    /// Total frames replayed during recovery.
+    pub recovery_frames_total: AtomicU64,
+    /// Total corruption events detected.
+    pub corruption_detected_total: AtomicU64,
+    /// Total frames successfully repaired (RaptorQ).
+    pub frames_repaired_total: AtomicU64,
+    /// Total recovery operations completed.
+    pub recovery_ops_total: AtomicU64,
+}
+
+impl WalRecoveryCounters {
+    /// Create a zeroed counters instance.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            recovery_frames_total: AtomicU64::new(0),
+            corruption_detected_total: AtomicU64::new(0),
+            frames_repaired_total: AtomicU64::new(0),
+            recovery_ops_total: AtomicU64::new(0),
+        }
+    }
+
+    /// Record frames replayed during a recovery.
+    pub fn record_recovery(&self, frames_replayed: u64, corrupted: u64, repaired: u64) {
+        self.recovery_ops_total.fetch_add(1, Ordering::Relaxed);
+        self.recovery_frames_total
+            .fetch_add(frames_replayed, Ordering::Relaxed);
+        self.corruption_detected_total
+            .fetch_add(corrupted, Ordering::Relaxed);
+        self.frames_repaired_total
+            .fetch_add(repaired, Ordering::Relaxed);
+    }
+
+    /// Take a snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> WalRecoveryCountersSnapshot {
+        WalRecoveryCountersSnapshot {
+            recovery_frames_total: self.recovery_frames_total.load(Ordering::Relaxed),
+            corruption_detected_total: self.corruption_detected_total.load(Ordering::Relaxed),
+            frames_repaired_total: self.frames_repaired_total.load(Ordering::Relaxed),
+            recovery_ops_total: self.recovery_ops_total.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Reset all counters to zero.
+    pub fn reset(&self) {
+        self.recovery_frames_total.store(0, Ordering::Relaxed);
+        self.corruption_detected_total.store(0, Ordering::Relaxed);
+        self.frames_repaired_total.store(0, Ordering::Relaxed);
+        self.recovery_ops_total.store(0, Ordering::Relaxed);
+    }
+}
+
+impl Default for WalRecoveryCounters {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Point-in-time snapshot of WAL recovery counters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalRecoveryCountersSnapshot {
+    pub recovery_frames_total: u64,
+    pub corruption_detected_total: u64,
+    pub frames_repaired_total: u64,
+    pub recovery_ops_total: u64,
+}
+
+impl fmt::Display for WalRecoveryCountersSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "wal_recovery_frames={} corruption_detected={} frames_repaired={} recovery_ops={}",
+            self.recovery_frames_total,
+            self.corruption_detected_total,
+            self.frames_repaired_total,
+            self.recovery_ops_total,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helper
 // ---------------------------------------------------------------------------
 
@@ -408,5 +498,48 @@ mod tests {
     fn fec_repair_default() {
         let c = WalFecRepairCounters::default();
         assert_eq!(c.snapshot().repairs_total, 0);
+    }
+
+    // ── WAL recovery counters ──
+
+    #[test]
+    fn recovery_counting() {
+        let r = WalRecoveryCounters::new();
+        r.record_recovery(100, 3, 2);
+        r.record_recovery(50, 1, 1);
+        let snap = r.snapshot();
+        assert_eq!(snap.recovery_ops_total, 2);
+        assert_eq!(snap.recovery_frames_total, 150);
+        assert_eq!(snap.corruption_detected_total, 4);
+        assert_eq!(snap.frames_repaired_total, 3);
+    }
+
+    #[test]
+    fn recovery_reset() {
+        let r = WalRecoveryCounters::new();
+        r.record_recovery(10, 1, 1);
+        r.reset();
+        let snap = r.snapshot();
+        assert_eq!(snap.recovery_ops_total, 0);
+        assert_eq!(snap.recovery_frames_total, 0);
+        assert_eq!(snap.corruption_detected_total, 0);
+        assert_eq!(snap.frames_repaired_total, 0);
+    }
+
+    #[test]
+    fn recovery_display() {
+        let r = WalRecoveryCounters::new();
+        r.record_recovery(20, 2, 1);
+        let s = r.snapshot().to_string();
+        assert!(s.contains("wal_recovery_frames=20"));
+        assert!(s.contains("corruption_detected=2"));
+        assert!(s.contains("frames_repaired=1"));
+        assert!(s.contains("recovery_ops=1"));
+    }
+
+    #[test]
+    fn recovery_default() {
+        let r = WalRecoveryCounters::default();
+        assert_eq!(r.snapshot().recovery_frames_total, 0);
     }
 }

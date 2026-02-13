@@ -24,7 +24,7 @@ use fsqlite_types::ecs::{
     source_symbol_count,
 };
 use fsqlite_types::{CommitMarker, CommitSeq, PageNumber};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 // ===========================================================================
 // §7.12 Recovery Types
@@ -254,10 +254,10 @@ impl NativeRecovery {
                     );
                 }
                 CapsuleDecodeOutcome::Failed { reason } => {
-                    warn!(
+                    error!(
                         commit_seq = marker.commit_seq.get(),
                         reason = reason.as_str(),
-                        "DURABILITY CONTRACT VIOLATED: capsule undecodable"
+                        "DURABILITY CONTRACT VIOLATED: capsule undecodable — unrecoverable corruption"
                     );
                     self.violations.push(DurabilityViolation {
                         commit_seq: marker.commit_seq,
@@ -283,8 +283,18 @@ impl NativeRecovery {
             .iter()
             .filter(|(_, o)| matches!(o, CapsuleDecodeOutcome::Repaired { .. }))
             .count();
+        let corrupted_frames = self.violations.len() + capsules_repaired;
 
         let ecs_epoch = self.root_manifest.as_ref().map_or(0, |rm| rm.ecs_epoch);
+
+        let span = tracing::span!(
+            tracing::Level::INFO,
+            "wal_recovery",
+            frames_replayed = self.replayed_markers.len(),
+            corrupted_frames = corrupted_frames,
+            repaired_frames = capsules_repaired,
+        );
+        let _guard = span.enter();
 
         info!(
             ecs_epoch,
@@ -297,10 +307,23 @@ impl NativeRecovery {
         );
 
         #[allow(clippy::cast_possible_truncation)]
+        let frames_replayed_u64 = self.replayed_markers.len() as u64;
+        #[allow(clippy::cast_possible_truncation)]
+        let corrupted_u64 = corrupted_frames as u64;
+        #[allow(clippy::cast_possible_truncation)]
+        let repaired_u64 = capsules_repaired as u64;
+
+        crate::metrics::GLOBAL_WAL_RECOVERY_METRICS.record_recovery(
+            frames_replayed_u64,
+            corrupted_u64,
+            repaired_u64,
+        );
+
+        #[allow(clippy::cast_possible_truncation)]
         RecoverySummary {
             ecs_epoch,
             commit_seq_recovered: self.recovered_tip,
-            markers_replayed: self.replayed_markers.len() as u64,
+            markers_replayed: frames_replayed_u64,
             capsules_repaired: capsules_repaired as u32,
             violations: self.violations,
             duration_ms,
