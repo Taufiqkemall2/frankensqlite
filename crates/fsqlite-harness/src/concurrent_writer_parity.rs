@@ -345,8 +345,7 @@ pub fn assess_concurrent_writer_parity(
         area: "multi_writer_scalability".to_owned(),
         critical: false,
         parity_achieved: true,
-        detail: "Two writers inserting to disjoint tables both commit without conflict"
-            .to_owned(),
+        detail: "Two writers inserting to disjoint tables both commit without conflict".to_owned(),
     });
     checks.push(ConcurrentWriterCheck {
         check_name: "ten_writers_disjoint_tables".to_owned(),
@@ -536,9 +535,7 @@ pub fn write_concurrent_writer_report(
     std::fs::write(path, json).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
-pub fn load_concurrent_writer_report(
-    path: &Path,
-) -> Result<ConcurrentWriterParityReport, String> {
+pub fn load_concurrent_writer_report(path: &Path) -> Result<ConcurrentWriterParityReport, String> {
     let json =
         std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     ConcurrentWriterParityReport::from_json(&json).map_err(|e| format!("parse: {e}"))
@@ -555,8 +552,10 @@ mod tests {
 
     #[test]
     fn area_as_str_unique() {
-        let mut names: Vec<&str> =
-            ConcurrentInvariantArea::ALL.iter().map(|a| a.as_str()).collect();
+        let mut names: Vec<&str> = ConcurrentInvariantArea::ALL
+            .iter()
+            .map(|a| a.as_str())
+            .collect();
         let len = names.len();
         names.sort();
         names.dedup();
@@ -576,7 +575,10 @@ mod tests {
     fn verdict_display() {
         assert_eq!(ConcurrentWriterVerdict::Parity.to_string(), "PARITY");
         assert_eq!(ConcurrentWriterVerdict::Partial.to_string(), "PARTIAL");
-        assert_eq!(ConcurrentWriterVerdict::Regression.to_string(), "REGRESSION");
+        assert_eq!(
+            ConcurrentWriterVerdict::Regression.to_string(),
+            "REGRESSION"
+        );
     }
 
     #[test]
@@ -589,8 +591,7 @@ mod tests {
 
     #[test]
     fn assess_parity() {
-        let report =
-            assess_concurrent_writer_parity(&ConcurrentWriterParityConfig::default());
+        let report = assess_concurrent_writer_parity(&ConcurrentWriterParityConfig::default());
         assert_eq!(report.verdict, ConcurrentWriterVerdict::Parity);
         assert_eq!(report.bead_id, CONCURRENT_WRITER_PARITY_BEAD_ID);
         assert_eq!(report.schema_version, CONCURRENT_WRITER_SCHEMA_VERSION);
@@ -598,8 +599,7 @@ mod tests {
 
     #[test]
     fn assess_all_areas() {
-        let report =
-            assess_concurrent_writer_parity(&ConcurrentWriterParityConfig::default());
+        let report = assess_concurrent_writer_parity(&ConcurrentWriterParityConfig::default());
         assert_eq!(report.areas_tested.len(), 10);
         assert_eq!(report.areas_at_parity.len(), 10);
         for a in ConcurrentInvariantArea::ALL {
@@ -612,55 +612,43 @@ mod tests {
 
     #[test]
     fn assess_critical_areas() {
-        let report =
-            assess_concurrent_writer_parity(&ConcurrentWriterParityConfig::default());
+        let report = assess_concurrent_writer_parity(&ConcurrentWriterParityConfig::default());
         assert_eq!(report.critical_areas_total, 5);
         assert_eq!(report.critical_areas_at_parity, 5);
     }
 
     #[test]
     fn assess_score() {
-        let report =
-            assess_concurrent_writer_parity(&ConcurrentWriterParityConfig::default());
+        let report = assess_concurrent_writer_parity(&ConcurrentWriterParityConfig::default());
         assert_eq!(report.parity_score, 1.0);
         assert_eq!(report.checks_at_parity, report.total_checks);
     }
 
     #[test]
     fn assess_concurrency_level() {
-        let report =
-            assess_concurrent_writer_parity(&ConcurrentWriterParityConfig::default());
+        let report = assess_concurrent_writer_parity(&ConcurrentWriterParityConfig::default());
         assert_eq!(report.max_writer_concurrency_tested, 100);
     }
 
     #[test]
     fn triage_line_fields() {
-        let report =
-            assess_concurrent_writer_parity(&ConcurrentWriterParityConfig::default());
+        let report = assess_concurrent_writer_parity(&ConcurrentWriterParityConfig::default());
         let line = report.triage_line();
-        for field in [
-            "verdict=",
-            "parity=",
-            "areas=",
-            "critical=",
-            "max_writers=",
-        ] {
+        for field in ["verdict=", "parity=", "areas=", "critical=", "max_writers="] {
             assert!(line.contains(field), "triage line missing field: {field}");
         }
     }
 
     #[test]
     fn summary_nonempty() {
-        let report =
-            assess_concurrent_writer_parity(&ConcurrentWriterParityConfig::default());
+        let report = assess_concurrent_writer_parity(&ConcurrentWriterParityConfig::default());
         assert!(!report.summary.is_empty());
         assert!(report.summary.contains("PARITY"));
     }
 
     #[test]
     fn json_roundtrip() {
-        let report =
-            assess_concurrent_writer_parity(&ConcurrentWriterParityConfig::default());
+        let report = assess_concurrent_writer_parity(&ConcurrentWriterParityConfig::default());
         let json = report.to_json().expect("serialize");
         let parsed = ConcurrentWriterParityReport::from_json(&json).expect("parse");
         assert_eq!(parsed.verdict, report.verdict);
@@ -669,8 +657,7 @@ mod tests {
 
     #[test]
     fn file_roundtrip() {
-        let report =
-            assess_concurrent_writer_parity(&ConcurrentWriterParityConfig::default());
+        let report = assess_concurrent_writer_parity(&ConcurrentWriterParityConfig::default());
         let dir = std::env::temp_dir().join("fsqlite-concurrent-test");
         std::fs::create_dir_all(&dir).expect("create dir");
         let path = dir.join("concurrent-test.json");
@@ -701,8 +688,7 @@ mod tests {
 
     #[test]
     fn all_checks_have_area() {
-        let report =
-            assess_concurrent_writer_parity(&ConcurrentWriterParityConfig::default());
+        let report = assess_concurrent_writer_parity(&ConcurrentWriterParityConfig::default());
         for check in &report.checks {
             assert!(
                 !check.area.is_empty(),
@@ -714,8 +700,7 @@ mod tests {
 
     #[test]
     fn critical_checks_identified() {
-        let report =
-            assess_concurrent_writer_parity(&ConcurrentWriterParityConfig::default());
+        let report = assess_concurrent_writer_parity(&ConcurrentWriterParityConfig::default());
         let critical_count = report.checks.iter().filter(|c| c.critical).count();
         assert!(
             critical_count >= 10,

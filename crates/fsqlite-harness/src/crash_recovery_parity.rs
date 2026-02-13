@@ -303,8 +303,10 @@ pub fn assess_crash_recovery_parity(
     let mut checks = Vec::new();
     let mut proof_artifacts = Vec::new();
 
-    let scenarios_tested: Vec<String> =
-        CrashScenario::ALL.iter().map(|s| s.as_str().to_owned()).collect();
+    let scenarios_tested: Vec<String> = CrashScenario::ALL
+        .iter()
+        .map(|s| s.as_str().to_owned())
+        .collect();
     let mut scenarios_at_parity = Vec::new();
 
     // --- Truncate ---
@@ -614,10 +616,7 @@ pub fn assess_crash_recovery_parity(
     let categories_ok = categories_covered.len() >= config.min_categories_covered;
     let catalog_ok = !config.require_catalog_validation || catalog_validated == 12;
 
-    let verdict = if scenarios_ok
-        && categories_ok
-        && catalog_ok
-        && checks_at_parity == total_checks
+    let verdict = if scenarios_ok && categories_ok && catalog_ok && checks_at_parity == total_checks
     {
         CrashRecoveryVerdict::Parity
     } else if checks_at_parity > 0 {
@@ -689,17 +688,32 @@ mod tests {
     #[test]
     fn scenario_category_mapping() {
         // Torn writes
-        assert_eq!(CrashScenario::Truncate.fault_category(), FaultCategory::TornWrite);
-        assert_eq!(CrashScenario::TornFrame.fault_category(), FaultCategory::TornWrite);
-        assert_eq!(CrashScenario::TornPageWrite.fault_category(), FaultCategory::TornWrite);
-        assert_eq!(CrashScenario::TornJournal.fault_category(), FaultCategory::TornWrite);
+        assert_eq!(
+            CrashScenario::Truncate.fault_category(),
+            FaultCategory::TornWrite
+        );
+        assert_eq!(
+            CrashScenario::TornFrame.fault_category(),
+            FaultCategory::TornWrite
+        );
+        assert_eq!(
+            CrashScenario::TornPageWrite.fault_category(),
+            FaultCategory::TornWrite
+        );
+        assert_eq!(
+            CrashScenario::TornJournal.fault_category(),
+            FaultCategory::TornWrite
+        );
         // Power loss
         assert_eq!(
             CrashScenario::PowerLossMidCommit.fault_category(),
             FaultCategory::PowerLoss,
         );
         // I/O error
-        assert_eq!(CrashScenario::IoErrorRead.fault_category(), FaultCategory::IoError);
+        assert_eq!(
+            CrashScenario::IoErrorRead.fault_category(),
+            FaultCategory::IoError
+        );
         // Sidecar corruption
         assert_eq!(
             CrashScenario::CorruptWalHeader.fault_category(),
@@ -709,9 +723,18 @@ mod tests {
 
     #[test]
     fn scenario_severity_mapping() {
-        assert_eq!(CrashScenario::IoErrorRead.expected_severity(), FaultSeverity::Benign);
-        assert_eq!(CrashScenario::IoErrorSync.expected_severity(), FaultSeverity::Degraded);
-        assert_eq!(CrashScenario::TornFrame.expected_severity(), FaultSeverity::Recoverable);
+        assert_eq!(
+            CrashScenario::IoErrorRead.expected_severity(),
+            FaultSeverity::Benign
+        );
+        assert_eq!(
+            CrashScenario::IoErrorSync.expected_severity(),
+            FaultSeverity::Degraded
+        );
+        assert_eq!(
+            CrashScenario::TornFrame.expected_severity(),
+            FaultSeverity::Recoverable
+        );
         assert_eq!(
             CrashScenario::CorruptWalHeader.expected_severity(),
             FaultSeverity::Catastrophic,
@@ -727,7 +750,10 @@ mod tests {
             .iter()
             .filter(|s| **s != CrashScenario::CorruptWalHeader)
         {
-            assert!(s.committed_data_preserved(), "scenario {s} should preserve data");
+            assert!(
+                s.committed_data_preserved(),
+                "scenario {s} should preserve data"
+            );
         }
     }
 
@@ -808,7 +834,11 @@ mod tests {
             report.proof_artifacts.len(),
         );
         for art in &report.proof_artifacts {
-            assert!(art.deterministic, "artifact for {} should be deterministic", art.scenario);
+            assert!(
+                art.deterministic,
+                "artifact for {} should be deterministic",
+                art.scenario
+            );
         }
     }
 
@@ -877,7 +907,10 @@ mod tests {
     #[test]
     fn recovery_outcome_display() {
         assert_eq!(RecoveryOutcome::FullRecovery.to_string(), "full_recovery");
-        assert_eq!(RecoveryOutcome::PartialRecovery.to_string(), "partial_recovery");
+        assert_eq!(
+            RecoveryOutcome::PartialRecovery.to_string(),
+            "partial_recovery"
+        );
         assert_eq!(RecoveryOutcome::GracefulRetry.to_string(), "graceful_retry");
         assert_eq!(RecoveryOutcome::Lost.to_string(), "lost");
     }

@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use fsqlite_harness::tcl_conformance::{
+    BEAD_ID, DEFAULT_TIMEOUT_SECS, TclExecutionMode, TclExecutionOptions,
     build_validated_tcl_harness_suite, execute_tcl_harness_suite, write_tcl_execution_summary_json,
-    write_tcl_suite_json, TclExecutionMode, TclExecutionOptions, BEAD_ID, DEFAULT_TIMEOUT_SECS,
+    write_tcl_suite_json,
 };
 
 #[derive(Debug)]

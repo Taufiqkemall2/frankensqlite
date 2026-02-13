@@ -111,7 +111,12 @@ struct WorkloadSummary {
     elapsed_seconds: f64,
 }
 
-fn run_ssi_workload(writers: usize, txns_per_writer: usize, seed: u64, label: &str) -> WorkloadSummary {
+fn run_ssi_workload(
+    writers: usize,
+    txns_per_writer: usize,
+    seed: u64,
+    label: &str,
+) -> WorkloadSummary {
     let db_dir = tempfile::tempdir().expect("create temp directory for workload");
     let db_path = db_dir.path().join("ssi_serialization.db");
     initialize_db(&db_path);
@@ -484,4 +489,3 @@ fn derive_worker_seed(seed: u64, worker_id: usize) -> u64 {
     let worker = u64::try_from(worker_id).expect("worker id should fit into u64");
     seed ^ worker.wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
-

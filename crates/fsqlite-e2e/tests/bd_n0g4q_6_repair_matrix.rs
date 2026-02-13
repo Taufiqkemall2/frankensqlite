@@ -6,8 +6,8 @@
 //! - presence/quality of structured repair evidence,
 //! - non-zero BLAKE3 witness + chain hashes in the evidence ledger.
 
-use fsqlite_e2e::corruption_scenarios::{scenario_catalog, CorruptionScenario};
-use fsqlite_e2e::recovery_runner::{run_recovery, RecoveryClassification};
+use fsqlite_e2e::corruption_scenarios::{CorruptionScenario, scenario_catalog};
+use fsqlite_e2e::recovery_runner::{RecoveryClassification, run_recovery};
 use fsqlite_wal::{raptorq_repair_evidence_snapshot, reset_raptorq_repair_telemetry};
 
 fn scenario_by_name(name: &str) -> CorruptionScenario {

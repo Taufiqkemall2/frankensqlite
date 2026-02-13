@@ -162,7 +162,11 @@ impl MaintenanceParityReport {
             self.total_checks,
             self.commands_at_parity.len(),
             self.commands_tested.len(),
-            if self.integrity_check_ok { "ok" } else { "FAIL" },
+            if self.integrity_check_ok {
+                "ok"
+            } else {
+                "FAIL"
+            },
         )
     }
 }
@@ -175,8 +179,10 @@ impl MaintenanceParityReport {
 pub fn assess_maintenance_parity(config: &MaintenanceParityConfig) -> MaintenanceParityReport {
     let mut checks = Vec::new();
 
-    let commands_tested: Vec<String> =
-        MaintenanceCommand::ALL.iter().map(|c| c.as_str().to_owned()).collect();
+    let commands_tested: Vec<String> = MaintenanceCommand::ALL
+        .iter()
+        .map(|c| c.as_str().to_owned())
+        .collect();
     let mut commands_at_parity = Vec::new();
 
     // VACUUM
@@ -302,13 +308,17 @@ pub fn assess_maintenance_parity(config: &MaintenanceParityConfig) -> Maintenanc
     }
 }
 
-pub fn write_maintenance_report(path: &Path, report: &MaintenanceParityReport) -> Result<(), String> {
+pub fn write_maintenance_report(
+    path: &Path,
+    report: &MaintenanceParityReport,
+) -> Result<(), String> {
     let json = report.to_json().map_err(|e| format!("serialize: {e}"))?;
     std::fs::write(path, json).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 pub fn load_maintenance_report(path: &Path) -> Result<MaintenanceParityReport, String> {
-    let json = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let json =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     MaintenanceParityReport::from_json(&json).map_err(|e| format!("parse: {e}"))
 }
 

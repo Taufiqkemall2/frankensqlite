@@ -11,15 +11,29 @@ const BEAD_ID: &str = "bd-1dp9.4.2";
 #[test]
 fn assessment_produces_parity_verdict() {
     let report = assess_lock_txn_parity(&LockTxnParityConfig::default());
-    assert_eq!(report.verdict, TxnParityVerdict::Parity, "bead_id={BEAD_ID} case=verdict");
-    assert_eq!(report.bead_id, LOCK_TXN_PARITY_BEAD_ID, "bead_id={BEAD_ID} case=bead_id");
-    assert_eq!(report.schema_version, LOCK_TXN_SCHEMA_VERSION, "bead_id={BEAD_ID} case=schema");
+    assert_eq!(
+        report.verdict,
+        TxnParityVerdict::Parity,
+        "bead_id={BEAD_ID} case=verdict"
+    );
+    assert_eq!(
+        report.bead_id, LOCK_TXN_PARITY_BEAD_ID,
+        "bead_id={BEAD_ID} case=bead_id"
+    );
+    assert_eq!(
+        report.schema_version, LOCK_TXN_SCHEMA_VERSION,
+        "bead_id={BEAD_ID} case=schema"
+    );
 }
 
 #[test]
 fn all_transaction_modes_tested() {
     let report = assess_lock_txn_parity(&LockTxnParityConfig::default());
-    assert_eq!(report.txn_modes_tested.len(), 4, "bead_id={BEAD_ID} case=modes_count");
+    assert_eq!(
+        report.txn_modes_tested.len(),
+        4,
+        "bead_id={BEAD_ID} case=modes_count"
+    );
     for mode in TransactionMode::ALL {
         assert!(
             report.txn_modes_tested.contains(&mode.as_str().to_owned()),
@@ -31,7 +45,11 @@ fn all_transaction_modes_tested() {
 #[test]
 fn all_feature_areas_at_parity() {
     let report = assess_lock_txn_parity(&LockTxnParityConfig::default());
-    assert_eq!(report.areas_tested.len(), 5, "bead_id={BEAD_ID} case=areas_count");
+    assert_eq!(
+        report.areas_tested.len(),
+        5,
+        "bead_id={BEAD_ID} case=areas_count"
+    );
     for area in TxnFeatureArea::ALL {
         assert!(
             report.areas_at_parity.contains(&area.as_str().to_owned()),
@@ -43,23 +61,41 @@ fn all_feature_areas_at_parity() {
 #[test]
 fn concurrent_and_savepoint_verified() {
     let report = assess_lock_txn_parity(&LockTxnParityConfig::default());
-    assert!(report.concurrent_default_verified, "bead_id={BEAD_ID} case=concurrent");
-    assert!(report.savepoint_nesting_verified, "bead_id={BEAD_ID} case=savepoints");
+    assert!(
+        report.concurrent_default_verified,
+        "bead_id={BEAD_ID} case=concurrent"
+    );
+    assert!(
+        report.savepoint_nesting_verified,
+        "bead_id={BEAD_ID} case=savepoints"
+    );
 }
 
 #[test]
 fn parity_score_is_full() {
     let report = assess_lock_txn_parity(&LockTxnParityConfig::default());
     assert_eq!(report.parity_score, 1.0, "bead_id={BEAD_ID} case=score");
-    assert_eq!(report.checks_at_parity, report.total_checks, "bead_id={BEAD_ID} case=all_pass");
+    assert_eq!(
+        report.checks_at_parity, report.total_checks,
+        "bead_id={BEAD_ID} case=all_pass"
+    );
 }
 
 #[test]
 fn checks_cover_all_areas() {
     let report = assess_lock_txn_parity(&LockTxnParityConfig::default());
     let areas: Vec<&str> = report.checks.iter().map(|c| c.area.as_str()).collect();
-    for expected in ["busy_timeout", "savepoint", "autocommit", "lock_transition", "concurrent_mode"] {
-        assert!(areas.contains(&expected), "bead_id={BEAD_ID} case=check_area area={expected}");
+    for expected in [
+        "busy_timeout",
+        "savepoint",
+        "autocommit",
+        "lock_transition",
+        "concurrent_mode",
+    ] {
+        assert!(
+            areas.contains(&expected),
+            "bead_id={BEAD_ID} case=check_area area={expected}"
+        );
     }
 }
 
@@ -67,16 +103,32 @@ fn checks_cover_all_areas() {
 fn triage_line_has_fields() {
     let report = assess_lock_txn_parity(&LockTxnParityConfig::default());
     let line = report.triage_line();
-    for field in ["verdict=", "modes=", "areas=", "concurrent=", "savepoints=", "gaps="] {
-        assert!(line.contains(field), "bead_id={BEAD_ID} case=triage field={field}");
+    for field in [
+        "verdict=",
+        "modes=",
+        "areas=",
+        "concurrent=",
+        "savepoints=",
+        "gaps=",
+    ] {
+        assert!(
+            line.contains(field),
+            "bead_id={BEAD_ID} case=triage field={field}"
+        );
     }
 }
 
 #[test]
 fn summary_is_informative() {
     let report = assess_lock_txn_parity(&LockTxnParityConfig::default());
-    assert!(!report.summary.is_empty(), "bead_id={BEAD_ID} case=summary_nonempty");
-    assert!(report.summary.contains("PARITY"), "bead_id={BEAD_ID} case=summary_verdict");
+    assert!(
+        !report.summary.is_empty(),
+        "bead_id={BEAD_ID} case=summary_nonempty"
+    );
+    assert!(
+        report.summary.contains("PARITY"),
+        "bead_id={BEAD_ID} case=summary_verdict"
+    );
 }
 
 #[test]
@@ -107,5 +159,9 @@ fn assessment_is_deterministic() {
     let cfg = LockTxnParityConfig::default();
     let r1 = assess_lock_txn_parity(&cfg);
     let r2 = assess_lock_txn_parity(&cfg);
-    assert_eq!(r1.to_json().unwrap(), r2.to_json().unwrap(), "bead_id={BEAD_ID} case=det");
+    assert_eq!(
+        r1.to_json().unwrap(),
+        r2.to_json().unwrap(),
+        "bead_id={BEAD_ID} case=det"
+    );
 }

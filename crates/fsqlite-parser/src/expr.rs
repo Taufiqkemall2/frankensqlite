@@ -22,7 +22,7 @@ use fsqlite_ast::{
     RaiseAction, SelectStatement, Span, TypeName, UnaryOp, WindowSpec,
 };
 
-use crate::parser::{is_nonreserved_kw, kw_to_str, ParseError, Parser};
+use crate::parser::{ParseError, Parser, is_nonreserved_kw, kw_to_str};
 use crate::token::{Token, TokenKind};
 
 // Binding powers: higher = tighter binding.

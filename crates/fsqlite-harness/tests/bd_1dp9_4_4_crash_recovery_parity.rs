@@ -12,8 +12,15 @@ const BEAD_ID: &str = "bd-1dp9.4.4";
 #[test]
 fn assessment_produces_parity_verdict() {
     let report = assess_crash_recovery_parity(&CrashRecoveryParityConfig::default());
-    assert_eq!(report.verdict, CrashRecoveryVerdict::Parity, "bead_id={BEAD_ID} case=verdict");
-    assert_eq!(report.bead_id, CRASH_RECOVERY_PARITY_BEAD_ID, "bead_id={BEAD_ID} case=bead_id");
+    assert_eq!(
+        report.verdict,
+        CrashRecoveryVerdict::Parity,
+        "bead_id={BEAD_ID} case=verdict"
+    );
+    assert_eq!(
+        report.bead_id, CRASH_RECOVERY_PARITY_BEAD_ID,
+        "bead_id={BEAD_ID} case=bead_id"
+    );
     assert_eq!(
         report.schema_version, CRASH_RECOVERY_SCHEMA_VERSION,
         "bead_id={BEAD_ID} case=schema",
@@ -23,7 +30,11 @@ fn assessment_produces_parity_verdict() {
 #[test]
 fn all_twelve_scenarios_tested() {
     let report = assess_crash_recovery_parity(&CrashRecoveryParityConfig::default());
-    assert_eq!(report.scenarios_tested.len(), 12, "bead_id={BEAD_ID} case=scenario_count");
+    assert_eq!(
+        report.scenarios_tested.len(),
+        12,
+        "bead_id={BEAD_ID} case=scenario_count"
+    );
     for s in CrashScenario::ALL {
         assert!(
             report.scenarios_tested.contains(&s.as_str().to_owned()),
@@ -45,13 +56,21 @@ fn all_scenarios_at_parity() {
 #[test]
 fn four_fault_categories_covered() {
     let report = assess_crash_recovery_parity(&CrashRecoveryParityConfig::default());
-    assert_eq!(report.categories_covered.len(), 4, "bead_id={BEAD_ID} case=categories");
+    assert_eq!(
+        report.categories_covered.len(),
+        4,
+        "bead_id={BEAD_ID} case=categories"
+    );
 }
 
 #[test]
 fn four_severity_levels_covered() {
     let report = assess_crash_recovery_parity(&CrashRecoveryParityConfig::default());
-    assert_eq!(report.severities_covered.len(), 4, "bead_id={BEAD_ID} case=severities");
+    assert_eq!(
+        report.severities_covered.len(),
+        4,
+        "bead_id={BEAD_ID} case=severities"
+    );
 }
 
 #[test]
@@ -94,8 +113,15 @@ fn proof_artifacts_generated() {
         report.proof_artifacts.len(),
     );
     for art in &report.proof_artifacts {
-        assert!(art.deterministic, "bead_id={BEAD_ID} case=deterministic scenario={}", art.scenario);
-        assert!(!art.description.is_empty(), "bead_id={BEAD_ID} case=art_desc");
+        assert!(
+            art.deterministic,
+            "bead_id={BEAD_ID} case=deterministic scenario={}",
+            art.scenario
+        );
+        assert!(
+            !art.description.is_empty(),
+            "bead_id={BEAD_ID} case=art_desc"
+        );
     }
 }
 
@@ -103,8 +129,17 @@ fn proof_artifacts_generated() {
 fn triage_line_has_fields() {
     let report = assess_crash_recovery_parity(&CrashRecoveryParityConfig::default());
     let line = report.triage_line();
-    for field in ["verdict=", "parity=", "scenarios=", "categories=", "profiles_validated="] {
-        assert!(line.contains(field), "bead_id={BEAD_ID} case=triage field={field}");
+    for field in [
+        "verdict=",
+        "parity=",
+        "scenarios=",
+        "categories=",
+        "profiles_validated=",
+    ] {
+        assert!(
+            line.contains(field),
+            "bead_id={BEAD_ID} case=triage field={field}"
+        );
     }
 }
 
@@ -112,7 +147,10 @@ fn triage_line_has_fields() {
 fn summary_is_informative() {
     let report = assess_crash_recovery_parity(&CrashRecoveryParityConfig::default());
     assert!(!report.summary.is_empty(), "bead_id={BEAD_ID} case=summary");
-    assert!(report.summary.contains("PARITY"), "bead_id={BEAD_ID} case=summary_verdict");
+    assert!(
+        report.summary.contains("PARITY"),
+        "bead_id={BEAD_ID} case=summary_verdict"
+    );
 }
 
 #[test]
@@ -143,7 +181,11 @@ fn assessment_is_deterministic() {
     let cfg = CrashRecoveryParityConfig::default();
     let r1 = assess_crash_recovery_parity(&cfg);
     let r2 = assess_crash_recovery_parity(&cfg);
-    assert_eq!(r1.to_json().unwrap(), r2.to_json().unwrap(), "bead_id={BEAD_ID} case=det");
+    assert_eq!(
+        r1.to_json().unwrap(),
+        r2.to_json().unwrap(),
+        "bead_id={BEAD_ID} case=det"
+    );
 }
 
 #[test]
@@ -153,7 +195,10 @@ fn scenario_category_and_severity_consistent() {
         let _cat = s.fault_category();
         let _sev = s.expected_severity();
         // Just verify these don't panic and return valid values
-        assert!(!s.as_str().is_empty(), "bead_id={BEAD_ID} case=scenario_str scenario={s}");
+        assert!(
+            !s.as_str().is_empty(),
+            "bead_id={BEAD_ID} case=scenario_str scenario={s}"
+        );
     }
 }
 

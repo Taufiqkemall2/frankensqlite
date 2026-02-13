@@ -80,7 +80,7 @@ fsqlite-e2e = { path = "crates/fsqlite-e2e" }
 fsqlite-observability = { path = "crates/fsqlite-observability" }
 
 # External dependencies
-ftui = { path = "/dp/frankentui/crates/ftui" }
+ftui = { path = "../frankentui/crates/ftui" }
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
@@ -102,7 +102,7 @@ chacha20poly1305 = "0.10"
 argon2 = "0.5"
 rand = "0.8"
 rusqlite = { version = "0.32", features = ["bundled", "backup"] }
-asupersync = { path = "/dp/asupersync" }
+asupersync = { path = "../asupersync" }
 
 # Dev dependencies
 criterion = { version = "0.5", features = ["html_reports"] }

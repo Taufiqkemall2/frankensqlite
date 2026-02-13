@@ -9,7 +9,10 @@
 //! - [`CommitResponse`]: Result type for the commit sequencer.
 
 use std::collections::HashMap;
-use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Duration;
 
 use fsqlite_types::{
@@ -22,7 +25,7 @@ use crate::cache_aligned::{logical_now_epoch_secs, logical_now_millis};
 use crate::core_types::{
     CommitIndex, InProcessPageLockTable, Transaction, TransactionMode, TransactionState,
 };
-use crate::ebr::{VersionGuard, VersionGuardRegistry};
+use crate::ebr::{VersionGuardRegistry, VersionGuardTicket};
 use crate::invariants::{SerializedWriteMutex, TxnManager, VersionStore};
 use crate::observability::{
     mvcc_snapshot_established, mvcc_snapshot_released, record_snapshot_read_versions_traversed,
@@ -439,7 +442,7 @@ impl TransactionManager {
         let mut txn = Transaction::new(txn_id, TxnEpoch::new(0), snapshot, mode);
         // Pin an EBR guard so that any version retired during this txn's
         // lifetime is deferred until all concurrent readers have unpinned.
-        txn.version_guard = Some(VersionGuard::pin(Arc::clone(
+        txn.version_guard = Some(VersionGuardTicket::register(Arc::clone(
             &self.version_guard_registry,
         )));
         txn.snapshot_established = snapshot_established;
@@ -1108,10 +1111,7 @@ impl TransactionManager {
 
         // Unpin the EBR guard — allows epoch advancement so deferred
         // retirements from superseded versions can be reclaimed.
-        if let Some(guard) = txn.version_guard.take() {
-            guard.flush();
-            drop(guard);
-        }
+        drop(txn.version_guard.take());
     }
 
     fn resolve_visible_commit_seq(&self, txn: &Transaction, pgno: PageNumber) -> Option<CommitSeq> {
@@ -5069,7 +5069,7 @@ mod tests {
     #[test]
     fn test_version_guard_defer_retire_returns_false_without_guard() {
         let txn = Transaction::new(
-            TxnId::new(1),
+            TxnId::new(1).expect("TxnId::new(1) should be valid"),
             TxnEpoch::new(0),
             Snapshot::new(CommitSeq::ZERO, SchemaEpoch::ZERO),
             TransactionMode::Concurrent,
@@ -5084,8 +5084,8 @@ mod tests {
 
     #[test]
     fn test_version_guard_deferred_value_freed_after_unpin() {
-        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
         use crossbeam_epoch as epoch;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
         #[derive(Clone)]
         struct DropTracker(Arc<AtomicUsize>);

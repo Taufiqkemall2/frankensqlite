@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 
 use fsqlite_harness::tcl_conformance::{
+    BEAD_ID, TclConformanceCategory, TclExecutionMode, TclExecutionOptions,
+    TclFailureClassification, TclHarnessOutcome, TclHarnessScenarioResult,
     build_tcl_conformance_matrix, build_validated_tcl_harness_suite, classify_failed_test_name,
     execute_tcl_harness_suite, parse_failed_test_names, parse_testrunner_counts,
-    TclConformanceCategory, TclExecutionMode, TclExecutionOptions, TclFailureClassification,
-    TclHarnessOutcome, TclHarnessScenarioResult, BEAD_ID,
 };
 
 #[test]

@@ -13,7 +13,13 @@ use fsqlite_harness::realdb_e2e_logging::{
 const BEAD_ID: &str = "bd-mblr.5.2.1";
 
 fn make_context(run_id: &str) -> RunContext {
-    RunContext::new(run_id, "bd-mblr.5.2.1", Some("REALDB-E2E"), Some(42), Some("fsqlite"))
+    RunContext::new(
+        run_id,
+        "bd-mblr.5.2.1",
+        Some("REALDB-E2E"),
+        Some(42),
+        Some("fsqlite"),
+    )
 }
 
 fn default_config() -> E2eLoggingConfig {
@@ -89,8 +95,7 @@ fn all_commands_propagate_run_id() {
 #[test]
 fn db_path_propagated_in_startup_event() {
     let ctx = make_context("integ-dbpath");
-    let meta = RealdbCommandMeta::for_command(RealdbCommand::Run)
-        .with_db_path("/data/test.db");
+    let meta = RealdbCommandMeta::for_command(RealdbCommand::Run).with_db_path("/data/test.db");
     let result = init_realdb_logging(ctx, &default_config(), &meta);
 
     assert_eq!(
@@ -107,8 +112,7 @@ fn db_path_propagated_in_startup_event() {
 #[test]
 fn page_size_propagated_in_startup_event() {
     let ctx = make_context("integ-pgsz");
-    let meta = RealdbCommandMeta::for_command(RealdbCommand::Bench)
-        .with_page_size(8192);
+    let meta = RealdbCommandMeta::for_command(RealdbCommand::Bench).with_page_size(8192);
     let result = init_realdb_logging(ctx, &default_config(), &meta);
 
     assert_eq!(
@@ -336,10 +340,7 @@ fn default_meta_always_has_concurrent_mode() {
         meta.concurrent_mode,
         "bead_id={BEAD_ID} case=default_concurrent",
     );
-    assert!(
-        meta.wal_mode,
-        "bead_id={BEAD_ID} case=default_wal",
-    );
+    assert!(meta.wal_mode, "bead_id={BEAD_ID} case=default_wal",);
 }
 
 // ---------------------------------------------------------------------------
@@ -357,18 +358,15 @@ fn init_is_deterministic_across_same_context() {
     let r2 = init_realdb_logging(ctx2, &cfg, &meta);
 
     assert_eq!(
-        r1.command_startup_event.run_id,
-        r2.command_startup_event.run_id,
+        r1.command_startup_event.run_id, r2.command_startup_event.run_id,
         "bead_id={BEAD_ID} case=det_run_id",
     );
     assert_eq!(
-        r1.command_startup_event.phase,
-        r2.command_startup_event.phase,
+        r1.command_startup_event.phase, r2.command_startup_event.phase,
         "bead_id={BEAD_ID} case=det_phase",
     );
     assert_eq!(
-        r1.command_startup_event.event_type,
-        r2.command_startup_event.event_type,
+        r1.command_startup_event.event_type, r2.command_startup_event.event_type,
         "bead_id={BEAD_ID} case=det_event_type",
     );
 }

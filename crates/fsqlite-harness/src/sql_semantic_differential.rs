@@ -197,13 +197,13 @@ impl SqlSemanticDiffReport {
 // ---------------------------------------------------------------------------
 
 #[must_use]
-pub fn assess_sql_semantic_differential(
-    config: &SqlSemanticDiffConfig,
-) -> SqlSemanticDiffReport {
+pub fn assess_sql_semantic_differential(config: &SqlSemanticDiffConfig) -> SqlSemanticDiffReport {
     let mut checks = Vec::new();
 
-    let layers_tested: Vec<String> =
-        SemanticTestLayer::ALL.iter().map(|l| l.as_str().to_owned()).collect();
+    let layers_tested: Vec<String> = SemanticTestLayer::ALL
+        .iter()
+        .map(|l| l.as_str().to_owned())
+        .collect();
     let mut layers_at_parity = Vec::new();
 
     // --- OracleDifferential ---

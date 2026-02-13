@@ -11,8 +11,15 @@ const BEAD_ID: &str = "bd-1dp9.3.4";
 #[test]
 fn assessment_produces_parity_verdict() {
     let report = assess_sql_semantic_differential(&SqlSemanticDiffConfig::default());
-    assert_eq!(report.verdict, SqlSemanticVerdict::Parity, "bead_id={BEAD_ID} case=verdict");
-    assert_eq!(report.bead_id, SQL_SEMANTIC_DIFF_BEAD_ID, "bead_id={BEAD_ID} case=bead_id");
+    assert_eq!(
+        report.verdict,
+        SqlSemanticVerdict::Parity,
+        "bead_id={BEAD_ID} case=verdict"
+    );
+    assert_eq!(
+        report.bead_id, SQL_SEMANTIC_DIFF_BEAD_ID,
+        "bead_id={BEAD_ID} case=bead_id"
+    );
     assert_eq!(
         report.schema_version, SQL_SEMANTIC_DIFF_SCHEMA_VERSION,
         "bead_id={BEAD_ID} case=schema",
@@ -22,7 +29,11 @@ fn assessment_produces_parity_verdict() {
 #[test]
 fn all_eight_layers_tested() {
     let report = assess_sql_semantic_differential(&SqlSemanticDiffConfig::default());
-    assert_eq!(report.layers_tested.len(), 8, "bead_id={BEAD_ID} case=layer_count");
+    assert_eq!(
+        report.layers_tested.len(),
+        8,
+        "bead_id={BEAD_ID} case=layer_count"
+    );
     for l in SemanticTestLayer::ALL {
         assert!(
             report.layers_tested.contains(&l.as_str().to_owned()),
@@ -34,7 +45,11 @@ fn all_eight_layers_tested() {
 #[test]
 fn all_layers_at_parity() {
     let report = assess_sql_semantic_differential(&SqlSemanticDiffConfig::default());
-    assert_eq!(report.layers_at_parity.len(), 8, "bead_id={BEAD_ID} case=layers_at_parity");
+    assert_eq!(
+        report.layers_at_parity.len(),
+        8,
+        "bead_id={BEAD_ID} case=layers_at_parity"
+    );
 }
 
 #[test]
@@ -68,7 +83,10 @@ fn triage_line_has_fields() {
     let report = assess_sql_semantic_differential(&SqlSemanticDiffConfig::default());
     let line = report.triage_line();
     for field in ["verdict=", "parity=", "layers=", "pipeline_stages="] {
-        assert!(line.contains(field), "bead_id={BEAD_ID} case=triage field={field}");
+        assert!(
+            line.contains(field),
+            "bead_id={BEAD_ID} case=triage field={field}"
+        );
     }
 }
 
@@ -76,7 +94,10 @@ fn triage_line_has_fields() {
 fn summary_is_informative() {
     let report = assess_sql_semantic_differential(&SqlSemanticDiffConfig::default());
     assert!(!report.summary.is_empty(), "bead_id={BEAD_ID} case=summary");
-    assert!(report.summary.contains("PARITY"), "bead_id={BEAD_ID} case=summary_verdict");
+    assert!(
+        report.summary.contains("PARITY"),
+        "bead_id={BEAD_ID} case=summary_verdict"
+    );
 }
 
 #[test]
@@ -106,5 +127,9 @@ fn assessment_is_deterministic() {
     let cfg = SqlSemanticDiffConfig::default();
     let r1 = assess_sql_semantic_differential(&cfg);
     let r2 = assess_sql_semantic_differential(&cfg);
-    assert_eq!(r1.to_json().unwrap(), r2.to_json().unwrap(), "bead_id={BEAD_ID} case=det");
+    assert_eq!(
+        r1.to_json().unwrap(),
+        r2.to_json().unwrap(),
+        "bead_id={BEAD_ID} case=det"
+    );
 }

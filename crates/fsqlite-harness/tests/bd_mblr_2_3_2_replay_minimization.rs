@@ -10,8 +10,8 @@ use fsqlite_harness::differential_v2::{
 };
 use fsqlite_harness::mismatch_minimizer::{MinimizerConfig, Subsystem};
 use fsqlite_harness::replay_harness::{
-    build_replay_minimization_package, DriftDetectorConfig, ReplayConfig, ReplayEntryResult,
-    ReplayMinimizationPackage, ReplayMinimizationRequest, ReplaySession,
+    DriftDetectorConfig, ReplayConfig, ReplayEntryResult, ReplayMinimizationPackage,
+    ReplayMinimizationRequest, ReplaySession, build_replay_minimization_package,
 };
 
 const BEAD_ID: &str = "bd-mblr.2.3.2";

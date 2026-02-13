@@ -45,7 +45,11 @@ fn full_pipeline_has_all_evidence_chain_entries() {
     let cert = generate_release_certificate(&config);
 
     // Should reference all 4 source beads: 8.1, 8.2, 8.3, 8.5
-    let sources: Vec<&str> = cert.evidence_chain.iter().map(|e| e.source_bead.as_str()).collect();
+    let sources: Vec<&str> = cert
+        .evidence_chain
+        .iter()
+        .map(|e| e.source_bead.as_str())
+        .collect();
     assert!(
         sources.contains(&"bd-1dp9.8.1"),
         "bead_id={BEAD_ID} case=chain_8_1"
@@ -238,10 +242,7 @@ fn triage_line_has_key_fields() {
     let cert = generate_release_certificate(&config);
     let line = cert.triage_line();
 
-    assert!(
-        line.contains("gate="),
-        "bead_id={BEAD_ID} case=triage_gate"
-    );
+    assert!(line.contains("gate="), "bead_id={BEAD_ID} case=triage_gate");
     assert!(
         line.contains("verified="),
         "bead_id={BEAD_ID} case=triage_verified"
@@ -289,10 +290,7 @@ fn full_pipeline_is_deterministic() {
     let c1 = generate_release_certificate(&config);
     let c2 = generate_release_certificate(&config);
 
-    assert_eq!(
-        c1.verdict, c2.verdict,
-        "bead_id={BEAD_ID} case=det_verdict"
-    );
+    assert_eq!(c1.verdict, c2.verdict, "bead_id={BEAD_ID} case=det_verdict");
     assert_eq!(
         c1.total_invariants, c2.total_invariants,
         "bead_id={BEAD_ID} case=det_invariants"

@@ -293,8 +293,10 @@ pub fn assess_wal_journal_parity(config: &WalJournalParityConfig) -> WalJournalP
 
     // -- Journal mode response parity --
     // All 6 modes echo correctly per oracle differential evidence.
-    let journal_modes_tested: Vec<String> =
-        JournalMode::ALL.iter().map(|m| m.as_str().to_owned()).collect();
+    let journal_modes_tested: Vec<String> = JournalMode::ALL
+        .iter()
+        .map(|m| m.as_str().to_owned())
+        .collect();
     let mut journal_at_parity = Vec::new();
 
     for mode in JournalMode::ALL {
@@ -314,8 +316,10 @@ pub fn assess_wal_journal_parity(config: &WalJournalParityConfig) -> WalJournalP
     }
 
     // -- Checkpoint mode parity --
-    let checkpoint_modes_tested: Vec<String> =
-        CheckpointMode::ALL.iter().map(|m| m.as_str().to_owned()).collect();
+    let checkpoint_modes_tested: Vec<String> = CheckpointMode::ALL
+        .iter()
+        .map(|m| m.as_str().to_owned())
+        .collect();
     let mut checkpoint_at_parity = Vec::new();
 
     for mode in CheckpointMode::ALL {
@@ -387,7 +391,11 @@ pub fn assess_wal_journal_parity(config: &WalJournalParityConfig) -> WalJournalP
     let sentinel_ok = !config.require_non_wal_sentinel || non_wal_sentinel;
     let transition_ok = !config.require_mode_transitions || mode_transition;
 
-    let verdict = if journal_ok && checkpoint_ok && sentinel_ok && transition_ok && checks_at_parity == total_checks
+    let verdict = if journal_ok
+        && checkpoint_ok
+        && sentinel_ok
+        && transition_ok
+        && checks_at_parity == total_checks
     {
         ParityVerdict::Parity
     } else if checks_at_parity > 0 {
@@ -407,8 +415,16 @@ pub fn assess_wal_journal_parity(config: &WalJournalParityConfig) -> WalJournalP
         journal_modes_tested.len(),
         checkpoint_at_parity.len(),
         checkpoint_modes_tested.len(),
-        if non_wal_sentinel { "PARITY" } else { "DIVERGENT" },
-        if mode_transition { "PARITY" } else { "DIVERGENT" },
+        if non_wal_sentinel {
+            "PARITY"
+        } else {
+            "DIVERGENT"
+        },
+        if mode_transition {
+            "PARITY"
+        } else {
+            "DIVERGENT"
+        },
         known_gaps.len(),
     );
 
@@ -433,7 +449,10 @@ pub fn assess_wal_journal_parity(config: &WalJournalParityConfig) -> WalJournalP
 }
 
 /// Write report to disk as JSON.
-pub fn write_wal_journal_report(path: &Path, report: &WalJournalParityReport) -> Result<(), String> {
+pub fn write_wal_journal_report(
+    path: &Path,
+    report: &WalJournalParityReport,
+) -> Result<(), String> {
     let json = report.to_json().map_err(|e| format!("serialize: {e}"))?;
     std::fs::write(path, json).map_err(|e| format!("write {}: {e}", path.display()))
 }
@@ -618,10 +637,7 @@ mod tests {
         assert_eq!(r1.verdict, r2.verdict);
         assert_eq!(r1.parity_score, r2.parity_score);
         assert_eq!(r1.total_checks, r2.total_checks);
-        assert_eq!(
-            r1.to_json().unwrap(),
-            r2.to_json().unwrap(),
-        );
+        assert_eq!(r1.to_json().unwrap(), r2.to_json().unwrap(),);
     }
 
     #[test]
@@ -660,7 +676,13 @@ mod tests {
         let cfg = WalJournalParityConfig::default();
         let json = serde_json::to_string(&cfg).expect("serialize");
         let restored: WalJournalParityConfig = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(restored.min_journal_modes_tested, cfg.min_journal_modes_tested);
-        assert_eq!(restored.min_checkpoint_modes_tested, cfg.min_checkpoint_modes_tested);
+        assert_eq!(
+            restored.min_journal_modes_tested,
+            cfg.min_journal_modes_tested
+        );
+        assert_eq!(
+            restored.min_checkpoint_modes_tested,
+            cfg.min_checkpoint_modes_tested
+        );
     }
 }

@@ -194,9 +194,7 @@ impl SqlPipelineOptReport {
 // ---------------------------------------------------------------------------
 
 #[must_use]
-pub fn assess_sql_pipeline_optimization(
-    config: &SqlPipelineOptConfig,
-) -> SqlPipelineOptReport {
+pub fn assess_sql_pipeline_optimization(config: &SqlPipelineOptConfig) -> SqlPipelineOptReport {
     let mut checks = Vec::new();
 
     let domains_profiled: Vec<String> = OptimizationDomain::ALL
@@ -411,8 +409,14 @@ mod tests {
     #[test]
     fn domain_target_crates() {
         assert_eq!(OptimizationDomain::Parser.target_crate(), "fsqlite-parser");
-        assert_eq!(OptimizationDomain::Planner.target_crate(), "fsqlite-planner");
-        assert_eq!(OptimizationDomain::VdbeExecution.target_crate(), "fsqlite-vdbe");
+        assert_eq!(
+            OptimizationDomain::Planner.target_crate(),
+            "fsqlite-planner"
+        );
+        assert_eq!(
+            OptimizationDomain::VdbeExecution.target_crate(),
+            "fsqlite-vdbe"
+        );
     }
 
     #[test]

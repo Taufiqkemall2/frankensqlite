@@ -9,8 +9,8 @@ pub mod parser;
 pub mod token;
 
 pub use lexer::{
-    reset_tokenize_metrics, tokenize_metrics_snapshot, Lexer, TokenizeDurationSecondsHistogram,
-    TokenizeMetricsSnapshot,
+    Lexer, TokenizeDurationSecondsHistogram, TokenizeMetricsSnapshot, reset_tokenize_metrics,
+    tokenize_metrics_snapshot,
 };
 pub use parser::{ParseError, Parser};
 pub use token::{Token, TokenKind};

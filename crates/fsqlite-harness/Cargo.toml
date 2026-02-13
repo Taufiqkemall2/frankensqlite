@@ -8,7 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-asupersync = { path = "/dp/asupersync" }
+asupersync.workspace = true
 fsqlite = { workspace = true }
 fsqlite-error = { workspace = true }
 fsqlite-types = { workspace = true }

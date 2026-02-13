@@ -978,7 +978,7 @@ fn wait_for_child(
             Err(error) => {
                 return Err(format!(
                     "scenario_try_wait_failed id={scenario_id} error={error}"
-                ))
+                ));
             }
         }
     }

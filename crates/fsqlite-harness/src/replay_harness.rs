@@ -37,7 +37,7 @@ use sha2::{Digest, Sha256};
 
 use crate::differential_v2::{DifferentialResult, Outcome};
 use crate::mismatch_minimizer::{
-    minimize_workload, MinimalReproduction, MinimizerConfig, ReproducibilityTest, Subsystem,
+    MinimalReproduction, MinimizerConfig, ReproducibilityTest, Subsystem, minimize_workload,
 };
 
 /// Bead identifier for log correlation.
@@ -1303,8 +1303,8 @@ mod tests {
         }
     }
 
-    fn make_reproducibility_test(
-    ) -> impl Fn(&[String], &[String]) -> Option<Vec<StatementDivergence>> {
+    fn make_reproducibility_test()
+    -> impl Fn(&[String], &[String]) -> Option<Vec<StatementDivergence>> {
         |_, workload| {
             let failing_index = workload
                 .iter()
@@ -1677,10 +1677,12 @@ mod tests {
         failing.total_divergent += 1;
         let fail_eval = manifest.evaluate_summary(&failing);
         assert_eq!(fail_eval.verdict, ReplayVerdict::Fail);
-        assert!(fail_eval
-            .reasons
-            .iter()
-            .any(|reason| reason.contains("divergent entries")));
+        assert!(
+            fail_eval
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("divergent entries"))
+        );
     }
 
     // --- Regime Display ---

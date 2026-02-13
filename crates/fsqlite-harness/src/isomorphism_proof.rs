@@ -510,8 +510,10 @@ mod tests {
 
     #[test]
     fn invariant_as_str_unique() {
-        let mut names: Vec<&str> =
-            ProofInvariantClass::ALL.iter().map(|i| i.as_str()).collect();
+        let mut names: Vec<&str> = ProofInvariantClass::ALL
+            .iter()
+            .map(|i| i.as_str())
+            .collect();
         let len = names.len();
         names.sort();
         names.dedup();
@@ -592,7 +594,11 @@ mod tests {
             report.proof_records.len(),
         );
         for rec in &report.proof_records {
-            assert!(rec.preserved, "proof record {} should be preserved", rec.change_id);
+            assert!(
+                rec.preserved,
+                "proof record {} should be preserved",
+                rec.change_id
+            );
         }
     }
 
@@ -653,8 +659,7 @@ mod tests {
     fn invariant_json_roundtrip() {
         for i in ProofInvariantClass::ALL {
             let json = serde_json::to_string(&i).expect("serialize");
-            let restored: ProofInvariantClass =
-                serde_json::from_str(&json).expect("deserialize");
+            let restored: ProofInvariantClass = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(restored, i);
         }
     }

@@ -31,7 +31,12 @@ pub enum TransactionMode {
 }
 
 impl TransactionMode {
-    pub const ALL: [Self; 4] = [Self::Deferred, Self::Immediate, Self::Exclusive, Self::Concurrent];
+    pub const ALL: [Self; 4] = [
+        Self::Deferred,
+        Self::Immediate,
+        Self::Exclusive,
+        Self::Concurrent,
+    ];
 
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -232,8 +237,16 @@ impl LockTxnParityReport {
             self.txn_modes_tested.len(),
             self.areas_at_parity.len(),
             self.areas_tested.len(),
-            if self.concurrent_default_verified { "ok" } else { "FAIL" },
-            if self.savepoint_nesting_verified { "ok" } else { "FAIL" },
+            if self.concurrent_default_verified {
+                "ok"
+            } else {
+                "FAIL"
+            },
+            if self.savepoint_nesting_verified {
+                "ok"
+            } else {
+                "FAIL"
+            },
             self.known_gaps.len(),
         )
     }
@@ -249,8 +262,10 @@ pub fn assess_lock_txn_parity(config: &LockTxnParityConfig) -> LockTxnParityRepo
     let mut checks = Vec::new();
 
     // -- Transaction modes --
-    let txn_modes_tested: Vec<String> =
-        TransactionMode::ALL.iter().map(|m| m.as_str().to_owned()).collect();
+    let txn_modes_tested: Vec<String> = TransactionMode::ALL
+        .iter()
+        .map(|m| m.as_str().to_owned())
+        .collect();
     let mut txn_at_parity = Vec::new();
 
     for mode in TransactionMode::ALL {
@@ -406,8 +421,10 @@ pub fn assess_lock_txn_parity(config: &LockTxnParityConfig) -> LockTxnParityRepo
     });
 
     // -- Collect areas --
-    let areas_tested: Vec<String> =
-        TxnFeatureArea::ALL.iter().map(|a| a.as_str().to_owned()).collect();
+    let areas_tested: Vec<String> = TxnFeatureArea::ALL
+        .iter()
+        .map(|a| a.as_str().to_owned())
+        .collect();
     let areas_at_parity = areas_tested.clone(); // All areas at parity
 
     // -- Known gaps --
@@ -423,7 +440,12 @@ pub fn assess_lock_txn_parity(config: &LockTxnParityConfig) -> LockTxnParityRepo
     let savepoint_ok = !config.require_savepoint_nesting || true;
     let concurrent_ok = !config.require_concurrent_default || true;
 
-    let verdict = if modes_ok && areas_ok && savepoint_ok && concurrent_ok && checks_at_parity == total_checks {
+    let verdict = if modes_ok
+        && areas_ok
+        && savepoint_ok
+        && concurrent_ok
+        && checks_at_parity == total_checks
+    {
         TxnParityVerdict::Parity
     } else if checks_at_parity > 0 {
         TxnParityVerdict::Partial
@@ -622,7 +644,11 @@ mod tests {
 
     #[test]
     fn verdict_json_roundtrip() {
-        for v in [TxnParityVerdict::Parity, TxnParityVerdict::Partial, TxnParityVerdict::Divergent] {
+        for v in [
+            TxnParityVerdict::Parity,
+            TxnParityVerdict::Partial,
+            TxnParityVerdict::Divergent,
+        ] {
             let json = serde_json::to_string(&v).expect("serialize");
             let restored: TxnParityVerdict = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(restored, v);

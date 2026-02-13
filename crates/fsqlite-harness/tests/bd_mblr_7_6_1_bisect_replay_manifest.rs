@@ -11,9 +11,9 @@
 
 use fsqlite_harness::ci_gate_matrix::BisectRequest;
 use fsqlite_harness::replay_harness::{
-    ArtifactDependency, BisectRange, BisectReplayManifest, BisectStrategy, BuildRequirements,
-    DriftDetectorConfig, FailureBundleRef, ReplayConfig, ReplayPassCriteria, ReplaySession,
-    ReplayVerdict, BISECT_REPLAY_MANIFEST_SCHEMA_VERSION,
+    ArtifactDependency, BISECT_REPLAY_MANIFEST_SCHEMA_VERSION, BisectRange, BisectReplayManifest,
+    BisectStrategy, BuildRequirements, DriftDetectorConfig, FailureBundleRef, ReplayConfig,
+    ReplayPassCriteria, ReplaySession, ReplayVerdict,
 };
 
 const BEAD_ID: &str = "bd-mblr.7.6.1";
@@ -393,7 +393,10 @@ fn full_manifest_json_roundtrip() {
     assert_eq!(restored.bisect_range, manifest.bisect_range);
     assert_eq!(restored.build_requirements, manifest.build_requirements);
     assert_eq!(restored.failure_bundle_ref, manifest.failure_bundle_ref);
-    assert_eq!(restored.artifact_dependencies, manifest.artifact_dependencies);
+    assert_eq!(
+        restored.artifact_dependencies,
+        manifest.artifact_dependencies
+    );
     assert_eq!(restored.bisect_strategy, manifest.bisect_strategy);
     assert_eq!(restored, manifest);
 }

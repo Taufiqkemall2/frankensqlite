@@ -201,8 +201,15 @@ fn triage_line_has_all_fields() {
     let report = assess_wal_journal_parity(&WalJournalParityConfig::default());
     let line = report.triage_line();
 
-    for field in ["verdict=", "parity=", "journal=", "ckpt=", "sentinel=", "transitions=", "gaps="]
-    {
+    for field in [
+        "verdict=",
+        "parity=",
+        "journal=",
+        "ckpt=",
+        "sentinel=",
+        "transitions=",
+        "gaps=",
+    ] {
         assert!(
             line.contains(field),
             "bead_id={BEAD_ID} case=triage_field field={field}"
@@ -238,7 +245,10 @@ fn report_json_roundtrip() {
     assert_eq!(parsed.verdict, report.verdict);
     assert_eq!(parsed.parity_score, report.parity_score);
     assert_eq!(parsed.total_checks, report.total_checks);
-    assert_eq!(parsed.journal_modes_tested.len(), report.journal_modes_tested.len());
+    assert_eq!(
+        parsed.journal_modes_tested.len(),
+        report.journal_modes_tested.len()
+    );
     assert_eq!(parsed.known_gaps.len(), report.known_gaps.len());
 }
 
@@ -270,10 +280,7 @@ fn assessment_is_deterministic() {
     let r1 = assess_wal_journal_parity(&cfg);
     let r2 = assess_wal_journal_parity(&cfg);
 
-    assert_eq!(
-        r1.verdict, r2.verdict,
-        "bead_id={BEAD_ID} case=det_verdict"
-    );
+    assert_eq!(r1.verdict, r2.verdict, "bead_id={BEAD_ID} case=det_verdict");
     assert_eq!(
         r1.parity_score, r2.parity_score,
         "bead_id={BEAD_ID} case=det_score"

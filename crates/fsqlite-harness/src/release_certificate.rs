@@ -296,7 +296,10 @@ fn sha256_hex(data: &str) -> String {
 
 /// Build a release certificate from pre-assembled inputs.
 #[must_use]
-pub fn build_certificate(inputs: &CertificateInputs, config: &CertificateConfig) -> ReleaseCertificate {
+pub fn build_certificate(
+    inputs: &CertificateInputs,
+    config: &CertificateConfig,
+) -> ReleaseCertificate {
     let gate_report = &inputs.gate_report;
     let ranking = &inputs.expected_loss_ranking;
     let ledger = &inputs.evidence_ledger;
@@ -354,7 +357,9 @@ pub fn build_certificate(inputs: &CertificateInputs, config: &CertificateConfig)
         content_hash: sha256_hex(&campaign_json),
         summary: format!(
             "Adversarial: {} trials, {} counterexamples, passed={}",
-            campaign.total_trials, campaign.counterexamples.len(), campaign.passed,
+            campaign.total_trials,
+            campaign.counterexamples.len(),
+            campaign.passed,
         ),
     });
 
@@ -421,12 +426,7 @@ pub fn build_certificate(inputs: &CertificateInputs, config: &CertificateConfig)
         .count();
 
     // ---- Verdict ----
-    let verdict = determine_verdict(
-        gate_report,
-        drift,
-        high_severity_count,
-        config,
-    );
+    let verdict = determine_verdict(gate_report, drift, high_severity_count, config);
 
     // ---- Summary ----
     let summary = format!(

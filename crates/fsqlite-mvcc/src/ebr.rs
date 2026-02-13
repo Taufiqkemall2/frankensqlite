@@ -329,12 +329,6 @@ impl Drop for VersionGuardTicket {
     }
 }
 
-// SAFETY: VersionGuardTicket contains only an Arc and trivial integers.
-// It does not hold a thread-local crossbeam Guard.
-unsafe impl Send for VersionGuardTicket {}
-// SAFETY: All fields are either atomic or behind a Mutex.
-unsafe impl Sync for VersionGuardTicket {}
-
 #[cfg(test)]
 mod tests {
     use std::{
