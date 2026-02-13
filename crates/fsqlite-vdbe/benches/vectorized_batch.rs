@@ -1,6 +1,9 @@
+use std::collections::HashMap;
+
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use fsqlite_types::value::SqliteValue;
 use fsqlite_vdbe::vectorized::{Batch, ColumnSpec, ColumnVectorType, DEFAULT_BATCH_ROW_CAPACITY};
+use fsqlite_vdbe::vectorized_join::{TrieRelation, TrieRow};
 
 fn benchmark_specs() -> Vec<ColumnSpec> {
     vec![
@@ -29,6 +32,36 @@ fn build_rows(row_count: usize) -> Vec<Vec<SqliteValue>> {
     rows
 }
 
+fn build_trie_rows(row_count: usize) -> Vec<TrieRow> {
+    let mut rows = Vec::with_capacity(row_count);
+    for row_id in 0..row_count {
+        let high = i64::try_from(row_id / 32).expect("high key should fit into i64");
+        let low = i64::try_from(row_id % 32).expect("low key should fit into i64");
+        rows.push(TrieRow::new(
+            vec![SqliteValue::Integer(high), SqliteValue::Integer(low)],
+            row_id,
+        ));
+    }
+    rows
+}
+
+fn build_hash_index(rows: &[TrieRow]) -> HashMap<(i64, i64), Vec<usize>> {
+    let mut index: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+    for row in rows {
+        let SqliteValue::Integer(high) = row.key[0] else {
+            continue;
+        };
+        let SqliteValue::Integer(low) = row.key[1] else {
+            continue;
+        };
+        index
+            .entry((high, low))
+            .or_default()
+            .push(row.payload_row_index);
+    }
+    index
+}
+
 fn bench_batch_construction(c: &mut Criterion) {
     let specs = benchmark_specs();
     let mut group = c.benchmark_group("vectorized_batch_construction");
@@ -47,5 +80,36 @@ fn bench_batch_construction(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_batch_construction);
+fn bench_trie_vs_hash_build(c: &mut Criterion) {
+    let mut group = c.benchmark_group("vectorized_join_index_build");
+
+    for row_count in [1_024_usize, 4_096_usize, 16_384_usize] {
+        let rows = build_trie_rows(row_count);
+        group.bench_with_input(
+            BenchmarkId::new("trie_build", row_count),
+            &rows,
+            |b, rows| {
+                b.iter(|| {
+                    let trie = TrieRelation::from_sorted_rows(rows.clone())
+                        .expect("trie build should succeed");
+                    criterion::black_box(trie.node_count());
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("hash_build", row_count),
+            &rows,
+            |b, rows| {
+                b.iter(|| {
+                    let index = build_hash_index(rows);
+                    criterion::black_box(index.len());
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_batch_construction, bench_trie_vs_hash_build);
 criterion_main!(benches);
