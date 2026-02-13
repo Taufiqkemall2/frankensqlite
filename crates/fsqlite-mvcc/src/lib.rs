@@ -61,14 +61,16 @@ pub use compat::{
 pub use conflict_model::{
     AMS_SKETCH_VERSION, AmsEvidenceLedger, AmsSketch, AmsSketchConfig, AmsWindowCollector,
     AmsWindowCollectorConfig, AmsWindowEstimate, DEFAULT_AMS_R, DEFAULT_HEAVY_HITTER_K,
-    DEFAULT_ZIPF_MAX_ITERS, HeadTailDecomposition, HeavyHitterLedgerEntry, InstrumentationCounters,
-    MAX_AMS_R, MAX_HEAVY_HITTER_K, MIN_AMS_R, MIN_HEAVY_HITTER_K, SpaceSavingEntry,
-    SpaceSavingSummary, WindowCloseReason, ZIPF_S_MAX, ZIPF_S_MIN, ZipfMleResult, ams_sign,
-    birthday_conflict_probability_m2, birthday_conflict_probability_uniform,
+    DEFAULT_NITRO_PRECISION, DEFAULT_ZIPF_MAX_ITERS, HeadTailDecomposition, HeavyHitterLedgerEntry,
+    InstrumentationCounters, MAX_AMS_R, MAX_HEAVY_HITTER_K, MAX_NITRO_PRECISION, MIN_AMS_R,
+    MIN_HEAVY_HITTER_K, MIN_NITRO_PRECISION, NITRO_SKETCH_VERSION, NitroSketch, NitroSketchConfig,
+    SpaceSavingEntry, SpaceSavingSummary, WindowCloseReason, ZIPF_S_MAX, ZIPF_S_MIN, ZipfMleResult,
+    ams_sign, birthday_conflict_probability_m2, birthday_conflict_probability_uniform,
     compute_head_tail_decomposition, dedup_write_set, effective_collision_pool,
     effective_w_index_multiplier, effective_w_leaf_split, effective_w_root_split, exact_m2, mix64,
     p_abort_attempt, p_drift, pairwise_conflict_probability, policy_collision_mass_input,
-    tps_estimate, validate_ams_r, validate_heavy_hitter_k, zipf_mle_from_ranked_counts,
+    tps_estimate, validate_ams_r, validate_heavy_hitter_k, validate_nitro_precision,
+    zipf_mle_from_ranked_counts,
 };
 pub use core_types::{
     CommitIndex, CommitLog, CommitRecord, DrainProgress, DrainResult, GcHorizonResult,
@@ -110,10 +112,11 @@ pub use invariants::{
 };
 pub use lifecycle::{BeginKind, CommitResponse, MvccError, Savepoint, TransactionManager};
 pub use observability::{
-    SharedObserver, SnapshotReadMetricsSnapshot, VersionsTraversedHistogram,
+    SharedObserver, SnapshotReadMetricsSnapshot, SsiMetricsSnapshot, VersionsTraversedHistogram,
     emit_conflict_resolved, emit_fcw_base_drift, emit_page_lock_contention, emit_ssi_abort,
     mvcc_snapshot_established, mvcc_snapshot_metrics_snapshot, mvcc_snapshot_released,
-    record_snapshot_read_versions_traversed, reset_mvcc_snapshot_metrics,
+    record_snapshot_read_versions_traversed, record_ssi_abort, record_ssi_commit,
+    reset_mvcc_snapshot_metrics, reset_ssi_metrics, ssi_metrics_snapshot,
 };
 pub use physical_merge::{
     CellOp, CellOpKind, FreeSpaceOp, HeaderOp, MergeError, MergeLadderResult, ParsedCell,

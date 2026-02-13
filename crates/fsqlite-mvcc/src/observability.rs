@@ -141,6 +141,101 @@ pub fn reset_mvcc_snapshot_metrics() {
 }
 
 // ---------------------------------------------------------------------------
+// SSI Metrics (bd-688.2)
+// ---------------------------------------------------------------------------
+
+static FSQLITE_SSI_COMMITS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_SSI_ABORTS_PIVOT: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_SSI_ABORTS_COMMITTED_PIVOT: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_SSI_ABORTS_MARKED_FOR_ABORT: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_SSI_VALIDATIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Record a successful SSI commit.
+pub fn record_ssi_commit() {
+    FSQLITE_SSI_COMMITS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    FSQLITE_SSI_VALIDATIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record an SSI abort with reason label.
+pub fn record_ssi_abort(reason: SsiAbortCategory) {
+    match reason {
+        SsiAbortCategory::Pivot => FSQLITE_SSI_ABORTS_PIVOT.fetch_add(1, Ordering::Relaxed),
+        SsiAbortCategory::CommittedPivot => {
+            FSQLITE_SSI_ABORTS_COMMITTED_PIVOT.fetch_add(1, Ordering::Relaxed)
+        }
+        SsiAbortCategory::MarkedForAbort => {
+            FSQLITE_SSI_ABORTS_MARKED_FOR_ABORT.fetch_add(1, Ordering::Relaxed)
+        }
+    };
+    FSQLITE_SSI_VALIDATIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Point-in-time snapshot of SSI metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SsiMetricsSnapshot {
+    pub commits_total: u64,
+    pub aborts_pivot: u64,
+    pub aborts_committed_pivot: u64,
+    pub aborts_marked_for_abort: u64,
+    pub validations_total: u64,
+}
+
+impl SsiMetricsSnapshot {
+    /// Total SSI aborts across all reasons.
+    #[must_use]
+    pub fn aborts_total(&self) -> u64 {
+        self.aborts_pivot + self.aborts_committed_pivot + self.aborts_marked_for_abort
+    }
+
+    /// SSI conflict rate as aborts / validations.  Returns 0.0 if no
+    /// validations have occurred.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn conflict_rate(&self) -> f64 {
+        if self.validations_total == 0 {
+            return 0.0;
+        }
+        self.aborts_total() as f64 / self.validations_total as f64
+    }
+}
+
+impl std::fmt::Display for SsiMetricsSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ssi: {} commits, {} aborts (pivot={}, committed_pivot={}, marked={}), rate={:.4}",
+            self.commits_total,
+            self.aborts_total(),
+            self.aborts_pivot,
+            self.aborts_committed_pivot,
+            self.aborts_marked_for_abort,
+            self.conflict_rate(),
+        )
+    }
+}
+
+/// Take a point-in-time snapshot of SSI metrics.
+#[must_use]
+pub fn ssi_metrics_snapshot() -> SsiMetricsSnapshot {
+    SsiMetricsSnapshot {
+        commits_total: FSQLITE_SSI_COMMITS_TOTAL.load(Ordering::Relaxed),
+        aborts_pivot: FSQLITE_SSI_ABORTS_PIVOT.load(Ordering::Relaxed),
+        aborts_committed_pivot: FSQLITE_SSI_ABORTS_COMMITTED_PIVOT.load(Ordering::Relaxed),
+        aborts_marked_for_abort: FSQLITE_SSI_ABORTS_MARKED_FOR_ABORT.load(Ordering::Relaxed),
+        validations_total: FSQLITE_SSI_VALIDATIONS_TOTAL.load(Ordering::Relaxed),
+    }
+}
+
+/// Reset SSI metrics to zero (tests/diagnostics).
+pub fn reset_ssi_metrics() {
+    FSQLITE_SSI_COMMITS_TOTAL.store(0, Ordering::Relaxed);
+    FSQLITE_SSI_ABORTS_PIVOT.store(0, Ordering::Relaxed);
+    FSQLITE_SSI_ABORTS_COMMITTED_PIVOT.store(0, Ordering::Relaxed);
+    FSQLITE_SSI_ABORTS_MARKED_FOR_ABORT.store(0, Ordering::Relaxed);
+    FSQLITE_SSI_VALIDATIONS_TOTAL.store(0, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
 // Emit helpers for each event kind
 // ---------------------------------------------------------------------------
 
@@ -373,15 +468,15 @@ mod tests {
         assert!(after.versions_traversed_sum >= before.versions_traversed_sum + 25);
         assert!(
             after.fsqlite_mvcc_versions_traversed.le_1
-                >= before.fsqlite_mvcc_versions_traversed.le_1 + 1
+                > before.fsqlite_mvcc_versions_traversed.le_1
         );
         assert!(
             after.fsqlite_mvcc_versions_traversed.le_4
-                >= before.fsqlite_mvcc_versions_traversed.le_4 + 1
+                > before.fsqlite_mvcc_versions_traversed.le_4
         );
         assert!(
             after.fsqlite_mvcc_versions_traversed.gt_16
-                >= before.fsqlite_mvcc_versions_traversed.gt_16 + 1
+                > before.fsqlite_mvcc_versions_traversed.gt_16
         );
         assert!(after.fsqlite_mvcc_active_snapshots >= 1);
     }
@@ -390,5 +485,79 @@ mod tests {
     fn snapshot_gauge_release_saturates() {
         // Saturating release must never underflow/panic, even when gauge is zero.
         mvcc_snapshot_released();
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-688.2: SSI Metrics Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ssi_metrics_commit_counting() {
+        // Use a local snapshot-delta pattern (global shared across tests).
+        let before = ssi_metrics_snapshot();
+        record_ssi_commit();
+        record_ssi_commit();
+        let after = ssi_metrics_snapshot();
+        assert!(after.commits_total >= before.commits_total + 2);
+        assert!(after.validations_total >= before.validations_total + 2);
+    }
+
+    #[test]
+    fn ssi_metrics_abort_by_reason() {
+        let before = ssi_metrics_snapshot();
+        record_ssi_abort(SsiAbortCategory::Pivot);
+        record_ssi_abort(SsiAbortCategory::CommittedPivot);
+        record_ssi_abort(SsiAbortCategory::MarkedForAbort);
+        let after = ssi_metrics_snapshot();
+        assert!(after.aborts_pivot > before.aborts_pivot);
+        assert!(after.aborts_committed_pivot > before.aborts_committed_pivot);
+        assert!(after.aborts_marked_for_abort > before.aborts_marked_for_abort);
+        assert!(after.aborts_total() >= before.aborts_total() + 3);
+        assert!(after.validations_total >= before.validations_total + 3);
+    }
+
+    #[test]
+    fn ssi_metrics_conflict_rate() {
+        let m = SsiMetricsSnapshot {
+            commits_total: 90,
+            aborts_pivot: 5,
+            aborts_committed_pivot: 3,
+            aborts_marked_for_abort: 2,
+            validations_total: 100,
+        };
+        assert!((m.conflict_rate() - 0.10).abs() < 1e-10);
+        assert_eq!(m.aborts_total(), 10);
+    }
+
+    #[test]
+    fn ssi_metrics_conflict_rate_zero_validations() {
+        let m = SsiMetricsSnapshot::default();
+        assert!((m.conflict_rate() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn ssi_metrics_display() {
+        let m = SsiMetricsSnapshot {
+            commits_total: 50,
+            aborts_pivot: 2,
+            aborts_committed_pivot: 1,
+            aborts_marked_for_abort: 0,
+            validations_total: 53,
+        };
+        let display = format!("{m}");
+        assert!(display.contains("50 commits"), "display: {display}");
+        assert!(display.contains("3 aborts"), "display: {display}");
+        assert!(display.contains("pivot=2"), "display: {display}");
+    }
+
+    #[test]
+    fn ssi_metrics_reset() {
+        record_ssi_commit();
+        record_ssi_abort(SsiAbortCategory::Pivot);
+        reset_ssi_metrics();
+        let snap = ssi_metrics_snapshot();
+        assert_eq!(snap.commits_total, 0);
+        assert_eq!(snap.aborts_pivot, 0);
+        assert_eq!(snap.validations_total, 0);
     }
 }

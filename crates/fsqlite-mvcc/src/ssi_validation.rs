@@ -15,6 +15,8 @@ use std::collections::HashSet;
 use fsqlite_types::{CommitSeq, ObjectId, PageNumber, TxnToken, WitnessKey};
 use tracing::{debug, info, warn};
 
+use crate::observability;
+
 use crate::witness_objects::{
     AbortPolicy, AbortReason, AbortWitness, DependencyEdgeKind, EcsCommitProof, EcsDependencyEdge,
     EdgeKeyBasis, KeySummary,
@@ -426,6 +428,18 @@ pub fn ssi_validate_and_publish(
     let mut state = SsiState::new(txn, begin_seq);
     state.marked_for_abort = marked_for_abort;
 
+    // bd-688.2: structured tracing span per bead specification.
+    let span = tracing::span!(
+        tracing::Level::INFO,
+        "ssi_validate",
+        txn_id = txn.id.get(),
+        read_set_size = read_keys.len(),
+        write_set_size = write_keys.len(),
+        conflict_detected = tracing::field::Empty,
+        decision_reason = tracing::field::Empty,
+    );
+    let _guard = span.enter();
+
     info!(
         bead_id = "bd-31bo",
         txn = ?txn,
@@ -440,12 +454,15 @@ pub fn ssi_validate_and_publish(
 
     // Step 2: Read-only fast path.
     if write_keys.is_empty() {
+        span.record("conflict_detected", false);
+        span.record("decision_reason", "read_only_fast_path");
         debug!(
             bead_id = "bd-31bo",
             txn = ?txn,
             "ssi_validate: read-only fast path, skipping SSI"
         );
         let proof = build_commit_proof(txn, begin_seq, commit_seq, &state, &[], &[]);
+        observability::record_ssi_commit();
         return Ok(SsiValidationOk {
             edges: Vec::new(),
             edge_ids: Vec::new(),
@@ -456,11 +473,14 @@ pub fn ssi_validate_and_publish(
 
     // Check eagerly marked for abort.
     if marked_for_abort {
+        span.record("conflict_detected", true);
+        span.record("decision_reason", "marked_for_abort");
         warn!(
             bead_id = "bd-31bo",
             txn = ?txn,
             "ssi_validate: transaction marked for abort by another committer"
         );
+        observability::record_ssi_abort(fsqlite_observability::SsiAbortCategory::MarkedForAbort);
         let witness = AbortWitness {
             txn,
             begin_seq,
@@ -513,6 +533,8 @@ pub fn ssi_validate_and_publish(
 
     // Step 5: Pivot rule (conservative).
     if state.has_in_rw && state.has_out_rw {
+        span.record("conflict_detected", true);
+        span.record("decision_reason", "pivot_abort");
         warn!(
             bead_id = "bd-31bo",
             txn = ?txn,
@@ -520,6 +542,7 @@ pub fn ssi_validate_and_publish(
             out_targets = ?state.rw_out_to,
             "ssi_validate: PIVOT ABORT — dangerous structure detected"
         );
+        observability::record_ssi_abort(fsqlite_observability::SsiAbortCategory::Pivot);
         let all_edges = build_dependency_edges(&in_edges, &out_edges, txn, commit_seq);
         let witness = AbortWitness {
             txn,
@@ -558,11 +581,16 @@ pub fn ssi_validate_and_publish(
             // R is committed: if R.has_in_rw at commit time,
             // T MUST abort (committed pivot cannot be undone).
             if edge.source_has_in_rw {
+                span.record("conflict_detected", true);
+                span.record("decision_reason", "committed_pivot_abort");
                 warn!(
                     bead_id = "bd-31bo",
                     txn = ?txn,
                     committed_pivot = ?edge.from,
                     "T3 rule: committed reader was pivot, T must abort"
+                );
+                observability::record_ssi_abort(
+                    fsqlite_observability::SsiAbortCategory::CommittedPivot,
                 );
                 let all_edges = build_dependency_edges(&in_edges, &out_edges, txn, commit_seq);
                 let witness = AbortWitness {
@@ -602,12 +630,18 @@ pub fn ssi_validate_and_publish(
 
     let proof = build_commit_proof(txn, begin_seq, commit_seq, &state, &edge_ids, &[]);
 
+    span.record("conflict_detected", false);
+    span.record("decision_reason", "commit_approved");
+
     info!(
         bead_id = "bd-31bo",
         txn = ?txn,
         edges_emitted = all_edges.len(),
         "ssi_validate: commit approved, evidence published"
     );
+
+    // bd-688.2: update SSI metrics.
+    observability::record_ssi_commit();
 
     Ok(SsiValidationOk {
         edges: all_edges,
