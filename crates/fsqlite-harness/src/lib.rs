@@ -10,8 +10,10 @@ pub mod ci_coverage_gate;
 pub mod ci_gate_matrix;
 pub mod closure_wave;
 pub mod commit_pipeline;
+pub mod concurrent_writer_parity;
 pub mod confidence_gates;
 pub mod corpus_ingest;
+pub mod crash_recovery_parity;
 pub mod differential_v2;
 pub mod drift_monitor;
 pub mod durability_matrix;
@@ -30,7 +32,9 @@ pub mod forensics_navigator;
 pub mod fslab;
 pub mod impact_graph;
 pub mod lane_selector;
+pub mod lock_txn_parity;
 pub mod log;
+pub mod maintenance_parity;
 pub mod log_schema_validator;
 pub mod metamorphic;
 pub mod mismatch_minimizer;
@@ -62,6 +66,7 @@ pub mod unit_fixtures;
 pub mod unit_matrix;
 pub mod verification_contract_enforcement;
 pub mod verification_gates;
+pub mod wal_journal_parity;
 
 #[cfg(test)]
 mod sql_pipeline_suites;

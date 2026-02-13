@@ -16,7 +16,6 @@
 //! Certificate generation is deterministic given identical inputs.  All
 //! floating-point values use `truncate_score` for cross-platform reproducibility.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
