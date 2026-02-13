@@ -285,56 +285,67 @@ impl ScriptEntryBuilder {
         }
     }
 
+    #[must_use]
     pub fn bead(mut self, id: &str) -> Self {
         self.entry.bead_id = Some(id.to_owned());
         self
     }
 
+    #[must_use]
     pub fn command(mut self, cmd: &str) -> Self {
-        self.entry.invocation.command = cmd.to_owned();
+        cmd.clone_into(&mut self.entry.invocation.command);
         self
     }
 
+    #[must_use]
     pub fn env(mut self, var: &str) -> Self {
         self.entry.invocation.env_vars.push(var.to_owned());
         self
     }
 
+    #[must_use]
     pub fn json_output(mut self) -> Self {
         self.entry.invocation.json_output = true;
         self
     }
 
+    #[must_use]
     pub fn timeout(mut self, secs: u32) -> Self {
         self.entry.invocation.timeout_secs = Some(secs);
         self
     }
 
+    #[must_use]
     pub fn scenarios(mut self, ids: &[&str]) -> Self {
         self.entry.scenario_ids = ids.iter().map(|s| (*s).to_owned()).collect();
         self
     }
 
+    #[must_use]
     pub fn storage(mut self, modes: &[StorageMode]) -> Self {
         self.entry.storage_modes = modes.to_vec();
         self
     }
 
+    #[must_use]
     pub fn concurrency(mut self, modes: &[ConcurrencyMode]) -> Self {
         self.entry.concurrency_modes = modes.to_vec();
         self
     }
 
+    #[must_use]
     pub fn artifacts(mut self, paths: &[&str]) -> Self {
         self.entry.artifact_paths = paths.iter().map(|s| (*s).to_owned()).collect();
         self
     }
 
+    #[must_use]
     pub fn log_schema(mut self, version: &str) -> Self {
         self.entry.log_schema_version = Some(version.to_owned());
         self
     }
 
+    #[must_use]
     pub fn build(self) -> ScriptEntry {
         self.entry
     }
@@ -347,7 +358,7 @@ impl ScriptEntryBuilder {
 /// This function catalogs every known E2E integration script with its
 /// scenario linkage, storage/concurrency mode annotations, and invocation
 /// contract.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::vec_init_then_push)]
 pub fn build_canonical_inventory() -> TraceabilityMatrix {
     let mut scripts = Vec::new();
 
