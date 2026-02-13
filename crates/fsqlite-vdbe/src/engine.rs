@@ -2959,19 +2959,25 @@ impl VdbeEngine {
                 // Byte 7: fragmented free bytes = 0.
 
                 // Write the initialized page to pager.
-                if page_io.write_page(&cx, root_pgno, &page).is_ok() {
-                    let cursor = BtCursor::new(page_io.clone(), root_pgno, PAGE_SIZE, true);
-                    self.storage_cursors.insert(
-                        cursor_id,
-                        StorageCursor {
-                            cursor: CursorBackend::Txn(cursor),
-                            cx,
-                            writable,
-                            last_alloc_rowid: 0,
-                        },
+                if let Err(err) = page_io.write_page(&cx, root_pgno, &page) {
+                    tracing::warn!(
+                        root_page,
+                        error = %err,
+                        "failed to initialize writable root page in pager"
                     );
-                    return true;
+                    return false;
                 }
+                let cursor = BtCursor::new(page_io.clone(), root_pgno, PAGE_SIZE, true);
+                self.storage_cursors.insert(
+                    cursor_id,
+                    StorageCursor {
+                        cursor: CursorBackend::Txn(cursor),
+                        cx,
+                        writable,
+                        last_alloc_rowid: 0,
+                    },
+                );
+                return true;
             }
             // Fall through to MemPageStore for ephemeral/read-only uninitialized tables.
         }
@@ -6645,6 +6651,37 @@ mod tests {
         let _txn = engine
             .take_transaction()
             .expect("take_transaction should succeed");
+    }
+
+    #[test]
+    fn test_open_storage_cursor_write_init_failure_does_not_fallback_to_mem() {
+        use fsqlite_mvcc::{ConcurrentRegistry, InProcessPageLockTable};
+        use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
+
+        let pager = MockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+
+        let mut engine = VdbeEngine::new(8);
+        // Use a page number whose low byte is 0 so MockTransaction::get_page
+        // returns a zero type byte, forcing the writable root-page init path.
+        let root = 256;
+
+        // Deliberately install concurrent context without a registered session.
+        // SharedTxnPageIo::write_page will fail before touching pager state.
+        let registry = std::rc::Rc::new(std::cell::RefCell::new(ConcurrentRegistry::new()));
+        let lock_table = std::rc::Rc::new(InProcessPageLockTable::new());
+        engine.set_transaction_concurrent(Box::new(txn), 999, registry, lock_table);
+
+        let opened = engine.open_storage_cursor(0, root, true);
+        assert!(
+            !opened,
+            "write-init errors must fail cursor open instead of silently falling back to Mem"
+        );
+        assert!(
+            !engine.storage_cursors.contains_key(&0),
+            "failed open must not leave a cursor installed"
+        );
     }
 
     #[test]

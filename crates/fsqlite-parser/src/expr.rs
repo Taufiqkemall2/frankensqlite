@@ -18,9 +18,8 @@
 //   -> ->> (JSON)
 
 use fsqlite_ast::{
-    BinaryOp, ColumnRef, Distinctness, Expr, FromClause, FunctionArgs, InSet, JsonArrow, LikeOp,
-    Literal, PlaceholderType, QualifiedName, RaiseAction, ResultColumn, SelectBody, SelectCore,
-    SelectStatement, Span, TableOrSubquery, TypeName, UnaryOp, WindowSpec,
+    BinaryOp, ColumnRef, Expr, FunctionArgs, InSet, JsonArrow, LikeOp, Literal, PlaceholderType,
+    RaiseAction, SelectStatement, Span, TypeName, UnaryOp, WindowSpec,
 };
 
 use crate::parser::{ParseError, Parser, is_nonreserved_kw, kw_to_str};
@@ -847,96 +846,9 @@ impl Parser {
         }
     }
 
-    /// Minimal subquery parser for EXISTS/IN expression support.
-    ///
-    /// Handles `SELECT [DISTINCT] columns [FROM table] [WHERE expr] [ORDER BY ...] [LIMIT ...]`.
+    /// Subquery parser for EXISTS/IN expression support.
     fn parse_subquery_minimal(&mut self) -> Result<SelectStatement, ParseError> {
-        if !self.eat_kind(&TokenKind::KwSelect) {
-            return Err(self.err_here("expected SELECT in subquery"));
-        }
-
-        let distinct = if self.eat_kind(&TokenKind::KwDistinct) {
-            Distinctness::Distinct
-        } else {
-            let _ = self.eat_kind(&TokenKind::KwAll);
-            Distinctness::All
-        };
-
-        let mut columns = Vec::new();
-        loop {
-            if matches!(self.peek_kind(), TokenKind::Star) {
-                self.advance_token();
-                columns.push(ResultColumn::Star);
-            } else {
-                let expr = self.parse_expr()?;
-                let alias = if self.eat_kind(&TokenKind::KwAs) {
-                    let tok = self.advance_token();
-                    match &tok.kind {
-                        TokenKind::Id(s) | TokenKind::QuotedId(s, _) => Some(s.clone()),
-                        _ => return Err(ParseError::at("expected alias", Some(&tok))),
-                    }
-                } else {
-                    None
-                };
-                columns.push(ResultColumn::Expr { expr, alias });
-            }
-            if !self.eat_kind(&TokenKind::Comma) {
-                break;
-            }
-        }
-
-        let from = if self.eat_kind(&TokenKind::KwFrom) {
-            let tok = self.advance_token();
-            let name = match &tok.kind {
-                TokenKind::Id(s) | TokenKind::QuotedId(s, _) => QualifiedName::bare(s.clone()),
-                _ => return Err(ParseError::at("expected table name", Some(&tok))),
-            };
-            Some(FromClause {
-                source: TableOrSubquery::Table {
-                    name,
-                    alias: None,
-                    index_hint: None,
-                },
-                joins: Vec::new(),
-            })
-        } else {
-            None
-        };
-
-        let where_clause = if self.eat_kind(&TokenKind::KwWhere) {
-            Some(Box::new(self.parse_expr()?))
-        } else {
-            None
-        };
-
-        // Parse ORDER BY clause (reuses method from parser.rs)
-        let order_by = if self.eat_kind(&TokenKind::KwOrder) {
-            self.expect_kind(&TokenKind::KwBy)?;
-            self.parse_comma_sep(Self::parse_ordering_term)?
-        } else {
-            Vec::new()
-        };
-
-        // Parse LIMIT clause (reuses method from parser.rs)
-        let limit = self.parse_limit()?;
-
-        Ok(SelectStatement {
-            with: None,
-            body: SelectBody {
-                select: SelectCore::Select {
-                    distinct,
-                    columns,
-                    from,
-                    where_clause,
-                    group_by: Vec::new(),
-                    having: None,
-                    windows: Vec::new(),
-                },
-                compounds: Vec::new(),
-            },
-            order_by,
-            limit,
-        })
+        self.parse_select_stmt(None)
     }
 }
 
@@ -956,6 +868,7 @@ pub fn parse_expr(sql: &str) -> Result<Expr, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fsqlite_ast::{SelectCore, TableOrSubquery};
 
     fn parse(sql: &str) -> Expr {
         match parse_expr(sql) {
@@ -1140,6 +1053,27 @@ mod tests {
         assert!(matches!(expr, Expr::Exists { not: true, .. }));
     }
 
+    #[test]
+    fn test_exists_subquery_supports_qualified_table_with_alias() {
+        let expr = parse("EXISTS (SELECT 1 FROM main.users AS u WHERE u.id = 1)");
+        match expr {
+            Expr::Exists { subquery, .. } => match subquery.body.select {
+                SelectCore::Select {
+                    from: Some(from), ..
+                } => match from.source {
+                    TableOrSubquery::Table { name, alias, .. } => {
+                        assert_eq!(name.schema.as_deref(), Some("main"));
+                        assert_eq!(name.name, "users");
+                        assert_eq!(alias.as_deref(), Some("u"));
+                    }
+                    other => unreachable!("expected table source, got {other:?}"),
+                },
+                other => unreachable!("expected SELECT core with FROM, got {other:?}"),
+            },
+            other => unreachable!("expected EXISTS subquery, got {other:?}"),
+        }
+    }
+
     // ── IN ──────────────────────────────────────────────────────────────
 
     #[test]
@@ -1183,6 +1117,26 @@ mod tests {
                 assert!(stmt.limit.is_some(), "LIMIT should be parsed");
             }
             other => unreachable!("expected NOT IN subquery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_in_subquery_supports_group_by_and_having() {
+        let expr = parse("x IN (SELECT y FROM t GROUP BY y HAVING COUNT(*) > 1)");
+        match expr {
+            Expr::In {
+                set: InSet::Subquery(stmt),
+                ..
+            } => match stmt.body.select {
+                SelectCore::Select {
+                    group_by, having, ..
+                } => {
+                    assert_eq!(group_by.len(), 1, "GROUP BY should be parsed");
+                    assert!(having.is_some(), "HAVING should be parsed");
+                }
+                SelectCore::Values(_) => unreachable!("expected SELECT core"),
+            },
+            other => unreachable!("expected IN subquery, got {other:?}"),
         }
     }
 

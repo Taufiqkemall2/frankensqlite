@@ -81,10 +81,15 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
     }
 
     fn read_page(&mut self, cx: &Cx, page_number: u32) -> Result<Option<Vec<u8>>> {
-        // Scan backwards from the most recent frame to find the latest
-        // version of the requested page — matching SQLite's WAL read
+        // Restrict visibility to committed frames only.
+        let Some(last_commit_frame) = self.wal.last_commit_frame(cx)? else {
+            return Ok(None);
+        };
+
+        // Scan backwards from the most recent committed frame to find the
+        // latest version of the requested page — matching SQLite's WAL read
         // protocol (newest frame wins).
-        for i in (0..self.wal.frame_count()).rev() {
+        for i in (0..=last_commit_frame).rev() {
             let header = self.wal.read_frame_header(cx, i)?;
             if header.page_number == page_number {
                 let (_, data) = self.wal.read_frame(cx, i)?;
@@ -326,6 +331,44 @@ mod tests {
             Some(new_data),
             "adapter should return the latest WAL version"
         );
+    }
+
+    #[test]
+    fn test_adapter_read_page_hides_uncommitted_frames() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut adapter = make_adapter(&vfs, &cx);
+
+        let committed = sample_page(0x31);
+        let uncommitted = sample_page(0x32);
+
+        adapter
+            .append_frame(&cx, 7, &committed, 7)
+            .expect("append committed frame");
+        adapter
+            .append_frame(&cx, 7, &uncommitted, 0)
+            .expect("append uncommitted frame");
+
+        let result = adapter.read_page(&cx, 7).expect("read committed page");
+        assert_eq!(
+            result,
+            Some(committed),
+            "reader must ignore uncommitted tail frames"
+        );
+    }
+
+    #[test]
+    fn test_adapter_read_page_none_when_wal_has_no_commit_frame() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut adapter = make_adapter(&vfs, &cx);
+
+        adapter
+            .append_frame(&cx, 3, &sample_page(0x44), 0)
+            .expect("append uncommitted frame");
+
+        let result = adapter.read_page(&cx, 3).expect("read page");
+        assert_eq!(result, None, "uncommitted WAL frames must stay invisible");
     }
 
     #[test]

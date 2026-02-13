@@ -478,7 +478,7 @@ fn codegen_insert_values(
 
         for (i, val_expr) in row_values.iter().enumerate() {
             let reg = val_regs + i as i32;
-            emit_expr(b, val_expr, reg);
+            emit_expr(b, val_expr, reg)?;
         }
 
         let rec_reg = b.alloc_reg();
@@ -670,17 +670,17 @@ pub fn codegen_update(
                     names.first().map_or("", |n| n.as_str())
                 }
             };
-            let col_idx = table
-                .column_index(col_name)
-                .ok_or_else(|| CodegenError::ColumnNotFound {
-                    table: table.name.clone(),
-                    column: col_name.to_owned(),
-                })
-                .expect("column must exist");
+            let col_idx =
+                table
+                    .column_index(col_name)
+                    .ok_or_else(|| CodegenError::ColumnNotFound {
+                        table: table.name.clone(),
+                        column: col_name.to_owned(),
+                    })?;
             let reg = b.alloc_reg();
-            (col_idx, reg)
+            Ok((col_idx, reg))
         })
-        .collect();
+        .collect::<Result<Vec<_>, CodegenError>>()?;
 
     // Emit Variable ops for new values.
     for (_col_idx, reg) in &new_val_regs {
@@ -898,7 +898,7 @@ fn emit_column_reads(
                 } else {
                     // For non-column expressions (literals, placeholders, etc.),
                     // evaluate the expression directly rather than reading a column.
-                    emit_expr(b, expr, reg);
+                    emit_expr(b, expr, reg)?;
                 }
                 reg += 1;
             }
@@ -1012,7 +1012,7 @@ fn bind_param_ref(expr: &Expr) -> Option<BindParamRef> {
 /// For bind parameters, emits a Variable instruction.
 /// For literals, emits the appropriate constant instruction.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32) {
+fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32) -> Result<(), CodegenError> {
     match expr {
         Expr::Placeholder(pt, _) => {
             let idx = match pt {
@@ -1020,16 +1020,20 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32) {
                 _ => 1, // Anonymous or other — will be renumbered by caller.
             };
             b.emit_op(Opcode::Variable, idx, reg, 0, P4::None, 0);
+            Ok(())
         }
         Expr::Literal(lit, _) => match lit {
             Literal::Integer(n) => {
                 b.emit_op(Opcode::Integer, *n as i32, reg, 0, P4::None, 0);
+                Ok(())
             }
             Literal::Float(f) => {
                 b.emit_op(Opcode::Real, 0, reg, 0, P4::Real(*f), 0);
+                Ok(())
             }
             Literal::String(s) => {
                 b.emit_op(Opcode::String8, 0, reg, 0, P4::Str(s.clone()), 0);
+                Ok(())
             }
             Literal::Blob(bytes) => {
                 b.emit_op(
@@ -1040,25 +1044,29 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32) {
                     P4::Blob(bytes.clone()),
                     0,
                 );
+                Ok(())
             }
             Literal::Null => {
                 b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+                Ok(())
             }
             Literal::True => {
                 b.emit_op(Opcode::Integer, 1, reg, 0, P4::None, 0);
+                Ok(())
             }
             Literal::False => {
                 b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
+                Ok(())
             }
             Literal::CurrentTime | Literal::CurrentDate | Literal::CurrentTimestamp => {
                 // Placeholder: emit NULL for now (datetime functions handle these).
                 b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+                Ok(())
             }
         },
-        _ => {
-            // For complex expressions, emit a placeholder (Null).
-            b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
-        }
+        _ => Err(CodegenError::Unsupported(
+            "planner expression codegen for this expression type".to_owned(),
+        )),
     }
 }
 
@@ -1230,48 +1238,54 @@ mod tests {
             &mut b,
             &Expr::Literal(Literal::Float(3.25), Span::ZERO),
             reg_real,
-        );
+        )
+        .unwrap();
 
         let reg_blob = b.alloc_reg();
         emit_expr(
             &mut b,
             &Expr::Literal(Literal::Blob(vec![0, 1, 2, 3]), Span::ZERO),
             reg_blob,
-        );
+        )
+        .unwrap();
 
         let reg_null = b.alloc_reg();
-        emit_expr(&mut b, &Expr::Literal(Literal::Null, Span::ZERO), reg_null);
+        emit_expr(&mut b, &Expr::Literal(Literal::Null, Span::ZERO), reg_null).unwrap();
 
         let reg_true = b.alloc_reg();
-        emit_expr(&mut b, &Expr::Literal(Literal::True, Span::ZERO), reg_true);
+        emit_expr(&mut b, &Expr::Literal(Literal::True, Span::ZERO), reg_true).unwrap();
 
         let reg_false = b.alloc_reg();
         emit_expr(
             &mut b,
             &Expr::Literal(Literal::False, Span::ZERO),
             reg_false,
-        );
+        )
+        .unwrap();
 
         let reg_current_time = b.alloc_reg();
         emit_expr(
             &mut b,
             &Expr::Literal(Literal::CurrentTime, Span::ZERO),
             reg_current_time,
-        );
+        )
+        .unwrap();
 
         let reg_current_date = b.alloc_reg();
         emit_expr(
             &mut b,
             &Expr::Literal(Literal::CurrentDate, Span::ZERO),
             reg_current_date,
-        );
+        )
+        .unwrap();
 
         let reg_current_timestamp = b.alloc_reg();
         emit_expr(
             &mut b,
             &Expr::Literal(Literal::CurrentTimestamp, Span::ZERO),
             reg_current_timestamp,
-        );
+        )
+        .unwrap();
 
         let prog = b.finish().unwrap();
         let ops = prog.ops();
@@ -2061,6 +2075,36 @@ mod tests {
     }
 
     #[test]
+    fn test_codegen_update_unknown_assignment_column_returns_error() {
+        let stmt = UpdateStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: None,
+                index_hint: None,
+            },
+            assignments: vec![Assignment {
+                target: AssignmentTarget::Column("no_such_col".to_owned()),
+                value: placeholder(1),
+            }],
+            from: None,
+            where_clause: Some(*rowid_eq_param()),
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_update(&mut b, &stmt, &schema, &ctx).expect_err("should fail");
+        assert!(matches!(
+            err,
+            CodegenError::ColumnNotFound { ref column, .. } if column == "no_such_col"
+        ));
+    }
+
+    #[test]
     fn test_codegen_update_requires_rowid_predicate() {
         let stmt = UpdateStatement {
             with: None,
@@ -2130,6 +2174,47 @@ mod tests {
     #[test]
     fn test_codegen_select_where_without_supported_pattern_is_error() {
         let stmt = simple_select(&["a"], "t", Some(col_eq_param("a", 1)));
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_select(&mut b, &stmt, &schema, &ctx).expect_err("should fail");
+        assert!(matches!(err, CodegenError::Unsupported(_)));
+    }
+
+    #[test]
+    fn test_codegen_select_unsupported_projection_expression_is_error() {
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::BinaryOp {
+                            left: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+                            op: AstBinaryOp::Add,
+                            right: Box::new(Expr::Literal(Literal::Integer(2), Span::ZERO)),
+                            span: Span::ZERO,
+                        },
+                        alias: None,
+                    }],
+                    from: Some(FromClause {
+                        source: TableOrSubquery::Table {
+                            name: QualifiedName::bare("t"),
+                            alias: None,
+                            index_hint: None,
+                        },
+                        joins: vec![],
+                    }),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
         let schema = test_schema();
         let ctx = CodegenContext::default();
         let mut b = ProgramBuilder::new();

@@ -1287,7 +1287,7 @@ fn cmd_run(argv: &[String]) -> i32 {
     let mut workload: Option<String> = None;
     let mut concurrency: Vec<u16> = vec![1];
     let mut repeat: usize = 1;
-    let mut fsqlite_mvcc: bool = false;
+    let mut fsqlite_mvcc: bool = true;
     let mut pretty: bool = false;
     let mut output_jsonl: Option<PathBuf> = None;
 
@@ -1350,6 +1350,9 @@ fn cmd_run(argv: &[String]) -> i32 {
             }
             "--mvcc" => {
                 fsqlite_mvcc = true;
+            }
+            "--no-mvcc" => {
+                fsqlite_mvcc = false;
             }
             "--pretty" => {
                 pretty = true;
@@ -1877,7 +1880,8 @@ OPTIONS:
     --workload <NAME>       OpLog preset name (e.g. commutative_inserts_disjoint_keys)
     --concurrency <N|LIST>  Number of workers, or comma-separated list (default: 1)
     --repeat <N>            Repetitions per concurrency (default: 1)
-    --mvcc                  For fsqlite: enable MVCC concurrent_mode
+    --mvcc                  For fsqlite: force MVCC concurrent_mode on (default)
+    --no-mvcc               For fsqlite: disable MVCC concurrent_mode
     --output-jsonl <PATH>   Append a single JSONL record to PATH
     --pretty                Pretty-print JSON to stdout (default: JSONL)
     -h, --help              Show this help message
@@ -1899,7 +1903,7 @@ fn cmd_bench(argv: &[String]) -> i32 {
     let mut presets: Vec<String> = Vec::new();
     let mut concurrency: Vec<u16> = vec![1, 2, 4, 8];
     let mut engine = "both".to_owned(); // sqlite3|fsqlite|both
-    let mut mvcc = false;
+    let mut mvcc = true;
     let defaults = BenchmarkConfig::default();
     let mut warmup_iterations = defaults.warmup_iterations;
     let mut min_iterations = defaults.min_iterations;
@@ -1968,6 +1972,7 @@ fn cmd_bench(argv: &[String]) -> i32 {
                 engine.clone_from(&argv[i]);
             }
             "--mvcc" => mvcc = true,
+            "--no-mvcc" => mvcc = false,
             "--warmup" => {
                 i += 1;
                 if i >= argv.len() {
@@ -2253,7 +2258,8 @@ OPTIONS:
     --preset <NAME>         Workload preset, or comma-separated list (default: all)
     --concurrency <N|LIST>  Concurrency levels (default: 1,2,4,8)
     --engine <NAME>         sqlite3 | fsqlite | both (default: both)
-    --mvcc                  For fsqlite: enable MVCC concurrent_mode
+    --mvcc                  For fsqlite: force MVCC concurrent_mode on (default)
+    --no-mvcc               For fsqlite: disable MVCC concurrent_mode
     --warmup <N>            Warmup iterations discarded (default: methodology default)
     --repeat <N>            Exact measurement iterations (sets --min-iters=N and --time-secs=0)
     --min-iters <N>         Minimum measurement iterations (default: methodology default)
@@ -3403,6 +3409,29 @@ mod tests {
             OsString::from("commutative_inserts_disjoint_keys"),
             OsString::from("--concurrency"),
             OsString::from("2"),
+        ];
+        assert_eq!(run_cli(os_args), 0);
+    }
+
+    #[test]
+    fn test_run_accepts_no_mvcc_flag() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_str().unwrap().to_owned();
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute_batch("CREATE TABLE seed (id INTEGER PRIMARY KEY);")
+            .unwrap();
+
+        let os_args = vec![
+            OsString::from("realdb-e2e"),
+            OsString::from("run"),
+            OsString::from("--engine"),
+            OsString::from("sqlite3"),
+            OsString::from("--db"),
+            OsString::from(db_path),
+            OsString::from("--workload"),
+            OsString::from("commutative_inserts_disjoint_keys"),
+            OsString::from("--no-mvcc"),
         ];
         assert_eq!(run_cli(os_args), 0);
     }
