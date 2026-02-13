@@ -79,6 +79,102 @@ pub struct SoakStepOutcome {
     pub checkpoint_triggered: bool,
 }
 
+/// Lifecycle boundary where telemetry was captured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TelemetryBoundary {
+    /// Initial run baseline before workload steps execute.
+    Startup,
+    /// Periodic checkpoint during the steady-state main loop.
+    SteadyState,
+    /// Final run snapshot captured at finalize.
+    Teardown,
+}
+
+/// Normalized resource telemetry record for leak-trend analysis (`bd-mblr.7.7.1`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResourceTelemetryRecord {
+    /// Deterministic run identifier for correlation across artifacts.
+    pub run_id: String,
+    /// Scenario identifier for per-scenario trend analysis.
+    pub scenario_id: String,
+    /// Profile name for the originating soak workload.
+    pub profile_name: String,
+    /// Deterministic seed used for this run.
+    pub run_seed: u64,
+    /// Monotonic sequence number within the run.
+    pub sequence: u64,
+    /// Lifecycle boundary at capture time.
+    pub boundary: TelemetryBoundary,
+    /// Soak phase at capture time.
+    pub phase: SoakPhase,
+    /// Monotonic transaction count at capture time.
+    pub transaction_count: u64,
+    /// Monotonic elapsed seconds at capture time.
+    pub elapsed_secs: f64,
+    /// Current WAL page count.
+    pub wal_pages: u64,
+    /// Current heap footprint estimate.
+    pub heap_bytes: u64,
+    /// Current active transaction count.
+    pub active_transactions: u32,
+    /// Current lock table size.
+    pub lock_table_size: u32,
+    /// Current max version chain length.
+    pub max_version_chain_len: u32,
+    /// Current p99 latency estimate.
+    pub p99_latency_us: u64,
+    /// SSI aborts observed since previous checkpoint.
+    pub ssi_aborts_since_last: u64,
+    /// Commits observed since previous checkpoint.
+    pub commits_since_last: u64,
+}
+
+impl ResourceTelemetryRecord {
+    /// Build a telemetry record from a checkpoint snapshot.
+    #[must_use]
+    pub fn from_snapshot(
+        run_id: &str,
+        scenario_id: &str,
+        profile_name: &str,
+        run_seed: u64,
+        sequence: u64,
+        boundary: TelemetryBoundary,
+        phase: SoakPhase,
+        snapshot: &CheckpointSnapshot,
+    ) -> Self {
+        Self {
+            run_id: run_id.to_owned(),
+            scenario_id: scenario_id.to_owned(),
+            profile_name: profile_name.to_owned(),
+            run_seed,
+            sequence,
+            boundary,
+            phase,
+            transaction_count: snapshot.transaction_count,
+            elapsed_secs: snapshot.elapsed_secs,
+            wal_pages: snapshot.wal_pages,
+            heap_bytes: snapshot.heap_bytes,
+            active_transactions: snapshot.active_transactions,
+            lock_table_size: snapshot.lock_table_size,
+            max_version_chain_len: snapshot.max_version_chain_len,
+            p99_latency_us: snapshot.p99_latency_us,
+            ssi_aborts_since_last: snapshot.ssi_aborts_since_last,
+            commits_since_last: snapshot.commits_since_last,
+        }
+    }
+
+    /// Serialize this record to JSON.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+
+    /// Parse a record from JSON.
+    pub fn from_json(input: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(input)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Soak run report
 // ---------------------------------------------------------------------------
@@ -110,6 +206,8 @@ pub struct SoakRunReport {
     pub active_fault_profile_ids: Vec<String>,
     /// Summary of the run for triage.
     pub summary: String,
+    /// Normalized resource telemetry records captured during this run.
+    pub resource_telemetry: Vec<ResourceTelemetryRecord>,
 }
 
 impl SoakRunReport {
@@ -178,6 +276,8 @@ struct SoakState {
     sim_lock_table_size: u64,
     sim_active_txns: u64,
     sim_heap_bytes: u64,
+    resource_telemetry: Vec<ResourceTelemetryRecord>,
+    telemetry_sequence: u64,
 }
 
 impl SoakState {
@@ -201,6 +301,8 @@ impl SoakState {
             sim_lock_table_size: 0,
             sim_active_txns: 0,
             sim_heap_bytes: 1024 * 1024, // 1 MiB baseline
+            resource_telemetry: Vec::new(),
+            telemetry_sequence: 0,
         }
     }
 
@@ -231,6 +333,12 @@ impl SoakState {
             commits_since_last: self.commits,
             elapsed_secs,
         }
+    }
+
+    fn next_telemetry_sequence(&mut self) -> u64 {
+        let sequence = self.telemetry_sequence;
+        self.telemetry_sequence = self.telemetry_sequence.saturating_add(1);
+        sequence
     }
 }
 
@@ -264,6 +372,7 @@ impl Default for SoakFaultConfig {
 pub struct SoakExecutor {
     spec: SoakWorkloadSpec,
     state: SoakState,
+    run_id: String,
     fault_config: SoakFaultConfig,
     /// Number of warmup transactions before main loop.
     warmup_count: u64,
@@ -278,13 +387,24 @@ impl SoakExecutor {
         let seed = spec.run_seed;
         let target = spec.profile.target_transactions;
         let warmup = target / 20; // 5% warmup
-        Self {
+        let run_id = deterministic_run_id(&spec);
+        let mut executor = Self {
             spec,
             state: SoakState::new(seed),
+            run_id,
             fault_config: SoakFaultConfig::default(),
             warmup_count: warmup.max(1),
             time_per_txn: 0.001, // 1ms per simulated transaction
-        }
+        };
+
+        let startup_snapshot = executor.state.capture_snapshot(0.0);
+        executor.emit_resource_telemetry(
+            TelemetryBoundary::Startup,
+            SoakPhase::Warmup,
+            &startup_snapshot,
+        );
+
+        executor
     }
 
     /// Attach fault injection configuration.
@@ -428,13 +548,29 @@ impl SoakExecutor {
 
         self.state.checkpoints.push(current);
         self.state.invariant_results.push(result.clone());
+        let snapshot = self.state.checkpoints.last().cloned();
+        if let Some(snapshot) = snapshot {
+            self.emit_resource_telemetry(
+                TelemetryBoundary::SteadyState,
+                SoakPhase::MainLoop,
+                &snapshot,
+            );
+        }
 
         result
     }
 
     /// Finalize the run and produce a report.
     #[must_use]
-    pub fn finalize(self) -> SoakRunReport {
+    pub fn finalize(mut self) -> SoakRunReport {
+        let elapsed = self.state.transaction_index as f64 * self.time_per_txn;
+        let teardown_snapshot = self.state.capture_snapshot(elapsed);
+        self.emit_resource_telemetry(
+            TelemetryBoundary::Teardown,
+            SoakPhase::Complete,
+            &teardown_snapshot,
+        );
+
         let summary = if self.state.aborted {
             format!(
                 "ABORTED at txn {}: {}",
@@ -473,6 +609,7 @@ impl SoakExecutor {
             checkpoints: self.state.checkpoints,
             active_fault_profile_ids: active_fault_ids,
             summary,
+            resource_telemetry: self.state.resource_telemetry,
         }
     }
 
@@ -509,7 +646,7 @@ impl SoakExecutor {
         }
     }
 
-    fn simulate_transaction(&mut self, action: StepAction, rand: u64) -> (bool, Option<String>) {
+    fn simulate_transaction(&self, action: StepAction, rand: u64) -> (bool, Option<String>) {
         // Check fault injection
         if !self.fault_config.profiles.is_empty() && self.fault_config.injection_probability > 0.0 {
             let fault_rand = (rand >> 32) as f64 / u32::MAX as f64;
@@ -566,6 +703,433 @@ impl SoakExecutor {
         self.state.sim_lock_table_size = self.state.sim_active_txns.saturating_mul(2);
         self.state.sim_active_txns = u64::from(self.spec.profile.concurrency.connections).min(4);
     }
+
+    fn emit_resource_telemetry(
+        &mut self,
+        boundary: TelemetryBoundary,
+        phase: SoakPhase,
+        snapshot: &CheckpointSnapshot,
+    ) {
+        if self.spec.profile.scenario_ids.is_empty() {
+            let sequence = self.state.next_telemetry_sequence();
+            self.state
+                .resource_telemetry
+                .push(ResourceTelemetryRecord::from_snapshot(
+                    &self.run_id,
+                    "UNSPECIFIED",
+                    &self.spec.profile.name,
+                    self.spec.run_seed,
+                    sequence,
+                    boundary,
+                    phase,
+                    snapshot,
+                ));
+            return;
+        }
+
+        for scenario_id in &self.spec.profile.scenario_ids {
+            let sequence = self.state.next_telemetry_sequence();
+            self.state
+                .resource_telemetry
+                .push(ResourceTelemetryRecord::from_snapshot(
+                    &self.run_id,
+                    scenario_id,
+                    &self.spec.profile.name,
+                    self.spec.run_seed,
+                    sequence,
+                    boundary,
+                    phase,
+                    snapshot,
+                ));
+        }
+    }
+}
+
+fn deterministic_run_id(spec: &SoakWorkloadSpec) -> String {
+    let mut profile_tag = String::with_capacity(spec.profile.name.len());
+    let mut last_was_dash = false;
+    for ch in spec.profile.name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            profile_tag.push(ch.to_ascii_lowercase());
+            last_was_dash = false;
+        } else if !last_was_dash {
+            profile_tag.push('-');
+            last_was_dash = true;
+        }
+    }
+    let profile_tag = profile_tag.trim_matches('-');
+    let profile_tag = if profile_tag.is_empty() {
+        "profile"
+    } else {
+        profile_tag
+    };
+    format!("soak-{profile_tag}-{:016x}", spec.run_seed)
+}
+
+/// Resource dimensions monitored by leak detectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackedResource {
+    /// Heap usage trend.
+    HeapBytes,
+    /// WAL growth trend.
+    WalPages,
+    /// Lock table growth trend.
+    LockTableSize,
+    /// Active transaction growth trend.
+    ActiveTransactions,
+}
+
+impl TrackedResource {
+    /// Ordered list used by leak detectors.
+    pub const ALL: [Self; 4] = [
+        Self::HeapBytes,
+        Self::WalPages,
+        Self::LockTableSize,
+        Self::ActiveTransactions,
+    ];
+
+    /// Stable resource label for diagnostics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HeapBytes => "heap_bytes",
+            Self::WalPages => "wal_pages",
+            Self::LockTableSize => "lock_table_size",
+            Self::ActiveTransactions => "active_transactions",
+        }
+    }
+}
+
+/// Numeric thresholds for a single tracked resource.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ResourceLeakBudget {
+    /// Warn when end-state delta exceeds this value.
+    pub warning_delta: f64,
+    /// Escalate to critical when end-state delta exceeds this value.
+    pub critical_delta: f64,
+    /// Warn when sustained per-sample slope exceeds this value.
+    pub warning_slope: f64,
+    /// Escalate to critical when sustained per-sample slope exceeds this value.
+    pub critical_slope: f64,
+}
+
+impl ResourceLeakBudget {
+    /// Construct a budget with explicit thresholds.
+    #[must_use]
+    pub const fn new(
+        warning_delta: f64,
+        critical_delta: f64,
+        warning_slope: f64,
+        critical_slope: f64,
+    ) -> Self {
+        Self {
+            warning_delta,
+            critical_delta,
+            warning_slope,
+            critical_slope,
+        }
+    }
+}
+
+/// Leak detector policy with baseline and escalation parameters (`bd-mblr.7.7.2`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LeakBudgetPolicy {
+    /// Number of early samples used as baseline.
+    pub baseline_window: usize,
+    /// Minimum number of post-baseline samples before sustained-growth checks apply.
+    pub sustained_window: usize,
+    /// Minimum fraction of positive adjacent deltas required for sustained growth.
+    pub monotone_growth_ratio: f64,
+    /// Heap leak thresholds.
+    pub heap_bytes: ResourceLeakBudget,
+    /// WAL leak thresholds.
+    pub wal_pages: ResourceLeakBudget,
+    /// Lock table leak thresholds.
+    pub lock_table_size: ResourceLeakBudget,
+    /// Active transaction leak thresholds.
+    pub active_transactions: ResourceLeakBudget,
+}
+
+impl Default for LeakBudgetPolicy {
+    fn default() -> Self {
+        Self {
+            baseline_window: 2,
+            sustained_window: 3,
+            monotone_growth_ratio: 0.75,
+            heap_bytes: ResourceLeakBudget::new(64.0 * 1024.0, 256.0 * 1024.0, 512.0, 2048.0),
+            wal_pages: ResourceLeakBudget::new(16.0, 64.0, 1.0, 4.0),
+            lock_table_size: ResourceLeakBudget::new(8.0, 32.0, 0.5, 2.0),
+            active_transactions: ResourceLeakBudget::new(2.0, 6.0, 0.2, 1.0),
+        }
+    }
+}
+
+impl LeakBudgetPolicy {
+    /// Resolve the configured thresholds for a tracked resource.
+    #[must_use]
+    pub const fn budget_for(&self, resource: TrackedResource) -> ResourceLeakBudget {
+        match resource {
+            TrackedResource::HeapBytes => self.heap_bytes,
+            TrackedResource::WalPages => self.wal_pages,
+            TrackedResource::LockTableSize => self.lock_table_size,
+            TrackedResource::ActiveTransactions => self.active_transactions,
+        }
+    }
+}
+
+/// Escalation level emitted by leak detectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeakSeverity {
+    /// Growth exceeded delta thresholds but looked like warmup/transient behavior.
+    Notice,
+    /// Sustained growth exceeded warning thresholds.
+    Warning,
+    /// Sustained growth or delta exceeded critical thresholds.
+    Critical,
+}
+
+/// Leak detector output aligned with soak/perf triage reporting.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LeakDetectorFinding {
+    /// Scenario tied to this finding.
+    pub scenario_id: String,
+    /// Resource dimension that triggered this finding.
+    pub resource: TrackedResource,
+    /// Escalation level.
+    pub severity: LeakSeverity,
+    /// Mean of baseline samples.
+    pub baseline_mean: f64,
+    /// Final observed value.
+    pub final_value: f64,
+    /// Final minus baseline mean.
+    pub delta: f64,
+    /// Linear slope (value/sample) on post-baseline samples.
+    pub slope_per_sample: f64,
+    /// Fraction of positive adjacent deltas in post-baseline samples.
+    pub growth_ratio: f64,
+    /// Whether this finding was suppressed as a warmup-style transient.
+    pub warmup_exempted: bool,
+    /// Human-readable detector rationale.
+    pub reason: String,
+}
+
+impl LeakDetectorFinding {
+    /// Render a compact line for CI/report triage.
+    #[must_use]
+    pub fn triage_line(&self) -> String {
+        format!(
+            "{} scenario={} resource={} delta={:.3} slope={:.3} growth_ratio={:.3} warmup_exempted={} reason={}",
+            match self.severity {
+                LeakSeverity::Notice => "NOTICE",
+                LeakSeverity::Warning => "WARN",
+                LeakSeverity::Critical => "CRIT",
+            },
+            self.scenario_id,
+            self.resource.as_str(),
+            self.delta,
+            self.slope_per_sample,
+            self.growth_ratio,
+            self.warmup_exempted,
+            self.reason
+        )
+    }
+}
+
+/// Summary output for leak-budget analysis.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LeakDetectionReport {
+    /// Number of telemetry records examined.
+    pub records_analyzed: usize,
+    /// Policy used for this evaluation.
+    pub policy: LeakBudgetPolicy,
+    /// Detector findings.
+    pub findings: Vec<LeakDetectorFinding>,
+}
+
+impl LeakDetectionReport {
+    /// Count warning-level findings.
+    #[must_use]
+    pub fn warning_count(&self) -> usize {
+        self.findings
+            .iter()
+            .filter(|finding| finding.severity == LeakSeverity::Warning)
+            .count()
+    }
+
+    /// Count critical-level findings.
+    #[must_use]
+    pub fn critical_count(&self) -> usize {
+        self.findings
+            .iter()
+            .filter(|finding| finding.severity == LeakSeverity::Critical)
+            .count()
+    }
+}
+
+/// Detect leak-budget violations across normalized telemetry records.
+#[must_use]
+pub fn detect_leak_budget_violations(
+    records: &[ResourceTelemetryRecord],
+    policy: &LeakBudgetPolicy,
+) -> LeakDetectionReport {
+    let mut by_scenario: std::collections::BTreeMap<&str, Vec<&ResourceTelemetryRecord>> =
+        std::collections::BTreeMap::new();
+    for record in records {
+        by_scenario
+            .entry(record.scenario_id.as_str())
+            .or_default()
+            .push(record);
+    }
+
+    let mut findings = Vec::new();
+    for (scenario_id, mut scenario_records) in by_scenario {
+        scenario_records.sort_by_key(|record| record.sequence);
+        findings.extend(detect_scenario_leaks(
+            scenario_id,
+            &scenario_records,
+            policy,
+        ));
+    }
+
+    LeakDetectionReport {
+        records_analyzed: records.len(),
+        policy: policy.clone(),
+        findings,
+    }
+}
+
+fn detect_scenario_leaks(
+    scenario_id: &str,
+    scenario_records: &[&ResourceTelemetryRecord],
+    policy: &LeakBudgetPolicy,
+) -> Vec<LeakDetectorFinding> {
+    let mut findings = Vec::new();
+    for resource in TrackedResource::ALL {
+        let samples: Vec<f64> = scenario_records
+            .iter()
+            .map(|record| metric_value(record, resource))
+            .collect();
+        if let Some(finding) = evaluate_resource_series(scenario_id, resource, &samples, policy) {
+            findings.push(finding);
+        }
+    }
+    findings
+}
+
+fn metric_value(record: &ResourceTelemetryRecord, resource: TrackedResource) -> f64 {
+    match resource {
+        TrackedResource::HeapBytes => record.heap_bytes as f64,
+        TrackedResource::WalPages => record.wal_pages as f64,
+        TrackedResource::LockTableSize => record.lock_table_size as f64,
+        TrackedResource::ActiveTransactions => record.active_transactions as f64,
+    }
+}
+
+fn evaluate_resource_series(
+    scenario_id: &str,
+    resource: TrackedResource,
+    samples: &[f64],
+    policy: &LeakBudgetPolicy,
+) -> Option<LeakDetectorFinding> {
+    if policy.baseline_window == 0 || samples.len() <= policy.baseline_window {
+        return None;
+    }
+
+    let baseline = &samples[..policy.baseline_window];
+    let post_baseline = &samples[policy.baseline_window - 1..];
+    if post_baseline.len() < 2 {
+        return None;
+    }
+
+    let baseline_mean = baseline.iter().sum::<f64>() / baseline.len() as f64;
+    let final_value = *samples.last()?;
+    let delta = final_value - baseline_mean;
+    let slope = linear_slope(post_baseline);
+    let growth_ratio = monotone_growth_fraction(post_baseline);
+
+    let budget = policy.budget_for(resource);
+    let sustained_growth = post_baseline.len() >= policy.sustained_window
+        && growth_ratio >= policy.monotone_growth_ratio;
+
+    let (severity, reason, warmup_exempted) = if sustained_growth
+        && (delta >= budget.critical_delta || slope >= budget.critical_slope)
+    {
+        (
+            LeakSeverity::Critical,
+            format!(
+                "sustained growth exceeded critical budget (delta>={:.3} or slope>={:.3})",
+                budget.critical_delta, budget.critical_slope
+            ),
+            false,
+        )
+    } else if sustained_growth && (delta >= budget.warning_delta || slope >= budget.warning_slope) {
+        (
+            LeakSeverity::Warning,
+            format!(
+                "sustained growth exceeded warning budget (delta>={:.3} or slope>={:.3})",
+                budget.warning_delta, budget.warning_slope
+            ),
+            false,
+        )
+    } else if delta >= budget.warning_delta {
+        (
+            LeakSeverity::Notice,
+            "growth exceeded delta threshold but lacked sustained trend after baseline".to_owned(),
+            true,
+        )
+    } else {
+        return None;
+    };
+
+    Some(LeakDetectorFinding {
+        scenario_id: scenario_id.to_owned(),
+        resource,
+        severity,
+        baseline_mean,
+        final_value,
+        delta,
+        slope_per_sample: slope,
+        growth_ratio,
+        warmup_exempted,
+        reason,
+    })
+}
+
+fn linear_slope(samples: &[f64]) -> f64 {
+    if samples.len() < 2 {
+        return 0.0;
+    }
+    let n = samples.len() as f64;
+    let sum_x = (0..samples.len()).map(|index| index as f64).sum::<f64>();
+    let sum_y = samples.iter().sum::<f64>();
+    let sum_xy = samples
+        .iter()
+        .enumerate()
+        .map(|(index, value)| index as f64 * *value)
+        .sum::<f64>();
+    let sum_xx = (0..samples.len())
+        .map(|index| {
+            let x = index as f64;
+            x * x
+        })
+        .sum::<f64>();
+    let denominator = n.mul_add(sum_xx, -(sum_x * sum_x));
+    if denominator.abs() <= f64::EPSILON {
+        0.0
+    } else {
+        (n.mul_add(sum_xy, -(sum_x * sum_y))) / denominator
+    }
+}
+
+fn monotone_growth_fraction(samples: &[f64]) -> f64 {
+    if samples.len() < 2 {
+        return 0.0;
+    }
+
+    let increases = samples.windows(2).filter(|pair| pair[1] > pair[0]).count();
+    increases as f64 / (samples.len() - 1) as f64
 }
 
 /// Convenience: create a default executor from a workload spec and run to completion.
@@ -600,9 +1164,13 @@ pub fn run_soak_with_faults(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
     use crate::soak_profiles::{profile_light, profile_moderate};
 
     const TEST_BEAD: &str = "bd-mblr.7.2.2";
+    const TELEMETRY_TEST_BEAD: &str = "bd-mblr.7.7.1";
+    const LEAK_POLICY_TEST_BEAD: &str = "bd-mblr.7.7.2";
 
     fn light_spec() -> SoakWorkloadSpec {
         SoakWorkloadSpec::from_profile(profile_light(), 0xDEAD_BEEF)
@@ -610,6 +1178,37 @@ mod tests {
 
     fn moderate_spec() -> SoakWorkloadSpec {
         SoakWorkloadSpec::from_profile(profile_moderate(), 0xCAFE_BABE)
+    }
+
+    fn synthetic_record(
+        sequence: u64,
+        boundary: TelemetryBoundary,
+        heap_bytes: u64,
+        wal_pages: u64,
+    ) -> ResourceTelemetryRecord {
+        ResourceTelemetryRecord {
+            run_id: "soak-synth".to_owned(),
+            scenario_id: "SYN-LEAK".to_owned(),
+            profile_name: "synthetic".to_owned(),
+            run_seed: 0x7772,
+            sequence,
+            boundary,
+            phase: match boundary {
+                TelemetryBoundary::Startup => SoakPhase::Warmup,
+                TelemetryBoundary::SteadyState => SoakPhase::MainLoop,
+                TelemetryBoundary::Teardown => SoakPhase::Complete,
+            },
+            transaction_count: sequence,
+            elapsed_secs: sequence as f64 * 0.01,
+            wal_pages,
+            heap_bytes,
+            active_transactions: 2,
+            lock_table_size: 4,
+            max_version_chain_len: 3,
+            p99_latency_us: 500,
+            ssi_aborts_since_last: 0,
+            commits_since_last: sequence,
+        }
     }
 
     #[test]
@@ -876,6 +1475,191 @@ mod tests {
         assert!(
             !report.active_fault_profile_ids.is_empty(),
             "bead_id={TEST_BEAD} case=fault_ids_populated"
+        );
+    }
+
+    #[test]
+    fn telemetry_captures_startup_steady_state_and_teardown() {
+        let mut spec = light_spec();
+        spec.profile.target_transactions = 200;
+        spec.profile.invariant_check_interval = 50;
+        let report = run_soak(spec);
+
+        let boundaries: BTreeSet<TelemetryBoundary> = report
+            .resource_telemetry
+            .iter()
+            .map(|record| record.boundary)
+            .collect();
+
+        assert!(
+            boundaries.contains(&TelemetryBoundary::Startup),
+            "bead_id={TELEMETRY_TEST_BEAD} case=boundary_startup_present"
+        );
+        assert!(
+            boundaries.contains(&TelemetryBoundary::SteadyState),
+            "bead_id={TELEMETRY_TEST_BEAD} case=boundary_steady_present"
+        );
+        assert!(
+            boundaries.contains(&TelemetryBoundary::Teardown),
+            "bead_id={TELEMETRY_TEST_BEAD} case=boundary_teardown_present"
+        );
+    }
+
+    #[test]
+    fn telemetry_records_include_run_and_scenario_correlation() {
+        let mut spec = light_spec();
+        spec.profile.scenario_ids = vec!["SOAK-ALPHA".to_owned(), "SOAK-BETA".to_owned()];
+        let report = run_soak(spec);
+
+        let run_ids: BTreeSet<&str> = report
+            .resource_telemetry
+            .iter()
+            .map(|record| record.run_id.as_str())
+            .collect();
+        assert_eq!(
+            run_ids.len(),
+            1,
+            "bead_id={TELEMETRY_TEST_BEAD} case=single_run_id"
+        );
+
+        let scenarios: BTreeSet<&str> = report
+            .resource_telemetry
+            .iter()
+            .map(|record| record.scenario_id.as_str())
+            .collect();
+        assert!(
+            scenarios.contains("SOAK-ALPHA"),
+            "bead_id={TELEMETRY_TEST_BEAD} case=scenario_alpha_present"
+        );
+        assert!(
+            scenarios.contains("SOAK-BETA"),
+            "bead_id={TELEMETRY_TEST_BEAD} case=scenario_beta_present"
+        );
+    }
+
+    #[test]
+    fn telemetry_record_json_round_trips() {
+        let snapshot = CheckpointSnapshot {
+            transaction_count: 12,
+            max_txn_id: 9,
+            max_commit_seq: 9,
+            active_transactions: 2,
+            wal_pages: 15,
+            max_version_chain_len: 3,
+            lock_table_size: 4,
+            heap_bytes: 1_048_576,
+            p99_latency_us: 777,
+            ssi_aborts_since_last: 0,
+            commits_since_last: 11,
+            elapsed_secs: 0.012,
+        };
+        let record = ResourceTelemetryRecord::from_snapshot(
+            "soak-roundtrip",
+            "SOAK-ROUNDTRIP",
+            "roundtrip-profile",
+            0xABCD,
+            1,
+            TelemetryBoundary::SteadyState,
+            SoakPhase::MainLoop,
+            &snapshot,
+        );
+
+        let json = record.to_json().expect("telemetry record should serialize");
+        let parsed =
+            ResourceTelemetryRecord::from_json(&json).expect("telemetry record should parse");
+
+        assert_eq!(
+            parsed, record,
+            "bead_id={TELEMETRY_TEST_BEAD} case=telemetry_round_trip"
+        );
+    }
+
+    #[test]
+    fn telemetry_sequence_is_monotone() {
+        let report = run_soak(light_spec());
+        let mut previous_sequence = None;
+        for record in &report.resource_telemetry {
+            if let Some(previous_sequence) = previous_sequence {
+                assert!(
+                    record.sequence > previous_sequence,
+                    "bead_id={TELEMETRY_TEST_BEAD} case=sequence_monotone prev={previous_sequence} cur={}",
+                    record.sequence
+                );
+            }
+            previous_sequence = Some(record.sequence);
+        }
+    }
+
+    #[test]
+    fn leak_detector_flags_sustained_growth() {
+        let records = vec![
+            synthetic_record(0, TelemetryBoundary::Startup, 1_000_000, 10),
+            synthetic_record(1, TelemetryBoundary::SteadyState, 1_020_000, 11),
+            synthetic_record(2, TelemetryBoundary::SteadyState, 1_070_000, 13),
+            synthetic_record(3, TelemetryBoundary::SteadyState, 1_150_000, 16),
+            synthetic_record(4, TelemetryBoundary::SteadyState, 1_260_000, 20),
+            synthetic_record(5, TelemetryBoundary::Teardown, 1_380_000, 24),
+        ];
+        let policy = LeakBudgetPolicy::default();
+        let report = detect_leak_budget_violations(&records, &policy);
+
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.resource == TrackedResource::HeapBytes
+                    && finding.severity >= LeakSeverity::Warning),
+            "bead_id={LEAK_POLICY_TEST_BEAD} case=sustained_growth_detected"
+        );
+    }
+
+    #[test]
+    fn leak_detector_marks_warmup_spike_as_notice() {
+        let records = vec![
+            synthetic_record(0, TelemetryBoundary::Startup, 1_000_000, 10),
+            synthetic_record(1, TelemetryBoundary::SteadyState, 1_500_000, 11),
+            synthetic_record(2, TelemetryBoundary::SteadyState, 1_490_000, 11),
+            synthetic_record(3, TelemetryBoundary::SteadyState, 1_486_000, 11),
+            synthetic_record(4, TelemetryBoundary::SteadyState, 1_484_000, 11),
+            synthetic_record(5, TelemetryBoundary::Teardown, 1_483_000, 11),
+        ];
+        let policy = LeakBudgetPolicy::default();
+        let report = detect_leak_budget_violations(&records, &policy);
+
+        assert!(
+            report.findings.iter().any(|finding| {
+                finding.resource == TrackedResource::HeapBytes
+                    && finding.severity == LeakSeverity::Notice
+                    && finding.warmup_exempted
+            }),
+            "bead_id={LEAK_POLICY_TEST_BEAD} case=warmup_notice_detected"
+        );
+        assert!(
+            report.critical_count() == 0,
+            "bead_id={LEAK_POLICY_TEST_BEAD} case=no_critical_for_warmup"
+        );
+    }
+
+    #[test]
+    fn leak_detector_reports_critical_delta_violation() {
+        let records = vec![
+            synthetic_record(0, TelemetryBoundary::Startup, 1_000_000, 10),
+            synthetic_record(1, TelemetryBoundary::SteadyState, 1_010_000, 11),
+            synthetic_record(2, TelemetryBoundary::SteadyState, 1_020_000, 12),
+            synthetic_record(3, TelemetryBoundary::SteadyState, 1_030_000, 13),
+            synthetic_record(4, TelemetryBoundary::SteadyState, 1_040_000, 14),
+            synthetic_record(5, TelemetryBoundary::Teardown, 1_700_000, 40),
+        ];
+        let policy = LeakBudgetPolicy::default();
+        let report = detect_leak_budget_violations(&records, &policy);
+
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.resource == TrackedResource::HeapBytes
+                    && finding.severity == LeakSeverity::Critical),
+            "bead_id={LEAK_POLICY_TEST_BEAD} case=critical_delta_detected"
         );
     }
 }
