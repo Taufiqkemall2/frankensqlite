@@ -482,6 +482,23 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
 
     scripts.push(
         ScriptEntryBuilder::new(
+            "e2e/json_fts_wave_report.sh",
+            ScriptKind::ShellE2e,
+            "JSON1 + FTS parity closure wave report with differential evidence",
+        )
+        .bead("bd-1dp9.5.2")
+        .command("bash e2e/json_fts_wave_report.sh --json")
+        .json_output()
+        .scenarios(&["EXT-1", "EXT-2", "EXT-4"])
+        .storage(&[StorageMode::InMemory, StorageMode::FileBacked])
+        .concurrency(&[ConcurrencyMode::Sequential])
+        .artifacts(&["test-results/bd_1dp9_5_2/"])
+        .timeout(1200)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
             "e2e/arc_warmup_report.sh",
             ScriptKind::ShellE2e,
             "ARC cache performance warmup analysis",
