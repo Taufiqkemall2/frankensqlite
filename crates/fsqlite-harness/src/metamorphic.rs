@@ -387,13 +387,13 @@ pub struct OracleContract {
 /// A metamorphic transform that produces semantically equivalent SQL.
 pub trait MetamorphicTransform: fmt::Debug {
     /// Transform name for triage tags.
-    fn name(&self) -> &str;
+    fn name(&self) -> &'static str;
 
     /// Brief proof sketch explaining why the rewrite preserves semantics.
-    fn soundness_sketch(&self) -> &str;
+    fn soundness_sketch(&self) -> &'static str;
 
     /// Taxonomy feature IDs this transform exercises.
-    fn feature_tags(&self) -> Vec<&str>;
+    fn feature_tags(&self) -> Vec<&'static str>;
 
     /// Semantic family this transform belongs to (bd-mblr.7.1.1).
     fn family(&self) -> TransformFamily;
@@ -690,16 +690,16 @@ pub fn test_case_to_entry(case: &MetamorphicTestCase) -> CorpusEntry {
 pub struct SubqueryWrap;
 
 impl MetamorphicTransform for SubqueryWrap {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "subquery_wrap"
     }
 
-    fn soundness_sketch(&self) -> &str {
+    fn soundness_sketch(&self) -> &'static str {
         "SELECT * FROM (Q) AS _sub = Q for any Q without ORDER BY/LIMIT. \
          The derived table preserves the multiset of rows."
     }
 
-    fn feature_tags(&self) -> Vec<&str> {
+    fn feature_tags(&self) -> Vec<&'static str> {
         vec!["F-SQL.7", "F-SQL.9"]
     }
 
@@ -739,16 +739,16 @@ impl MetamorphicTransform for SubqueryWrap {
 pub struct TautologicalPredicate;
 
 impl MetamorphicTransform for TautologicalPredicate {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "tautological_predicate"
     }
 
-    fn soundness_sketch(&self) -> &str {
+    fn soundness_sketch(&self) -> &'static str {
         "WHERE (P AND 1=1) = WHERE P, since 1=1 is TRUE for all rows. \
          WHERE 1=1 selects all rows."
     }
 
-    fn feature_tags(&self) -> Vec<&str> {
+    fn feature_tags(&self) -> Vec<&'static str> {
         vec!["F-SQL.2", "F-SQL.39"]
     }
 
@@ -822,17 +822,17 @@ impl MetamorphicTransform for TautologicalPredicate {
 pub struct DoubleNegation;
 
 impl MetamorphicTransform for DoubleNegation {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "double_negation"
     }
 
-    fn soundness_sketch(&self) -> &str {
+    fn soundness_sketch(&self) -> &'static str {
         "NOT(NOT(P)) has the same truth value as P in SQL's three-valued \
          logic. NULL maps to NULL under double negation, and WHERE treats \
          both NULL and FALSE as exclusion."
     }
 
-    fn feature_tags(&self) -> Vec<&str> {
+    fn feature_tags(&self) -> Vec<&'static str> {
         vec!["F-SQL.39", "F-SQL.43"]
     }
 
@@ -889,16 +889,16 @@ impl MetamorphicTransform for DoubleNegation {
 pub struct CoalesceIdentity;
 
 impl MetamorphicTransform for CoalesceIdentity {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "coalesce_identity"
     }
 
-    fn soundness_sketch(&self) -> &str {
+    fn soundness_sketch(&self) -> &'static str {
         "COALESCE(x, x) = x for all x. If x is non-NULL, returns first \
          non-NULL (x). If x is NULL, both args are NULL, returns NULL."
     }
 
-    fn feature_tags(&self) -> Vec<&str> {
+    fn feature_tags(&self) -> Vec<&'static str> {
         vec!["F-FUNC.7"]
     }
 
@@ -994,16 +994,16 @@ impl MetamorphicTransform for CoalesceIdentity {
 pub struct UnionSelfIntersect;
 
 impl MetamorphicTransform for UnionSelfIntersect {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "union_self_intersect"
     }
 
-    fn soundness_sketch(&self) -> &str {
+    fn soundness_sketch(&self) -> &'static str {
         "Q INTERSECT Q = SELECT DISTINCT of Q's results. Applied only to \
          SELECT DISTINCT queries where the result is already a set."
     }
 
-    fn feature_tags(&self) -> Vec<&str> {
+    fn feature_tags(&self) -> Vec<&'static str> {
         vec!["F-SQL.8"]
     }
 
@@ -1047,16 +1047,16 @@ impl MetamorphicTransform for UnionSelfIntersect {
 pub struct CastLiteralIdentity;
 
 impl MetamorphicTransform for CastLiteralIdentity {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "cast_literal_identity"
     }
 
-    fn soundness_sketch(&self) -> &str {
+    fn soundness_sketch(&self) -> &'static str {
         "CAST(n AS INTEGER) = n when n is an integer literal. The type \
          affinity is already INTEGER, so CAST is a no-op."
     }
 
-    fn feature_tags(&self) -> Vec<&str> {
+    fn feature_tags(&self) -> Vec<&'static str> {
         vec!["F-SQL.45"]
     }
 
@@ -1088,9 +1088,9 @@ impl MetamorphicTransform for CastLiteralIdentity {
                 }
                 // Ensure it's a standalone literal (not part of an identifier).
                 let before_ok = start == 0
-                    || !bytes[start - 1].is_ascii_alphanumeric() && bytes[start - 1] != b'_';
+                    || (!bytes[start - 1].is_ascii_alphanumeric() && bytes[start - 1] != b'_');
                 let after_ok =
-                    i >= bytes.len() || !bytes[i].is_ascii_alphanumeric() && bytes[i] != b'_';
+                    i >= bytes.len() || (!bytes[i].is_ascii_alphanumeric() && bytes[i] != b'_');
                 if before_ok && after_ok && i - start <= 10 {
                     literals.push((start, i));
                 }
@@ -1132,16 +1132,16 @@ impl MetamorphicTransform for CastLiteralIdentity {
 pub struct ExpressionCommute;
 
 impl MetamorphicTransform for ExpressionCommute {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "expression_commute"
     }
 
-    fn soundness_sketch(&self) -> &str {
+    fn soundness_sketch(&self) -> &'static str {
         "Equality (=) and inequality (!=, <>) are symmetric relations. \
          a = b iff b = a. a != b iff b != a."
     }
 
-    fn feature_tags(&self) -> Vec<&str> {
+    fn feature_tags(&self) -> Vec<&'static str> {
         vec!["F-SQL.38"]
     }
 
@@ -1213,16 +1213,16 @@ impl MetamorphicTransform for ExpressionCommute {
 pub struct NullCoalesce;
 
 impl MetamorphicTransform for NullCoalesce {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "null_coalesce"
     }
 
-    fn soundness_sketch(&self) -> &str {
+    fn soundness_sketch(&self) -> &'static str {
         "COALESCE(x, NULL) = x. If x is non-NULL, returns x (first non-NULL). \
          If x is NULL, returns NULL (no non-NULL args found)."
     }
 
-    fn feature_tags(&self) -> Vec<&str> {
+    fn feature_tags(&self) -> Vec<&'static str> {
         vec!["F-FUNC.7", "F-TYPE.3"]
     }
 

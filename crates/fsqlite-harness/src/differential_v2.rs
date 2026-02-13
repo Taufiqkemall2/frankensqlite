@@ -632,6 +632,180 @@ pub fn run_differential<F: SqlExecutor, C: SqlExecutor>(
     result
 }
 
+/// Deterministic reduction artifact for a divergent workload.
+///
+/// The reducer keeps shrinking `envelope.workload` while preserving a
+/// differential divergence. This is used to produce a compact, reproducible
+/// repro workload for triage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MismatchReduction {
+    /// Original workload statement count.
+    pub original_workload_len: usize,
+    /// Minimized workload statement count.
+    pub minimized_workload_len: usize,
+    /// Zero-based indices from the original workload that were removed.
+    pub removed_workload_indices: Vec<usize>,
+    /// Envelope containing the minimized workload.
+    pub minimized_envelope: ExecutionEnvelope,
+    /// Differential result for the minimized envelope.
+    pub minimized_result: DifferentialResult,
+}
+
+impl MismatchReduction {
+    /// Fraction of workload statements removed by minimization.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn reduction_ratio(&self) -> f64 {
+        if self.original_workload_len == 0 {
+            return 0.0;
+        }
+        let removed = self
+            .original_workload_len
+            .saturating_sub(self.minimized_workload_len);
+        removed as f64 / self.original_workload_len as f64
+    }
+}
+
+/// Reduce a divergent workload to a smaller deterministic repro.
+///
+/// This uses a deterministic delta-debugging strategy over workload
+/// statements. Each probe run is executed from a fresh pair of executors
+/// created by the supplied factories.
+///
+/// Returns:
+/// - `Ok(None)` when the baseline envelope does not diverge.
+/// - `Ok(Some(_))` when divergence is present and a minimized repro was found.
+/// - `Err(_)` when executor construction fails.
+pub fn minimize_mismatch_workload<FFactory, CFactory, F, C>(
+    envelope: &ExecutionEnvelope,
+    make_fsqlite: FFactory,
+    make_csqlite: CFactory,
+) -> Result<Option<MismatchReduction>, String>
+where
+    FFactory: Fn() -> Result<F, String>,
+    CFactory: Fn() -> Result<C, String>,
+    F: SqlExecutor,
+    C: SqlExecutor,
+{
+    let baseline = run_differential_with_factories(envelope, &make_fsqlite, &make_csqlite)?;
+    if !has_divergence(&baseline) {
+        return Ok(None);
+    }
+
+    let original_workload_len = envelope.workload.len();
+    let mut selected: Vec<(usize, String)> =
+        envelope.workload.iter().cloned().enumerate().collect();
+    let mut best_result = baseline;
+
+    if selected.len() > 1 {
+        let mut granularity = 2usize;
+        while selected.len() > 1 {
+            let chunk_size = selected.len().div_ceil(granularity);
+            let mut reduced = false;
+            let mut start = 0usize;
+
+            while start < selected.len() {
+                let end = (start + chunk_size).min(selected.len());
+                if end - start == selected.len() {
+                    // Skip empty-complement probe.
+                    start = end;
+                    continue;
+                }
+
+                let mut candidate = Vec::with_capacity(selected.len() - (end - start));
+                candidate.extend_from_slice(&selected[..start]);
+                candidate.extend_from_slice(&selected[end..]);
+
+                let candidate_envelope = envelope_with_workload(envelope, &candidate);
+                let candidate_result = run_differential_with_factories(
+                    &candidate_envelope,
+                    &make_fsqlite,
+                    &make_csqlite,
+                )?;
+
+                if has_divergence(&candidate_result) {
+                    selected = candidate;
+                    best_result = candidate_result;
+                    granularity = granularity.saturating_sub(1).max(2);
+                    reduced = true;
+                    break;
+                }
+
+                start = end;
+            }
+
+            if !reduced {
+                if granularity >= selected.len() {
+                    break;
+                }
+                granularity = (granularity * 2).min(selected.len());
+            }
+        }
+    }
+
+    // Deterministic local-minimum cleanup pass (single-statement removals).
+    let mut idx = 0usize;
+    while selected.len() > 1 && idx < selected.len() {
+        let mut candidate = selected.clone();
+        candidate.remove(idx);
+
+        let candidate_envelope = envelope_with_workload(envelope, &candidate);
+        let candidate_result =
+            run_differential_with_factories(&candidate_envelope, &make_fsqlite, &make_csqlite)?;
+
+        if has_divergence(&candidate_result) {
+            selected = candidate;
+            best_result = candidate_result;
+        } else {
+            idx += 1;
+        }
+    }
+
+    let minimized_envelope = envelope_with_workload(envelope, &selected);
+    let removed_workload_indices = (0..original_workload_len)
+        .filter(|i| !selected.iter().any(|(orig, _)| orig == i))
+        .collect();
+
+    Ok(Some(MismatchReduction {
+        original_workload_len,
+        minimized_workload_len: selected.len(),
+        removed_workload_indices,
+        minimized_envelope,
+        minimized_result: best_result,
+    }))
+}
+
+fn run_differential_with_factories<FFactory, CFactory, F, C>(
+    envelope: &ExecutionEnvelope,
+    make_fsqlite: &FFactory,
+    make_csqlite: &CFactory,
+) -> Result<DifferentialResult, String>
+where
+    FFactory: Fn() -> Result<F, String>,
+    CFactory: Fn() -> Result<C, String>,
+    F: SqlExecutor,
+    C: SqlExecutor,
+{
+    let fsqlite_exec = make_fsqlite()?;
+    let csqlite_exec = make_csqlite()?;
+    Ok(run_differential(envelope, &fsqlite_exec, &csqlite_exec))
+}
+
+fn envelope_with_workload(
+    envelope: &ExecutionEnvelope,
+    selected: &[(usize, String)],
+) -> ExecutionEnvelope {
+    let mut minimized = envelope.clone();
+    minimized.workload = selected.iter().map(|(_, sql)| sql.clone()).collect();
+    minimized
+}
+
+fn has_divergence(result: &DifferentialResult) -> bool {
+    matches!(result.outcome, Outcome::Divergence | Outcome::Error)
+        || result.statements_mismatched > 0
+        || !result.logical_state_matched
+}
+
 // ─── Outcome comparison with canonicalization ────────────────────────────
 
 fn outcomes_match(

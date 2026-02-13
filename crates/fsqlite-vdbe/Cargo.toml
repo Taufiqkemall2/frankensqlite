@@ -21,6 +21,11 @@ tracing = { workspace = true }
 [dev-dependencies]
 fsqlite-parser = { workspace = true }
 tempfile = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "vectorized_batch"
+harness = false
 
 [lints]
 workspace = true

@@ -976,6 +976,7 @@ dependencies = [
 name = "fsqlite-vdbe"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "fsqlite-ast",
  "fsqlite-btree",
  "fsqlite-error",

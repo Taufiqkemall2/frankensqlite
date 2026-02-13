@@ -170,9 +170,8 @@ fn deterministic_redact(value: &str, salt: u64) -> String {
 
 /// Redact a file path by keeping only the basename.
 fn redact_path(value: &str) -> String {
-    let parts: Vec<&str> = value.split(',').collect();
-    parts
-        .iter()
+    value
+        .split(',')
         .map(|p| {
             let trimmed = p.trim();
             if let Some(pos) = trimmed.rfind('/') {
@@ -346,10 +345,8 @@ pub fn verify_roundtrip(events: &[LogEventSchema]) -> Result<(), String> {
     let encoded_2 =
         encode_jsonl_stream(&decoded.events).map_err(|e| format!("encode pass 2: {e}"))?;
     if encoded_1 != encoded_2 {
-        let lines_1: Vec<&str> = encoded_1.lines().collect();
-        let lines_2: Vec<&str> = encoded_2.lines().collect();
         let mut diff_summary = String::new();
-        for (i, (l1, l2)) in lines_1.iter().zip(lines_2.iter()).enumerate() {
+        for (i, (l1, l2)) in encoded_1.lines().zip(encoded_2.lines()).enumerate() {
             if l1 != l2 {
                 let _ = writeln!(diff_summary, "line {i}: first divergence");
                 break;
@@ -443,7 +440,7 @@ impl ValidationReport {
                 let field_str = diag
                     .field
                     .as_deref()
-                    .map_or(String::new(), |f| format!(" [{f}]"));
+                    .map_or_else(String::new, |f| format!(" [{f}]"));
                 let _ = writeln!(
                     out,
                     "  [{:?}] event[{}] run_id={}{}: {}",

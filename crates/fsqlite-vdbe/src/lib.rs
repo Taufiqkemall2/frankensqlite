@@ -12,6 +12,7 @@ pub mod engine;
 pub mod frame;
 #[cfg(test)]
 mod repro_delete_skip;
+pub mod vectorized;
 
 // ── Label System ────────────────────────────────────────────────────────────
 

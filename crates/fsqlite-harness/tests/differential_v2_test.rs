@@ -381,3 +381,82 @@ fn result_hash_changes_when_outcome_changes() {
     let pass_result2 = run_test(&pass_envelope);
     assert_eq!(hash1, pass_result2.artifact_hashes.result_hash);
 }
+
+#[derive(Clone, Copy)]
+enum MockEngine {
+    Fsqlite,
+    Csqlite,
+}
+
+struct ReducerMockExecutor {
+    engine: MockEngine,
+}
+
+impl ReducerMockExecutor {
+    const fn new(engine: MockEngine) -> Self {
+        Self { engine }
+    }
+}
+
+impl SqlExecutor for ReducerMockExecutor {
+    fn execute(&self, _sql: &str) -> Result<usize, String> {
+        Ok(0)
+    }
+
+    fn query(&self, sql: &str) -> Result<Vec<Vec<NormalizedValue>>, String> {
+        let trimmed = sql.trim();
+        let value = if trimmed.eq_ignore_ascii_case("SELECT MISMATCH")
+            && matches!(self.engine, MockEngine::Fsqlite)
+        {
+            2
+        } else {
+            1
+        };
+        Ok(vec![vec![NormalizedValue::Integer(value)]])
+    }
+}
+
+#[test]
+fn mismatch_reducer_minimizes_to_single_divergent_statement() {
+    let envelope = make_test_envelope(
+        99,
+        vec![],
+        vec!["SELECT 1", "SELECT 2", "SELECT MISMATCH", "SELECT 3"],
+    );
+
+    let reduction = differential_v2::minimize_mismatch_workload(
+        &envelope,
+        || Ok(ReducerMockExecutor::new(MockEngine::Fsqlite)),
+        || Ok(ReducerMockExecutor::new(MockEngine::Csqlite)),
+    )
+    .expect("reducer should execute")
+    .expect("baseline workload should diverge");
+
+    assert_eq!(reduction.original_workload_len, 4);
+    assert_eq!(reduction.minimized_workload_len, 1);
+    assert_eq!(
+        reduction.minimized_envelope.workload,
+        vec!["SELECT MISMATCH".to_owned()]
+    );
+    assert_eq!(reduction.removed_workload_indices, vec![0, 1, 3]);
+    assert_eq!(reduction.minimized_result.outcome, Outcome::Divergence);
+    assert_eq!(reduction.minimized_result.statements_mismatched, 1);
+    assert!(
+        reduction.reduction_ratio() >= 0.75,
+        "expected at least 75% reduction"
+    );
+}
+
+#[test]
+fn mismatch_reducer_returns_none_for_passing_workload() {
+    let envelope = make_test_envelope(101, vec![], vec!["SELECT 1", "SELECT 2"]);
+
+    let reduction = differential_v2::minimize_mismatch_workload(
+        &envelope,
+        || Ok(ReducerMockExecutor::new(MockEngine::Csqlite)),
+        || Ok(ReducerMockExecutor::new(MockEngine::Csqlite)),
+    )
+    .expect("reducer should execute");
+
+    assert!(reduction.is_none());
+}
