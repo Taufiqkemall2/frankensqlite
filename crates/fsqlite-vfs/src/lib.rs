@@ -1,4 +1,5 @@
 pub mod memory;
+pub mod metrics;
 pub mod shm;
 pub mod traits;
 #[cfg(unix)]
@@ -81,6 +82,7 @@ pub mod host_fs {
 }
 
 pub use memory::{MemoryFile, MemoryVfs};
+pub use metrics::{GLOBAL_VFS_METRICS, TracingFile, VfsMetrics};
 pub use shm::ShmRegion;
 pub use traits::{Vfs, VfsFile};
 #[cfg(unix)]
