@@ -114,3 +114,32 @@ The scan source reads rows from a B-tree cursor and emits `Batch` values:
 
 Correctness is validated against row-at-a-time scans, and scan throughput is
 tracked by `crates/fsqlite-vdbe/benches/vectorized_scan.rs`.
+
+## Morsel Dispatcher (`bd-14vp7.6`, initial slice)
+
+Implemented in `crates/fsqlite-vdbe/src/vectorized_dispatch.rs`.
+
+Current scope:
+
+- Page-range morsel partitioning: `partition_page_morsels(start, end, pages_per_morsel, numa_nodes)`
+- Pipeline task model:
+  - `PipelineId`
+  - `PipelineKind`
+  - `PipelineTask`
+  - `build_pipeline_tasks(...)`
+- Work-stealing execution using `crossbeam-deque`:
+  - per-worker local queues
+  - peer stealing when local queue empties
+  - NUMA locality hints via `preferred_numa_node` assignment
+- Pipeline barriers:
+  - `execute_with_barriers(...)` runs pipeline wave `i` to completion before wave `i+1`
+
+Validation:
+
+- Deterministic unit tests for:
+  - partition coverage/no gaps
+  - barrier ordering
+  - multi-worker utilization
+- Micro-benchmark scaffold:
+  - `crates/fsqlite-vdbe/benches/vectorized_dispatch.rs`
+  - scaling harness for worker counts `1, 2, 4, 8`

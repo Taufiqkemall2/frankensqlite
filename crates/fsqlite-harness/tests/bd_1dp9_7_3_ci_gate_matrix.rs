@@ -177,16 +177,11 @@ fn e2e_flake_budget_mixed_lanes() {
     );
 
     // Lane 3: E2eCorrectness — all pass
-    let correctness_result = evaluate_flake_budget(
-        CiLane::E2eCorrectness,
-        &[TestOutcome::Pass; 50],
-        &policy,
-    );
+    let correctness_result =
+        evaluate_flake_budget(CiLane::E2eCorrectness, &[TestOutcome::Pass; 50], &policy);
 
-    let global = evaluate_global_flake_budget(
-        &[unit_result, perf_result, correctness_result],
-        &policy,
-    );
+    let global =
+        evaluate_global_flake_budget(&[unit_result, perf_result, correctness_result], &policy);
 
     // Global: 17 flakes out of 250 = 6.8% > 5% global budget
     assert!(

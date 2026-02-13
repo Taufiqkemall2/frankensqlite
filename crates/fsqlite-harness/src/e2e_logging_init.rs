@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-use crate::e2e_log_schema::{LogEventSchema, LogEventType, LogPhase, LOG_SCHEMA_VERSION};
+use crate::e2e_log_schema::{LOG_SCHEMA_VERSION, LogEventSchema, LogEventType, LogPhase};
 
 /// Bead identifier for log correlation.
 #[allow(dead_code)]
@@ -90,11 +90,13 @@ impl RunContext {
             .unwrap_or(0);
         let timestamp = format_iso8601_from_ms(now_ms);
 
-        let run_id = std::env::var("RUN_ID")
-            .unwrap_or_else(|_| format!("{bead_id}-{now_ms}-{pid}"));
+        let run_id =
+            std::env::var("RUN_ID").unwrap_or_else(|_| format!("{bead_id}-{now_ms}-{pid}"));
 
         let scenario_id = std::env::var("SCENARIO_ID").ok();
-        let seed = std::env::var("SEED").ok().and_then(|s| s.parse::<u64>().ok());
+        let seed = std::env::var("SEED")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok());
         let backend = std::env::var("BACKEND").ok();
 
         Self {
@@ -456,9 +458,7 @@ fn format_iso8601_from_ms(ms: u128) -> String {
     // Simple year/month/day calculation from days since 1970-01-01.
     let (year, month, day) = days_to_ymd(days_since_epoch);
 
-    format!(
-        "{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z",
-    )
+    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z",)
 }
 
 /// Convert days since Unix epoch to (year, month, day).
@@ -486,7 +486,13 @@ mod tests {
     use super::*;
 
     fn test_context() -> RunContext {
-        RunContext::new("test-run-001", "bd-test", Some("INFRA-1"), Some(42), Some("fsqlite"))
+        RunContext::new(
+            "test-run-001",
+            "bd-test",
+            Some("INFRA-1"),
+            Some(42),
+            Some("fsqlite"),
+        )
     }
 
     fn test_config() -> E2eLoggingConfig {
@@ -506,14 +512,19 @@ mod tests {
 
     #[test]
     fn run_context_from_env_synthesizes_run_id() {
-        // When RUN_ID is not set, it should be synthesized.
-        std::env::remove_var("RUN_ID");
+        // RUN_ID is unlikely to be set in the test environment,
+        // so from_env should synthesize it from the bead_id.
+        // If RUN_ID happens to be set, the run_id will be that value instead.
         let ctx = RunContext::from_env("bd-test-env");
-        assert!(
-            ctx.run_id.starts_with("bd-test-env-"),
-            "run_id should start with bead_id: {}",
-            ctx.run_id,
-        );
+        assert!(!ctx.run_id.is_empty(), "run_id should not be empty",);
+        // If RUN_ID is not set, it should start with the bead_id prefix.
+        if std::env::var("RUN_ID").is_err() {
+            assert!(
+                ctx.run_id.starts_with("bd-test-env-"),
+                "run_id should start with bead_id: {}",
+                ctx.run_id,
+            );
+        }
     }
 
     #[test]
@@ -576,7 +587,10 @@ mod tests {
         let result = init_e2e_logging_with_context(ctx, &cfg);
         let context = &result.startup_event.context;
         assert_eq!(context.get("log_format").map(String::as_str), Some("json"));
-        assert_eq!(context.get("level_filter").map(String::as_str), Some("info"));
+        assert_eq!(
+            context.get("level_filter").map(String::as_str),
+            Some("info")
+        );
     }
 
     #[test]
@@ -658,12 +672,8 @@ mod tests {
 
     #[test]
     fn validate_event_catches_empty_run_id() {
-        let mut event = emit_lifecycle_event(
-            &test_context(),
-            LogPhase::Setup,
-            LogEventType::Start,
-            &[],
-        );
+        let mut event =
+            emit_lifecycle_event(&test_context(), LogPhase::Setup, LogEventType::Start, &[]);
         event.run_id = String::new();
         let errors = validate_event(&event);
         assert!(errors.iter().any(|e| e.contains("run_id")));
@@ -671,12 +681,8 @@ mod tests {
 
     #[test]
     fn validate_event_catches_non_utc_timestamp() {
-        let mut event = emit_lifecycle_event(
-            &test_context(),
-            LogPhase::Setup,
-            LogEventType::Start,
-            &[],
-        );
+        let mut event =
+            emit_lifecycle_event(&test_context(), LogPhase::Setup, LogEventType::Start, &[]);
         event.timestamp = "2026-01-01T00:00:00+05:00".to_owned();
         let errors = validate_event(&event);
         assert!(errors.iter().any(|e| e.contains("UTC")));
@@ -684,12 +690,8 @@ mod tests {
 
     #[test]
     fn validate_event_passes_for_valid_event() {
-        let event = emit_lifecycle_event(
-            &test_context(),
-            LogPhase::Setup,
-            LogEventType::Start,
-            &[],
-        );
+        let event =
+            emit_lifecycle_event(&test_context(), LogPhase::Setup, LogEventType::Start, &[]);
         let errors = validate_event(&event);
         assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
     }

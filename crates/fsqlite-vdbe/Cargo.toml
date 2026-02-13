@@ -32,5 +32,9 @@ harness = false
 name = "vectorized_scan"
 harness = false
 
+[[bench]]
+name = "vectorized_dispatch"
+harness = false
+
 [lints]
 workspace = true
