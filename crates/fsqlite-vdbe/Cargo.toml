@@ -17,6 +17,7 @@ fsqlite-mvcc = { workspace = true }
 fsqlite-wal = { workspace = true }
 fsqlite-func = { workspace = true }
 tracing = { workspace = true }
+crossbeam-deque = { workspace = true }
 
 [dev-dependencies]
 fsqlite-parser = { workspace = true }

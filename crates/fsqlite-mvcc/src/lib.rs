@@ -14,6 +14,7 @@ pub mod conflict_model;
 pub mod coordinator_ipc;
 pub mod core_types;
 pub mod deterministic_rebase;
+pub mod ebr;
 pub mod gc;
 pub mod history_compression;
 pub mod hot_witness_index;
@@ -81,6 +82,7 @@ pub use deterministic_rebase::{
     TableConstraints, UpdateExpressionCandidate, can_emit_update_expression,
     check_rebase_eligibility, check_schema_epoch, deterministic_rebase, replay_update_expression,
 };
+pub use ebr::{ReaderPinSnapshot, StaleReaderConfig, VersionGuard, VersionGuardRegistry};
 pub use gc::{
     GC_F_MAX_HZ, GC_F_MIN_HZ, GC_PAGES_BUDGET, GC_TARGET_CHAIN_LENGTH, GC_VERSIONS_BUDGET,
     GcScheduler, GcTickResult, GcTodo, PruneResult, gc_tick, prune_page_chain,

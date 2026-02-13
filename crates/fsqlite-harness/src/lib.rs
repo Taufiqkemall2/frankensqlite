@@ -16,6 +16,7 @@ pub mod differential_v2;
 pub mod drift_monitor;
 pub mod durability_matrix;
 pub mod e2e_log_schema;
+pub mod e2e_logging_init;
 pub mod e2e_orchestrator;
 pub mod e2e_traceability;
 pub mod eprocess;

@@ -418,13 +418,13 @@ impl ValidationReport {
     #[must_use]
     pub fn render_summary(&self) -> String {
         let mut out = String::new();
-        let _ = write!(
+        let _ = writeln!(
             out,
             "Schema Validation Report (bd-1dp9.7.6)\n\
              Schema version: {}\n\
              Events: {} total, {} valid, {} invalid\n\
              Diagnostics: {} errors, {} warnings, {} info\n\
-             Result: {}\n",
+             Result: {}",
             self.schema_version,
             self.stats.total_events,
             self.stats.valid_events,
@@ -435,7 +435,7 @@ impl ValidationReport {
             if self.passed { "PASS" } else { "FAIL" },
         );
         if !self.diagnostics.is_empty() {
-            let _ = write!(out, "\nDiagnostics:\n");
+            let _ = writeln!(out, "\nDiagnostics:");
             for diag in &self.diagnostics {
                 let field_str = diag
                     .field

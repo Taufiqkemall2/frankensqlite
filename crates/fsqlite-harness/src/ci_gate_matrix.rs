@@ -367,7 +367,7 @@ pub struct BisectRequest {
 }
 
 /// Configuration for the auto-bisect hook.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AutoBisectConfig {
     /// Whether auto-bisect is enabled.
     pub enabled: bool,
@@ -398,6 +398,7 @@ impl AutoBisectConfig {
 
 /// Build a bisect request from a detected regression.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn build_bisect_request(
     trigger: BisectTrigger,
     lane: CiLane,

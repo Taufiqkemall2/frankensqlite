@@ -893,6 +893,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "criterion",
+ "crossbeam-epoch",
  "fsqlite-error",
  "fsqlite-observability",
  "fsqlite-pager",
@@ -977,6 +978,7 @@ name = "fsqlite-vdbe"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "crossbeam-deque",
  "fsqlite-ast",
  "fsqlite-btree",
  "fsqlite-error",
