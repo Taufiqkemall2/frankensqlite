@@ -802,7 +802,79 @@ pub struct ReplayManifestEnvironment {
     pub platform: Option<String>,
 }
 
+/// Git bisect range specifying the good (last-passing) and bad (first-failing) commits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BisectRange {
+    /// SHA of the last known-good commit.
+    pub good_commit: String,
+    /// SHA of the first known-bad commit.
+    pub bad_commit: String,
+    /// Branch the regression was detected on (e.g., `main`).
+    pub branch: Option<String>,
+}
+
+/// Build requirements for reproducing the workload on each bisect candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct BuildRequirements {
+    /// Cargo build profile (e.g., `debug`, `release`, `release-perf`).
+    pub profile: Option<String>,
+    /// Cargo feature flags required (e.g., `["wal-fec", "native-mode"]`).
+    pub features: Vec<String>,
+    /// Extra `cargo test` flags (e.g., `["--no-default-features"]`).
+    pub extra_cargo_args: Vec<String>,
+    /// Minimum Rust toolchain version required.
+    pub min_toolchain: Option<String>,
+}
+
+/// Reference to an associated failure artifact bundle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailureBundleRef {
+    /// Unique bundle identifier from the failure_bundle module.
+    pub bundle_id: String,
+    /// Path (workspace-relative or URL) to the serialized bundle.
+    pub bundle_path: Option<String>,
+    /// SHA-256 hash of the bundle for integrity verification.
+    pub bundle_hash: Option<String>,
+}
+
+/// A corpus or fixture artifact required for replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactDependency {
+    /// Human-readable name for this artifact.
+    pub name: String,
+    /// Workspace-relative path to the artifact file or directory.
+    pub path: String,
+    /// SHA-256 hash for integrity verification.
+    pub hash: Option<String>,
+}
+
+/// Configuration controlling how bisect orchestration should proceed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BisectStrategy {
+    /// Maximum number of bisect steps before giving up.
+    pub max_steps: u32,
+    /// Timeout per bisect step in seconds.
+    pub step_timeout_secs: u64,
+    /// Number of retry attempts per candidate on transient failure.
+    pub retries_per_step: u32,
+}
+
+impl Default for BisectStrategy {
+    fn default() -> Self {
+        Self {
+            max_steps: 20,
+            step_timeout_secs: 300,
+            retries_per_step: 1,
+        }
+    }
+}
+
 /// Versioned, machine-readable replay contract for deterministic bisect runs.
+///
+/// Contains everything needed to rerun a failing workload exactly on any
+/// candidate commit during automated bisection: the git range, build
+/// requirements, deterministic replay seed, pass/fail predicates, and
+/// references to associated failure artifacts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BisectReplayManifest {
     /// Manifest schema version for strict compatibility checks.
@@ -831,6 +903,21 @@ pub struct BisectReplayManifest {
     pub environment: ReplayManifestEnvironment,
     /// Optional operator notes.
     pub notes: Vec<String>,
+    /// Git bisect range (good/bad commits). `None` if not yet bound to a range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bisect_range: Option<BisectRange>,
+    /// Build requirements for reproducing on each candidate commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_requirements: Option<BuildRequirements>,
+    /// Reference to the original failure bundle that triggered bisection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_bundle_ref: Option<FailureBundleRef>,
+    /// Corpus/fixture artifacts required for replay.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifact_dependencies: Vec<ArtifactDependency>,
+    /// Strategy configuration for the bisect orchestrator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bisect_strategy: Option<BisectStrategy>,
 }
 
 impl BisectReplayManifest {
@@ -859,7 +946,75 @@ impl BisectReplayManifest {
             pass_criteria,
             environment: ReplayManifestEnvironment::default(),
             notes: Vec::new(),
+            bisect_range: None,
+            build_requirements: None,
+            failure_bundle_ref: None,
+            artifact_dependencies: Vec::new(),
+            bisect_strategy: None,
         }
+    }
+
+    /// Construct a manifest from a replay summary and a `BisectRequest`,
+    /// binding the manifest to a specific git bisect range.
+    #[must_use]
+    pub fn from_summary_and_bisect_request(
+        summary: &ReplaySummary,
+        request: &crate::ci_gate_matrix::BisectRequest,
+        bead_id: &str,
+        created_at: &str,
+        pass_criteria: ReplayPassCriteria,
+    ) -> Self {
+        let mut manifest = Self::from_summary(
+            summary,
+            bead_id,
+            &request.request_id,
+            created_at,
+            &request.replay_command,
+            pass_criteria,
+        );
+        manifest.base_seed = request.replay_seed;
+        manifest.bisect_range = Some(BisectRange {
+            good_commit: request.good_commit.clone(),
+            bad_commit: request.bad_commit.clone(),
+            branch: None,
+        });
+        manifest.bisect_strategy = Some(BisectStrategy::default());
+        manifest
+    }
+
+    /// Set the bisect range on this manifest.
+    #[must_use]
+    pub fn with_bisect_range(mut self, range: BisectRange) -> Self {
+        self.bisect_range = Some(range);
+        self
+    }
+
+    /// Set the build requirements on this manifest.
+    #[must_use]
+    pub fn with_build_requirements(mut self, reqs: BuildRequirements) -> Self {
+        self.build_requirements = Some(reqs);
+        self
+    }
+
+    /// Attach a failure bundle reference.
+    #[must_use]
+    pub fn with_failure_bundle_ref(mut self, bundle_ref: FailureBundleRef) -> Self {
+        self.failure_bundle_ref = Some(bundle_ref);
+        self
+    }
+
+    /// Add an artifact dependency.
+    #[must_use]
+    pub fn with_artifact_dependency(mut self, dep: ArtifactDependency) -> Self {
+        self.artifact_dependencies.push(dep);
+        self
+    }
+
+    /// Set the bisect strategy.
+    #[must_use]
+    pub fn with_bisect_strategy(mut self, strategy: BisectStrategy) -> Self {
+        self.bisect_strategy = Some(strategy);
+        self
     }
 
     /// Validate required manifest fields.
@@ -893,7 +1048,44 @@ impl BisectReplayManifest {
         if self.expected_entry_count == 0 {
             errors.push("expected_entry_count must be > 0".to_owned());
         }
+        // Validate bisect range if present.
+        if let Some(range) = &self.bisect_range {
+            if range.good_commit.is_empty() {
+                errors.push("bisect_range.good_commit is empty".to_owned());
+            }
+            if range.bad_commit.is_empty() {
+                errors.push("bisect_range.bad_commit is empty".to_owned());
+            }
+            if range.good_commit == range.bad_commit && !range.good_commit.is_empty() {
+                errors.push("bisect_range.good_commit == bad_commit".to_owned());
+            }
+        }
+        // Validate failure bundle ref if present.
+        if let Some(bundle_ref) = &self.failure_bundle_ref {
+            if bundle_ref.bundle_id.is_empty() {
+                errors.push("failure_bundle_ref.bundle_id is empty".to_owned());
+            }
+        }
+        // Validate artifact dependencies.
+        for (i, dep) in self.artifact_dependencies.iter().enumerate() {
+            if dep.path.is_empty() {
+                errors.push(format!("artifact_dependencies[{i}].path is empty"));
+            }
+        }
         errors
+    }
+
+    /// Check whether this manifest is fully bisect-ready (has all optional
+    /// fields populated for automated bisection).
+    #[must_use]
+    pub fn is_bisect_ready(&self) -> bool {
+        let base_valid = self.validate().is_empty();
+        let has_range = self
+            .bisect_range
+            .as_ref()
+            .is_some_and(|r| !r.good_commit.is_empty() && !r.bad_commit.is_empty());
+        let has_strategy = self.bisect_strategy.is_some();
+        base_valid && has_range && has_strategy
     }
 
     /// Serialize contract to pretty JSON.

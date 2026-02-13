@@ -240,6 +240,101 @@ impl Drop for VersionGuard {
     }
 }
 
+/// Send-safe transaction-scoped epoch registration.
+///
+/// Unlike [`VersionGuard`], a ticket does not hold a thread-local
+/// `crossbeam-epoch::Guard`.  This makes it `Send + Sync` so it can live
+/// inside a [`Transaction`] that may be moved between threads (async
+/// workloads, thread pools, etc.).
+///
+/// Stale-reader detection and epoch-advancement tracking still work because the
+/// ticket is registered in the [`VersionGuardRegistry`] for its entire
+/// lifetime.  Actual epoch pinning for deferred retirement happens via
+/// short-lived [`VersionGuard`]s at the point where version chains are
+/// traversed or old versions are freed.
+#[derive(Debug)]
+pub struct VersionGuardTicket {
+    registry: Arc<VersionGuardRegistry>,
+    guard_id: u64,
+    pinned_at: Instant,
+}
+
+impl VersionGuardTicket {
+    /// Register a transaction-scoped ticket.
+    #[must_use]
+    pub fn register(registry: Arc<VersionGuardRegistry>) -> Self {
+        let pinned_at = Instant::now();
+        let guard_id = registry.register_guard(pinned_at);
+        Self {
+            registry,
+            guard_id,
+            pinned_at,
+        }
+    }
+
+    /// Stable ID for diagnostics and stale-reader reporting.
+    #[must_use]
+    pub const fn guard_id(&self) -> u64 {
+        self.guard_id
+    }
+
+    /// Elapsed registration duration.
+    #[must_use]
+    pub fn registered_for(&self) -> Duration {
+        self.pinned_at.elapsed()
+    }
+
+    /// Reference to the owning registry.
+    #[must_use]
+    pub fn registry(&self) -> &Arc<VersionGuardRegistry> {
+        &self.registry
+    }
+
+    /// Pin the current thread's epoch and defer retirement of a value.
+    ///
+    /// The short-lived epoch pin ensures correctness: the deferred value is
+    /// only reclaimed after all concurrently pinned readers have advanced
+    /// past the current epoch.
+    pub fn defer_retire<T: Send + 'static>(&self, retired: T) {
+        let guard = epoch::pin();
+        guard.defer(move || drop(retired));
+        guard.flush();
+    }
+
+    /// Pin the current thread's epoch and defer an arbitrary closure.
+    pub fn defer_retire_with<F, R>(&self, retire: F)
+    where
+        F: FnOnce() -> R + Send + 'static,
+    {
+        let guard = epoch::pin();
+        guard.defer(retire);
+        guard.flush();
+    }
+}
+
+impl Drop for VersionGuardTicket {
+    fn drop(&mut self) {
+        let pinned_for = self
+            .registry
+            .unregister_guard(self.guard_id)
+            .unwrap_or_else(|| self.pinned_at.elapsed());
+        if pinned_for >= self.registry.stale_reader_config().warn_after {
+            tracing::warn!(
+                guard_id = self.guard_id,
+                pinned_for_ms = pinned_for.as_millis(),
+                stale_warn_after_ms = self.registry.stale_reader_config().warn_after.as_millis(),
+                "MVCC reader registration ended after stale threshold"
+            );
+        }
+    }
+}
+
+// SAFETY: VersionGuardTicket contains only an Arc and trivial integers.
+// It does not hold a thread-local crossbeam Guard.
+unsafe impl Send for VersionGuardTicket {}
+// SAFETY: All fields are either atomic or behind a Mutex.
+unsafe impl Sync for VersionGuardTicket {}
+
 #[cfg(test)]
 mod tests {
     use std::{

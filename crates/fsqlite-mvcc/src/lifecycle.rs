@@ -9,7 +9,7 @@
 //! - [`CommitResponse`]: Result type for the commit sequencer.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 use std::time::Duration;
 
 use fsqlite_types::{
@@ -22,6 +22,7 @@ use crate::cache_aligned::{logical_now_epoch_secs, logical_now_millis};
 use crate::core_types::{
     CommitIndex, InProcessPageLockTable, Transaction, TransactionMode, TransactionState,
 };
+use crate::ebr::{VersionGuard, VersionGuardRegistry};
 use crate::invariants::{SerializedWriteMutex, TxnManager, VersionStore};
 use crate::observability::{
     mvcc_snapshot_established, mvcc_snapshot_released, record_snapshot_read_versions_traversed,
@@ -285,6 +286,11 @@ pub struct TransactionManager {
     busy_timeout_ms: u64,
     serialized_writer_lease_secs: u64,
     txn_max_duration_ms: u64,
+    /// Epoch-based reclamation registry for version chain GC (§14.10).
+    ///
+    /// When present, `begin()` pins a [`VersionGuard`] on the transaction so
+    /// that superseded page versions can be retired safely via `defer_retire`.
+    version_guard_registry: Arc<VersionGuardRegistry>,
 }
 
 impl TransactionManager {
@@ -306,7 +312,14 @@ impl TransactionManager {
             busy_timeout_ms: DEFAULT_BUSY_TIMEOUT_MS,
             serialized_writer_lease_secs: DEFAULT_SERIALIZED_WRITER_LEASE_SECS,
             txn_max_duration_ms: 5_000,
+            version_guard_registry: Arc::new(VersionGuardRegistry::default()),
         }
+    }
+
+    /// Reference to the epoch-based reclamation guard registry.
+    #[must_use]
+    pub fn version_guard_registry(&self) -> &Arc<VersionGuardRegistry> {
+        &self.version_guard_registry
     }
 
     /// Opaque per-connection identifier used in logs (helps prove PRAGMA scope).
@@ -424,6 +437,11 @@ impl TransactionManager {
         let snapshot_established = kind != BeginKind::Deferred;
 
         let mut txn = Transaction::new(txn_id, TxnEpoch::new(0), snapshot, mode);
+        // Pin an EBR guard so that any version retired during this txn's
+        // lifetime is deferred until all concurrent readers have unpinned.
+        txn.version_guard = Some(VersionGuard::pin(Arc::clone(
+            &self.version_guard_registry,
+        )));
         txn.snapshot_established = snapshot_established;
         if snapshot_established {
             mvcc_snapshot_established();
@@ -1086,6 +1104,13 @@ impl TransactionManager {
             // Per spec: clear serialized writer indicator BEFORE releasing mutex.
             self.release_serialized_writer_exclusion(txn.txn_id);
             txn.serialized_write_lock_held = false;
+        }
+
+        // Unpin the EBR guard — allows epoch advancement so deferred
+        // retirements from superseded versions can be reclaimed.
+        if let Some(guard) = txn.version_guard.take() {
+            guard.flush();
+            drop(guard);
         }
     }
 
@@ -4949,5 +4974,159 @@ mod tests {
     #[test]
     fn test_rebase_merge_same_key_abort() {
         test_conflict_response_sqlite_busy();
+    }
+
+    // ── EBR VersionGuard lifecycle tests (bd-2y306.1) ───────────────
+
+    #[test]
+    fn test_version_guard_pinned_at_begin() {
+        let mgr = TransactionManager::new(PageSize::new(4096).unwrap());
+        let txn = mgr.begin(BeginKind::Concurrent).unwrap();
+        assert!(
+            txn.has_version_guard(),
+            "VersionGuard must be pinned at begin"
+        );
+        assert_eq!(mgr.version_guard_registry().active_guard_count(), 1);
+    }
+
+    #[test]
+    fn test_version_guard_unpinned_on_commit() {
+        let mgr = TransactionManager::new(PageSize::new(4096).unwrap());
+        let mut txn = mgr.begin(BeginKind::Concurrent).unwrap();
+        assert_eq!(mgr.version_guard_registry().active_guard_count(), 1);
+        let _ = mgr.commit(&mut txn);
+        assert!(
+            !txn.has_version_guard(),
+            "VersionGuard must be unpinned after commit"
+        );
+        assert_eq!(mgr.version_guard_registry().active_guard_count(), 0);
+    }
+
+    #[test]
+    fn test_version_guard_unpinned_on_abort() {
+        let mgr = TransactionManager::new(PageSize::new(4096).unwrap());
+        let mut txn = mgr.begin(BeginKind::Concurrent).unwrap();
+        assert_eq!(mgr.version_guard_registry().active_guard_count(), 1);
+        mgr.abort(&mut txn);
+        assert!(
+            !txn.has_version_guard(),
+            "VersionGuard must be unpinned after abort"
+        );
+        assert_eq!(mgr.version_guard_registry().active_guard_count(), 0);
+    }
+
+    #[test]
+    fn test_version_guard_pinned_for_all_begin_kinds() {
+        let mgr = TransactionManager::new(PageSize::new(4096).unwrap());
+
+        // Concurrent
+        let mut txn = mgr.begin(BeginKind::Concurrent).unwrap();
+        assert!(txn.has_version_guard());
+        mgr.abort(&mut txn);
+
+        // Deferred
+        let mut txn = mgr.begin(BeginKind::Deferred).unwrap();
+        assert!(txn.has_version_guard());
+        mgr.abort(&mut txn);
+
+        // Immediate
+        let mut txn = mgr.begin(BeginKind::Immediate).unwrap();
+        assert!(txn.has_version_guard());
+        mgr.abort(&mut txn);
+
+        assert_eq!(mgr.version_guard_registry().active_guard_count(), 0);
+    }
+
+    #[test]
+    fn test_multiple_concurrent_txns_pin_separate_guards() {
+        let mgr = TransactionManager::new(PageSize::new(4096).unwrap());
+        let txn1 = mgr.begin(BeginKind::Concurrent).unwrap();
+        let txn2 = mgr.begin(BeginKind::Concurrent).unwrap();
+        let txn3 = mgr.begin(BeginKind::Concurrent).unwrap();
+
+        assert_eq!(mgr.version_guard_registry().active_guard_count(), 3);
+        assert!(txn1.has_version_guard());
+        assert!(txn2.has_version_guard());
+        assert!(txn3.has_version_guard());
+
+        drop(txn1);
+        // Guard drops when Transaction drops (not just on explicit commit/abort).
+        // But note: explicit release_all_resources is needed for proper cleanup.
+    }
+
+    #[test]
+    fn test_version_guard_defer_retire_returns_true_when_pinned() {
+        let mgr = TransactionManager::new(PageSize::new(4096).unwrap());
+        let txn = mgr.begin(BeginKind::Concurrent).unwrap();
+        // Defer a simple value through the guard.
+        let result = txn.defer_retire_version(vec![1_u8, 2, 3]);
+        assert!(
+            result,
+            "defer_retire_version must return true when guard is pinned"
+        );
+    }
+
+    #[test]
+    fn test_version_guard_defer_retire_returns_false_without_guard() {
+        let txn = Transaction::new(
+            TxnId::new(1),
+            TxnEpoch::new(0),
+            Snapshot::new(CommitSeq::ZERO, SchemaEpoch::ZERO),
+            TransactionMode::Concurrent,
+        );
+        // No guard pinned — defer_retire should return false.
+        let result = txn.defer_retire_version(42_u64);
+        assert!(
+            !result,
+            "defer_retire_version must return false when no guard is pinned"
+        );
+    }
+
+    #[test]
+    fn test_version_guard_deferred_value_freed_after_unpin() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use crossbeam_epoch as epoch;
+
+        #[derive(Clone)]
+        struct DropTracker(Arc<AtomicUsize>);
+        impl Drop for DropTracker {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+        }
+
+        let mgr = TransactionManager::new(PageSize::new(4096).unwrap());
+        let mut txn = mgr.begin(BeginKind::Concurrent).unwrap();
+        let drop_count = Arc::new(AtomicUsize::new(0));
+
+        // Defer a tracker through the EBR guard.
+        txn.defer_retire_version(DropTracker(Arc::clone(&drop_count)));
+        assert_eq!(drop_count.load(AtomicOrdering::SeqCst), 0);
+
+        // Commit (which unpins the guard and flushes).
+        let _ = mgr.commit(&mut txn);
+
+        // Drive epoch advancement to trigger deferred drops.
+        for _ in 0..64 {
+            let g = epoch::pin();
+            g.flush();
+            if drop_count.load(AtomicOrdering::SeqCst) > 0 {
+                break;
+            }
+            std::thread::yield_now();
+        }
+
+        assert_eq!(
+            drop_count.load(AtomicOrdering::SeqCst),
+            1,
+            "deferred value must be freed after guard unpin + epoch advance"
+        );
+    }
+
+    #[test]
+    fn test_version_guard_registry_accessor() {
+        let mgr = TransactionManager::new(PageSize::new(4096).unwrap());
+        let registry = mgr.version_guard_registry();
+        assert_eq!(registry.active_guard_count(), 0);
     }
 }

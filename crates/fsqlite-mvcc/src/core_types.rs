@@ -20,6 +20,7 @@ use crate::cache_aligned::{
     CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS, CacheAligned, SharedTxnSlot, TAG_CLAIMING,
     decode_payload, decode_tag, encode_cleaning, is_sentinel, logical_now_millis,
 };
+use crate::ebr::VersionGuardTicket;
 pub use fsqlite_pager::PageBuf;
 use fsqlite_types::{
     CommitSeq, IntentLog, PageData, PageNumber, PageNumberBuildHasher, PageVersion, Snapshot,
@@ -893,6 +894,11 @@ pub struct Transaction {
     pub has_out_rw: bool,
     /// Monotonic start time (logical milliseconds) used for max-duration enforcement.
     pub started_at_ms: u64,
+    /// Epoch-based reclamation ticket registered at transaction begin, dropped on
+    /// commit/abort.  Tracks this transaction in the [`VersionGuardRegistry`] for
+    /// stale-reader detection and provides `defer_retire` for safe deferred
+    /// reclamation of superseded page versions (§14.10, bd-2y306.1).
+    pub version_guard: Option<VersionGuardTicket>,
 }
 
 impl Transaction {
@@ -928,6 +934,7 @@ impl Transaction {
             has_in_rw: false,
             has_out_rw: false,
             started_at_ms: logical_now_millis(),
+            version_guard: None,
         }
     }
 
@@ -935,6 +942,27 @@ impl Transaction {
     #[must_use]
     pub fn token(&self) -> TxnToken {
         TxnToken::new(self.txn_id, self.txn_epoch)
+    }
+
+    /// Whether an EBR guard is currently pinned for this transaction.
+    #[must_use]
+    pub fn has_version_guard(&self) -> bool {
+        self.version_guard.is_some()
+    }
+
+    /// Defer retirement of a superseded page version through the EBR ticket.
+    ///
+    /// Pins the current thread's epoch, defers the value's drop until all
+    /// concurrent readers have advanced past the current epoch, then flushes.
+    /// Returns `false` if no ticket is registered (caller should fall back to
+    /// synchronous freeing).
+    pub fn defer_retire_version<T: Send + 'static>(&self, retired: T) -> bool {
+        if let Some(ticket) = &self.version_guard {
+            ticket.defer_retire(retired);
+            true
+        } else {
+            false
+        }
     }
 
     /// Set read-set storage mode.
