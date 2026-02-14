@@ -15,6 +15,146 @@ use std::{
 
 use crossbeam_epoch::{self as epoch, Guard};
 use parking_lot::Mutex;
+use serde::Serialize;
+
+// ---------------------------------------------------------------------------
+// EBR metrics (bd-688.4)
+// ---------------------------------------------------------------------------
+
+/// Global EBR metrics singleton.
+///
+/// Tracks epoch-based reclamation activity across all `VersionGuard` and
+/// `VersionGuardTicket` instances. Counters are lock-free `AtomicU64` with
+/// `Relaxed` ordering — callers may observe stale reads but never torn values.
+pub static GLOBAL_EBR_METRICS: EbrMetrics = EbrMetrics::new();
+
+/// Atomic counters for EBR version-chain garbage collection telemetry.
+pub struct EbrMetrics {
+    /// Total version objects deferred for retirement via `defer_retire`.
+    pub retirements_deferred_total: AtomicU64,
+    /// Total explicit `flush()` calls that push deferred retirements toward
+    /// execution.
+    pub flush_calls_total: AtomicU64,
+    /// Total epoch pins created (`VersionGuard::pin` + ticket-scoped pins).
+    pub guards_pinned_total: AtomicU64,
+    /// Total epoch pins dropped (guards unpinned).
+    pub guards_unpinned_total: AtomicU64,
+    /// Total stale-reader warnings emitted.
+    pub stale_reader_warnings_total: AtomicU64,
+    /// High-water mark of concurrently active guards observed.
+    pub active_guards_high_water: AtomicU64,
+}
+
+impl EbrMetrics {
+    /// Create a new metrics instance with all counters at zero.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            retirements_deferred_total: AtomicU64::new(0),
+            flush_calls_total: AtomicU64::new(0),
+            guards_pinned_total: AtomicU64::new(0),
+            guards_unpinned_total: AtomicU64::new(0),
+            stale_reader_warnings_total: AtomicU64::new(0),
+            active_guards_high_water: AtomicU64::new(0),
+        }
+    }
+
+    /// Record a deferred retirement.
+    pub fn record_retirement_deferred(&self) {
+        self.retirements_deferred_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a flush call.
+    pub fn record_flush(&self) {
+        self.flush_calls_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a guard pin event and update the high-water mark.
+    pub fn record_guard_pinned(&self, current_active: u64) {
+        self.guards_pinned_total.fetch_add(1, Ordering::Relaxed);
+        // CAS loop to update high-water mark.
+        loop {
+            let prev = self.active_guards_high_water.load(Ordering::Relaxed);
+            if current_active <= prev {
+                break;
+            }
+            if self
+                .active_guards_high_water
+                .compare_exchange_weak(prev, current_active, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+        }
+    }
+
+    /// Record a guard unpin event.
+    pub fn record_guard_unpinned(&self) {
+        self.guards_unpinned_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record stale-reader warnings emitted.
+    pub fn record_stale_warnings(&self, count: u64) {
+        self.stale_reader_warnings_total
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Read a point-in-time snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> EbrMetricsSnapshot {
+        EbrMetricsSnapshot {
+            retirements_deferred_total: self.retirements_deferred_total.load(Ordering::Relaxed),
+            flush_calls_total: self.flush_calls_total.load(Ordering::Relaxed),
+            guards_pinned_total: self.guards_pinned_total.load(Ordering::Relaxed),
+            guards_unpinned_total: self.guards_unpinned_total.load(Ordering::Relaxed),
+            stale_reader_warnings_total: self.stale_reader_warnings_total.load(Ordering::Relaxed),
+            active_guards_high_water: self.active_guards_high_water.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Reset all counters to zero (tests/diagnostics).
+    pub fn reset(&self) {
+        self.retirements_deferred_total.store(0, Ordering::Relaxed);
+        self.flush_calls_total.store(0, Ordering::Relaxed);
+        self.guards_pinned_total.store(0, Ordering::Relaxed);
+        self.guards_unpinned_total.store(0, Ordering::Relaxed);
+        self.stale_reader_warnings_total.store(0, Ordering::Relaxed);
+        self.active_guards_high_water.store(0, Ordering::Relaxed);
+    }
+}
+
+impl Default for EbrMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Serializable snapshot of EBR metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct EbrMetricsSnapshot {
+    pub retirements_deferred_total: u64,
+    pub flush_calls_total: u64,
+    pub guards_pinned_total: u64,
+    pub guards_unpinned_total: u64,
+    pub stale_reader_warnings_total: u64,
+    pub active_guards_high_water: u64,
+}
+
+impl std::fmt::Display for EbrMetricsSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ebr(retired={} flushed={} pinned={} unpinned={} stale_warn={} hw={})",
+            self.retirements_deferred_total,
+            self.flush_calls_total,
+            self.guards_pinned_total,
+            self.guards_unpinned_total,
+            self.stale_reader_warnings_total,
+            self.active_guards_high_water,
+        )
+    }
+}
 
 /// Configuration for stale-reader detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +270,9 @@ impl VersionGuardRegistry {
             }
         }
         drop(active);
+        if warned > 0 {
+            GLOBAL_EBR_METRICS.record_stale_warnings(warned as u64);
+        }
         warned
     }
 
@@ -179,6 +322,14 @@ impl VersionGuard {
         let pinned_at = Instant::now();
         let guard_id = registry.register_guard(pinned_at);
         let guard = epoch::pin();
+        let active_count = registry.active_guard_count() as u64;
+        GLOBAL_EBR_METRICS.record_guard_pinned(active_count);
+        tracing::trace!(
+            target: "fsqlite_mvcc::ebr",
+            guard_id,
+            active_guards = active_count,
+            "epoch guard pinned"
+        );
         Self {
             registry,
             guard_id,
@@ -204,6 +355,7 @@ impl VersionGuard {
     where
         T: Send + 'static,
     {
+        GLOBAL_EBR_METRICS.record_retirement_deferred();
         self.guard.defer(move || drop(retired));
     }
 
@@ -212,6 +364,7 @@ impl VersionGuard {
     where
         F: FnOnce() -> R + Send + 'static,
     {
+        GLOBAL_EBR_METRICS.record_retirement_deferred();
         self.guard.defer(retire);
     }
 
@@ -219,16 +372,24 @@ impl VersionGuard {
     ///
     /// Actual execution still depends on epoch advancement and active readers.
     pub fn flush(&self) {
+        GLOBAL_EBR_METRICS.record_flush();
         self.guard.flush();
     }
 }
 
 impl Drop for VersionGuard {
     fn drop(&mut self) {
+        GLOBAL_EBR_METRICS.record_guard_unpinned();
         let pinned_for = self
             .registry
             .unregister_guard(self.guard_id)
             .unwrap_or_else(|| self.pinned_at.elapsed());
+        tracing::trace!(
+            target: "fsqlite_mvcc::ebr",
+            guard_id = self.guard_id,
+            pinned_for_us = pinned_for.as_micros(),
+            "epoch guard unpinned"
+        );
         if pinned_for >= self.registry.stale_reader_config().warn_after {
             tracing::warn!(
                 guard_id = self.guard_id,
@@ -265,6 +426,14 @@ impl VersionGuardTicket {
     pub fn register(registry: Arc<VersionGuardRegistry>) -> Self {
         let pinned_at = Instant::now();
         let guard_id = registry.register_guard(pinned_at);
+        let active_count = registry.active_guard_count() as u64;
+        GLOBAL_EBR_METRICS.record_guard_pinned(active_count);
+        tracing::trace!(
+            target: "fsqlite_mvcc::ebr",
+            guard_id,
+            active_guards = active_count,
+            "epoch ticket registered"
+        );
         Self {
             registry,
             guard_id,
@@ -296,6 +465,7 @@ impl VersionGuardTicket {
     /// only reclaimed after all concurrently pinned readers have advanced
     /// past the current epoch.
     pub fn defer_retire<T: Send + 'static>(&self, retired: T) {
+        GLOBAL_EBR_METRICS.record_retirement_deferred();
         let guard = epoch::pin();
         guard.defer(move || drop(retired));
         guard.flush();
@@ -306,6 +476,7 @@ impl VersionGuardTicket {
     where
         F: FnOnce() -> R + Send + 'static,
     {
+        GLOBAL_EBR_METRICS.record_retirement_deferred();
         let guard = epoch::pin();
         guard.defer(retire);
         guard.flush();
@@ -314,10 +485,17 @@ impl VersionGuardTicket {
 
 impl Drop for VersionGuardTicket {
     fn drop(&mut self) {
+        GLOBAL_EBR_METRICS.record_guard_unpinned();
         let pinned_for = self
             .registry
             .unregister_guard(self.guard_id)
             .unwrap_or_else(|| self.pinned_at.elapsed());
+        tracing::trace!(
+            target: "fsqlite_mvcc::ebr",
+            guard_id = self.guard_id,
+            registered_for_us = pinned_for.as_micros(),
+            "epoch ticket unregistered"
+        );
         if pinned_for >= self.registry.stale_reader_config().warn_after {
             tracing::warn!(
                 guard_id = self.guard_id,
@@ -342,7 +520,10 @@ mod tests {
 
     use crossbeam_epoch as epoch;
 
-    use super::{StaleReaderConfig, VersionGuard, VersionGuardRegistry};
+    use super::{
+        EbrMetrics, GLOBAL_EBR_METRICS, StaleReaderConfig, VersionGuard, VersionGuardRegistry,
+        VersionGuardTicket,
+    };
 
     #[test]
     fn version_guard_registers_and_unregisters() {
@@ -427,5 +608,163 @@ mod tests {
         }
 
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+
+    // ===================================================================
+    // bd-688.4: EBR metrics tests
+    // ===================================================================
+
+    #[test]
+    fn ebr_metrics_basic_recording() {
+        let m = EbrMetrics::new();
+
+        m.record_retirement_deferred();
+        m.record_retirement_deferred();
+        m.record_flush();
+        m.record_guard_pinned(1);
+        m.record_guard_unpinned();
+        m.record_stale_warnings(2);
+
+        let snap = m.snapshot();
+        assert_eq!(snap.retirements_deferred_total, 2);
+        assert_eq!(snap.flush_calls_total, 1);
+        assert_eq!(snap.guards_pinned_total, 1);
+        assert_eq!(snap.guards_unpinned_total, 1);
+        assert_eq!(snap.stale_reader_warnings_total, 2);
+        assert_eq!(snap.active_guards_high_water, 1);
+    }
+
+    #[test]
+    fn ebr_metrics_reset() {
+        let m = EbrMetrics::new();
+        m.record_retirement_deferred();
+        m.record_guard_pinned(5);
+        assert!(m.retirements_deferred_total.load(Ordering::Relaxed) > 0);
+
+        m.reset();
+        let snap = m.snapshot();
+        assert_eq!(snap.retirements_deferred_total, 0);
+        assert_eq!(snap.guards_pinned_total, 0);
+        assert_eq!(snap.active_guards_high_water, 0);
+    }
+
+    #[test]
+    fn ebr_metrics_high_water_mark_monotonic() {
+        let m = EbrMetrics::new();
+
+        m.record_guard_pinned(3);
+        assert_eq!(m.snapshot().active_guards_high_water, 3);
+
+        // Lower value should not reduce high-water mark.
+        m.record_guard_pinned(1);
+        assert_eq!(m.snapshot().active_guards_high_water, 3);
+
+        // Higher value should update.
+        m.record_guard_pinned(7);
+        assert_eq!(m.snapshot().active_guards_high_water, 7);
+    }
+
+    #[test]
+    fn ebr_metrics_display() {
+        let m = EbrMetrics::new();
+        m.record_retirement_deferred();
+        m.record_flush();
+        m.record_guard_pinned(1);
+        let display = format!("{}", m.snapshot());
+        assert!(display.contains("retired=1"));
+        assert!(display.contains("flushed=1"));
+        assert!(display.contains("pinned=1"));
+    }
+
+    #[test]
+    fn ebr_metrics_snapshot_serializable() {
+        let m = EbrMetrics::new();
+        m.record_retirement_deferred();
+        m.record_guard_pinned(2);
+        let snap = m.snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(json.contains("\"retirements_deferred_total\":1"));
+        assert!(json.contains("\"active_guards_high_water\":2"));
+    }
+
+    #[test]
+    fn ebr_metrics_guard_lifecycle_records() {
+        // Use delta-based assertions to avoid global counter interference.
+        let registry = Arc::new(VersionGuardRegistry::default());
+        let before = GLOBAL_EBR_METRICS.snapshot();
+
+        {
+            let guard = VersionGuard::pin(Arc::clone(&registry));
+            let after_pin = GLOBAL_EBR_METRICS.snapshot();
+            assert_eq!(
+                after_pin.guards_pinned_total - before.guards_pinned_total,
+                1
+            );
+
+            guard.defer_retire(42_u64);
+            let after_retire = GLOBAL_EBR_METRICS.snapshot();
+            assert_eq!(
+                after_retire.retirements_deferred_total - before.retirements_deferred_total,
+                1
+            );
+
+            guard.flush();
+            let after_flush = GLOBAL_EBR_METRICS.snapshot();
+            assert_eq!(after_flush.flush_calls_total - before.flush_calls_total, 1);
+        }
+
+        let after_drop = GLOBAL_EBR_METRICS.snapshot();
+        assert_eq!(
+            after_drop.guards_unpinned_total - before.guards_unpinned_total,
+            1
+        );
+    }
+
+    #[test]
+    fn ebr_metrics_ticket_lifecycle_records() {
+        let registry = Arc::new(VersionGuardRegistry::default());
+        let before = GLOBAL_EBR_METRICS.snapshot();
+
+        {
+            let ticket = VersionGuardTicket::register(Arc::clone(&registry));
+            let after_reg = GLOBAL_EBR_METRICS.snapshot();
+            assert_eq!(
+                after_reg.guards_pinned_total - before.guards_pinned_total,
+                1
+            );
+
+            ticket.defer_retire(99_u32);
+            let after_retire = GLOBAL_EBR_METRICS.snapshot();
+            assert_eq!(
+                after_retire.retirements_deferred_total - before.retirements_deferred_total,
+                1
+            );
+        }
+
+        let after_drop = GLOBAL_EBR_METRICS.snapshot();
+        assert_eq!(
+            after_drop.guards_unpinned_total - before.guards_unpinned_total,
+            1
+        );
+    }
+
+    #[test]
+    fn ebr_metrics_stale_warning_records() {
+        let before = GLOBAL_EBR_METRICS.snapshot();
+
+        let registry = Arc::new(VersionGuardRegistry::new(StaleReaderConfig {
+            warn_after: Duration::ZERO,
+            warn_every: Duration::ZERO,
+        }));
+        let _guard = VersionGuard::pin(Arc::clone(&registry));
+
+        let warned = registry.warn_on_stale_readers(Instant::now());
+        assert!(warned > 0);
+
+        let after = GLOBAL_EBR_METRICS.snapshot();
+        assert!(
+            after.stale_reader_warnings_total > before.stale_reader_warnings_total,
+            "stale warnings should have been recorded"
+        );
     }
 }

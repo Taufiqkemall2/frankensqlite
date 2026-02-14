@@ -347,6 +347,189 @@ impl fmt::Display for WalRecoveryCountersSnapshot {
 }
 
 // ---------------------------------------------------------------------------
+// Group commit metrics
+// ---------------------------------------------------------------------------
+
+/// Global group commit metrics singleton.
+pub static GLOBAL_GROUP_COMMIT_METRICS: GroupCommitMetrics = GroupCommitMetrics::new();
+
+/// Atomic counters tracking parallel WAL group commit activity.
+pub struct GroupCommitMetrics {
+    /// Total group commit flushes (each flush = 1 fsync1 + 1 fsync2).
+    pub group_commits_total: AtomicU64,
+    /// Sum of batch sizes across all group commits (for computing average).
+    pub group_commit_size_sum: AtomicU64,
+    /// Total individual commit submissions processed.
+    pub submissions_total: AtomicU64,
+    /// Cumulative group commit latency in microseconds (submit → drain).
+    pub commit_latency_us_total: AtomicU64,
+    /// Total FSYNC_1 (pre-marker) barrier completions.
+    pub fsync1_total: AtomicU64,
+    /// Total FSYNC_2 (post-marker) barrier completions.
+    pub fsync2_total: AtomicU64,
+    /// Total first-committer-wins conflict rejections.
+    pub fcw_conflicts_total: AtomicU64,
+    /// Total SSI conflict rejections.
+    pub ssi_conflicts_total: AtomicU64,
+    /// Total shutdown rejections.
+    pub shutdown_rejections_total: AtomicU64,
+}
+
+impl GroupCommitMetrics {
+    /// Create a zeroed metrics instance.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            group_commits_total: AtomicU64::new(0),
+            group_commit_size_sum: AtomicU64::new(0),
+            submissions_total: AtomicU64::new(0),
+            commit_latency_us_total: AtomicU64::new(0),
+            fsync1_total: AtomicU64::new(0),
+            fsync2_total: AtomicU64::new(0),
+            fcw_conflicts_total: AtomicU64::new(0),
+            ssi_conflicts_total: AtomicU64::new(0),
+            shutdown_rejections_total: AtomicU64::new(0),
+        }
+    }
+
+    /// Record a group commit flush with the given batch size and latency.
+    pub fn record_group_commit(&self, batch_size: u64, latency_us: u64) {
+        self.group_commits_total.fetch_add(1, Ordering::Relaxed);
+        self.group_commit_size_sum
+            .fetch_add(batch_size, Ordering::Relaxed);
+        self.commit_latency_us_total
+            .fetch_add(latency_us, Ordering::Relaxed);
+    }
+
+    /// Record an individual submission.
+    pub fn record_submission(&self) {
+        self.submissions_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an FSYNC_1 completion.
+    pub fn record_fsync1(&self) {
+        self.fsync1_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an FSYNC_2 completion.
+    pub fn record_fsync2(&self) {
+        self.fsync2_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an FCW conflict.
+    pub fn record_fcw_conflict(&self) {
+        self.fcw_conflicts_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an SSI conflict.
+    pub fn record_ssi_conflict(&self) {
+        self.ssi_conflicts_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a shutdown rejection.
+    pub fn record_shutdown_rejection(&self) {
+        self.shutdown_rejections_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Take a consistent snapshot of all counters.
+    #[must_use]
+    pub fn snapshot(&self) -> GroupCommitMetricsSnapshot {
+        GroupCommitMetricsSnapshot {
+            group_commits_total: self.group_commits_total.load(Ordering::Relaxed),
+            group_commit_size_sum: self.group_commit_size_sum.load(Ordering::Relaxed),
+            submissions_total: self.submissions_total.load(Ordering::Relaxed),
+            commit_latency_us_total: self.commit_latency_us_total.load(Ordering::Relaxed),
+            fsync1_total: self.fsync1_total.load(Ordering::Relaxed),
+            fsync2_total: self.fsync2_total.load(Ordering::Relaxed),
+            fcw_conflicts_total: self.fcw_conflicts_total.load(Ordering::Relaxed),
+            ssi_conflicts_total: self.ssi_conflicts_total.load(Ordering::Relaxed),
+            shutdown_rejections_total: self.shutdown_rejections_total.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Reset all counters to zero.
+    pub fn reset(&self) {
+        self.group_commits_total.store(0, Ordering::Relaxed);
+        self.group_commit_size_sum.store(0, Ordering::Relaxed);
+        self.submissions_total.store(0, Ordering::Relaxed);
+        self.commit_latency_us_total.store(0, Ordering::Relaxed);
+        self.fsync1_total.store(0, Ordering::Relaxed);
+        self.fsync2_total.store(0, Ordering::Relaxed);
+        self.fcw_conflicts_total.store(0, Ordering::Relaxed);
+        self.ssi_conflicts_total.store(0, Ordering::Relaxed);
+        self.shutdown_rejections_total.store(0, Ordering::Relaxed);
+    }
+}
+
+impl Default for GroupCommitMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Point-in-time snapshot of group commit metrics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupCommitMetricsSnapshot {
+    pub group_commits_total: u64,
+    pub group_commit_size_sum: u64,
+    pub submissions_total: u64,
+    pub commit_latency_us_total: u64,
+    pub fsync1_total: u64,
+    pub fsync2_total: u64,
+    pub fcw_conflicts_total: u64,
+    pub ssi_conflicts_total: u64,
+    pub shutdown_rejections_total: u64,
+}
+
+impl GroupCommitMetricsSnapshot {
+    /// Average group commit batch size, or 0 if no group commits.
+    #[must_use]
+    pub fn avg_group_size(&self) -> u64 {
+        self.group_commit_size_sum
+            .checked_div(self.group_commits_total)
+            .unwrap_or(0)
+    }
+
+    /// Average commit latency in microseconds, or 0 if no group commits.
+    #[must_use]
+    pub fn avg_commit_latency_us(&self) -> u64 {
+        self.commit_latency_us_total
+            .checked_div(self.group_commits_total)
+            .unwrap_or(0)
+    }
+
+    /// Fsync reduction ratio: submissions / (fsync1 + fsync2), or 0 if none.
+    /// A value of N means N submissions per fsync operation.
+    #[must_use]
+    pub fn fsync_reduction_ratio(&self) -> u64 {
+        let total_fsyncs = self.fsync1_total + self.fsync2_total;
+        self.submissions_total
+            .checked_div(total_fsyncs)
+            .unwrap_or(0)
+    }
+}
+
+impl fmt::Display for GroupCommitMetricsSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "group_commits={} size_sum={} submissions={} latency_us={} \
+             fsync1={} fsync2={} fcw_conflicts={} ssi_conflicts={} shutdown_rejections={}",
+            self.group_commits_total,
+            self.group_commit_size_sum,
+            self.submissions_total,
+            self.commit_latency_us_total,
+            self.fsync1_total,
+            self.fsync2_total,
+            self.fcw_conflicts_total,
+            self.ssi_conflicts_total,
+            self.shutdown_rejections_total,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helper
 // ---------------------------------------------------------------------------
 

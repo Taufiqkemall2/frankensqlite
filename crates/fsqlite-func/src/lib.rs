@@ -14,8 +14,46 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tracing::debug;
+
+// ── Function evaluation metrics (bd-2wt.1) ─────────────────────────────────
+
+/// Total number of scalar function calls across all statements.
+static FSQLITE_FUNC_CALLS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Cumulative function evaluation duration in microseconds.
+static FSQLITE_FUNC_EVAL_DURATION_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of function evaluation metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FuncMetricsSnapshot {
+    /// Total scalar function calls.
+    pub calls_total: u64,
+    /// Cumulative evaluation duration in microseconds.
+    pub eval_duration_us_total: u64,
+}
+
+/// Read a point-in-time snapshot of function evaluation metrics.
+#[must_use]
+pub fn func_metrics_snapshot() -> FuncMetricsSnapshot {
+    FuncMetricsSnapshot {
+        calls_total: FSQLITE_FUNC_CALLS_TOTAL.load(Ordering::Relaxed),
+        eval_duration_us_total: FSQLITE_FUNC_EVAL_DURATION_US_TOTAL.load(Ordering::Relaxed),
+    }
+}
+
+/// Reset function metrics to zero (tests/diagnostics).
+pub fn reset_func_metrics() {
+    FSQLITE_FUNC_CALLS_TOTAL.store(0, Ordering::Relaxed);
+    FSQLITE_FUNC_EVAL_DURATION_US_TOTAL.store(0, Ordering::Relaxed);
+}
+
+/// Record a function call for metrics (called from VDBE engine).
+pub fn record_func_call(duration_us: u64) {
+    FSQLITE_FUNC_CALLS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    FSQLITE_FUNC_EVAL_DURATION_US_TOTAL.fetch_add(duration_us, Ordering::Relaxed);
+}
 
 pub mod agg_builtins;
 pub mod aggregate;

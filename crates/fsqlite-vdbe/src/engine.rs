@@ -15,6 +15,8 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::time::Instant;
 
 use fsqlite_btree::{BtCursor, BtreeCursorOps, MemPageStore, PageReader, PageWriter, SeekResult};
 use fsqlite_error::{ErrorCode, FrankenError, Result};
@@ -770,6 +772,49 @@ impl Default for MemDatabase {
 const VDBE_TRACE_ENV: &str = "FSQLITE_VDBE_TRACE_OPCODES";
 const VDBE_TRACE_LOGGING_STANDARD: &str = "bd-1fpm";
 
+/// Slow query threshold for INFO-level logging (100ms).
+const SLOW_QUERY_THRESHOLD_MS: u128 = 100;
+
+// ── VDBE execution metrics (bd-1rw.1) ──────────────────────────────────────
+
+/// Total number of VDBE opcodes executed across all statements.
+static FSQLITE_VDBE_OPCODES_EXECUTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total number of VDBE statements executed.
+static FSQLITE_VDBE_STATEMENTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Cumulative statement duration in microseconds (for histogram approximation).
+static FSQLITE_VDBE_STATEMENT_DURATION_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Monotonic program ID counter for tracing correlation.
+static VDBE_PROGRAM_ID_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Snapshot of VDBE execution metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VdbeMetricsSnapshot {
+    /// Total opcodes executed across all statements.
+    pub opcodes_executed_total: u64,
+    /// Total statements executed.
+    pub statements_total: u64,
+    /// Cumulative statement duration in microseconds.
+    pub statement_duration_us_total: u64,
+}
+
+/// Read a point-in-time snapshot of VDBE execution metrics.
+#[must_use]
+pub fn vdbe_metrics_snapshot() -> VdbeMetricsSnapshot {
+    VdbeMetricsSnapshot {
+        opcodes_executed_total: FSQLITE_VDBE_OPCODES_EXECUTED_TOTAL.load(AtomicOrdering::Relaxed),
+        statements_total: FSQLITE_VDBE_STATEMENTS_TOTAL.load(AtomicOrdering::Relaxed),
+        statement_duration_us_total: FSQLITE_VDBE_STATEMENT_DURATION_US_TOTAL
+            .load(AtomicOrdering::Relaxed),
+    }
+}
+
+/// Reset VDBE metrics to zero (tests/diagnostics).
+pub fn reset_vdbe_metrics() {
+    FSQLITE_VDBE_OPCODES_EXECUTED_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_STATEMENTS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_STATEMENT_DURATION_US_TOTAL.store(0, AtomicOrdering::Relaxed);
+}
+
 /// Register spans touched by an opcode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct OpcodeRegisterSpans {
@@ -973,16 +1018,30 @@ impl VdbeEngine {
 
         self.aggregates.clear();
 
+        let program_id = VDBE_PROGRAM_ID_SEQ.fetch_add(1, AtomicOrdering::Relaxed);
+        let start_time = Instant::now();
+        let mut opcode_count: u64 = 0;
+        let result_rows_before = self.results.len();
+
+        // DEBUG-level per-statement log (bd-1rw.1).
+        tracing::debug!(
+            target: "fsqlite_vdbe::statement",
+            program_id,
+            num_ops = ops.len(),
+            "vdbe statement begin",
+        );
+
         let mut pc: usize = 0;
         // "once" flags: one bit per instruction address.
         let mut once_flags = vec![false; ops.len()];
 
-        loop {
+        let outcome = loop {
             if pc >= ops.len() {
-                return Ok(ExecOutcome::Done);
+                break ExecOutcome::Done;
             }
 
             let op = &ops[pc];
+            opcode_count += 1;
             self.trace_opcode(pc, op);
             match op.opcode {
                 // ── Control Flow ────────────────────────────────────────
@@ -1009,12 +1068,12 @@ impl VdbeEngine {
                             P4::Str(s) => s.clone(),
                             _ => format!("halt with error code {}", op.p1),
                         };
-                        return Ok(ExecOutcome::Error {
+                        break ExecOutcome::Error {
                             code: op.p1,
                             message: msg,
-                        });
+                        };
                     }
-                    return Ok(ExecOutcome::Done);
+                    break ExecOutcome::Done;
                 }
 
                 Opcode::Noop => {
@@ -2169,7 +2228,7 @@ impl VdbeEngine {
                                     }
                                     _ => {
                                         // Default (ABORT/FAIL/ROLLBACK): constraint error.
-                                        return Ok(pk_conflict);
+                                        break pk_conflict;
                                     }
                                 }
                             } else {
@@ -2197,7 +2256,7 @@ impl VdbeEngine {
                                     }
                                     _ => {
                                         // Default (ABORT/FAIL/ROLLBACK): constraint error.
-                                        return Ok(pk_conflict);
+                                        break pk_conflict;
                                     }
                                 }
                             } else {
@@ -2407,10 +2466,10 @@ impl VdbeEngine {
                             P4::Str(s) => s.clone(),
                             _ => "NOT NULL constraint failed".to_owned(),
                         };
-                        return Ok(ExecOutcome::Error {
+                        break ExecOutcome::Error {
                             code: op.p1,
                             message: msg,
-                        });
+                        };
                     }
                     pc += 1;
                 }
@@ -2763,7 +2822,44 @@ impl VdbeEngine {
                         args.push(self.get_reg(reg_idx).clone());
                     }
 
+                    // func_eval span with tracing (bd-2wt.1).
+                    let func_start = Instant::now();
                     let result = func.invoke(&args)?;
+                    let func_elapsed = func_start.elapsed();
+
+                    // TRACE-level per-call log (bd-2wt.1).
+                    let result_type = match &result {
+                        SqliteValue::Null => "null",
+                        SqliteValue::Integer(_) => "integer",
+                        SqliteValue::Float(_) => "real",
+                        SqliteValue::Text(_) => "text",
+                        SqliteValue::Blob(_) => "blob",
+                    };
+                    tracing::trace!(
+                        target: "fsqlite_func::eval",
+                        func_name,
+                        arg_count,
+                        result_type,
+                        "func_eval",
+                    );
+
+                    // DEBUG-level for slow functions (>1ms).
+                    #[allow(clippy::cast_possible_truncation)]
+                    let func_us = func_elapsed.as_micros() as u64;
+                    if func_us >= 1000 {
+                        tracing::debug!(
+                            target: "fsqlite_func::slow",
+                            func_name,
+                            arg_count,
+                            result_type,
+                            elapsed_us = func_us,
+                            "slow func_eval",
+                        );
+                    }
+
+                    // Update global metrics counter (bd-2wt.1).
+                    fsqlite_func::record_func_call(func_us);
+
                     self.set_reg(output_reg, result);
                     pc += 1;
                 }
@@ -2802,13 +2898,63 @@ impl VdbeEngine {
 
                 // ── Catch-all for remaining opcodes ─────────────────────
                 _ => {
-                    return Ok(ExecOutcome::Error {
+                    break ExecOutcome::Error {
                         code: 1,
                         message: format!("unimplemented opcode {:?} at pc={}", op.opcode, pc),
-                    });
+                    };
                 }
             }
+        };
+
+        // ── Post-execution metrics and tracing (bd-1rw.1) ──────────────────
+        let elapsed = start_time.elapsed();
+        let elapsed_us = elapsed.as_micros();
+        let result_rows = self.results.len() - result_rows_before;
+
+        // Update global counters.
+        FSQLITE_VDBE_OPCODES_EXECUTED_TOTAL.fetch_add(opcode_count, AtomicOrdering::Relaxed);
+        FSQLITE_VDBE_STATEMENTS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+        #[allow(clippy::cast_possible_truncation)]
+        FSQLITE_VDBE_STATEMENT_DURATION_US_TOTAL
+            .fetch_add(elapsed_us as u64, AtomicOrdering::Relaxed);
+
+        // vdbe_exec span with fields: opcode_count, program_id, result_rows (bd-1rw.1).
+        let span = tracing::info_span!(
+            target: "fsqlite_vdbe",
+            "vdbe_exec",
+            opcode_count,
+            program_id,
+            result_rows,
+            elapsed_us = elapsed_us as u64,
+        );
+        let _guard = span.enter();
+
+        // DEBUG-level per-statement completion log.
+        tracing::debug!(
+            target: "fsqlite_vdbe::statement",
+            program_id,
+            opcode_count,
+            result_rows,
+            elapsed_us = elapsed_us as u64,
+            outcome = ?outcome,
+            "vdbe statement done",
+        );
+
+        // INFO-level slow query log (>100ms).
+        if elapsed.as_millis() >= SLOW_QUERY_THRESHOLD_MS {
+            #[allow(clippy::cast_possible_truncation)]
+            let millis = elapsed.as_millis() as u64;
+            tracing::info!(
+                target: "fsqlite_vdbe::slow_query",
+                program_id,
+                opcode_count,
+                result_rows,
+                elapsed_ms = millis,
+                "slow vdbe statement",
+            );
         }
+
+        Ok(outcome)
     }
 
     /// Get the collected result rows.
@@ -3011,11 +3157,11 @@ impl VdbeEngine {
     }
 
     fn trace_opcode(&self, pc: usize, op: &VdbeOp) {
-        if !self.trace_opcodes || !tracing::enabled!(tracing::Level::DEBUG) {
+        if !self.trace_opcodes || !tracing::enabled!(tracing::Level::TRACE) {
             return;
         }
         let spans = opcode_register_spans(op);
-        tracing::debug!(
+        tracing::trace!(
             target: "fsqlite_vdbe::opcode",
             logging_standard = VDBE_TRACE_LOGGING_STANDARD,
             pc,

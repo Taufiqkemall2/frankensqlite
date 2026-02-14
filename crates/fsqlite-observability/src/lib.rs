@@ -99,6 +99,163 @@ pub fn reset_trace_metrics() {
 }
 
 // ---------------------------------------------------------------------------
+// Cx propagation telemetry (bd-2g5.6.1)
+// ---------------------------------------------------------------------------
+
+/// Global Cx propagation metrics singleton.
+///
+/// Tracks how well the capability context (`Cx`) is threaded through
+/// connection and transaction paths. Incremented on the code paths that
+/// detect missing or invalid propagation, as well as on successful
+/// propagation checkpoints, cancellation cleanup outcomes, and trace
+/// linkage establishments.
+pub static GLOBAL_CX_PROPAGATION_METRICS: CxPropagationMetrics = CxPropagationMetrics::new();
+
+/// Atomic counters for Cx propagation telemetry.
+///
+/// Counters follow the same lock-free `Relaxed` ordering convention as
+/// the rest of the observability crate — callers may observe stale reads
+/// but never torn values.
+pub struct CxPropagationMetrics {
+    /// Number of successful Cx propagation checkpoints.
+    pub propagation_successes_total: AtomicU64,
+    /// Number of detected missing or invalid Cx propagation.
+    pub propagation_failures_total: AtomicU64,
+    /// Number of cancellation cleanup operations completed.
+    pub cancellation_cleanups_total: AtomicU64,
+    /// Number of trace-ID linkage establishments (Cx → span).
+    pub trace_linkages_total: AtomicU64,
+    /// Number of Cx instances created for transaction scopes.
+    pub cx_created_total: AtomicU64,
+    /// Number of Cx cancel propagations observed.
+    pub cancel_propagations_total: AtomicU64,
+}
+
+impl Default for CxPropagationMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CxPropagationMetrics {
+    /// Create a new metrics instance with all counters at zero.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            propagation_successes_total: AtomicU64::new(0),
+            propagation_failures_total: AtomicU64::new(0),
+            cancellation_cleanups_total: AtomicU64::new(0),
+            trace_linkages_total: AtomicU64::new(0),
+            cx_created_total: AtomicU64::new(0),
+            cancel_propagations_total: AtomicU64::new(0),
+        }
+    }
+
+    /// Record a successful Cx propagation checkpoint.
+    pub fn record_propagation_success(&self) {
+        self.propagation_successes_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a missing or invalid Cx propagation and emit a WARN diagnostic.
+    pub fn record_propagation_failure(&self, site: &str) {
+        self.propagation_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            target: "fsqlite.cx_propagation",
+            site,
+            "missing or invalid Cx propagation detected"
+        );
+    }
+
+    /// Record a cancellation cleanup completion.
+    pub fn record_cancellation_cleanup(&self) {
+        self.cancellation_cleanups_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a trace-ID linkage establishment.
+    pub fn record_trace_linkage(&self) {
+        self.trace_linkages_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record creation of a Cx for a transaction scope.
+    pub fn record_cx_created(&self) {
+        self.cx_created_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a cancel propagation event.
+    pub fn record_cancel_propagation(&self) {
+        self.cancel_propagations_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read a point-in-time snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> CxPropagationMetricsSnapshot {
+        CxPropagationMetricsSnapshot {
+            propagation_successes_total: self.propagation_successes_total.load(Ordering::Relaxed),
+            propagation_failures_total: self.propagation_failures_total.load(Ordering::Relaxed),
+            cancellation_cleanups_total: self.cancellation_cleanups_total.load(Ordering::Relaxed),
+            trace_linkages_total: self.trace_linkages_total.load(Ordering::Relaxed),
+            cx_created_total: self.cx_created_total.load(Ordering::Relaxed),
+            cancel_propagations_total: self.cancel_propagations_total.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Reset all counters to zero (tests/diagnostics).
+    pub fn reset(&self) {
+        self.propagation_successes_total.store(0, Ordering::Relaxed);
+        self.propagation_failures_total.store(0, Ordering::Relaxed);
+        self.cancellation_cleanups_total.store(0, Ordering::Relaxed);
+        self.trace_linkages_total.store(0, Ordering::Relaxed);
+        self.cx_created_total.store(0, Ordering::Relaxed);
+        self.cancel_propagations_total.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Serializable snapshot of Cx propagation metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CxPropagationMetricsSnapshot {
+    pub propagation_successes_total: u64,
+    pub propagation_failures_total: u64,
+    pub cancellation_cleanups_total: u64,
+    pub trace_linkages_total: u64,
+    pub cx_created_total: u64,
+    pub cancel_propagations_total: u64,
+}
+
+impl CxPropagationMetricsSnapshot {
+    /// Propagation failure ratio (failures / total attempts). Returns 0.0
+    /// when no attempts have been recorded.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn failure_ratio(&self) -> f64 {
+        let total = self.propagation_successes_total + self.propagation_failures_total;
+        if total == 0 {
+            return 0.0;
+        }
+        self.propagation_failures_total as f64 / total as f64
+    }
+}
+
+impl std::fmt::Display for CxPropagationMetricsSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cx_propagation(ok={} fail={} cancel_cleanup={} trace_link={} cx_new={} cancel_prop={} fail_ratio={:.4})",
+            self.propagation_successes_total,
+            self.propagation_failures_total,
+            self.cancellation_cleanups_total,
+            self.trace_linkages_total,
+            self.cx_created_total,
+            self.cancel_propagations_total,
+            self.failure_ratio(),
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ConflictEvent — the core event type
 // ---------------------------------------------------------------------------
 
@@ -1063,5 +1220,150 @@ mod tests {
             }
             .is_conflict()
         );
+    }
+
+    // ===================================================================
+    // bd-2g5.6.1: Cx propagation telemetry tests
+    // ===================================================================
+
+    #[test]
+    fn cx_propagation_metrics_basic() {
+        GLOBAL_CX_PROPAGATION_METRICS.reset();
+
+        GLOBAL_CX_PROPAGATION_METRICS.record_propagation_success();
+        GLOBAL_CX_PROPAGATION_METRICS.record_propagation_success();
+        GLOBAL_CX_PROPAGATION_METRICS.record_propagation_failure("test_site_1");
+        GLOBAL_CX_PROPAGATION_METRICS.record_cancellation_cleanup();
+        GLOBAL_CX_PROPAGATION_METRICS.record_trace_linkage();
+        GLOBAL_CX_PROPAGATION_METRICS.record_cx_created();
+        GLOBAL_CX_PROPAGATION_METRICS.record_cancel_propagation();
+
+        let snap = GLOBAL_CX_PROPAGATION_METRICS.snapshot();
+        assert_eq!(snap.propagation_successes_total, 2);
+        assert_eq!(snap.propagation_failures_total, 1);
+        assert_eq!(snap.cancellation_cleanups_total, 1);
+        assert_eq!(snap.trace_linkages_total, 1);
+        assert_eq!(snap.cx_created_total, 1);
+        assert_eq!(snap.cancel_propagations_total, 1);
+    }
+
+    #[test]
+    fn cx_propagation_metrics_reset() {
+        GLOBAL_CX_PROPAGATION_METRICS.reset();
+        GLOBAL_CX_PROPAGATION_METRICS.record_propagation_success();
+        GLOBAL_CX_PROPAGATION_METRICS.record_propagation_failure("reset_test");
+        assert!(
+            GLOBAL_CX_PROPAGATION_METRICS
+                .propagation_successes_total
+                .load(Ordering::Relaxed)
+                > 0
+        );
+
+        GLOBAL_CX_PROPAGATION_METRICS.reset();
+        let snap = GLOBAL_CX_PROPAGATION_METRICS.snapshot();
+        assert_eq!(snap.propagation_successes_total, 0);
+        assert_eq!(snap.propagation_failures_total, 0);
+        assert_eq!(snap.cancellation_cleanups_total, 0);
+        assert_eq!(snap.trace_linkages_total, 0);
+        assert_eq!(snap.cx_created_total, 0);
+        assert_eq!(snap.cancel_propagations_total, 0);
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn cx_propagation_failure_ratio() {
+        let m = CxPropagationMetrics::new();
+
+        // Zero total → 0.0 ratio.
+        assert_eq!(m.snapshot().failure_ratio(), 0.0);
+
+        // 1 success, 0 failures → 0.0 ratio.
+        m.record_propagation_success();
+        assert!((m.snapshot().failure_ratio() - 0.0).abs() < f64::EPSILON);
+
+        // 1 success, 1 failure → 0.5 ratio.
+        m.record_propagation_failure("ratio_test");
+        assert!((m.snapshot().failure_ratio() - 0.5).abs() < f64::EPSILON);
+
+        // 1 success, 3 failures → 0.75 ratio.
+        m.record_propagation_failure("ratio_test");
+        m.record_propagation_failure("ratio_test");
+        assert!((m.snapshot().failure_ratio() - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn cx_propagation_snapshot_display() {
+        let m = CxPropagationMetrics::new();
+        m.record_propagation_success();
+        m.record_propagation_success();
+        m.record_propagation_failure("display_test");
+        let display = format!("{}", m.snapshot());
+        assert!(display.contains("ok=2"));
+        assert!(display.contains("fail=1"));
+        assert!(display.contains("fail_ratio="));
+    }
+
+    #[test]
+    fn cx_propagation_snapshot_serializable() {
+        let m = CxPropagationMetrics::new();
+        m.record_propagation_success();
+        m.record_trace_linkage();
+        let snap = m.snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(json.contains("\"propagation_successes_total\":1"));
+        assert!(json.contains("\"trace_linkages_total\":1"));
+    }
+
+    #[test]
+    fn cx_propagation_independent_counters() {
+        // Each counter increments independently.
+        let m = CxPropagationMetrics::new();
+        for _ in 0..5 {
+            m.record_propagation_success();
+        }
+        for _ in 0..3 {
+            m.record_cancellation_cleanup();
+        }
+        m.record_cx_created();
+        m.record_cx_created();
+
+        let snap = m.snapshot();
+        assert_eq!(snap.propagation_successes_total, 5);
+        assert_eq!(snap.propagation_failures_total, 0);
+        assert_eq!(snap.cancellation_cleanups_total, 3);
+        assert_eq!(snap.trace_linkages_total, 0);
+        assert_eq!(snap.cx_created_total, 2);
+        assert_eq!(snap.cancel_propagations_total, 0);
+    }
+
+    #[test]
+    fn cx_propagation_concurrent_safety() {
+        // Multiple threads can record concurrently without panicking.
+        let m = &CxPropagationMetrics::new();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                let b = barrier.clone();
+                s.spawn(move || {
+                    b.wait();
+                    for _ in 0..100 {
+                        m.record_propagation_success();
+                        m.record_propagation_failure("concurrent_test");
+                        m.record_cancellation_cleanup();
+                        m.record_trace_linkage();
+                        m.record_cx_created();
+                        m.record_cancel_propagation();
+                    }
+                });
+            }
+        });
+
+        let snap = m.snapshot();
+        assert_eq!(snap.propagation_successes_total, 400);
+        assert_eq!(snap.propagation_failures_total, 400);
+        assert_eq!(snap.cancellation_cleanups_total, 400);
+        assert_eq!(snap.trace_linkages_total, 400);
+        assert_eq!(snap.cx_created_total, 400);
+        assert_eq!(snap.cancel_propagations_total, 400);
     }
 }

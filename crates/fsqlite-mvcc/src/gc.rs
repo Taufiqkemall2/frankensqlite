@@ -7,6 +7,7 @@
 //! - [`prune_page_chain`]: Single-page chain severing and free-list return.
 
 use std::collections::{HashSet, VecDeque};
+use std::time::Instant;
 
 use fsqlite_types::{CommitSeq, PageNumber, PageNumberBuildHasher, VersionPointer};
 
@@ -355,6 +356,15 @@ pub fn gc_tick(
     arena: &mut VersionArena,
     chain_heads: &mut std::collections::HashMap<PageNumber, VersionIdx, PageNumberBuildHasher>,
 ) -> GcTickResult {
+    let start = Instant::now();
+    let span = tracing::info_span!(
+        target: "fsqlite_mvcc::gc",
+        "ebr_reclaim",
+        horizon = horizon.get(),
+        queue_size = todo.len(),
+    );
+    let _guard = span.enter();
+
     let mut pages_budget = GC_PAGES_BUDGET;
     let mut versions_budget = GC_VERSIONS_BUDGET;
     let mut pages_pruned = 0_u32;
@@ -373,22 +383,27 @@ pub fn gc_tick(
 
     let versions_budget_exhausted = versions_budget == 0 && !todo.is_empty();
     let pages_budget_exhausted = pages_budget == 0 && !todo.is_empty();
+    #[allow(clippy::cast_possible_truncation)]
+    let grace_period_us = start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
 
     if pages_pruned > 0 {
         tracing::info!(
+            target: "fsqlite_mvcc::gc",
             pages_pruned,
             versions_freed,
             queue_remaining = todo.len(),
-            "gc_tick: pruning batch complete"
+            grace_period_us,
+            "ebr_reclaim: pruning batch complete"
         );
     }
 
     if !todo.is_empty() && (versions_budget_exhausted || pages_budget_exhausted) {
         tracing::warn!(
+            target: "fsqlite_mvcc::gc",
             queue_remaining = todo.len(),
             versions_budget_exhausted,
             pages_budget_exhausted,
-            "gc_tick: budget exhausted with pages still queued"
+            "ebr_reclaim: budget exhausted with pages still queued"
         );
     }
 

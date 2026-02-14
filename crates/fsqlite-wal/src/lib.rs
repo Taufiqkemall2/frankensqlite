@@ -37,7 +37,8 @@ pub use checksum::{
     write_wal_header_checksum, write_wal_header_salts, zero_page_checksum_trailer,
 };
 pub use metrics::{
-    GLOBAL_WAL_FEC_REPAIR_METRICS, GLOBAL_WAL_METRICS, GLOBAL_WAL_RECOVERY_METRICS,
+    GLOBAL_GROUP_COMMIT_METRICS, GLOBAL_WAL_FEC_REPAIR_METRICS, GLOBAL_WAL_METRICS,
+    GLOBAL_WAL_RECOVERY_METRICS, GroupCommitMetrics, GroupCommitMetricsSnapshot,
     WalFecRepairCounters, WalFecRepairCountersSnapshot, WalMetrics, WalMetricsSnapshot,
     WalRecoveryCounters, WalRecoveryCountersSnapshot,
 };

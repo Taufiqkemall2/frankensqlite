@@ -9,6 +9,8 @@
 //! the serialized commit section (§5.9). The coordinator never performs B-tree
 //! traversal or expression evaluation.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use fsqlite_types::TypeAffinity;
 use fsqlite_types::glossary::{
     ColumnIdx, IndexId, IntentOp, IntentOpKind, RebaseExpr, RowId, Snapshot, StructuralEffects,
@@ -25,6 +27,43 @@ use crate::index_regen::{
 
 /// Bead identifier for tracing.
 const BEAD_ID: &str = "bd-1h3b";
+
+// ── Rebase metrics (bd-688.5) ──────────────────────────────────────────────
+
+/// Total number of deterministic rebase attempts.
+static FSQLITE_REBASE_ATTEMPTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total number of rebase conflicts (rebase failures).
+static FSQLITE_REBASE_CONFLICTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total successful rebases.
+static FSQLITE_REBASE_SUCCESSES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of rebase metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RebaseMetricsSnapshot {
+    /// Total rebase attempts.
+    pub attempts_total: u64,
+    /// Total rebase conflicts (failures).
+    pub conflicts_total: u64,
+    /// Total successful rebases.
+    pub successes_total: u64,
+}
+
+/// Read a point-in-time snapshot of rebase metrics.
+#[must_use]
+pub fn rebase_metrics_snapshot() -> RebaseMetricsSnapshot {
+    RebaseMetricsSnapshot {
+        attempts_total: FSQLITE_REBASE_ATTEMPTS_TOTAL.load(Ordering::Relaxed),
+        conflicts_total: FSQLITE_REBASE_CONFLICTS_TOTAL.load(Ordering::Relaxed),
+        successes_total: FSQLITE_REBASE_SUCCESSES_TOTAL.load(Ordering::Relaxed),
+    }
+}
+
+/// Reset rebase metrics to zero (tests/diagnostics).
+pub fn reset_rebase_metrics() {
+    FSQLITE_REBASE_ATTEMPTS_TOTAL.store(0, Ordering::Relaxed);
+    FSQLITE_REBASE_CONFLICTS_TOTAL.store(0, Ordering::Relaxed);
+    FSQLITE_REBASE_SUCCESSES_TOTAL.store(0, Ordering::Relaxed);
+}
 
 // ── Error types ──────────────────────────────────────────────────────────────
 
@@ -372,6 +411,7 @@ pub struct RebaseResult {
 /// 2. Check rebase eligibility (no blocking reads, no structural effects)
 /// 3. For each `UpdateExpression`: replay against new base, regenerate index ops
 /// 4. For non-`UpdateExpression` ops: pass through unchanged
+#[allow(clippy::too_many_lines)]
 pub fn deterministic_rebase(
     intent_log: &[IntentOp],
     current_snapshot: Snapshot,
@@ -379,16 +419,45 @@ pub fn deterministic_rebase(
     schema: &dyn RebaseSchemaLookup,
     unique_checker: &dyn UniqueChecker,
 ) -> Result<RebaseResult, RebaseError> {
+    FSQLITE_REBASE_ATTEMPTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+
     // Step 1: Schema epoch guard.
-    check_schema_epoch(intent_log, current_snapshot)?;
+    if let Err(e) = check_schema_epoch(intent_log, current_snapshot) {
+        FSQLITE_REBASE_CONFLICTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        warn!(
+            target: "fsqlite_mvcc::rebase",
+            bead_id = BEAD_ID,
+            conflict = %e,
+            intents = intent_log.len(),
+            "rebase conflict: schema epoch mismatch",
+        );
+        return Err(e);
+    }
 
     // Step 2: Eligibility check.
     match check_rebase_eligibility(intent_log) {
         RebaseEligibility::Eligible => {}
         RebaseEligibility::BlockingReads { op_index } => {
+            FSQLITE_REBASE_CONFLICTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                target: "fsqlite_mvcc::rebase",
+                bead_id = BEAD_ID,
+                op_index,
+                intents = intent_log.len(),
+                "rebase conflict: blocking reads",
+            );
             return Err(RebaseError::BlockingReads { op_index });
         }
         RebaseEligibility::StructuralEffects { op_index, effects } => {
+            FSQLITE_REBASE_CONFLICTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                target: "fsqlite_mvcc::rebase",
+                bead_id = BEAD_ID,
+                op_index,
+                effects,
+                intents = intent_log.len(),
+                "rebase conflict: structural effects",
+            );
             return Err(RebaseError::StructuralEffects { op_index, effects });
         }
     }
@@ -409,14 +478,27 @@ pub fn deterministic_rebase(
                 // Discard stale index ops that follow this UpdateExpression.
                 // (In a real pipeline these would be in the same intent log;
                 // here we handle each op independently.)
-                let result = replay_update_expression(
+                let result = match replay_update_expression(
                     *table,
                     *key,
                     column_updates,
                     base_reader,
                     schema,
                     unique_checker,
-                )?;
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        FSQLITE_REBASE_CONFLICTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            target: "fsqlite_mvcc::rebase",
+                            bead_id = BEAD_ID,
+                            intents_replayed = replayed_count,
+                            conflict = %e,
+                            "rebase conflict during intent replay",
+                        );
+                        return Err(e);
+                    }
+                };
 
                 // Emit the materialized Update op.
                 rebased_ops.push(IntentOpKind::Update {
@@ -430,6 +512,7 @@ pub fn deterministic_rebase(
                 replayed_count += 1;
 
                 debug!(
+                    target: "fsqlite_mvcc::rebase",
                     bead_id = BEAD_ID,
                     table = table.get(),
                     key = key.get(),
@@ -443,6 +526,18 @@ pub fn deterministic_rebase(
             }
         }
     }
+
+    FSQLITE_REBASE_SUCCESSES_TOTAL.fetch_add(1, Ordering::Relaxed);
+
+    // INFO-level rebase outcome (bd-688.5).
+    tracing::info!(
+        target: "fsqlite_mvcc::rebase",
+        bead_id = BEAD_ID,
+        intents_replayed = replayed_count,
+        total_ops = intent_log.len(),
+        rebased_ops = rebased_ops.len(),
+        "rebase succeeded",
+    );
 
     Ok(RebaseResult {
         rebased_ops,

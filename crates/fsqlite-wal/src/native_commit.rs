@@ -21,11 +21,14 @@
 //! - FSYNC_2 prevents "client thinks committed, marker not persisted."
 
 use std::collections::VecDeque;
+use std::time::Instant;
 
 use fsqlite_types::{
     CommitMarker, CommitProof, CommitSeq, ObjectId, OperatingMode, PageNumber, TxnToken,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
+
+use crate::metrics::GLOBAL_GROUP_COMMIT_METRICS;
 
 // ---------------------------------------------------------------------------
 // §7.11.1 Writer submission request
@@ -284,6 +287,8 @@ pub struct WriteCoordinator {
     batch: GroupCommitBatch,
     /// Whether the coordinator is shutting down.
     shutting_down: bool,
+    /// Monotonic epoch counter: incremented once per group commit flush.
+    epoch: u64,
 }
 
 impl WriteCoordinator {
@@ -307,6 +312,7 @@ impl WriteCoordinator {
             prev_marker_id: None,
             batch: GroupCommitBatch::new(group_commit_max),
             shutting_down: false,
+            epoch: 0,
         }
     }
 
@@ -328,6 +334,12 @@ impl WriteCoordinator {
         self.batch.len()
     }
 
+    /// The current epoch (incremented once per group commit flush).
+    #[must_use]
+    pub const fn current_epoch(&self) -> u64 {
+        self.epoch
+    }
+
     /// Initiate shutdown: new submissions will be rejected.
     pub fn initiate_shutdown(&mut self) {
         self.shutting_down = true;
@@ -342,6 +354,7 @@ impl WriteCoordinator {
     /// the write-set summary against the commit index.
     pub fn validate(&self, submission: &CommitSubmission) -> Result<(), CommitResult> {
         if self.shutting_down {
+            GLOBAL_GROUP_COMMIT_METRICS.record_shutdown_rejection();
             warn!(
                 phase = "validate",
                 "rejecting submission: coordinator shutting down"
@@ -354,6 +367,7 @@ impl WriteCoordinator {
             .commit_index
             .check_conflicts(&submission.write_set_pages, submission.begin_seq);
         if !conflicts.is_empty() {
+            GLOBAL_GROUP_COMMIT_METRICS.record_fcw_conflict();
             debug!(
                 phase = "validate",
                 begin_seq = submission.begin_seq.get(),
@@ -392,6 +406,8 @@ impl WriteCoordinator {
         // Step 1: Validate
         self.validate(&submission)?;
 
+        GLOBAL_GROUP_COMMIT_METRICS.record_submission();
+
         // Step 2: Allocate gap-free commit_seq
         let new_seq = self.commit_seq_tip.next();
         let commit_time = now_unix_ns.max(self.last_commit_time_ns.wrapping_add(1));
@@ -410,10 +426,13 @@ impl WriteCoordinator {
         self.commit_index
             .record_commit(&submission.write_set_pages, new_seq);
 
-        debug!(
+        trace!(
+            target: "fsqlite_wal::native_commit",
             phase = "submit",
             commit_seq = new_seq.get(),
             pages = submission.write_set_pages.len(),
+            begin_seq = submission.begin_seq.get(),
+            pending_batch = self.batch.len() + 1,
             "allocated commit_seq"
         );
 
@@ -439,7 +458,9 @@ impl WriteCoordinator {
     pub fn fsync1(&mut self) -> usize {
         let count = self.batch.len();
         self.batch.mark_fsync1_complete();
+        GLOBAL_GROUP_COMMIT_METRICS.record_fsync1();
         debug!(
+            target: "fsqlite_wal::native_commit",
             phase = "fsync1",
             batch_size = count,
             "pre-marker fsync complete"
@@ -478,8 +499,10 @@ impl WriteCoordinator {
 
         // Step 6: FSYNC_2 on marker stream
         self.batch.mark_fsync2_complete();
+        GLOBAL_GROUP_COMMIT_METRICS.record_fsync2();
 
         debug!(
+            target: "fsqlite_wal::native_commit",
             phase = "fsync2",
             markers_appended = markers.len(),
             "post-marker fsync complete"
@@ -494,16 +517,77 @@ impl WriteCoordinator {
     /// these results — the coordinator only manages the serialized section.
     pub fn drain_committed(&mut self) -> Vec<CommitResult> {
         let drained = self.batch.drain_committed();
+        let batch_size = drained.len();
         let results: Vec<CommitResult> = drained
             .into_iter()
             .map(|(_, seq, time)| {
-                info!(commit_seq = seq.get(), durable = true, "commit published");
+                info!(
+                    target: "fsqlite_wal::native_commit",
+                    commit_seq = seq.get(),
+                    durable = true,
+                    "commit published"
+                );
                 CommitResult::Committed {
                     commit_seq: seq,
                     commit_time_unix_ns: time,
                 }
             })
             .collect();
+
+        if batch_size > 0 {
+            info!(
+                target: "fsqlite_wal::native_commit",
+                group_size = batch_size,
+                "parallel_wal_commit group drained"
+            );
+        }
+
+        results
+    }
+
+    /// Flush the pending batch: fsync1, append markers, fsync2, drain.
+    ///
+    /// Wraps the full group commit cycle in a `parallel_wal_commit` tracing
+    /// span with epoch, group_size, and commit_seq range fields.
+    /// Returns the committed results and records metrics.
+    pub fn flush_batch(&mut self) -> Vec<CommitResult> {
+        let group_size = self.batch.len();
+        if group_size == 0 {
+            return Vec::new();
+        }
+
+        let start = Instant::now();
+        self.epoch += 1;
+        let epoch = self.epoch;
+
+        let span = tracing::info_span!(
+            target: "fsqlite_wal::native_commit",
+            "parallel_wal_commit",
+            epoch,
+            group_size,
+            frames_in_batch = group_size,
+        );
+        let _guard = span.enter();
+
+        let fsync1_count = self.fsync1();
+        let markers = self.append_markers_and_fsync2();
+        let results = self.drain_committed();
+
+        #[allow(clippy::cast_possible_truncation)]
+        let latency_us = start.elapsed().as_micros() as u64;
+        GLOBAL_GROUP_COMMIT_METRICS.record_group_commit(group_size as u64, latency_us);
+
+        info!(
+            target: "fsqlite_wal::native_commit",
+            epoch,
+            group_size,
+            fsync1_count,
+            markers_appended = markers.len(),
+            committed = results.len(),
+            latency_us,
+            "parallel_wal_commit complete"
+        );
+
         results
     }
 
@@ -519,9 +603,7 @@ impl WriteCoordinator {
     ) -> CommitResult {
         match self.submit(submission, now_unix_ns) {
             Ok(_seq) => {
-                self.fsync1();
-                let _markers = self.append_markers_and_fsync2();
-                let mut results = self.drain_committed();
+                let mut results = self.flush_batch();
                 results.pop().unwrap_or(CommitResult::ShuttingDown)
             }
             Err(result) => result,
@@ -937,5 +1019,257 @@ mod tests {
 
         barriers.fsync2_complete = true;
         assert!(barriers.all_complete());
+    }
+
+    // ── bd-14m.2.1: Group commit observability metrics ──
+
+    #[test]
+    fn test_group_commit_metrics_basic() {
+        use crate::metrics::GroupCommitMetrics;
+        let m = GroupCommitMetrics::new();
+
+        m.record_submission();
+        m.record_submission();
+        m.record_submission();
+        m.record_group_commit(3, 500);
+        m.record_fsync1();
+        m.record_fsync2();
+        m.record_fcw_conflict();
+        m.record_ssi_conflict();
+        m.record_shutdown_rejection();
+
+        let snap = m.snapshot();
+        assert_eq!(snap.submissions_total, 3);
+        assert_eq!(snap.group_commits_total, 1);
+        assert_eq!(snap.group_commit_size_sum, 3);
+        assert_eq!(snap.commit_latency_us_total, 500);
+        assert_eq!(snap.fsync1_total, 1);
+        assert_eq!(snap.fsync2_total, 1);
+        assert_eq!(snap.fcw_conflicts_total, 1);
+        assert_eq!(snap.ssi_conflicts_total, 1);
+        assert_eq!(snap.shutdown_rejections_total, 1);
+        assert_eq!(snap.avg_group_size(), 3);
+        assert_eq!(snap.avg_commit_latency_us(), 500);
+    }
+
+    #[test]
+    fn test_group_commit_metrics_reset() {
+        use crate::metrics::GroupCommitMetrics;
+        let m = GroupCommitMetrics::new();
+        m.record_submission();
+        m.record_group_commit(1, 100);
+        m.record_fsync1();
+        m.record_fsync2();
+        m.record_fcw_conflict();
+        m.reset();
+        let snap = m.snapshot();
+        assert_eq!(snap.submissions_total, 0);
+        assert_eq!(snap.group_commits_total, 0);
+        assert_eq!(snap.fsync1_total, 0);
+        assert_eq!(snap.fsync2_total, 0);
+        assert_eq!(snap.fcw_conflicts_total, 0);
+    }
+
+    #[test]
+    fn test_group_commit_metrics_display() {
+        use crate::metrics::GroupCommitMetrics;
+        let m = GroupCommitMetrics::new();
+        m.record_submission();
+        m.record_group_commit(1, 200);
+        m.record_fsync1();
+        m.record_fsync2();
+        let s = m.snapshot().to_string();
+        assert!(s.contains("group_commits=1"));
+        assert!(s.contains("submissions=1"));
+        assert!(s.contains("fsync1=1"));
+        assert!(s.contains("fsync2=1"));
+    }
+
+    #[test]
+    fn test_group_commit_metrics_avg_zero() {
+        use crate::metrics::GroupCommitMetrics;
+        let m = GroupCommitMetrics::new();
+        let snap = m.snapshot();
+        assert_eq!(snap.avg_group_size(), 0);
+        assert_eq!(snap.avg_commit_latency_us(), 0);
+        assert_eq!(snap.fsync_reduction_ratio(), 0);
+    }
+
+    /// Deterministic proof that group commit achieves >5x fsync reduction.
+    ///
+    /// Without group commit: N commits × 2 fsyncs = 2N fsyncs.
+    /// With group commit: N commits batched → 1 fsync1 + 1 fsync2 = 2 fsyncs.
+    /// Reduction ratio: 2N / 2 = N (for N >= 6, ratio > 5x).
+    #[test]
+    fn test_fsync_reduction_proof_deterministic() {
+        use crate::metrics::GLOBAL_GROUP_COMMIT_METRICS;
+
+        // Reset global metrics for this test.
+        GLOBAL_GROUP_COMMIT_METRICS.reset();
+
+        let n = 10_u8; // 10 concurrent writers
+        let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, 32);
+
+        let base_time = 1_700_000_000_000_000_000_u64;
+
+        // Phase 1: Submit all N writers (disjoint pages)
+        for i in 0..n {
+            let page = u32::from(i) + 1;
+            let sub = make_submission(&[page], 0, i);
+            coord.submit(sub, base_time + u64::from(i)).unwrap();
+        }
+
+        // Phase 2: Single batch flush (1 fsync1 + 1 fsync2)
+        coord.fsync1();
+        coord.append_markers_and_fsync2();
+        let results = coord.drain_committed();
+        assert_eq!(results.len(), usize::from(n));
+
+        // Record the group commit metric
+        GLOBAL_GROUP_COMMIT_METRICS.record_group_commit(u64::from(n), 0);
+
+        let snap = GLOBAL_GROUP_COMMIT_METRICS.snapshot();
+
+        // Verify: N submissions, but only 1 fsync1 + 1 fsync2 = 2 fsyncs total
+        assert_eq!(snap.submissions_total, u64::from(n));
+        assert_eq!(snap.fsync1_total, 1, "only 1 FSYNC_1 for entire batch");
+        assert_eq!(snap.fsync2_total, 1, "only 1 FSYNC_2 for entire batch");
+
+        // Without batching: each commit needs its own fsync1 + fsync2 = 2N fsyncs
+        let unbatched_fsyncs = u64::from(n) * 2;
+        let batched_fsyncs = snap.fsync1_total + snap.fsync2_total;
+        let reduction = unbatched_fsyncs / batched_fsyncs;
+
+        assert!(
+            reduction >= 5,
+            "group commit must achieve >=5x fsync reduction: \
+             {n} commits, unbatched={unbatched_fsyncs} fsyncs, \
+             batched={batched_fsyncs} fsyncs, reduction={reduction}x"
+        );
+
+        // Verify the snapshot ratio method agrees
+        assert!(
+            snap.fsync_reduction_ratio() >= 5,
+            "fsync_reduction_ratio must be >= 5: got {}",
+            snap.fsync_reduction_ratio()
+        );
+    }
+
+    /// Verify metrics are emitted during submit_and_commit convenience path.
+    #[test]
+    fn test_submit_and_commit_records_metrics() {
+        use crate::metrics::GLOBAL_GROUP_COMMIT_METRICS;
+
+        GLOBAL_GROUP_COMMIT_METRICS.reset();
+
+        let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, 16);
+        let sub = make_submission(&[1], 0, 1);
+        let result = coord.submit_and_commit(sub, 1_000_000);
+        assert!(matches!(result, CommitResult::Committed { .. }));
+
+        let snap = GLOBAL_GROUP_COMMIT_METRICS.snapshot();
+        assert_eq!(snap.submissions_total, 1);
+        assert_eq!(snap.group_commits_total, 1);
+        assert_eq!(snap.group_commit_size_sum, 1);
+        assert_eq!(snap.fsync1_total, 1);
+        assert_eq!(snap.fsync2_total, 1);
+    }
+
+    /// Verify FCW conflict increments the metric counter.
+    #[test]
+    fn test_fcw_conflict_metric() {
+        use crate::metrics::GLOBAL_GROUP_COMMIT_METRICS;
+
+        GLOBAL_GROUP_COMMIT_METRICS.reset();
+
+        let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, 16);
+
+        // First commit succeeds
+        let sub1 = make_submission(&[1], 0, 1);
+        coord.submit_and_commit(sub1, 1_000_000);
+
+        // Second commit to same page with stale begin_seq fails
+        let sub2 = make_submission(&[1], 0, 2);
+        let result = coord.submit(sub2, 2_000_000);
+        assert!(matches!(result, Err(CommitResult::ConflictFcw { .. })));
+
+        let snap = GLOBAL_GROUP_COMMIT_METRICS.snapshot();
+        assert_eq!(snap.fcw_conflicts_total, 1);
+    }
+
+    /// Verify shutdown rejection increments the metric counter.
+    #[test]
+    fn test_shutdown_rejection_metric() {
+        use crate::metrics::GLOBAL_GROUP_COMMIT_METRICS;
+
+        GLOBAL_GROUP_COMMIT_METRICS.reset();
+
+        let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, 16);
+        coord.initiate_shutdown();
+
+        let sub = make_submission(&[1], 0, 1);
+        let result = coord.submit(sub, 1_000_000);
+        assert!(matches!(result, Err(CommitResult::ShuttingDown)));
+
+        let snap = GLOBAL_GROUP_COMMIT_METRICS.snapshot();
+        assert_eq!(snap.shutdown_rejections_total, 1);
+    }
+
+    // ── bd-14m.2: Parallel WAL epoch and flush_batch ──
+
+    /// Verify flush_batch increments epoch and records metrics.
+    #[test]
+    fn test_flush_batch_epoch_tracking() {
+        use crate::metrics::GLOBAL_GROUP_COMMIT_METRICS;
+
+        GLOBAL_GROUP_COMMIT_METRICS.reset();
+
+        let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, 32);
+        assert_eq!(coord.current_epoch(), 0);
+
+        // First batch: 3 commits
+        let base_time = 1_700_000_000_000_000_000_u64;
+        for i in 0..3u8 {
+            let sub = make_submission(&[u32::from(i) + 1], 0, i);
+            coord.submit(sub, base_time + u64::from(i)).unwrap();
+        }
+        let results = coord.flush_batch();
+        assert_eq!(results.len(), 3);
+        assert_eq!(coord.current_epoch(), 1);
+
+        // Second batch: 2 commits
+        for i in 3..5u8 {
+            let sub = make_submission(&[u32::from(i) + 10], 3, i);
+            coord.submit(sub, base_time + 100 + u64::from(i)).unwrap();
+        }
+        let results = coord.flush_batch();
+        assert_eq!(results.len(), 2);
+        assert_eq!(coord.current_epoch(), 2);
+
+        let snap = GLOBAL_GROUP_COMMIT_METRICS.snapshot();
+        assert_eq!(snap.group_commits_total, 2);
+        assert_eq!(snap.group_commit_size_sum, 5); // 3 + 2
+        assert_eq!(snap.submissions_total, 5);
+        assert_eq!(snap.fsync1_total, 2);
+        assert_eq!(snap.fsync2_total, 2);
+    }
+
+    /// flush_batch on empty batch is a no-op.
+    #[test]
+    fn test_flush_batch_empty_noop() {
+        let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, 16);
+        let results = coord.flush_batch();
+        assert!(results.is_empty());
+        assert_eq!(coord.current_epoch(), 0); // epoch not incremented
+    }
+
+    /// Verify submit_and_commit delegates through flush_batch path.
+    #[test]
+    fn test_submit_and_commit_uses_flush_batch_epoch() {
+        let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, 16);
+        let sub = make_submission(&[1], 0, 1);
+        let result = coord.submit_and_commit(sub, 1_000_000);
+        assert!(matches!(result, CommitResult::Committed { .. }));
+        assert_eq!(coord.current_epoch(), 1);
     }
 }
