@@ -187,12 +187,120 @@ jobs:
         with:
           toolchain: nightly
 
+      - name: Install cargo-llvm-cov
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install cargo-llvm-cov --locked
+
       - name: Download unit-shard artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts/downloaded-unit-shards
           pattern: unit-shard-*-artifacts
           merge-multiple: false
+
+      - name: Run canonical coverage wrapper + per-crate delta report
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          artifact_root="artifacts/unit-coverage-drift-gate"
+          coverage_root="${artifact_root}/coverage"
+          coverage_log="${coverage_root}/coverage_wrapper.log"
+          coverage_json="${coverage_root}/coverage_latest.json"
+          per_crate_json="${coverage_root}/coverage_per_crate_delta.json"
+
+          mkdir -p "${coverage_root}"
+
+          set +e
+          bash ./scripts/coverage.sh --json --fail-under-lines 70 --fail-under-functions 65 \
+            > "${coverage_log}" 2>&1
+          coverage_status=$?
+          set -e
+
+          if [[ -f "target/coverage/coverage_latest.json" ]]; then
+            cp "target/coverage/coverage_latest.json" "${coverage_json}"
+          fi
+
+          if [[ -f "${coverage_json}" ]]; then
+            jq '
+              def crate_name($f):
+                if ($f | test("/crates/[^/]+/")) then
+                  ($f | capture("/crates/(?<crate>[^/]+)/").crate)
+                else
+                  "workspace-root"
+                end;
+              [ .data[0].files[]
+                | {
+                    crate: crate_name(.filename),
+                    lines_count: (.summary.lines.count // 0),
+                    lines_covered: (.summary.lines.covered // 0),
+                    functions_count: (.summary.functions.count // 0),
+                    functions_covered: (.summary.functions.covered // 0)
+                  }
+              ]
+              | group_by(.crate)
+              | map({
+                  crate: .[0].crate,
+                  lines_count: (map(.lines_count) | add),
+                  lines_covered: (map(.lines_covered) | add),
+                  lines_percent:
+                    (if (map(.lines_count) | add) > 0
+                     then ((map(.lines_covered) | add) / (map(.lines_count) | add) * 100)
+                     else 0 end),
+                  lines_delta_vs_slo:
+                    (if (map(.lines_count) | add) > 0
+                     then ((map(.lines_covered) | add) / (map(.lines_count) | add) * 100 - 70)
+                     else -70 end),
+                  functions_count: (map(.functions_count) | add),
+                  functions_covered: (map(.functions_covered) | add),
+                  functions_percent:
+                    (if (map(.functions_count) | add) > 0
+                     then ((map(.functions_covered) | add) / (map(.functions_count) | add) * 100)
+                     else 0 end),
+                  functions_delta_vs_slo:
+                    (if (map(.functions_count) | add) > 0
+                     then ((map(.functions_covered) | add) / (map(.functions_count) | add) * 100 - 65)
+                     else -65 end)
+                })
+              | sort_by(.crate)
+            ' "${coverage_json}" > "${per_crate_json}"
+
+            line_pct="$(jq -r '.data[0].totals.lines.percent // 0' "${coverage_json}")"
+            function_pct="$(jq -r '.data[0].totals.functions.percent // 0' "${coverage_json}")"
+            line_delta="$(jq -n --arg pct "${line_pct}" '($pct | tonumber) - 70')"
+            function_delta="$(jq -n --arg pct "${function_pct}" '($pct | tonumber) - 65')"
+            failing_crates="$(jq -r '
+              [ .[]
+                | select(.lines_delta_vs_slo < 0 or .functions_delta_vs_slo < 0)
+                | .crate
+              ] | join(", ")
+            ' "${per_crate_json}")"
+            if [[ -z "${failing_crates}" ]]; then
+              failing_crates="none"
+            fi
+
+            {
+              echo "### Canonical coverage wrapper"
+              echo "- exit_code: ${coverage_status}"
+              echo "- lines_pct: ${line_pct} (delta vs 70: ${line_delta})"
+              echo "- functions_pct: ${function_pct} (delta vs 65: ${function_delta})"
+              echo "- per_crate_delta: \`${per_crate_json}\`"
+              echo "- crates_below_slo: \`${failing_crates}\`"
+              echo "- local_parity_command: \`bash ./scripts/coverage.sh --json --fail-under-lines 70 --fail-under-functions 65\`"
+            } >> "${GITHUB_STEP_SUMMARY}"
+          else
+            {
+              echo "### Canonical coverage wrapper"
+              echo "- exit_code: ${coverage_status}"
+              echo "- coverage JSON not produced; see \`${coverage_log}\`"
+            } >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+          if [[ ${coverage_status} -ne 0 ]]; then
+            exit "${coverage_status}"
+          fi
 
       - name: Run unit coverage drift gate
         shell: bash

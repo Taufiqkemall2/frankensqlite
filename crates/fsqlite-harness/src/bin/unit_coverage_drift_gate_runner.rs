@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt;
 use std::fs;
@@ -78,6 +78,8 @@ struct UnitCoverageDriftReport {
     discovered_lane_count: usize,
     required_gap_count: usize,
     informational_gap_count: usize,
+    per_crate_lane_deltas: Vec<CrateLaneDelta>,
+    invariant_impact_hints: Vec<InvariantImpactHint>,
     overall_pass: bool,
     gaps: Vec<UnitCoverageGap>,
 }
@@ -94,6 +96,24 @@ struct UnitShardSummary {
     shard_id: String,
     failed_crates: Vec<String>,
     failed_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CrateLaneDelta {
+    crate_name: String,
+    failing_lanes: Vec<String>,
+    failure_count: usize,
+    expected_failure_count: usize,
+    delta_vs_expected: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct InvariantImpactHint {
+    matrix_test_id: String,
+    category: String,
+    invariant: String,
+    impact: String,
+    remediation: String,
 }
 
 #[derive(Debug, Clone)]
@@ -366,6 +386,7 @@ fn build_report(config: &Config) -> Result<UnitCoverageDriftReport, String> {
 
     let mut critical_invariant_count = 0_usize;
     let mut critical_invariants_with_real_evidence = 0_usize;
+    let mut per_crate_failures: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
     for test in &matrix.tests {
         for invariant in &test.invariants {
@@ -424,6 +445,12 @@ fn build_report(config: &Config) -> Result<UnitCoverageDriftReport, String> {
             Some(summary) => {
                 let has_failures = summary.failed_count > 0 || !summary.failed_crates.is_empty();
                 if has_failures {
+                    for crate_name in &summary.failed_crates {
+                        per_crate_failures
+                            .entry(crate_name.clone())
+                            .or_default()
+                            .insert(lane.clone());
+                    }
                     gaps.push(UnitCoverageGap {
                         reason: GapReason::RequiredUnitLaneFailed,
                         severity: GapSeverity::Required,
@@ -473,6 +500,49 @@ fn build_report(config: &Config) -> Result<UnitCoverageDriftReport, String> {
         .filter(|gap| gap.severity == GapSeverity::Required)
         .count();
     let informational_gap_count = gaps.len().saturating_sub(required_gap_count);
+    let per_crate_lane_deltas: Vec<CrateLaneDelta> = per_crate_failures
+        .into_iter()
+        .map(|(crate_name, lanes)| {
+            let failure_count = lanes.len();
+            CrateLaneDelta {
+                crate_name,
+                failing_lanes: lanes.into_iter().collect(),
+                failure_count,
+                expected_failure_count: 0,
+                delta_vs_expected: i64::try_from(failure_count).unwrap_or(i64::MAX),
+            }
+        })
+        .collect();
+
+    let invariant_impact_hints: Vec<InvariantImpactHint> = gaps
+        .iter()
+        .filter_map(|gap| match gap.reason {
+            GapReason::MissingInvariantEvidence | GapReason::MockOnlyCriticalPathInvariant => {
+                Some(InvariantImpactHint {
+                    matrix_test_id: gap
+                        .matrix_test_id
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_owned()),
+                    category: gap.category.clone().unwrap_or_else(|| "unknown".to_owned()),
+                    invariant: gap
+                        .invariant
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_owned()),
+                    impact: match gap.reason {
+                        GapReason::MissingInvariantEvidence => {
+                            "no evidence entry blocks invariant confidence".to_owned()
+                        }
+                        GapReason::MockOnlyCriticalPathInvariant => {
+                            "critical invariant lacks real-component evidence".to_owned()
+                        }
+                        _ => unreachable!("filtered to invariant-impact reasons"),
+                    },
+                    remediation: gap.remediation.clone(),
+                })
+            }
+            _ => None,
+        })
+        .collect();
 
     Ok(UnitCoverageDriftReport {
         schema_version: REPORT_SCHEMA_VERSION.to_owned(),
@@ -493,6 +563,8 @@ fn build_report(config: &Config) -> Result<UnitCoverageDriftReport, String> {
         discovered_lane_count: unit_shard_summaries.len(),
         required_gap_count,
         informational_gap_count,
+        per_crate_lane_deltas,
+        invariant_impact_hints,
         overall_pass: required_gap_count == 0,
         gaps,
     })
@@ -548,6 +620,31 @@ fn render_human_summary(report: &UnitCoverageDriftReport) -> String {
         report.informational_gap_count
     ));
     out.push_str(&format!("- overall_pass: `{}`\n", report.overall_pass));
+
+    if !report.per_crate_lane_deltas.is_empty() {
+        out.push_str("\n## Per-Crate Delta (Required Lane Failures)\n");
+        for delta in &report.per_crate_lane_deltas {
+            out.push_str(&format!(
+                "- crate=`{}` failure_count={} expected={} delta={} lanes={:?}\n",
+                delta.crate_name,
+                delta.failure_count,
+                delta.expected_failure_count,
+                delta.delta_vs_expected,
+                delta.failing_lanes
+            ));
+        }
+    }
+
+    if !report.invariant_impact_hints.is_empty() {
+        out.push_str("\n## Invariant Impact Hints\n");
+        for hint in &report.invariant_impact_hints {
+            out.push_str(&format!(
+                "- test_id=`{}` category=`{}` invariant=\"{}\" impact=\"{}\"\n",
+                hint.matrix_test_id, hint.category, hint.invariant, hint.impact
+            ));
+            out.push_str(&format!("  remediation: {}\n", hint.remediation));
+        }
+    }
 
     if report.gaps.is_empty() {
         out.push_str(
