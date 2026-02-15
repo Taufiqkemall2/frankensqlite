@@ -862,7 +862,8 @@ pub fn evaluate_invariant_drift_status() -> InvariantDriftStatus {
     let evidence_map = no_mock_evidence::build_evidence_map();
     let evidence_index = index_evidence(&evidence_map.entries);
 
-    let total_matrix_invariants: usize = matrix.tests.iter().map(|test| test.invariants.len()).sum();
+    let total_matrix_invariants: usize =
+        matrix.tests.iter().map(|test| test.invariants.len()).sum();
     let mut gaps = Vec::new();
 
     for error in matrix.validate() {
@@ -932,8 +933,8 @@ pub fn evaluate_invariant_drift_status() -> InvariantDriftStatus {
                         matrix_test_id: Some(test.test_id.clone()),
                         category: Some(test.category.display_name().to_owned()),
                         invariant: Some(invariant.clone()),
-                        details:
-                            "Critical-path invariant lacks real non-exception evidence".to_owned(),
+                        details: "Critical-path invariant lacks real non-exception evidence"
+                            .to_owned(),
                         remediation:
                             "Add or restore real-component evidence for this critical invariant"
                                 .to_owned(),
@@ -1041,8 +1042,11 @@ pub fn evaluate_scenario_coverage_drift_status(
             })
             .collect();
 
-    let missing_manifest: BTreeSet<String> =
-        execution_summary.missing_scenarios.iter().cloned().collect();
+    let missing_manifest: BTreeSet<String> = execution_summary
+        .missing_scenarios
+        .iter()
+        .cloned()
+        .collect();
     let scenario_index = build_scenario_script_index();
 
     let mut gaps = Vec::new();
@@ -1124,7 +1128,10 @@ pub fn validate_manifest_contract(manifest: &ValidationManifest) -> Vec<String> 
         errors.push("schema_version must be non-empty".to_owned());
     }
     if manifest.bead_id != BEAD_ID {
-        errors.push(format!("bead_id '{}' must equal '{BEAD_ID}'", manifest.bead_id));
+        errors.push(format!(
+            "bead_id '{}' must equal '{BEAD_ID}'",
+            manifest.bead_id
+        ));
     }
     if manifest.run_id.trim().is_empty() {
         errors.push("run_id must be non-empty".to_owned());
@@ -1152,7 +1159,10 @@ pub fn validate_manifest_contract(manifest: &ValidationManifest) -> Vec<String> 
             errors.push("gate_id must be non-empty".to_owned());
         }
         if gate.commit_sha.trim().is_empty() {
-            errors.push(format!("gate {} commit_sha must be non-empty", gate.gate_id));
+            errors.push(format!(
+                "gate {} commit_sha must be non-empty",
+                gate.gate_id
+            ));
         }
         if gate.artifact_uris.is_empty() {
             errors.push(format!("gate {} must have artifact URIs", gate.gate_id));
@@ -1329,7 +1339,9 @@ mod tests {
             .unwrap_or_else(|error| panic!("bundle build failed: {error}"));
         let previous = bundle.manifest.clone();
         let mut candidate = bundle.manifest;
-        candidate.gates.retain(|gate| gate.gate_id != LOGGING_GATE_ID);
+        candidate
+            .gates
+            .retain(|gate| gate.gate_id != LOGGING_GATE_ID);
         let issues = detect_backward_incompatible_change(&previous, &candidate);
         assert!(issues.iter().any(|issue| issue.contains(LOGGING_GATE_ID)));
     }
