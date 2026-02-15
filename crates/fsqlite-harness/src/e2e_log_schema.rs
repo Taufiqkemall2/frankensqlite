@@ -30,6 +30,10 @@ const BEAD_ID: &str = "bd-1dp9.7.2";
 pub const LOG_SCHEMA_VERSION: &str = "1.0.0";
 /// Oldest schema version this module guarantees compatibility with.
 pub const LOG_SCHEMA_MIN_SUPPORTED_VERSION: &str = "1.0.0";
+/// Version of the shell-script logging profile derived from this schema.
+pub const SHELL_SCRIPT_LOG_PROFILE_VERSION: &str = "1.0.0";
+/// Repository-relative path to the machine-readable shell-script profile.
+pub const SHELL_SCRIPT_LOG_PROFILE_DOC_PATH: &str = "docs/e2e_shell_script_log_profile.json";
 /// Fields that must be present in every event.
 pub const REQUIRED_EVENT_FIELDS: &[&str] = &["run_id", "timestamp", "phase", "event_type"];
 /// Replayability keys required for deterministic triage and reruns.
@@ -470,6 +474,330 @@ pub fn build_schema_compatibility_policy() -> SchemaCompatibilityPolicy {
     }
 }
 
+/// Legacy shell-script token mapping to canonical schema fields.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShellScriptMigrationAlias {
+    pub legacy_token: String,
+    pub canonical_field: String,
+    pub guidance: String,
+}
+
+/// Normative shell-script logging example paired with a canonical event payload.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShellScriptNormativeExample {
+    pub name: String,
+    pub notes: String,
+    pub event: LogEventSchema,
+}
+
+/// Machine-readable profile consumed by shell scripts and CI conformance checks.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShellScriptLogProfile {
+    pub profile_version: String,
+    pub log_schema_version: String,
+    pub required_fields: Vec<String>,
+    pub optional_fields: Vec<String>,
+    pub replayability_keys: Vec<String>,
+    pub migration_aliases: Vec<ShellScriptMigrationAlias>,
+    pub normative_examples: Vec<ShellScriptNormativeExample>,
+    pub replay_instructions: Vec<String>,
+}
+
+/// Build the canonical shell-script logging profile for E2E scripts.
+#[must_use]
+pub fn build_shell_script_log_profile() -> ShellScriptLogProfile {
+    let required_fields = REQUIRED_EVENT_FIELDS
+        .iter()
+        .map(|field| (*field).to_owned())
+        .collect::<Vec<_>>();
+
+    let optional_fields = vec![
+        "scenario_id".to_owned(),
+        "seed".to_owned(),
+        "backend".to_owned(),
+        "artifact_hash".to_owned(),
+        "context".to_owned(),
+        "context.trace_id".to_owned(),
+        "context.level".to_owned(),
+        "context.outcome".to_owned(),
+        "context.duration_ms".to_owned(),
+        "context.retry_attempt".to_owned(),
+        "context.artifact_paths".to_owned(),
+        "context.invariant_ids".to_owned(),
+    ];
+
+    let replayability_keys = REPLAYABILITY_KEYS
+        .iter()
+        .map(|field| (*field).to_owned())
+        .collect::<Vec<_>>();
+
+    let migration_aliases = vec![
+        ShellScriptMigrationAlias {
+            legacy_token: "level".to_owned(),
+            canonical_field: "context.level".to_owned(),
+            guidance: "Keep severity as INFO/WARN/ERROR in context while mapping state changes to event_type."
+                .to_owned(),
+        },
+        ShellScriptMigrationAlias {
+            legacy_token: "status".to_owned(),
+            canonical_field: "context.outcome".to_owned(),
+            guidance: "Preserve script status details in context.outcome and use event_type for schema enums."
+                .to_owned(),
+        },
+        ShellScriptMigrationAlias {
+            legacy_token: "log".to_owned(),
+            canonical_field: "context.artifact_paths".to_owned(),
+            guidance: "Record artifact paths as comma-separated deterministic paths in context.artifact_paths."
+                .to_owned(),
+        },
+        ShellScriptMigrationAlias {
+            legacy_token: "duration_ms".to_owned(),
+            canonical_field: "context.duration_ms".to_owned(),
+            guidance: "Keep duration as stringified integer milliseconds in context.duration_ms.".to_owned(),
+        },
+        ShellScriptMigrationAlias {
+            legacy_token: "retry_count".to_owned(),
+            canonical_field: "context.retry_attempt".to_owned(),
+            guidance: "Normalize retry metadata under context.retry_attempt with zero-based attempt numbers."
+                .to_owned(),
+        },
+        ShellScriptMigrationAlias {
+            legacy_token: "scenario".to_owned(),
+            canonical_field: "scenario_id".to_owned(),
+            guidance: "Promote scenario token to scenario_id using CATEGORY-NUMBER convention.".to_owned(),
+        },
+        ShellScriptMigrationAlias {
+            legacy_token: "seed_value".to_owned(),
+            canonical_field: "seed".to_owned(),
+            guidance: "Emit deterministic seed as unsigned integer in seed.".to_owned(),
+        },
+    ];
+
+    let mut success_context = BTreeMap::new();
+    success_context.insert("trace_id".to_owned(), "2d8d9c8ec6f4b42d".to_owned());
+    success_context.insert("level".to_owned(), "INFO".to_owned());
+    success_context.insert("outcome".to_owned(), "pass".to_owned());
+    success_context.insert("duration_ms".to_owned(), "137".to_owned());
+    success_context.insert("retry_attempt".to_owned(), "0".to_owned());
+    success_context.insert(
+        "artifact_paths".to_owned(),
+        "test-results/e2e/events.jsonl,test-results/e2e/summary.json".to_owned(),
+    );
+    success_context.insert("invariant_ids".to_owned(), "INV-1,INV-9".to_owned());
+
+    let mut failure_context = BTreeMap::new();
+    failure_context.insert("trace_id".to_owned(), "2d8d9c8ec6f4b42d".to_owned());
+    failure_context.insert("level".to_owned(), "ERROR".to_owned());
+    failure_context.insert("outcome".to_owned(), "fail".to_owned());
+    failure_context.insert("duration_ms".to_owned(), "421".to_owned());
+    failure_context.insert("retry_attempt".to_owned(), "2".to_owned());
+    failure_context.insert(
+        "artifact_paths".to_owned(),
+        "test-results/e2e/events.jsonl,test-results/e2e/first-divergence.json".to_owned(),
+    );
+    failure_context.insert("invariant_ids".to_owned(), "INV-1,INV-9".to_owned());
+
+    let normative_examples = vec![
+        ShellScriptNormativeExample {
+            name: "success_case".to_owned(),
+            notes: "Canonical pass event with deterministic replay metadata.".to_owned(),
+            event: LogEventSchema {
+                run_id: "bd-mblr.5.5.1-20260215T000000Z-424242".to_owned(),
+                timestamp: "2026-02-15T00:00:00.000Z".to_owned(),
+                phase: LogPhase::Validate,
+                event_type: LogEventType::Pass,
+                scenario_id: Some("MVCC-3".to_owned()),
+                seed: Some(424242),
+                backend: Some("fsqlite".to_owned()),
+                artifact_hash: Some(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+                ),
+                context: success_context,
+            },
+        },
+        ShellScriptNormativeExample {
+            name: "failure_case".to_owned(),
+            notes: "Canonical fail event carrying traceability + replay hooks.".to_owned(),
+            event: LogEventSchema {
+                run_id: "bd-mblr.5.5.1-20260215T000000Z-424242".to_owned(),
+                timestamp: "2026-02-15T00:00:01.000Z".to_owned(),
+                phase: LogPhase::Validate,
+                event_type: LogEventType::Fail,
+                scenario_id: Some("COR-2".to_owned()),
+                seed: Some(424242),
+                backend: Some("both".to_owned()),
+                artifact_hash: Some(
+                    "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_owned(),
+                ),
+                context: failure_context,
+            },
+        },
+    ];
+
+    let replay_instructions = vec![
+        "./scripts/verify_e2e_log_schema.sh --json --deterministic --seed 424242".to_owned(),
+        "jq '.normative_examples[] | {name, event_type: .event.event_type, scenario_id: .event.scenario_id}' docs/e2e_shell_script_log_profile.json"
+            .to_owned(),
+    ];
+
+    ShellScriptLogProfile {
+        profile_version: SHELL_SCRIPT_LOG_PROFILE_VERSION.to_owned(),
+        log_schema_version: LOG_SCHEMA_VERSION.to_owned(),
+        required_fields,
+        optional_fields,
+        replayability_keys,
+        migration_aliases,
+        normative_examples,
+        replay_instructions,
+    }
+}
+
+/// Validate shell-script profile integrity and alignment with core schema invariants.
+#[must_use]
+pub fn validate_shell_script_log_profile(profile: &ShellScriptLogProfile) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    if profile.profile_version.trim().is_empty() {
+        errors.push("profile_version must be non-empty".to_owned());
+    }
+    if profile.log_schema_version != LOG_SCHEMA_VERSION {
+        errors.push(format!(
+            "log_schema_version '{}' must match '{}'",
+            profile.log_schema_version, LOG_SCHEMA_VERSION
+        ));
+    }
+
+    let required_set: BTreeSet<String> = profile.required_fields.iter().cloned().collect();
+    let optional_set: BTreeSet<String> = profile.optional_fields.iter().cloned().collect();
+    let canonical_required = REQUIRED_EVENT_FIELDS
+        .iter()
+        .map(|field| (*field).to_owned())
+        .collect::<BTreeSet<_>>();
+    let known_fields = build_field_specs()
+        .into_iter()
+        .map(|spec| spec.name)
+        .collect::<BTreeSet<_>>();
+
+    if required_set != canonical_required {
+        errors.push(format!(
+            "required_fields mismatch: expected {:?}, got {:?}",
+            canonical_required, required_set
+        ));
+    }
+    if required_set.len() != profile.required_fields.len() {
+        errors.push("required_fields must not contain duplicates".to_owned());
+    }
+    if optional_set.len() != profile.optional_fields.len() {
+        errors.push("optional_fields must not contain duplicates".to_owned());
+    }
+    if !required_set.is_disjoint(&optional_set) {
+        errors.push("required_fields and optional_fields must be disjoint".to_owned());
+    }
+
+    for field in required_set.union(&optional_set) {
+        let known = known_fields.contains(field) || field.starts_with("context.");
+        if !known {
+            errors.push(format!("unknown profile field '{}'", field));
+        }
+    }
+
+    for replay_key in &profile.replayability_keys {
+        let tracked = required_set.contains(replay_key)
+            || optional_set.contains(replay_key)
+            || replay_key.starts_with("context.");
+        if !tracked {
+            errors.push(format!(
+                "replayability key '{}' must map to required/optional/context namespace",
+                replay_key
+            ));
+        }
+    }
+
+    if profile.migration_aliases.is_empty() {
+        errors.push("migration_aliases must not be empty".to_owned());
+    }
+    for alias in &profile.migration_aliases {
+        if alias.legacy_token.trim().is_empty() {
+            errors.push("migration alias legacy_token must be non-empty".to_owned());
+        }
+        if alias.canonical_field.trim().is_empty() {
+            errors.push("migration alias canonical_field must be non-empty".to_owned());
+        }
+        let canonical_known = required_set.contains(&alias.canonical_field)
+            || optional_set.contains(&alias.canonical_field)
+            || alias.canonical_field.starts_with("context.");
+        if !canonical_known {
+            errors.push(format!(
+                "migration alias canonical_field '{}' is not tracked in profile",
+                alias.canonical_field
+            ));
+        }
+    }
+
+    if profile.normative_examples.len() < 2 {
+        errors
+            .push("normative_examples must include at least success and failure cases".to_owned());
+    }
+    let field_specs = build_field_specs();
+    let mut saw_success = false;
+    let mut saw_failure = false;
+    for example in &profile.normative_examples {
+        if example.name.trim().is_empty() {
+            errors.push("normative example name must be non-empty".to_owned());
+        }
+
+        let schema_errors = validate_log_event(&example.event);
+        if !schema_errors.is_empty() {
+            errors.push(format!(
+                "normative example '{}' failed schema validation: {}",
+                example.name,
+                schema_errors.join("; ")
+            ));
+        }
+
+        let contract_errors = validate_event_against_field_specs(&example.event, &field_specs);
+        if !contract_errors.is_empty() {
+            errors.push(format!(
+                "normative example '{}' failed field-spec validation: {}",
+                example.name,
+                contract_errors.join("; ")
+            ));
+        }
+
+        match example.event.event_type {
+            LogEventType::Pass => saw_success = true,
+            LogEventType::Fail | LogEventType::Error | LogEventType::FirstDivergence => {
+                saw_failure = true;
+            }
+            _ => {}
+        }
+    }
+    if !saw_success {
+        errors.push("normative_examples must include at least one pass event".to_owned());
+    }
+    if !saw_failure {
+        errors.push(
+            "normative_examples must include at least one fail/error/divergence event".to_owned(),
+        );
+    }
+
+    if profile.replay_instructions.is_empty() {
+        errors.push("replay_instructions must not be empty".to_owned());
+    }
+    for instruction in &profile.replay_instructions {
+        if instruction.trim().is_empty() {
+            errors.push("replay instructions must be non-empty strings".to_owned());
+        }
+    }
+
+    errors
+}
+
+/// Serialize the shell-script profile as canonical pretty JSON for docs/CI.
+pub fn render_shell_script_log_profile_json() -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(&build_shell_script_log_profile())
+}
+
 /// Classify a version transition according to schema policy.
 pub fn classify_version_transition(from: &str, to: &str) -> Result<VersionTransition, String> {
     let from = SchemaVersion::parse(from)?;
@@ -545,6 +873,7 @@ pub fn render_schema_contract_markdown() -> String {
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let shell_profile = build_shell_script_log_profile();
 
     format!(
         "# Unified E2E Log Schema Contract\n\n\
@@ -561,7 +890,14 @@ Replayability keys: `{}`\n\n\
 - {}\n\
 - {}\n\n\
 ## Tooling Compatibility Rules\n\n\
-{}\n",
+{}\n\n\
+## Shell-Script Profile\n\n\
+- Profile artifact: `{}`\n\
+- Profile version: `{}`\n\
+- Required shell fields: `{}`\n\
+- Optional shell fields: `{}`\n\
+- Migration aliases: {}\n\
+- Deterministic replay command: `{}`\n",
         policy.current_version,
         policy.minimum_supported_version,
         policy.required_fields.join("`, `"),
@@ -571,6 +907,15 @@ Replayability keys: `{}`\n\n\
         policy.breaking_change_rule,
         policy.downgrade_rule,
         tooling_rule_lines,
+        SHELL_SCRIPT_LOG_PROFILE_DOC_PATH,
+        shell_profile.profile_version,
+        shell_profile.required_fields.join("`, `"),
+        shell_profile.optional_fields.join("`, `"),
+        shell_profile.migration_aliases.len(),
+        shell_profile
+            .replay_instructions
+            .first()
+            .map_or("", String::as_str),
     )
 }
 
@@ -1316,6 +1661,12 @@ pub fn validate_log_event(event: &LogEventSchema) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{fs, path::PathBuf};
+
+    fn shell_script_profile_doc_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/e2e_shell_script_log_profile.json")
+    }
 
     #[test]
     fn coverage_report_builds() {
@@ -1507,11 +1858,51 @@ mod tests {
     }
 
     #[test]
+    fn shell_script_profile_validates() {
+        let profile = build_shell_script_log_profile();
+        let errors = validate_shell_script_log_profile(&profile);
+        assert!(
+            errors.is_empty(),
+            "shell-script profile must validate cleanly: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn shell_script_profile_json_is_deterministic() {
+        let rendered_a =
+            render_shell_script_log_profile_json().expect("shell profile render should succeed");
+        let rendered_b =
+            render_shell_script_log_profile_json().expect("shell profile render should succeed");
+        assert_eq!(rendered_a, rendered_b);
+    }
+
+    #[test]
+    fn shell_script_profile_doc_matches_generated_profile() {
+        let generated = render_shell_script_log_profile_json().expect("profile render");
+        let generated_value: serde_json::Value =
+            serde_json::from_str(&generated).expect("generated profile must parse");
+
+        let doc_path = shell_script_profile_doc_path();
+        let doc_json = fs::read_to_string(&doc_path).unwrap_or_else(|err| {
+            panic!("failed to read profile doc {}: {err}", doc_path.display());
+        });
+        let doc_value: serde_json::Value =
+            serde_json::from_str(&doc_json).expect("profile doc JSON must parse");
+
+        assert_eq!(
+            doc_value, generated_value,
+            "profile doc must stay in sync with canonical generator"
+        );
+    }
+
+    #[test]
     fn schema_contract_markdown_contains_core_sections() {
         let markdown = render_schema_contract_markdown();
         assert!(markdown.contains("# Unified E2E Log Schema Contract"));
         assert!(markdown.contains(LOG_SCHEMA_VERSION));
         assert!(markdown.contains(LOG_SCHEMA_MIN_SUPPORTED_VERSION));
+        assert!(markdown.contains("## Shell-Script Profile"));
+        assert!(markdown.contains(SHELL_SCRIPT_LOG_PROFILE_DOC_PATH));
         for field in REQUIRED_EVENT_FIELDS {
             assert!(
                 markdown.contains(field),

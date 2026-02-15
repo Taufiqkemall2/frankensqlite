@@ -6,6 +6,7 @@ This document defines the canonical E2E structured log schema for FrankenSQLite 
 - Minimum supported version: `1.0.0`
 - Required fields: `run_id`, `timestamp`, `phase`, `event_type`
 - Replayability keys: `scenario_id`, `seed`, `phase`, `context.invariant_ids`, `context.artifact_paths`
+- Shell-script profile artifact: `docs/e2e_shell_script_log_profile.json` (version `1.0.0`)
 
 ## Field Contract
 
@@ -20,6 +21,28 @@ This document defines the canonical E2E structured log schema for FrankenSQLite 
 | `backend` | Recommended | Enum | Backend under test | `fsqlite`, `rusqlite`, `both` | - | Differential run disambiguation |
 | `artifact_hash` | Optional | String | Artifact integrity hash | - | 64 lowercase hex chars | Evidence integrity and dedupe |
 | `context` | Optional | Object | Additional key/value context | - | String map with replay keys when relevant | Extensible deterministic metadata |
+
+## Shell-Script Profile (Machine-Readable)
+
+Shell-script emitters and CI conformance checks consume `docs/e2e_shell_script_log_profile.json`.
+The profile is versioned, deterministic, and includes:
+
+- Required shell fields: `run_id`, `timestamp`, `phase`, `event_type`
+- Optional shell fields: `scenario_id`, `seed`, `backend`, `artifact_hash`, `context`, and context-namespaced keys for `trace_id`, `level`, `outcome`, `duration_ms`, `retry_attempt`, `artifact_paths`, `invariant_ids`
+- Normative success/failure examples encoded as canonical event payloads
+- Replay instructions for deterministic local/CI verification
+
+### Legacy Ad-Hoc Log Migration Guidance
+
+| Legacy token | Canonical field | Migration guidance |
+| --- | --- | --- |
+| `level` | `context.level` | Keep INFO/WARN/ERROR severity in context and map state changes to `event_type`. |
+| `status` | `context.outcome` | Preserve script-level status in context; keep schema enum values in `event_type`. |
+| `log` | `context.artifact_paths` | Normalize to deterministic comma-separated artifact paths. |
+| `duration_ms` | `context.duration_ms` | Keep duration as stringified integer milliseconds. |
+| `retry_count` | `context.retry_attempt` | Normalize retries to zero-based attempt count. |
+| `scenario` | `scenario_id` | Promote to `CATEGORY-NUMBER` scenario ID format. |
+| `seed_value` | `seed` | Emit deterministic seed as unsigned integer. |
 
 ## Versioning Policy
 
@@ -46,3 +69,7 @@ This document defines the canonical E2E structured log schema for FrankenSQLite 
 {"run_id":"bd-mblr.5.3.1-20260213T090000Z-1001","timestamp":"2026-02-13T09:00:03.100Z","phase":"validate","event_type":"pass","scenario_id":"MVCC-3","seed":1001,"backend":"fsqlite","artifact_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","context":{"invariant_ids":"INV-1,INV-9","artifact_paths":"artifacts/events.jsonl,artifacts/diff.json"}}
 {"run_id":"bd-mblr.5.3.1-20260213T090000Z-1001","timestamp":"2026-02-13T09:00:04.250Z","phase":"validate","event_type":"first_divergence","scenario_id":"COR-2","seed":1001,"backend":"both","artifact_hash":"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789","context":{"invariant_ids":"INV-1,INV-9","artifact_paths":"artifacts/events.jsonl,artifacts/diff.json"}}
 ```
+
+Shell-script normative success/failure examples are maintained in:
+
+- `docs/e2e_shell_script_log_profile.json` (`normative_examples`)

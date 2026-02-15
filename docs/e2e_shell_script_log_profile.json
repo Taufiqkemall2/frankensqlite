@@ -1,0 +1,120 @@
+{
+  "profile_version": "1.0.0",
+  "log_schema_version": "1.0.0",
+  "required_fields": [
+    "run_id",
+    "timestamp",
+    "phase",
+    "event_type"
+  ],
+  "optional_fields": [
+    "scenario_id",
+    "seed",
+    "backend",
+    "artifact_hash",
+    "context",
+    "context.trace_id",
+    "context.level",
+    "context.outcome",
+    "context.duration_ms",
+    "context.retry_attempt",
+    "context.artifact_paths",
+    "context.invariant_ids"
+  ],
+  "replayability_keys": [
+    "scenario_id",
+    "seed",
+    "phase",
+    "context.invariant_ids",
+    "context.artifact_paths"
+  ],
+  "migration_aliases": [
+    {
+      "legacy_token": "level",
+      "canonical_field": "context.level",
+      "guidance": "Keep severity as INFO/WARN/ERROR in context while mapping state changes to event_type."
+    },
+    {
+      "legacy_token": "status",
+      "canonical_field": "context.outcome",
+      "guidance": "Preserve script status details in context.outcome and use event_type for schema enums."
+    },
+    {
+      "legacy_token": "log",
+      "canonical_field": "context.artifact_paths",
+      "guidance": "Record artifact paths as comma-separated deterministic paths in context.artifact_paths."
+    },
+    {
+      "legacy_token": "duration_ms",
+      "canonical_field": "context.duration_ms",
+      "guidance": "Keep duration as stringified integer milliseconds in context.duration_ms."
+    },
+    {
+      "legacy_token": "retry_count",
+      "canonical_field": "context.retry_attempt",
+      "guidance": "Normalize retry metadata under context.retry_attempt with zero-based attempt numbers."
+    },
+    {
+      "legacy_token": "scenario",
+      "canonical_field": "scenario_id",
+      "guidance": "Promote scenario token to scenario_id using CATEGORY-NUMBER convention."
+    },
+    {
+      "legacy_token": "seed_value",
+      "canonical_field": "seed",
+      "guidance": "Emit deterministic seed as unsigned integer in seed."
+    }
+  ],
+  "normative_examples": [
+    {
+      "name": "success_case",
+      "notes": "Canonical pass event with deterministic replay metadata.",
+      "event": {
+        "run_id": "bd-mblr.5.5.1-20260215T000000Z-424242",
+        "timestamp": "2026-02-15T00:00:00.000Z",
+        "phase": "Validate",
+        "event_type": "Pass",
+        "scenario_id": "MVCC-3",
+        "seed": 424242,
+        "backend": "fsqlite",
+        "artifact_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "context": {
+          "artifact_paths": "test-results/e2e/events.jsonl,test-results/e2e/summary.json",
+          "duration_ms": "137",
+          "invariant_ids": "INV-1,INV-9",
+          "level": "INFO",
+          "outcome": "pass",
+          "retry_attempt": "0",
+          "trace_id": "2d8d9c8ec6f4b42d"
+        }
+      }
+    },
+    {
+      "name": "failure_case",
+      "notes": "Canonical fail event carrying traceability + replay hooks.",
+      "event": {
+        "run_id": "bd-mblr.5.5.1-20260215T000000Z-424242",
+        "timestamp": "2026-02-15T00:00:01.000Z",
+        "phase": "Validate",
+        "event_type": "Fail",
+        "scenario_id": "COR-2",
+        "seed": 424242,
+        "backend": "both",
+        "artifact_hash": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+        "context": {
+          "artifact_paths": "test-results/e2e/events.jsonl,test-results/e2e/first-divergence.json",
+          "duration_ms": "421",
+          "invariant_ids": "INV-1,INV-9",
+          "level": "ERROR",
+          "outcome": "fail",
+          "retry_attempt": "2",
+          "trace_id": "2d8d9c8ec6f4b42d"
+        }
+      }
+    }
+  ],
+  "replay_instructions": [
+    "./scripts/verify_e2e_log_schema.sh --json --deterministic --seed 424242",
+    "jq '.normative_examples[] | {name, event_type: .event.event_type, scenario_id: .event.scenario_id}' docs/e2e_shell_script_log_profile.json"
+  ]
+}
