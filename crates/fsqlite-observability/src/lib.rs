@@ -256,6 +256,172 @@ impl std::fmt::Display for CxPropagationMetricsSnapshot {
 }
 
 // ---------------------------------------------------------------------------
+// TxnSlot crash/occupancy telemetry (bd-2g5.1)
+// ---------------------------------------------------------------------------
+
+/// Sentinel slot-id value used when the caller cannot map a concrete index.
+const UNKNOWN_SLOT_ID: usize = usize::MAX;
+
+/// Global TxnSlot observability metrics singleton.
+///
+/// Tracks active TxnSlot occupancy (`fsqlite_txn_slots_active`) and crash
+/// detections (`fsqlite_txn_slot_crashes_detected_total`).
+pub static GLOBAL_TXN_SLOT_METRICS: TxnSlotMetrics = TxnSlotMetrics::new();
+
+/// Atomic counters for TxnSlot lifecycle telemetry.
+///
+/// Counters follow the same lock-free `Relaxed` ordering convention used by the
+/// rest of this crate.
+pub struct TxnSlotMetrics {
+    /// Gauge: number of currently active (published) transaction slots.
+    pub fsqlite_txn_slots_active: AtomicU64,
+    /// Counter: number of detected orphan/crashed transaction slots.
+    pub fsqlite_txn_slot_crashes_detected_total: AtomicU64,
+}
+
+impl Default for TxnSlotMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TxnSlotMetrics {
+    /// Create a new metrics instance with all counters at zero.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            fsqlite_txn_slots_active: AtomicU64::new(0),
+            fsqlite_txn_slot_crashes_detected_total: AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    const fn normalize_slot_id(slot_id: Option<usize>) -> usize {
+        match slot_id {
+            Some(value) => value,
+            None => UNKNOWN_SLOT_ID,
+        }
+    }
+
+    fn decrement_active_slots_saturating(&self) -> u64 {
+        loop {
+            let prev = self.fsqlite_txn_slots_active.load(Ordering::Relaxed);
+            let next = prev.saturating_sub(1);
+            if self
+                .fsqlite_txn_slots_active
+                .compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return next;
+            }
+        }
+    }
+
+    /// Record a successful slot allocation/publish.
+    pub fn record_slot_allocated(&self, slot_id: usize, process_id: u32) {
+        let active_after = self
+            .fsqlite_txn_slots_active
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let span = tracing::span!(
+            target: "fsqlite.txn_slot",
+            tracing::Level::INFO,
+            "txn_slot",
+            slot_id,
+            process_id,
+            operation = "alloc"
+        );
+        let _guard = span.enter();
+        tracing::info!(
+            fsqlite_txn_slots_active = active_after,
+            "transaction slot allocated"
+        );
+    }
+
+    /// Record a slot release/free operation.
+    pub fn record_slot_released(&self, slot_id: Option<usize>, process_id: u32) {
+        let active_after = self.decrement_active_slots_saturating();
+        let slot_id = Self::normalize_slot_id(slot_id);
+        let span = tracing::span!(
+            target: "fsqlite.txn_slot",
+            tracing::Level::INFO,
+            "txn_slot",
+            slot_id,
+            process_id,
+            operation = "release"
+        );
+        let _guard = span.enter();
+        tracing::info!(
+            fsqlite_txn_slots_active = active_after,
+            "transaction slot released"
+        );
+    }
+
+    /// Record detection/reclamation of a crashed/orphaned slot.
+    pub fn record_crash_detected(
+        &self,
+        slot_id: Option<usize>,
+        process_id: u32,
+        orphan_txn_id: u64,
+    ) {
+        let total = self
+            .fsqlite_txn_slot_crashes_detected_total
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let slot_id = Self::normalize_slot_id(slot_id);
+        let span = tracing::span!(
+            target: "fsqlite.txn_slot",
+            tracing::Level::WARN,
+            "txn_slot",
+            slot_id,
+            process_id,
+            operation = "crash_detect"
+        );
+        let _guard = span.enter();
+        tracing::warn!(
+            orphan_txn_id,
+            fsqlite_txn_slot_crashes_detected_total = total,
+            "orphaned transaction slot crash detected"
+        );
+    }
+
+    /// Read a point-in-time snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> TxnSlotMetricsSnapshot {
+        TxnSlotMetricsSnapshot {
+            fsqlite_txn_slots_active: self.fsqlite_txn_slots_active.load(Ordering::Relaxed),
+            fsqlite_txn_slot_crashes_detected_total: self
+                .fsqlite_txn_slot_crashes_detected_total
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    /// Reset all counters to zero (tests/diagnostics).
+    pub fn reset(&self) {
+        self.fsqlite_txn_slots_active.store(0, Ordering::Relaxed);
+        self.fsqlite_txn_slot_crashes_detected_total
+            .store(0, Ordering::Relaxed);
+    }
+}
+
+/// Serializable snapshot of TxnSlot telemetry counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct TxnSlotMetricsSnapshot {
+    pub fsqlite_txn_slots_active: u64,
+    pub fsqlite_txn_slot_crashes_detected_total: u64,
+}
+
+impl std::fmt::Display for TxnSlotMetricsSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "txn_slots(active={} crashes={})",
+            self.fsqlite_txn_slots_active, self.fsqlite_txn_slot_crashes_detected_total
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ConflictEvent — the core event type
 // ---------------------------------------------------------------------------
 
@@ -1365,5 +1531,51 @@ mod tests {
         assert_eq!(snap.trace_linkages_total, 400);
         assert_eq!(snap.cx_created_total, 400);
         assert_eq!(snap.cancel_propagations_total, 400);
+    }
+
+    // ===================================================================
+    // bd-2g5.1: TxnSlot telemetry tests
+    // ===================================================================
+
+    #[test]
+    fn txn_slot_metrics_alloc_release_and_crash() {
+        let m = TxnSlotMetrics::new();
+
+        m.record_slot_allocated(3, 1001);
+        m.record_slot_allocated(4, 1001);
+        m.record_crash_detected(Some(4), 1001, 42);
+        m.record_slot_released(Some(4), 1001);
+
+        let snap = m.snapshot();
+        assert_eq!(snap.fsqlite_txn_slots_active, 1);
+        assert_eq!(snap.fsqlite_txn_slot_crashes_detected_total, 1);
+    }
+
+    #[test]
+    fn txn_slot_metrics_release_saturates_at_zero() {
+        let m = TxnSlotMetrics::new();
+
+        // Releasing without prior alloc should never underflow.
+        m.record_slot_released(None, 0);
+        m.record_slot_released(None, 0);
+
+        let snap = m.snapshot();
+        assert_eq!(snap.fsqlite_txn_slots_active, 0);
+        assert_eq!(snap.fsqlite_txn_slot_crashes_detected_total, 0);
+    }
+
+    #[test]
+    fn txn_slot_metrics_snapshot_display_and_serde() {
+        let m = TxnSlotMetrics::new();
+        m.record_slot_allocated(7, 2222);
+        m.record_crash_detected(None, 2222, 9001);
+
+        let snap = m.snapshot();
+        let display = format!("{snap}");
+        assert!(display.contains("txn_slots(active=1 crashes=1)"));
+
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(json.contains("\"fsqlite_txn_slots_active\":1"));
+        assert!(json.contains("\"fsqlite_txn_slot_crashes_detected_total\":1"));
     }
 }

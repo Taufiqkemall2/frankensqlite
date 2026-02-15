@@ -21,6 +21,7 @@ use crate::cache_aligned::{
     decode_payload, decode_tag, encode_cleaning, is_sentinel, logical_now_millis,
 };
 use crate::ebr::VersionGuardTicket;
+use fsqlite_observability::GLOBAL_TXN_SLOT_METRICS;
 pub use fsqlite_pager::PageBuf;
 use fsqlite_types::{
     CommitSeq, IntentLog, PageData, PageNumber, PageNumberBuildHasher, PageVersion, Snapshot,
@@ -1477,6 +1478,8 @@ pub fn try_cleanup_sentinel_slot(
     }
 
     let was_claiming = tag == TAG_CLAIMING;
+    let reclaim_pid = slot.pid.load(Ordering::Acquire);
+    let prior_cleanup_marker = slot.cleanup_txn_id.load(Ordering::Acquire);
 
     // Seed claiming_timestamp if not yet set (CAS to avoid race).
     let claiming_ts = slot.claiming_timestamp.load(Ordering::Acquire);
@@ -1564,6 +1567,12 @@ pub fn try_cleanup_sentinel_slot(
     // Free the slot — Release ordering ensures all field clears are visible.
     slot.txn_id.store(0, Ordering::Release);
 
+    // If a stuck CLEANING slot carried a prewritten cleanup marker, it may have
+    // originated from a previously published real transaction slot.
+    if !was_claiming && prior_cleanup_marker != 0 {
+        GLOBAL_TXN_SLOT_METRICS.record_slot_released(None, reclaim_pid);
+    }
+
     SlotCleanupResult::Reclaimed {
         orphan_txn_id,
         was_claiming,
@@ -1584,10 +1593,12 @@ pub fn cleanup_and_raise_gc_horizon(
 ) -> (GcHorizonResult, usize) {
     let mut cleaned = 0_usize;
 
-    for slot in slots {
+    for (idx, slot) in slots.iter().enumerate() {
+        let slot_pid = slot.pid.load(Ordering::Acquire);
         let result = try_cleanup_sentinel_slot(slot, now_epoch_secs, &process_alive);
-        if matches!(result, SlotCleanupResult::Reclaimed { .. }) {
+        if let SlotCleanupResult::Reclaimed { orphan_txn_id, .. } = result {
             cleaned += 1;
+            GLOBAL_TXN_SLOT_METRICS.record_crash_detected(Some(idx), slot_pid, orphan_txn_id);
         }
     }
 
@@ -1673,6 +1684,8 @@ pub fn try_cleanup_orphaned_slot(
     if tag != 0 {
         // ===== Sentinel-tagged slot =====
         let was_claiming = tag == TAG_CLAIMING;
+        let reclaim_pid = slot.pid.load(Ordering::Acquire);
+        let prior_cleanup_marker = slot.cleanup_txn_id.load(Ordering::Acquire);
 
         // Seed claiming_timestamp if not yet set (CAS to avoid race).
         let claiming_ts = slot.claiming_timestamp.load(Ordering::Acquire);
@@ -1745,6 +1758,10 @@ pub fn try_cleanup_orphaned_slot(
 
         clear_slot_fields(slot);
 
+        if !was_claiming && prior_cleanup_marker != 0 {
+            GLOBAL_TXN_SLOT_METRICS.record_slot_released(None, reclaim_pid);
+        }
+
         return SlotCleanupResult::Reclaimed {
             orphan_txn_id,
             was_claiming,
@@ -1788,6 +1805,7 @@ pub fn try_cleanup_orphaned_slot(
     tracing::info!(orphan_txn_id, "reclaiming orphaned real TxnId slot");
 
     clear_slot_fields(slot);
+    GLOBAL_TXN_SLOT_METRICS.record_slot_released(None, pid);
 
     SlotCleanupResult::Reclaimed {
         orphan_txn_id,
@@ -1815,6 +1833,7 @@ pub fn cleanup_orphaned_slots(
     );
 
     for (idx, slot) in slots.iter().enumerate() {
+        let slot_pid = slot.pid.load(Ordering::Acquire);
         let result =
             try_cleanup_orphaned_slot(slot, now_epoch_secs, &process_alive, &release_locks);
         if let SlotCleanupResult::Reclaimed {
@@ -1824,6 +1843,7 @@ pub fn cleanup_orphaned_slots(
         {
             orphans_found += 1;
             locks_released += 1;
+            GLOBAL_TXN_SLOT_METRICS.record_crash_detected(Some(idx), slot_pid, orphan_txn_id);
             tracing::debug!(
                 slot_idx = idx,
                 orphan_txn_id,

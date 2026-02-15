@@ -15,6 +15,8 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
+use fsqlite_observability::GLOBAL_TXN_SLOT_METRICS;
+
 /// Cache line size in bytes.
 ///
 /// 64 bytes for x86-64 (Intel/AMD) and AArch64 (Apple M-series, Graviton).
@@ -473,6 +475,9 @@ impl SharedTxnSlot {
     /// This ensures other processes never observe a free slot with stale
     /// sequence numbers, SSI flags, or process identity.
     pub fn release(&self) {
+        let old_tid = self.txn_id.load(Ordering::Acquire);
+        let release_pid = self.pid.load(Ordering::Acquire);
+
         // Clear all data fields first (any order among these is fine).
         self.begin_seq.store(0, Ordering::Release);
         self.snapshot_high.store(0, Ordering::Release);
@@ -493,6 +498,10 @@ impl SharedTxnSlot {
         // txn_id = 0 MUST be the final write so scanners never see a
         // free slot with stale fields populated.
         self.txn_id.store(0, Ordering::Release);
+
+        if old_tid != 0 && !is_sentinel(old_tid) {
+            GLOBAL_TXN_SLOT_METRICS.record_slot_released(None, release_pid);
+        }
     }
 }
 
@@ -615,6 +624,7 @@ impl TxnSlotArray {
 
             // Phase 3: publish — CAS claiming → real tid.
             if slot.phase3_publish(txn_id_raw) {
+                GLOBAL_TXN_SLOT_METRICS.record_slot_allocated(idx, pid);
                 return Ok(idx);
             }
 
