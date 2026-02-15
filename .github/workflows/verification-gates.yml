@@ -2,18 +2,54 @@ name: Verification Gates
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "17 5 * * *"
   pull_request:
     branches:
       - main
     paths:
       - ".github/workflows/verification-gates.yml"
+      - "conformance/backlog_quality_gate_baseline.json"
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/fsqlite-core/**"
+      - "crates/fsqlite-harness/src/backlog_quality_gate.rs"
+      - "crates/fsqlite-harness/src/bin/backlog_quality_gate_runner.rs"
       - "crates/fsqlite-vdbe/**"
+      - "scripts/verify_backlog_quality_gate.sh"
 
 jobs:
+  backlog-quality-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RUST_BACKTRACE: "1"
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly
+
+      - name: Backlog acceptance completeness gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash ./scripts/verify_backlog_quality_gate.sh --repo-gate
+
+      - name: Upload backlog quality gate artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backlog-quality-gate-artifacts
+          path: artifacts/backlog-quality-gate-e2e/
+          retention-days: 21
+
   param-binding-regression-guard:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:

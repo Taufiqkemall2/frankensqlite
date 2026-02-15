@@ -336,10 +336,56 @@ jobs:
             exit "${gate_status}"
           fi
 
+      - name: Run no-mock critical-path gate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          artifact_root="artifacts/no-mock-critical-path-gate"
+          report_json="${artifact_root}/no_mock_critical_path_report.json"
+          report_md="${artifact_root}/no_mock_critical_path_summary.md"
+          gate_log="${artifact_root}/no_mock_critical_path_gate_runner.log"
+
+          mkdir -p "${artifact_root}"
+
+          set +e
+          cargo run -p fsqlite-harness --bin no_mock_critical_path_gate_runner -- \
+            --output-json "${report_json}" \
+            --output-human "${report_md}" \
+            > "${gate_log}" 2>&1
+          gate_status=$?
+          set -e
+
+          verdict="unknown"
+          blocking_count="unknown"
+          warning_count="unknown"
+          if [[ -f "${report_json}" ]]; then
+            verdict="$(jq -r '.verdict // "unknown"' "${report_json}")"
+            blocking_count="$(jq -r '.blocking_count // 0' "${report_json}")"
+            warning_count="$(jq -r '.warning_count // 0' "${report_json}")"
+          fi
+
+          {
+            echo "### No-mock critical-path gate"
+            echo "- exit_code: ${gate_status}"
+            echo "- verdict: ${verdict}"
+            echo "- blocking_count: ${blocking_count}"
+            echo "- warning_count: ${warning_count}"
+            echo "- report: \`${report_json}\`"
+            echo "- summary: \`${report_md}\`"
+            echo "- local_parity_command: \`cargo run -p fsqlite-harness --bin no_mock_critical_path_gate_runner -- --output-json ${report_json} --output-human ${report_md}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          if [[ ${gate_status} -ne 0 ]]; then
+            exit "${gate_status}"
+          fi
+
       - name: Upload unit coverage drift artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: unit-coverage-drift-gate-artifacts
-          path: artifacts/unit-coverage-drift-gate/
+          path: |
+            artifacts/unit-coverage-drift-gate/
+            artifacts/no-mock-critical-path-gate/
           retention-days: 21

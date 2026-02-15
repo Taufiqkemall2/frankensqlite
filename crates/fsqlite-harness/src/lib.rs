@@ -5,6 +5,7 @@
 //! that other crates can call into from their own tests.
 
 pub mod adversarial_search;
+pub mod backlog_quality_gate;
 pub mod benchmark_corpus;
 pub mod ci_coverage_gate;
 pub mod ci_gate_matrix;
