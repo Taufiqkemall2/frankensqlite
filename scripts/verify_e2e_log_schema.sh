@@ -139,7 +139,7 @@ if $JSON_OUTPUT; then
   "run_id": "$RUN_ID",
   "phase": "e2e_log_schema_validation",
   "bead_id": "bd-1dp9.7.2",
-  "related_bead_ids": ["bd-mblr.5.3", "bd-mblr.5.3.1"],
+  "related_bead_ids": ["bd-mblr.5.3", "bd-mblr.5.3.1", "bd-mblr.5.5.1"],
   "module_hash": "$MODULE_HASH",
   "contract_doc_hash": "$DOC_HASH",
   "profile_doc_hash": "$PROFILE_HASH",

@@ -1,22 +1,65 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BEAD_ID="bd-ncivz.1"
-SCENARIO_ID="E2E-CNC-007"
-SEED=2026021601
+BEAD_ID="${BEAD_ID:-bd-ncivz.1}"
+SCENARIO_ID="${SCENARIO_ID:-E2E-CNC-007}"
+SEED="${SEED:-2026021601}"
 WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPORT_ROOT="${WORKSPACE_ROOT}/artifacts/ncivz_1_parallel_wal_buffer"
+TEST_FILTER="${TEST_FILTER:-bd_ncivz_1_}"
+REPLAY_COMMAND="RUST_TEST_THREADS=1 rch exec -- cargo test -p fsqlite-wal ${TEST_FILTER} -- --nocapture"
+JSON_OUTPUT=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --json)
+            JSON_OUTPUT=true
+            shift
+            ;;
+        --filter)
+            if [[ $# -lt 2 ]]; then
+                echo "ERROR: --filter requires a value" >&2
+                exit 2
+            fi
+            TEST_FILTER="$2"
+            shift 2
+            ;;
+        --scenario-id)
+            if [[ $# -lt 2 ]]; then
+                echo "ERROR: --scenario-id requires a value" >&2
+                exit 2
+            fi
+            SCENARIO_ID="$2"
+            shift 2
+            ;;
+        --bead-id)
+            if [[ $# -lt 2 ]]; then
+                echo "ERROR: --bead-id requires a value" >&2
+                exit 2
+            fi
+            BEAD_ID="$2"
+            shift 2
+            ;;
+        --seed)
+            if [[ $# -lt 2 ]]; then
+                echo "ERROR: --seed requires a value" >&2
+                exit 2
+            fi
+            SEED="$2"
+            shift 2
+            ;;
+        *)
+            echo "ERROR: unknown argument '$1'" >&2
+            exit 2
+            ;;
+    esac
+done
+
 RUN_ID="${BEAD_ID}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 TRACE_ID="${RUN_ID}"
 REPORT_JSONL="${REPORT_ROOT}/${RUN_ID}.jsonl"
 LOG_PATH="${REPORT_ROOT}/${RUN_ID}.log"
-TEST_FILTER="bd_ncivz_1_"
 REPLAY_COMMAND="RUST_TEST_THREADS=1 rch exec -- cargo test -p fsqlite-wal ${TEST_FILTER} -- --nocapture"
-JSON_OUTPUT=false
-
-if [[ "${1:-}" == "--json" ]]; then
-    JSON_OUTPUT=true
-fi
 
 if ! command -v rch >/dev/null 2>&1; then
     printf 'bead_id=%s level=ERROR run_id=%s trace_id=%s scenario_id=%s phase=preflight error_code=E_RCH_MISSING\n' \

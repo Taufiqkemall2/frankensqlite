@@ -192,3 +192,19 @@ Artifacts:
 Replay command:
 
 - `RUST_TEST_THREADS=1 rch exec -- cargo test -p fsqlite-wal bd_ncivz_1_ -- --nocapture`
+
+## `bd-ncivz.2` Progress Notes
+
+`bd-ncivz.2` builds directly on this contract with an epoch-order coordinator in
+`crates/fsqlite-wal/src/per_core_buffer.rs`:
+
+- global epoch clock with default `10ms` advance interval metadata
+- active-core fence (`advance_epoch_and_wait`) before sealing the previous epoch
+- per-epoch group flush across all core lanes with deterministic straddle detection
+- durability wait API (`wait_until_epoch_durable`) for writer unblock semantics
+- recovery ordering helper that replays records by `(epoch, begin_seq, txn_id, page_id)`
+
+Deterministic test replay:
+
+- `RUST_TEST_THREADS=1 rch exec -- cargo test -p fsqlite-wal bd_ncivz_2_ -- --nocapture`
+- `bash e2e/bd_ncivz_1_parallel_wal_buffer_pilot.sh --json --bead-id bd-ncivz.2 --scenario-id E2E-CNC-008 --filter bd_ncivz_2_`
