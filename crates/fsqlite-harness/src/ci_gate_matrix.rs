@@ -90,15 +90,55 @@ impl CiLane {
 
 // ---- Flake Budget Policy ----
 
+/// Escalation level derived from observed flake rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlakeEscalationLevel {
+    /// Below warning threshold.
+    None,
+    /// At or above warning threshold but below critical threshold.
+    Warn,
+    /// At or above critical threshold.
+    Critical,
+}
+
+impl FlakeEscalationLevel {
+    /// Stable string label for reports and structured logs.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Warn => "warn",
+            Self::Critical => "critical",
+        }
+    }
+}
+
 /// Configuration for flake budget enforcement on a single CI lane.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LaneFlakeBudget {
     /// Maximum allowed flake rate (0.0 = no flakes allowed, 1.0 = all flakes allowed).
     pub max_flake_rate: f64,
+    /// Warning threshold for escalation.
+    #[serde(default = "default_warn_flake_rate")]
+    pub warn_flake_rate: f64,
+    /// Critical threshold for escalation.
+    #[serde(default = "default_critical_flake_rate")]
+    pub critical_flake_rate: f64,
     /// Maximum number of retries for flake detection.
     pub max_retries: u32,
     /// Whether flakes in this lane are blocking (fail the pipeline) or advisory.
     pub blocking: bool,
+}
+
+#[must_use]
+const fn default_warn_flake_rate() -> f64 {
+    0.03
+}
+
+#[must_use]
+const fn default_critical_flake_rate() -> f64 {
+    0.08
 }
 
 impl LaneFlakeBudget {
@@ -107,6 +147,8 @@ impl LaneFlakeBudget {
     pub fn default_strict() -> Self {
         Self {
             max_flake_rate: 0.05,
+            warn_flake_rate: 0.03,
+            critical_flake_rate: 0.08,
             max_retries: 2,
             blocking: true,
         }
@@ -117,8 +159,22 @@ impl LaneFlakeBudget {
     pub fn default_relaxed() -> Self {
         Self {
             max_flake_rate: 0.10,
+            warn_flake_rate: 0.07,
+            critical_flake_rate: 0.15,
             max_retries: 3,
             blocking: false,
+        }
+    }
+
+    /// Determine the escalation level for the observed flake rate.
+    #[must_use]
+    pub fn escalation_level(&self, flake_rate: f64) -> FlakeEscalationLevel {
+        if flake_rate >= self.critical_flake_rate {
+            FlakeEscalationLevel::Critical
+        } else if flake_rate >= self.warn_flake_rate {
+            FlakeEscalationLevel::Warn
+        } else {
+            FlakeEscalationLevel::None
         }
     }
 }
@@ -187,6 +243,9 @@ pub struct FlakeBudgetResult {
     pub skip_count: usize,
     pub flake_rate: f64,
     pub budget_max_flake_rate: f64,
+    pub escalation_warn_flake_rate: f64,
+    pub escalation_critical_flake_rate: f64,
+    pub escalation_level: FlakeEscalationLevel,
     pub within_budget: bool,
     pub blocking: bool,
     /// Whether this lane's result should fail the overall pipeline.
@@ -218,6 +277,7 @@ pub fn evaluate_flake_budget(
     };
 
     let within_budget = flake_rate <= budget.max_flake_rate;
+    let escalation_level = budget.escalation_level(flake_rate);
     let pipeline_fail = (!within_budget && budget.blocking) || fail_count > 0;
 
     FlakeBudgetResult {
@@ -229,6 +289,9 @@ pub fn evaluate_flake_budget(
         skip_count,
         flake_rate,
         budget_max_flake_rate: budget.max_flake_rate,
+        escalation_warn_flake_rate: budget.warn_flake_rate,
+        escalation_critical_flake_rate: budget.critical_flake_rate,
+        escalation_level,
         within_budget,
         blocking: budget.blocking,
         pipeline_fail,
@@ -323,8 +386,245 @@ impl GlobalFlakeBudgetResult {
                     "advisory"
                 },
             );
+            let _ = writeln!(
+                out,
+                "      escalation={} (warn: {:.1}%, critical: {:.1}%)",
+                lane.escalation_level.as_str(),
+                lane.escalation_warn_flake_rate * 100.0,
+                lane.escalation_critical_flake_rate * 100.0,
+            );
         }
         out
+    }
+}
+
+// ---- Retry and Quarantine Policy (bd-mblr.3.3) ----
+
+/// Failure class used by retry policy to avoid masking regressions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryFailureClass {
+    /// Deterministic correctness failure; must not be treated as flake.
+    CorrectnessRegression,
+    /// Infrastructure/transient failure (timeouts, ephemeral network issues).
+    InfrastructureTransient,
+    /// Persistent infrastructure failure (infra outage, invalid environment).
+    InfrastructurePersistent,
+}
+
+/// Retry policy contract for CI gates.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetryPolicy {
+    /// Retries allowed for transient infrastructure failures.
+    pub max_transient_retries: u32,
+    /// Retries allowed for persistent infrastructure failures.
+    pub max_persistent_retries: u32,
+    /// Whether correctness failures are ever retryable.
+    pub allow_correctness_retry: bool,
+    /// Schema version for serialized policy artifacts.
+    pub schema_version: String,
+}
+
+impl RetryPolicy {
+    /// Canonical retry policy for CI gates.
+    #[must_use]
+    pub fn canonical() -> Self {
+        Self {
+            max_transient_retries: 2,
+            max_persistent_retries: 1,
+            allow_correctness_retry: false,
+            schema_version: "1.0.0".to_owned(),
+        }
+    }
+}
+
+/// Decision returned by retry-policy evaluation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetryDecision {
+    /// Whether another retry attempt is allowed.
+    pub allow_retry: bool,
+    /// Whether this failure path is eligible to be counted as a flake.
+    pub classify_as_flake: bool,
+    /// Whether the failure is terminal for pipeline purposes.
+    pub hard_failure: bool,
+    /// Human-readable reason.
+    pub reason: String,
+}
+
+/// Evaluate retry behavior for a lane/failure class combination.
+///
+/// `attempt` is zero-based (0 = first failure observation before any retry).
+#[must_use]
+pub fn evaluate_retry_decision(
+    lane: CiLane,
+    failure_class: RetryFailureClass,
+    attempt: u32,
+    recovered_on_retry: bool,
+    policy: &RetryPolicy,
+) -> RetryDecision {
+    if matches!(failure_class, RetryFailureClass::CorrectnessRegression) {
+        return RetryDecision {
+            allow_retry: policy.allow_correctness_retry && lane.supports_retry(),
+            classify_as_flake: false,
+            hard_failure: !policy.allow_correctness_retry,
+            reason: "correctness regression is non-flaky and must not be masked".to_owned(),
+        };
+    }
+
+    if recovered_on_retry && matches!(failure_class, RetryFailureClass::InfrastructureTransient) {
+        return RetryDecision {
+            allow_retry: false,
+            classify_as_flake: true,
+            hard_failure: false,
+            reason: "transient infrastructure failure recovered on retry".to_owned(),
+        };
+    }
+
+    if !lane.supports_retry() {
+        return RetryDecision {
+            allow_retry: false,
+            classify_as_flake: false,
+            hard_failure: true,
+            reason: "lane does not allow retry; failure is terminal".to_owned(),
+        };
+    }
+
+    match failure_class {
+        RetryFailureClass::InfrastructureTransient => {
+            let allow_retry = attempt < policy.max_transient_retries;
+            RetryDecision {
+                allow_retry,
+                classify_as_flake: false,
+                hard_failure: !allow_retry,
+                reason: if allow_retry {
+                    "transient infrastructure failure eligible for retry".to_owned()
+                } else {
+                    "transient retry budget exhausted".to_owned()
+                },
+            }
+        }
+        RetryFailureClass::InfrastructurePersistent => {
+            let allow_retry = attempt < policy.max_persistent_retries;
+            RetryDecision {
+                allow_retry,
+                classify_as_flake: false,
+                hard_failure: !allow_retry,
+                reason: if allow_retry {
+                    "persistent infrastructure failure granted final retry".to_owned()
+                } else {
+                    "persistent infrastructure failure exhausted retry budget".to_owned()
+                },
+            }
+        }
+        RetryFailureClass::CorrectnessRegression => unreachable!(),
+    }
+}
+
+/// Quarantine policy for temporarily waiving flake-budget failures.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QuarantinePolicy {
+    /// Whether quarantine is enabled.
+    pub enabled: bool,
+    /// Maximum run-count TTL for quarantine entries.
+    pub max_expires_after_runs: u32,
+    /// Require an explicit owner.
+    pub require_owner: bool,
+    /// Require a follow-up bead/issue linkage.
+    pub require_follow_up_issue: bool,
+    /// Schema version for serialized policy artifacts.
+    pub schema_version: String,
+}
+
+impl QuarantinePolicy {
+    /// Canonical quarantine policy for flake workflow control.
+    #[must_use]
+    pub fn canonical() -> Self {
+        Self {
+            enabled: true,
+            max_expires_after_runs: 5,
+            require_owner: true,
+            require_follow_up_issue: true,
+            schema_version: "1.0.0".to_owned(),
+        }
+    }
+}
+
+/// Quarantine request ticket attached to CI lane decisions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QuarantineTicket {
+    pub lane: String,
+    pub gate_id: String,
+    pub owner: String,
+    pub follow_up_issue: String,
+    pub reason: String,
+    /// TTL in CI runs before expiry.
+    pub expires_after_runs: u32,
+}
+
+/// Quarantine evaluation decision.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QuarantineDecision {
+    pub approved: bool,
+    pub effective_pipeline_fail: bool,
+    pub reasons: Vec<String>,
+}
+
+/// Evaluate whether a quarantine ticket can waive a lane-level pipeline failure.
+#[must_use]
+pub fn evaluate_quarantine_ticket(
+    lane_result: &FlakeBudgetResult,
+    ticket: &QuarantineTicket,
+    policy: &QuarantinePolicy,
+) -> QuarantineDecision {
+    let mut reasons = Vec::new();
+
+    if !policy.enabled {
+        reasons.push("quarantine policy disabled".to_owned());
+    }
+    if ticket.lane != lane_result.lane {
+        reasons.push("ticket lane does not match lane result".to_owned());
+    }
+    if ticket.gate_id.trim().is_empty() {
+        reasons.push("gate_id is required".to_owned());
+    }
+    if ticket.reason.trim().is_empty() {
+        reasons.push("quarantine reason is required".to_owned());
+    }
+    if policy.require_owner && ticket.owner.trim().is_empty() {
+        reasons.push("owner is required".to_owned());
+    }
+    if policy.require_follow_up_issue && ticket.follow_up_issue.trim().is_empty() {
+        reasons.push("follow_up_issue is required".to_owned());
+    }
+    if ticket.expires_after_runs == 0 || ticket.expires_after_runs > policy.max_expires_after_runs {
+        reasons.push(format!(
+            "expires_after_runs must be between 1 and {}",
+            policy.max_expires_after_runs
+        ));
+    }
+    if lane_result.fail_count > 0 {
+        reasons.push("quarantine cannot mask hard failures".to_owned());
+    }
+    if lane_result.within_budget {
+        reasons.push("lane is already within budget; quarantine not applicable".to_owned());
+    }
+    if matches!(lane_result.escalation_level, FlakeEscalationLevel::Critical) {
+        reasons
+            .push("critical escalation requires immediate remediation, not quarantine".to_owned());
+    }
+    if !lane_result.blocking {
+        reasons.push("advisory lanes do not require quarantine waivers".to_owned());
+    }
+
+    let approved = reasons.is_empty();
+    QuarantineDecision {
+        approved,
+        effective_pipeline_fail: if approved {
+            false
+        } else {
+            lane_result.pipeline_fail
+        },
+        reasons,
     }
 }
 
@@ -762,6 +1062,26 @@ mod tests {
     }
 
     #[test]
+    fn flake_budget_escalation_thresholds() {
+        let policy = FlakeBudgetPolicy::canonical();
+
+        // 3% flake rate should trigger warning for strict lanes.
+        let mut warn_outcomes = vec![TestOutcome::Pass; 97];
+        warn_outcomes.extend(vec![TestOutcome::Flake; 3]);
+        let warn_result = evaluate_flake_budget(CiLane::Unit, &warn_outcomes, &policy);
+        assert_eq!(warn_result.escalation_level, FlakeEscalationLevel::Warn);
+
+        // 9% flake rate should trigger critical escalation for strict lanes.
+        let mut critical_outcomes = vec![TestOutcome::Pass; 91];
+        critical_outcomes.extend(vec![TestOutcome::Flake; 9]);
+        let critical_result = evaluate_flake_budget(CiLane::Unit, &critical_outcomes, &policy);
+        assert_eq!(
+            critical_result.escalation_level,
+            FlakeEscalationLevel::Critical
+        );
+    }
+
+    #[test]
     fn flake_budget_hard_failure_always_fails() {
         let policy = FlakeBudgetPolicy::canonical();
         // Even one hard failure should fail the pipeline
@@ -838,6 +1158,123 @@ mod tests {
         assert!(summary.contains("PASS"));
     }
 
+    // ---- Retry and Quarantine Tests (bd-mblr.3.3) ----
+
+    #[test]
+    fn retry_policy_correctness_regression_is_not_flake() {
+        let policy = RetryPolicy::canonical();
+        let decision = evaluate_retry_decision(
+            CiLane::Unit,
+            RetryFailureClass::CorrectnessRegression,
+            0,
+            false,
+            &policy,
+        );
+        assert!(!decision.allow_retry);
+        assert!(!decision.classify_as_flake);
+        assert!(decision.hard_failure);
+    }
+
+    #[test]
+    fn retry_policy_transient_recovery_classifies_flake() {
+        let policy = RetryPolicy::canonical();
+        let decision = evaluate_retry_decision(
+            CiLane::E2eCorrectness,
+            RetryFailureClass::InfrastructureTransient,
+            1,
+            true,
+            &policy,
+        );
+        assert!(!decision.allow_retry);
+        assert!(decision.classify_as_flake);
+        assert!(!decision.hard_failure);
+    }
+
+    #[test]
+    fn quarantine_requires_owner_follow_up_and_expiry() {
+        let policy = FlakeBudgetPolicy::canonical();
+        let mut outcomes = vec![TestOutcome::Pass; 88];
+        outcomes.extend(vec![TestOutcome::Flake; 12]);
+        let lane_result = evaluate_flake_budget(CiLane::Unit, &outcomes, &policy);
+        assert!(lane_result.pipeline_fail);
+
+        let quarantine_policy = QuarantinePolicy::canonical();
+        let ticket = QuarantineTicket {
+            lane: "unit".to_owned(),
+            gate_id: "unit-gate".to_owned(),
+            owner: String::new(),
+            follow_up_issue: String::new(),
+            reason: "temporary infra incident".to_owned(),
+            expires_after_runs: 0,
+        };
+        let decision = evaluate_quarantine_ticket(&lane_result, &ticket, &quarantine_policy);
+        assert!(!decision.approved);
+        assert!(decision.effective_pipeline_fail);
+        assert!(
+            decision
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("owner is required"))
+        );
+        assert!(
+            decision
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("follow_up_issue is required"))
+        );
+    }
+
+    #[test]
+    fn quarantine_cannot_mask_hard_failures() {
+        let policy = FlakeBudgetPolicy::canonical();
+        let outcomes = vec![TestOutcome::Pass, TestOutcome::Fail];
+        let lane_result = evaluate_flake_budget(CiLane::Unit, &outcomes, &policy);
+        assert!(lane_result.pipeline_fail);
+
+        let ticket = QuarantineTicket {
+            lane: "unit".to_owned(),
+            gate_id: "unit-gate".to_owned(),
+            owner: "MaroonCanyon".to_owned(),
+            follow_up_issue: "bd-mblr.3.3".to_owned(),
+            reason: "trying to waive correctness regression".to_owned(),
+            expires_after_runs: 2,
+        };
+        let decision =
+            evaluate_quarantine_ticket(&lane_result, &ticket, &QuarantinePolicy::canonical());
+        assert!(!decision.approved);
+        assert!(decision.effective_pipeline_fail);
+        assert!(
+            decision
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("cannot mask hard failures"))
+        );
+    }
+
+    #[test]
+    fn quarantine_allows_flake_only_lane_with_valid_ticket() {
+        let policy = FlakeBudgetPolicy::canonical();
+        let mut outcomes = vec![TestOutcome::Pass; 94];
+        outcomes.extend(vec![TestOutcome::Flake; 6]);
+        let lane_result = evaluate_flake_budget(CiLane::Unit, &outcomes, &policy);
+        assert!(lane_result.pipeline_fail);
+        assert_eq!(lane_result.escalation_level, FlakeEscalationLevel::Warn);
+
+        let ticket = QuarantineTicket {
+            lane: "unit".to_owned(),
+            gate_id: "unit-gate".to_owned(),
+            owner: "MaroonCanyon".to_owned(),
+            follow_up_issue: "bd-mblr.3.3".to_owned(),
+            reason: "known transient runner instability".to_owned(),
+            expires_after_runs: 2,
+        };
+        let decision =
+            evaluate_quarantine_ticket(&lane_result, &ticket, &QuarantinePolicy::canonical());
+        assert!(decision.approved);
+        assert!(!decision.effective_pipeline_fail);
+        assert!(decision.reasons.is_empty());
+    }
+
     // ---- Auto-Bisect Tests ----
 
     #[test]
@@ -852,6 +1289,9 @@ mod tests {
             skip_count: 0,
             flake_rate: 0.0,
             budget_max_flake_rate: 0.05,
+            escalation_warn_flake_rate: 0.03,
+            escalation_critical_flake_rate: 0.08,
+            escalation_level: FlakeEscalationLevel::None,
             within_budget: true,
             blocking: true,
             pipeline_fail: true,
@@ -873,6 +1313,9 @@ mod tests {
             skip_count: 0,
             flake_rate: 0.0,
             budget_max_flake_rate: 0.05,
+            escalation_warn_flake_rate: 0.03,
+            escalation_critical_flake_rate: 0.08,
+            escalation_level: FlakeEscalationLevel::None,
             within_budget: true,
             blocking: true,
             pipeline_fail: true,
@@ -892,6 +1335,9 @@ mod tests {
             skip_count: 0,
             flake_rate: 0.0,
             budget_max_flake_rate: 0.05,
+            escalation_warn_flake_rate: 0.03,
+            escalation_critical_flake_rate: 0.08,
+            escalation_level: FlakeEscalationLevel::None,
             within_budget: true,
             blocking: true,
             pipeline_fail: true,
@@ -911,6 +1357,9 @@ mod tests {
             skip_count: 0,
             flake_rate: 0.0,
             budget_max_flake_rate: 0.05,
+            escalation_warn_flake_rate: 0.03,
+            escalation_critical_flake_rate: 0.08,
+            escalation_level: FlakeEscalationLevel::None,
             within_budget: true,
             blocking: true,
             pipeline_fail: false,

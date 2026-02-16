@@ -14,7 +14,9 @@ use sha2::{Digest, Sha256};
 use crate::ci_coverage_gate::{
     CoverageGateReport, CoverageThresholds, CoverageVerdict, evaluate_coverage_gate,
 };
-use crate::e2e_log_schema::{self, LogEventSchema, LogEventType, LogPhase, ScenarioCriticality};
+use crate::e2e_log_schema::{
+    self, LogEventSchema, LogEventType, LogPhase, ScenarioCriticality, ShellScriptConformanceReport,
+};
 use crate::e2e_orchestrator::{
     ManifestExecutionMode, build_default_manifest, build_execution_manifest, execute_manifest,
 };
@@ -258,6 +260,8 @@ pub struct LoggingConformanceStatus {
     pub profile_errors: Vec<String>,
     /// Structured log validation report for manifest-generation events.
     pub log_validation: ValidationReport,
+    /// Static shell-entrypoint conformance report.
+    pub shell_script_conformance: ShellScriptConformanceReport,
     /// Overall pass/fail.
     pub overall_pass: bool,
 }
@@ -530,7 +534,16 @@ pub fn build_validation_manifest_bundle(
     let log_validation = validate_event_stream(&log_events);
     let shell_profile = e2e_log_schema::build_shell_script_log_profile();
     let profile_errors = e2e_log_schema::validate_shell_script_log_profile(&shell_profile);
-    let logging_pass = profile_errors.is_empty() && log_validation.passed;
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .map_err(|error| format!("workspace_root_resolve_failed: {error}"))?;
+    let traceability = e2e_traceability::build_canonical_inventory();
+    let shell_script_conformance =
+        e2e_log_schema::assess_shell_script_profile_conformance(&workspace_root, &traceability)
+            .map_err(|error| format!("shell_script_conformance_failed: {error}"))?;
+    let logging_pass =
+        profile_errors.is_empty() && log_validation.passed && shell_script_conformance.overall_pass;
 
     let logging_conformance = LoggingConformanceStatus {
         schema_version: VALIDATION_MANIFEST_SCHEMA_VERSION.to_owned(),
@@ -539,6 +552,7 @@ pub fn build_validation_manifest_bundle(
         profile_version: shell_profile.profile_version,
         profile_errors,
         log_validation,
+        shell_script_conformance,
         overall_pass: logging_pass,
     };
     gate_artifacts.insert(
@@ -556,10 +570,12 @@ pub fn build_validation_manifest_bundle(
         commit_sha: config.commit_sha.clone(),
         artifact_uris: vec![logging_uri.clone(), log_events_uri.clone()],
         summary: format!(
-            "logging conformance: profile_errors={} schema_errors={} warnings={}",
+            "logging conformance: profile_errors={} schema_errors={} warnings={} shell_errors={} shell_warnings={}",
             logging_conformance.profile_errors.len(),
             logging_conformance.log_validation.stats.error_count,
-            logging_conformance.log_validation.stats.warning_count
+            logging_conformance.log_validation.stats.warning_count,
+            logging_conformance.shell_script_conformance.error_count,
+            logging_conformance.shell_script_conformance.warning_count,
         ),
     });
     normalize_gate_records(&mut gate_records);
@@ -1192,6 +1208,25 @@ pub fn validate_manifest_contract(manifest: &ValidationManifest) -> Vec<String> 
     if manifest.logging_conformance.gate_id != LOGGING_GATE_ID {
         errors.push("logging_conformance gate_id mismatch".to_owned());
     }
+    if manifest
+        .logging_conformance
+        .shell_script_conformance
+        .bead_id
+        != "bd-mblr.5.5"
+    {
+        errors.push("logging_conformance shell_script_conformance bead_id mismatch".to_owned());
+    }
+    if manifest.logging_conformance.overall_pass
+        && !manifest
+            .logging_conformance
+            .shell_script_conformance
+            .overall_pass
+    {
+        errors.push(
+            "logging_conformance overall_pass inconsistent with shell_script_conformance"
+                .to_owned(),
+        );
+    }
 
     let artifact_set = manifest
         .artifact_uris
@@ -1325,6 +1360,39 @@ mod tests {
         assert!(errors.iter().any(|error| error.contains("commit_sha")));
         assert!(errors.iter().any(|error| error.contains("gates")));
         assert!(errors.iter().any(|error| error.contains("artifact_uris")));
+    }
+
+    #[test]
+    fn contract_validator_flags_shell_conformance_bead_id_mismatch() {
+        let bundle = build_validation_manifest_bundle(&fixed_config())
+            .unwrap_or_else(|error| panic!("bundle build failed: {error}"));
+        let mut manifest = bundle.manifest;
+        manifest
+            .logging_conformance
+            .shell_script_conformance
+            .bead_id = "bd-mblr.invalid".to_owned();
+        let errors = validate_manifest_contract(&manifest);
+        assert!(errors.iter().any(|error| {
+            error.contains("logging_conformance shell_script_conformance bead_id mismatch")
+        }));
+    }
+
+    #[test]
+    fn contract_validator_flags_shell_conformance_pass_inconsistency() {
+        let bundle = build_validation_manifest_bundle(&fixed_config())
+            .unwrap_or_else(|error| panic!("bundle build failed: {error}"));
+        let mut manifest = bundle.manifest;
+        manifest.logging_conformance.overall_pass = true;
+        manifest
+            .logging_conformance
+            .shell_script_conformance
+            .overall_pass = false;
+        let errors = validate_manifest_contract(&manifest);
+        assert!(errors.iter().any(|error| {
+            error.contains(
+                "logging_conformance overall_pass inconsistent with shell_script_conformance",
+            )
+        }));
     }
 
     #[test]

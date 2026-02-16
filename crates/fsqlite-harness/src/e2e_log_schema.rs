@@ -1029,8 +1029,8 @@ pub fn assess_shell_script_profile_conformance(
 /// # Errors
 ///
 /// Returns an error when repository roots cannot be resolved or files are unreadable.
-pub fn build_workspace_shell_script_conformance_report(
-) -> Result<ShellScriptConformanceReport, String> {
+pub fn build_workspace_shell_script_conformance_report()
+-> Result<ShellScriptConformanceReport, String> {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()

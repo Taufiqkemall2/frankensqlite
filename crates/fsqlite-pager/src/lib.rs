@@ -4,6 +4,7 @@ pub mod journal;
 pub mod page_buf;
 pub mod page_cache;
 pub mod pager;
+pub mod s3_fifo;
 pub mod traits;
 
 pub use arc_cache::{ArcCache, ArcCacheInner, CacheKey, CacheLookup, CachedPage};
@@ -19,6 +20,7 @@ pub use journal::{
 pub use page_buf::{PageBuf, PageBufPool};
 pub use page_cache::PageCache;
 pub use pager::{SimplePager, SimplePagerCheckpointWriter, SimpleTransaction};
+pub use s3_fifo::{QueueKind, QueueLocation, S3Fifo, S3FifoConfig, S3FifoEvent};
 pub use traits::{
     CheckpointMode, CheckpointPageWriter, CheckpointResult, JournalMode, MockCheckpointPageWriter,
     MockMvccPager, MockTransaction, MvccPager, TransactionHandle, TransactionMode, WalBackend,

@@ -5,8 +5,10 @@
 
 use fsqlite_harness::ci_gate_matrix::{
     ArtifactEntry, ArtifactKind, AutoBisectConfig, BisectTrigger, CiLane, FlakeBudgetPolicy,
-    TestOutcome, build_artifact_manifest, build_bisect_request, evaluate_flake_budget,
-    evaluate_global_flake_budget, should_trigger_bisect,
+    QuarantinePolicy, QuarantineTicket, RetryFailureClass, RetryPolicy, TestOutcome,
+    build_artifact_manifest, build_bisect_request, evaluate_flake_budget,
+    evaluate_global_flake_budget, evaluate_quarantine_ticket, evaluate_retry_decision,
+    should_trigger_bisect,
 };
 
 const BEAD_ID: &str = "bd-1dp9.7.3";
@@ -206,6 +208,63 @@ fn e2e_flake_budget_mixed_lanes() {
          total_flakes={} global_rate={:.1}% result=PASS",
         global.total_flakes,
         global.global_flake_rate * 100.0,
+    );
+}
+
+#[test]
+fn e2e_retry_and_quarantine_workflow() {
+    let retry_policy = RetryPolicy::canonical();
+    let flake_policy = FlakeBudgetPolicy::canonical();
+    let quarantine_policy = QuarantinePolicy::canonical();
+
+    // Correctness failures must not be maskable as flakes.
+    let correctness_decision = evaluate_retry_decision(
+        CiLane::Unit,
+        RetryFailureClass::CorrectnessRegression,
+        0,
+        false,
+        &retry_policy,
+    );
+    assert!(!correctness_decision.allow_retry);
+    assert!(!correctness_decision.classify_as_flake);
+    assert!(correctness_decision.hard_failure);
+
+    // Transient infra recovered on retry is counted as flake.
+    let transient_decision = evaluate_retry_decision(
+        CiLane::Unit,
+        RetryFailureClass::InfrastructureTransient,
+        1,
+        true,
+        &retry_policy,
+    );
+    assert!(transient_decision.classify_as_flake);
+    assert!(!transient_decision.hard_failure);
+
+    // Flake-only over-budget lane can be quarantined with explicit owner + expiry + follow-up.
+    let mut outcomes = vec![TestOutcome::Pass; 94];
+    outcomes.extend(vec![TestOutcome::Flake; 6]);
+    let lane_result = evaluate_flake_budget(CiLane::Unit, &outcomes, &flake_policy);
+    assert!(lane_result.pipeline_fail);
+
+    let ticket = QuarantineTicket {
+        lane: "unit".to_owned(),
+        gate_id: "unit-gate".to_owned(),
+        owner: "MaroonCanyon".to_owned(),
+        follow_up_issue: "bd-mblr.3.3".to_owned(),
+        reason: "temporary CI runner packet loss".to_owned(),
+        expires_after_runs: 2,
+    };
+    let quarantine_decision = evaluate_quarantine_ticket(&lane_result, &ticket, &quarantine_policy);
+    assert!(quarantine_decision.approved);
+    assert!(!quarantine_decision.effective_pipeline_fail);
+
+    eprintln!(
+        "bead_id={BEAD_ID} run_id={BEAD_ID}-retry-quarantine-{SEED} seed={SEED} \
+         scenario_id=CI-FLAKE-QUARANTINE phase=validate event_type=pass \
+         retry_correctness_hard_failure={} transient_classified_as_flake={} quarantine_approved={}",
+        correctness_decision.hard_failure,
+        transient_decision.classify_as_flake,
+        quarantine_decision.approved,
     );
 }
 
