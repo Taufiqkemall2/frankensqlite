@@ -1503,4 +1503,743 @@ mod tests {
             let _ = run_sequence_with_invariants(24, 3, &ops, 256);
         }
     }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum WorkloadKind {
+        SequentialScan,
+        ZipfianRandom,
+        MixedInterleaved,
+        ScanPollution,
+    }
+
+    impl WorkloadKind {
+        const ALL: [Self; 4] = [
+            Self::SequentialScan,
+            Self::ZipfianRandom,
+            Self::MixedInterleaved,
+            Self::ScanPollution,
+        ];
+
+        const fn as_str(self) -> &'static str {
+            match self {
+                Self::SequentialScan => "sequential_scan_x3",
+                Self::ZipfianRandom => "zipfian_random_skew1",
+                Self::MixedInterleaved => "mixed_50_50",
+                Self::ScanPollution => "scan_pollution",
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct AccessOutcome {
+        hit: bool,
+        evicted: bool,
+        metadata_ops: usize,
+        adaptive_split_changed: bool,
+    }
+
+    impl AccessOutcome {
+        const fn hit(metadata_ops: usize) -> Self {
+            Self {
+                hit: true,
+                evicted: false,
+                metadata_ops,
+                adaptive_split_changed: false,
+            }
+        }
+
+        const fn miss(evicted: bool, metadata_ops: usize, adaptive_split_changed: bool) -> Self {
+            Self {
+                hit: false,
+                evicted,
+                metadata_ops,
+                adaptive_split_changed,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    struct CacheStats {
+        accesses: usize,
+        hits: usize,
+        misses: usize,
+        compulsory_misses: usize,
+        capacity_misses: usize,
+        conflict_misses: usize,
+        evictions: usize,
+        metadata_ops: usize,
+        elapsed_nanos: u128,
+        max_metadata_entries: usize,
+        adaptation_changes: usize,
+        adaptation_last_change_access: Option<usize>,
+    }
+
+    impl CacheStats {
+        fn note_access(
+            &mut self,
+            access_index: usize,
+            outcome: AccessOutcome,
+            metadata_entries: usize,
+        ) {
+            self.accesses = self.accesses.saturating_add(1);
+            self.metadata_ops = self.metadata_ops.saturating_add(outcome.metadata_ops);
+            self.max_metadata_entries = self.max_metadata_entries.max(metadata_entries);
+
+            if outcome.hit {
+                self.hits = self.hits.saturating_add(1);
+            } else {
+                self.misses = self.misses.saturating_add(1);
+            }
+
+            if outcome.evicted {
+                self.evictions = self.evictions.saturating_add(1);
+            }
+
+            if outcome.adaptive_split_changed {
+                self.adaptation_changes = self.adaptation_changes.saturating_add(1);
+                self.adaptation_last_change_access = Some(access_index.saturating_add(1));
+            }
+        }
+
+        #[inline]
+        fn hit_rate(self) -> f64 {
+            if self.accesses == 0 {
+                return 0.0;
+            }
+            self.hits as f64 / self.accesses as f64
+        }
+
+        #[inline]
+        fn metadata_ops_per_eviction(self) -> f64 {
+            if self.evictions == 0 {
+                return 0.0;
+            }
+            self.metadata_ops as f64 / self.evictions as f64
+        }
+
+        #[inline]
+        fn nanos_per_eviction(self) -> f64 {
+            if self.evictions == 0 {
+                return 0.0;
+            }
+            self.elapsed_nanos as f64 / self.evictions as f64
+        }
+
+        #[inline]
+        fn metadata_entries_per_capacity(self, capacity: usize) -> f64 {
+            if capacity == 0 {
+                return 0.0;
+            }
+            self.max_metadata_entries as f64 / capacity as f64
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct BenchmarkRow {
+        workload: WorkloadKind,
+        capacity_percent: usize,
+        capacity_pages: usize,
+        s3_fifo: CacheStats,
+        lru: CacheStats,
+        arc: CacheStats,
+    }
+
+    #[derive(Debug, Clone)]
+    struct ZipfSampler {
+        cumulative_weights: Vec<u64>,
+        total_weight: u64,
+    }
+
+    impl ZipfSampler {
+        fn new(domain_pages: u32) -> Self {
+            let page_count = usize::try_from(domain_pages).unwrap_or(usize::MAX).max(1);
+            let mut cumulative_weights = Vec::with_capacity(page_count);
+            let mut total_weight = 0_u64;
+            for rank in 1..=page_count {
+                let rank_u64 = u64::try_from(rank).unwrap_or(u64::MAX);
+                let weight = (1_000_000_u64 / rank_u64).max(1);
+                total_weight = total_weight.saturating_add(weight);
+                cumulative_weights.push(total_weight);
+            }
+            Self {
+                cumulative_weights,
+                total_weight,
+            }
+        }
+
+        fn sample(&self, state: &mut u64) -> u32 {
+            if self.total_weight == 0 {
+                return 1;
+            }
+            let pick = next_lcg(state) % self.total_weight;
+            let index = self.cumulative_weights.partition_point(|prefix| *prefix <= pick);
+            u32::try_from(index.saturating_add(1))
+                .unwrap_or(u32::MAX)
+                .max(1)
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct LruSimulator {
+        capacity: usize,
+        queue: VecDeque<PageNumber>,
+        members: HashSet<PageNumber>,
+    }
+
+    impl LruSimulator {
+        fn new(capacity: usize) -> Self {
+            Self {
+                capacity: capacity.max(1),
+                queue: VecDeque::new(),
+                members: HashSet::new(),
+            }
+        }
+
+        fn metadata_entries(&self) -> usize {
+            self.queue.len()
+        }
+
+        fn access(&mut self, page_id: PageNumber) -> AccessOutcome {
+            if self.members.contains(&page_id) {
+                if let Some(position) = self.queue.iter().position(|candidate| *candidate == page_id)
+                {
+                    let _ = self.queue.remove(position);
+                    self.queue.push_back(page_id);
+                    return AccessOutcome::hit(position.saturating_add(2));
+                }
+                return AccessOutcome::hit(1);
+            }
+
+            let mut metadata_ops = 1_usize;
+            let mut evicted = false;
+            if self.queue.len() >= self.capacity {
+                if let Some(victim) = self.queue.pop_front() {
+                    let _ = self.members.remove(&victim);
+                    metadata_ops = metadata_ops.saturating_add(2);
+                    evicted = true;
+                }
+            }
+            self.queue.push_back(page_id);
+            let _ = self.members.insert(page_id);
+            metadata_ops = metadata_ops.saturating_add(2);
+            AccessOutcome::miss(evicted, metadata_ops, false)
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct ArcSimulator {
+        capacity: usize,
+        target_t1: usize,
+        t1: VecDeque<PageNumber>,
+        t2: VecDeque<PageNumber>,
+        b1: VecDeque<PageNumber>,
+        b2: VecDeque<PageNumber>,
+    }
+
+    impl ArcSimulator {
+        fn new(capacity: usize) -> Self {
+            Self {
+                capacity: capacity.max(1),
+                target_t1: 0,
+                t1: VecDeque::new(),
+                t2: VecDeque::new(),
+                b1: VecDeque::new(),
+                b2: VecDeque::new(),
+            }
+        }
+
+        fn metadata_entries(&self) -> usize {
+            self.t1
+                .len()
+                .saturating_add(self.t2.len())
+                .saturating_add(self.b1.len())
+                .saturating_add(self.b2.len())
+        }
+
+        fn access(&mut self, page_id: PageNumber) -> AccessOutcome {
+            let mut metadata_ops = 0_usize;
+
+            if let Some(position) = self.t1.iter().position(|candidate| *candidate == page_id) {
+                let _ = self.t1.remove(position);
+                self.t2.push_back(page_id);
+                metadata_ops = metadata_ops.saturating_add(position.saturating_add(2));
+                return AccessOutcome::hit(metadata_ops);
+            }
+
+            if let Some(position) = self.t2.iter().position(|candidate| *candidate == page_id) {
+                let _ = self.t2.remove(position);
+                self.t2.push_back(page_id);
+                metadata_ops = metadata_ops.saturating_add(position.saturating_add(2));
+                return AccessOutcome::hit(metadata_ops);
+            }
+
+            if let Some(position) = self.b1.iter().position(|candidate| *candidate == page_id) {
+                let b1_len = self.b1.len().max(1);
+                let delta = (self.b2.len() / b1_len).max(1);
+                self.target_t1 = self.target_t1.saturating_add(delta).min(self.capacity);
+                let (evicted, replace_ops) = self.replace(false);
+                metadata_ops = metadata_ops.saturating_add(position.saturating_add(1));
+                metadata_ops = metadata_ops.saturating_add(replace_ops);
+                let _ = self.b1.remove(position);
+                self.t2.push_back(page_id);
+                metadata_ops = metadata_ops.saturating_add(2);
+                return AccessOutcome::miss(evicted, metadata_ops, false);
+            }
+
+            if let Some(position) = self.b2.iter().position(|candidate| *candidate == page_id) {
+                let b2_len = self.b2.len().max(1);
+                let delta = (self.b1.len() / b2_len).max(1);
+                self.target_t1 = self.target_t1.saturating_sub(delta);
+                let (evicted, replace_ops) = self.replace(true);
+                metadata_ops = metadata_ops.saturating_add(position.saturating_add(1));
+                metadata_ops = metadata_ops.saturating_add(replace_ops);
+                let _ = self.b2.remove(position);
+                self.t2.push_back(page_id);
+                metadata_ops = metadata_ops.saturating_add(2);
+                return AccessOutcome::miss(evicted, metadata_ops, false);
+            }
+
+            let mut evicted = false;
+            let t1_plus_b1 = self.t1.len().saturating_add(self.b1.len());
+            if t1_plus_b1 == self.capacity {
+                if self.t1.len() < self.capacity {
+                    if self.b1.pop_front().is_some() {
+                        metadata_ops = metadata_ops.saturating_add(1);
+                    }
+                    let (did_evict, replace_ops) = self.replace(false);
+                    metadata_ops = metadata_ops.saturating_add(replace_ops);
+                    evicted |= did_evict;
+                } else if self.t1.pop_front().is_some() {
+                    metadata_ops = metadata_ops.saturating_add(1);
+                    evicted = true;
+                }
+            } else {
+                let total = self.metadata_entries();
+                if total >= self.capacity {
+                    if total >= self.capacity.saturating_mul(2) && self.b2.pop_front().is_some() {
+                        metadata_ops = metadata_ops.saturating_add(1);
+                    }
+                    let (did_evict, replace_ops) = self.replace(false);
+                    metadata_ops = metadata_ops.saturating_add(replace_ops);
+                    evicted |= did_evict;
+                }
+            }
+
+            self.t1.push_back(page_id);
+            metadata_ops = metadata_ops.saturating_add(1);
+            AccessOutcome::miss(evicted, metadata_ops, false)
+        }
+
+        fn replace(&mut self, request_from_b2: bool) -> (bool, usize) {
+            let mut metadata_ops = 0_usize;
+            let choose_t1 = !self.t1.is_empty()
+                && (self.t1.len() > self.target_t1
+                    || (request_from_b2 && self.t1.len() == self.target_t1));
+
+            if choose_t1 {
+                if let Some(victim) = self.t1.pop_front() {
+                    self.b1.push_back(victim);
+                    metadata_ops = metadata_ops.saturating_add(2);
+                    if self.b1.len() > self.capacity {
+                        let _ = self.b1.pop_front();
+                        metadata_ops = metadata_ops.saturating_add(1);
+                    }
+                    return (true, metadata_ops);
+                }
+                return (false, metadata_ops);
+            }
+
+            if let Some(victim) = self.t2.pop_front() {
+                self.b2.push_back(victim);
+                metadata_ops = metadata_ops.saturating_add(2);
+                if self.b2.len() > self.capacity {
+                    let _ = self.b2.pop_front();
+                    metadata_ops = metadata_ops.saturating_add(1);
+                }
+                return (true, metadata_ops);
+            }
+
+            (false, metadata_ops)
+        }
+    }
+
+    fn sweep_capacity_pages(domain_pages: usize, percent: usize) -> usize {
+        let scaled = domain_pages.saturating_mul(percent);
+        let mut pages = scaled / 100;
+        if scaled % 100 != 0 {
+            pages = pages.saturating_add(1);
+        }
+        pages.max(1)
+    }
+
+    fn make_workload_trace(kind: WorkloadKind, domain_pages: u32, seed: u64) -> Vec<PageNumber> {
+        let mut state = seed;
+        let mut out = Vec::new();
+        let domain_usize = usize::try_from(domain_pages).unwrap_or(usize::MAX).max(1);
+        match kind {
+            WorkloadKind::SequentialScan => {
+                out.reserve(domain_usize.saturating_mul(3));
+                for _ in 0..3 {
+                    for page in 1..=domain_pages {
+                        out.push(pg(page));
+                    }
+                }
+            }
+            WorkloadKind::ZipfianRandom => {
+                let sampler = ZipfSampler::new(domain_pages);
+                let draws = domain_usize.saturating_mul(30);
+                out.reserve(draws);
+                for _ in 0..draws {
+                    out.push(pg(sampler.sample(&mut state)));
+                }
+            }
+            WorkloadKind::MixedInterleaved => {
+                let sampler = ZipfSampler::new(domain_pages);
+                let draws = domain_usize.saturating_mul(30);
+                out.reserve(draws);
+                let mut scan_cursor = 1_u32;
+                for index in 0..draws {
+                    if index % 2 == 0 {
+                        out.push(pg(scan_cursor));
+                        scan_cursor = if scan_cursor >= domain_pages {
+                            1
+                        } else {
+                            scan_cursor.saturating_add(1)
+                        };
+                    } else {
+                        out.push(pg(sampler.sample(&mut state)));
+                    }
+                }
+            }
+            WorkloadKind::ScanPollution => {
+                let hot_set = domain_pages.clamp(8, 64);
+                let rounds = domain_usize.saturating_mul(6);
+                out.reserve(rounds.saturating_mul(32).saturating_add(domain_usize.saturating_mul(6)));
+                for round in 0..rounds {
+                    for _ in 0..32 {
+                        let offset = u32::try_from(next_lcg(&mut state) % u64::from(hot_set))
+                            .unwrap_or(0);
+                        out.push(pg(offset.saturating_add(1)));
+                    }
+                    if round % 4 == 0 {
+                        for page in 1..=domain_pages {
+                            out.push(pg(page));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn run_s3_fifo_trace(trace: &[PageNumber], capacity: usize) -> CacheStats {
+        let mut stats = CacheStats::default();
+        let mut seen_pages = HashSet::new();
+        let mut cache = S3Fifo::new(capacity.max(1));
+        cache.set_adaptation_interval(128);
+        let started_at = std::time::Instant::now();
+
+        for (access_index, page_id) in trace.iter().copied().enumerate() {
+            if cache.access(page_id) {
+                let metadata_entries = cache.resident_len().saturating_add(cache.ghost_len());
+                stats.note_access(
+                    access_index,
+                    AccessOutcome::hit(1),
+                    metadata_entries,
+                );
+                continue;
+            }
+
+            if seen_pages.insert(page_id) {
+                stats.compulsory_misses = stats.compulsory_misses.saturating_add(1);
+            } else {
+                stats.capacity_misses = stats.capacity_misses.saturating_add(1);
+            }
+            let events = cache.insert(page_id);
+            let mut evicted = false;
+            let mut adaptive_split_changed = false;
+            for event in &events {
+                if matches!(
+                    event,
+                    S3FifoEvent::EvictedFromSmallToGhost(_)
+                        | S3FifoEvent::EvictedFromMain(_)
+                        | S3FifoEvent::GhostTrimmed(_)
+                ) {
+                    evicted = true;
+                }
+                if matches!(event, S3FifoEvent::AdaptiveSplitChanged { .. }) {
+                    adaptive_split_changed = true;
+                }
+            }
+            let metadata_entries = cache.resident_len().saturating_add(cache.ghost_len());
+            stats.note_access(
+                access_index,
+                AccessOutcome::miss(evicted, events.len().max(1), adaptive_split_changed),
+                metadata_entries,
+            );
+        }
+
+        stats.elapsed_nanos = started_at.elapsed().as_nanos();
+        stats
+    }
+
+    fn run_lru_trace(trace: &[PageNumber], capacity: usize) -> CacheStats {
+        let mut stats = CacheStats::default();
+        let mut seen_pages = HashSet::new();
+        let mut cache = LruSimulator::new(capacity.max(1));
+        let started_at = std::time::Instant::now();
+
+        for (access_index, page_id) in trace.iter().copied().enumerate() {
+            let outcome = cache.access(page_id);
+            if !outcome.hit {
+                if seen_pages.insert(page_id) {
+                    stats.compulsory_misses = stats.compulsory_misses.saturating_add(1);
+                } else {
+                    stats.capacity_misses = stats.capacity_misses.saturating_add(1);
+                }
+            }
+            stats.note_access(
+                access_index,
+                outcome,
+                cache.metadata_entries(),
+            );
+        }
+
+        stats.elapsed_nanos = started_at.elapsed().as_nanos();
+        stats
+    }
+
+    fn run_arc_trace(trace: &[PageNumber], capacity: usize) -> CacheStats {
+        let mut stats = CacheStats::default();
+        let mut seen_pages = HashSet::new();
+        let mut cache = ArcSimulator::new(capacity.max(1));
+        let started_at = std::time::Instant::now();
+
+        for (access_index, page_id) in trace.iter().copied().enumerate() {
+            let outcome = cache.access(page_id);
+            if !outcome.hit {
+                if seen_pages.insert(page_id) {
+                    stats.compulsory_misses = stats.compulsory_misses.saturating_add(1);
+                } else {
+                    stats.capacity_misses = stats.capacity_misses.saturating_add(1);
+                }
+            }
+            stats.note_access(
+                access_index,
+                outcome,
+                cache.metadata_entries(),
+            );
+        }
+
+        stats.elapsed_nanos = started_at.elapsed().as_nanos();
+        stats
+    }
+
+    fn format_percent(value: f64) -> String {
+        format!("{:.2}%", value * 100.0)
+    }
+
+    fn format_bar(value: f64) -> String {
+        let clamped = value.clamp(0.0, 1.0);
+        let width = (clamped * 20.0).round() as usize;
+        let count = width.max(1);
+        "#".repeat(count)
+    }
+
+    fn render_benchmark_report(rows: &[BenchmarkRow], domain_pages: u32) -> String {
+        let mut report = String::new();
+        report.push_str("# S3-FIFO vs LRU vs ARC Benchmark Report\n\n");
+        report.push_str("Generated by `s3_fifo_benchmark_matrix_meets_acceptance_contract`.\n\n");
+        report.push_str(&format!("- Domain pages: {domain_pages}\n"));
+        report.push_str("- Buffer sizes: 10%, 25%, 50%, 75%\n");
+        report.push_str("- Workloads: sequential scan x3, zipfian random, mixed 50/50, scan pollution\n\n");
+        report.push_str("## Hit-Rate Matrix\n\n");
+        report.push_str("| Workload | Capacity | S3-FIFO Hit | LRU Hit | ARC Hit |\n");
+        report.push_str("|---|---:|---:|---:|---:|\n");
+        for row in rows {
+            report.push_str(&format!(
+                "| {} | {}% ({}) | {} | {} | {} |\n",
+                row.workload.as_str(),
+                row.capacity_percent,
+                row.capacity_pages,
+                format_percent(row.s3_fifo.hit_rate()),
+                format_percent(row.lru.hit_rate()),
+                format_percent(row.arc.hit_rate()),
+            ));
+        }
+
+        report.push_str("\n## Overhead Metrics\n\n");
+        report.push_str("| Workload | Capacity | S3 ops/evict | LRU ops/evict | ARC ops/evict | S3 ns/evict | LRU ns/evict | ARC ns/evict |\n");
+        report.push_str("|---|---:|---:|---:|---:|---:|---:|---:|\n");
+        for row in rows {
+            report.push_str(&format!(
+                "| {} | {}% | {:.2} | {:.2} | {:.2} | {:.1} | {:.1} | {:.1} |\n",
+                row.workload.as_str(),
+                row.capacity_percent,
+                row.s3_fifo.metadata_ops_per_eviction(),
+                row.lru.metadata_ops_per_eviction(),
+                row.arc.metadata_ops_per_eviction(),
+                row.s3_fifo.nanos_per_eviction(),
+                row.lru.nanos_per_eviction(),
+                row.arc.nanos_per_eviction(),
+            ));
+        }
+
+        report.push_str("\n## Metadata Overhead Per Resident Capacity\n\n");
+        report.push_str("| Workload | Capacity | S3 metadata xC | LRU metadata xC | ARC metadata xC |\n");
+        report.push_str("|---|---:|---:|---:|---:|\n");
+        for row in rows {
+            report.push_str(&format!(
+                "| {} | {}% | {:.2} | {:.2} | {:.2} |\n",
+                row.workload.as_str(),
+                row.capacity_percent,
+                row.s3_fifo
+                    .metadata_entries_per_capacity(row.capacity_pages),
+                row.lru.metadata_entries_per_capacity(row.capacity_pages),
+                row.arc.metadata_entries_per_capacity(row.capacity_pages),
+            ));
+        }
+
+        report.push_str("\n## Hit-Rate Bars (S3-FIFO)\n\n");
+        for row in rows {
+            report.push_str(&format!(
+                "- {} @ {}%: `{}` ({})\n",
+                row.workload.as_str(),
+                row.capacity_percent,
+                format_bar(row.s3_fifo.hit_rate()),
+                format_percent(row.s3_fifo.hit_rate()),
+            ));
+        }
+
+        report.push_str("\n## Adaptive Convergence (S3-FIFO)\n\n");
+        report.push_str("| Workload | Capacity | Adaptation changes | Last change access |\n");
+        report.push_str("|---|---:|---:|---:|\n");
+        for row in rows {
+            let last_change = row
+                .s3_fifo
+                .adaptation_last_change_access
+                .map_or_else(|| String::from("none"), |value| value.to_string());
+            report.push_str(&format!(
+                "| {} | {}% | {} | {} |\n",
+                row.workload.as_str(),
+                row.capacity_percent,
+                row.s3_fifo.adaptation_changes,
+                last_change,
+            ));
+        }
+
+        report
+    }
+
+    fn write_benchmark_report(report: &str) -> std::path::PathBuf {
+        let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| String::from("target"));
+        let mut path = std::path::PathBuf::from(target_dir);
+        path.push("s3_fifo_benchmark_report.md");
+        if let Some(parent) = path.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                panic!("failed to create benchmark report directory: {error}");
+            }
+        }
+        if let Err(error) = std::fs::write(&path, report) {
+            panic!("failed to write benchmark report: {error}");
+        }
+        path
+    }
+
+    #[test]
+    fn s3_fifo_benchmark_matrix_meets_acceptance_contract() {
+        let domain_pages = 512_u32;
+        let domain_usize = usize::try_from(domain_pages).unwrap_or(usize::MAX);
+        let capacity_percents = [10_usize, 25, 50, 75];
+        let mut rows = Vec::new();
+
+        for (workload_index, workload) in WorkloadKind::ALL.iter().copied().enumerate() {
+            let seed = 0x51F0_0000_0000_0000_u64
+                .saturating_add(u64::try_from(workload_index).unwrap_or(u64::MAX));
+            let trace = make_workload_trace(workload, domain_pages, seed);
+            for capacity_percent in capacity_percents {
+                let capacity_pages = sweep_capacity_pages(domain_usize, capacity_percent);
+                let s3_fifo = run_s3_fifo_trace(&trace, capacity_pages);
+                let lru = run_lru_trace(&trace, capacity_pages);
+                let arc = run_arc_trace(&trace, capacity_pages);
+                rows.push(BenchmarkRow {
+                    workload,
+                    capacity_percent,
+                    capacity_pages,
+                    s3_fifo,
+                    lru,
+                    arc,
+                });
+            }
+        }
+
+        assert_eq!(
+            rows.len(),
+            WorkloadKind::ALL.len().saturating_mul(capacity_percents.len())
+        );
+
+        for row in &rows {
+            assert_eq!(
+                row.s3_fifo.misses,
+                row.s3_fifo
+                    .compulsory_misses
+                    .saturating_add(row.s3_fifo.capacity_misses)
+                    .saturating_add(row.s3_fifo.conflict_misses)
+            );
+            assert_eq!(
+                row.lru.misses,
+                row.lru
+                    .compulsory_misses
+                    .saturating_add(row.lru.capacity_misses)
+                    .saturating_add(row.lru.conflict_misses)
+            );
+            assert_eq!(
+                row.arc.misses,
+                row.arc
+                    .compulsory_misses
+                    .saturating_add(row.arc.capacity_misses)
+                    .saturating_add(row.arc.conflict_misses)
+            );
+
+            match row.workload {
+                WorkloadKind::ZipfianRandom => {
+                    assert!(
+                        row.s3_fifo.hit_rate() + 0.02 >= row.arc.hit_rate(),
+                        "S3-FIFO must remain within 2% absolute hit-rate of ARC on Zipfian workloads"
+                    );
+                }
+                WorkloadKind::MixedInterleaved => {
+                    assert!(
+                        row.s3_fifo.hit_rate() + 0.01 >= row.arc.hit_rate(),
+                        "S3-FIFO should approximately match ARC on mixed workloads"
+                    );
+                }
+                WorkloadKind::ScanPollution => {
+                    assert!(
+                        row.s3_fifo.hit_rate() >= row.lru.hit_rate() + 0.05,
+                        "S3-FIFO should materially exceed LRU on scan pollution workloads"
+                    );
+                }
+                WorkloadKind::SequentialScan => {
+                    assert!(
+                        row.s3_fifo.hit_rate() + 0.05 >= row.arc.hit_rate(),
+                        "Sequential scans should not regress S3-FIFO far below ARC"
+                    );
+                }
+            }
+
+            assert!(
+                row.s3_fifo.metadata_ops_per_eviction()
+                    <= row.arc.metadata_ops_per_eviction() + 3.0,
+                "S3-FIFO eviction overhead should stay close to ARC in metadata-op budget"
+            );
+        }
+
+        let report = render_benchmark_report(&rows, domain_pages);
+        let report_path = write_benchmark_report(&report);
+        assert!(
+            report.contains("| Workload | Capacity | S3-FIFO Hit | LRU Hit | ARC Hit |")
+        );
+        assert!(report_path.exists());
+    }
 }
