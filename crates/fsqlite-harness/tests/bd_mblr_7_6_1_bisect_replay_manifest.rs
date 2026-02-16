@@ -66,7 +66,7 @@ fn make_bisect_request() -> BisectRequest {
         failing_gate: "phase_4_6_gate".to_owned(),
         good_commit: "abc1234".to_owned(),
         bad_commit: "def5678".to_owned(),
-        replay_seed: 424_242,
+        replay_seed: 42,
         replay_command: "cargo test -p fsqlite-harness -- bisect_replay".to_owned(),
         expected_exit_code: 0,
         requested_at: "2026-02-13T10:00:00Z".to_owned(),
