@@ -20,6 +20,7 @@ argon2 = { workspace = true }
 asupersync.workspace = true
 proptest = { workspace = true }
 tempfile = { workspace = true }
+blake3 = { workspace = true }
 
 [lints]
 workspace = true
