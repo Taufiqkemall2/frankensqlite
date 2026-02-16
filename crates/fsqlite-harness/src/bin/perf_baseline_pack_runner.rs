@@ -28,6 +28,7 @@ const HYPERFINE_FILENAME: &str = "bd-1dp9.6.1-hyperfine.json";
 const OPPORTUNITY_FILENAME: &str = "opportunity_matrix.json";
 const PROFILING_REPORT_FILENAME: &str = "profiling_artifact_report.json";
 const SUMMARY_FILENAME: &str = "perf_baseline_pack_summary.md";
+const TOP_FLAMEGRAPH_COUNT: usize = 3;
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -283,6 +284,22 @@ fn derive_opportunity_entry(sample: &BaselineSample) -> OpportunityMatrixEntry {
     }
 }
 
+fn top_flamegraph_scenarios(samples: &[BaselineSample], count: usize) -> Vec<String> {
+    let mut ranked = samples.iter().collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .p95_micros
+            .cmp(&left.p95_micros)
+            .then_with(|| right.p99_micros.cmp(&left.p99_micros))
+            .then_with(|| left.scenario_id.cmp(&right.scenario_id))
+    });
+    ranked
+        .into_iter()
+        .take(count)
+        .map(|sample| sample.scenario_id.clone())
+        .collect()
+}
+
 fn compute_config_hash<T: Serialize>(value: &T) -> Result<String, String> {
     let bytes = serde_json::to_vec(value)
         .map_err(|error| format!("config_hash_serialize_failed: {error}"))?;
@@ -454,19 +471,59 @@ fn run() -> Result<PerfBaselinePackReport, String> {
             profiling_dir.display()
         )
     })?;
+    let top_flamegraph_scenarios = top_flamegraph_scenarios(&samples, TOP_FLAMEGRAPH_COUNT);
+    if top_flamegraph_scenarios.is_empty() {
+        return Err("top_flamegraph_selection_failed: no benchmark samples available".to_owned());
+    }
+
     let flamegraph_path = profiling_dir.join("flamegraph.svg");
     let heaptrack_path = profiling_dir.join("heaptrack.out");
     let strace_path = profiling_dir.join("strace.txt");
-    fs::write(
-        &flamegraph_path,
-        "<svg xmlns=\"http://www.w3.org/2000/svg\"><title>bd-1dp9.6.1 flamegraph</title><rect x=\"0\" y=\"0\" width=\"100\" height=\"16\"/></svg>",
-    )
-    .map_err(|error| {
-        format!(
-            "flamegraph_write_failed path={} error={error}",
-            flamegraph_path.display()
-        )
-    })?;
+    let mut flamegraph_manifest_entries = Vec::new();
+    for (index, scenario_id) in top_flamegraph_scenarios.iter().enumerate() {
+        let rank = index + 1;
+        let flamegraph_filename = format!("flamegraph_top_{rank:02}.svg");
+        let flamegraph_ranked_path = profiling_dir.join(&flamegraph_filename);
+        let flamegraph_relative_path = format!("profiling/{flamegraph_filename}");
+        let flamegraph_svg = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\"><title>bd-1dp9.6.1 flamegraph rank={rank} scenario={scenario_id}</title><rect x=\"0\" y=\"0\" width=\"100\" height=\"16\"/></svg>"
+        );
+        fs::write(&flamegraph_ranked_path, flamegraph_svg).map_err(|error| {
+            format!(
+                "flamegraph_write_failed path={} error={error}",
+                flamegraph_ranked_path.display()
+            )
+        })?;
+        validate_flamegraph_output(&flamegraph_ranked_path)
+            .map_err(|error| format!("flamegraph_validation_failed rank={rank}: {error}"))?;
+
+        if rank == 1 {
+            fs::copy(&flamegraph_ranked_path, &flamegraph_path).map_err(|error| {
+                format!(
+                    "flamegraph_primary_copy_failed src={} dst={} error={error}",
+                    flamegraph_ranked_path.display(),
+                    flamegraph_path.display()
+                )
+            })?;
+        }
+
+        flamegraph_manifest_entries.push(serde_json::json!({
+            "rank": rank,
+            "scenario_id": scenario_id,
+            "artifact_path": flamegraph_relative_path,
+        }));
+    }
+    validate_flamegraph_output(&flamegraph_path)
+        .map_err(|error| format!("flamegraph_validation_failed primary: {error}"))?;
+
+    let flamegraph_manifest_path = profiling_dir.join("flamegraph_top3.json");
+    let flamegraph_manifest = serde_json::json!({
+        "schema_version": "fsqlite.perf.flamegraph-top3.v1",
+        "selection_metric": "p95_desc_then_p99_desc",
+        "entries": flamegraph_manifest_entries,
+    });
+    write_pretty_json(&flamegraph_manifest_path, &flamegraph_manifest)?;
+
     fs::write(&heaptrack_path, "heaptrack sample placeholder\n").map_err(|error| {
         format!(
             "heaptrack_write_failed path={} error={error}",
@@ -479,9 +536,6 @@ fn run() -> Result<PerfBaselinePackReport, String> {
             strace_path.display()
         )
     })?;
-    validate_flamegraph_output(&flamegraph_path)
-        .map_err(|error| format!("flamegraph_validation_failed: {error}"))?;
-
     let p95_mean = if samples.is_empty() {
         0.0
     } else {
@@ -508,7 +562,7 @@ fn run() -> Result<PerfBaselinePackReport, String> {
     let profiling_hyperfine_path = profiling_dir.join("hyperfine.json");
     write_pretty_json(&profiling_hyperfine_path, &hyperfine_payload)?;
 
-    let metadata = record_profiling_metadata(
+    let mut metadata = record_profiling_metadata(
         &git_sha,
         &format!(
             "{}?seed={}",
@@ -518,22 +572,39 @@ fn run() -> Result<PerfBaselinePackReport, String> {
         "RUSTFLAGS=-C force-frame-pointers=yes;features=perf",
         &format!("{} {}", env::consts::OS, env::consts::ARCH),
     );
+    metadata.insert(
+        "flamegraph_top_scenarios".to_owned(),
+        top_flamegraph_scenarios.join(","),
+    );
+
+    let mut artifact_paths = BTreeMap::from([
+        (
+            "flamegraph".to_owned(),
+            "profiling/flamegraph.svg".to_owned(),
+        ),
+        (
+            "hyperfine".to_owned(),
+            "profiling/hyperfine.json".to_owned(),
+        ),
+        ("heaptrack".to_owned(), "profiling/heaptrack.out".to_owned()),
+        ("strace".to_owned(), "profiling/strace.txt".to_owned()),
+    ]);
+    for index in 1..=top_flamegraph_scenarios.len() {
+        artifact_paths.insert(
+            format!("flamegraph_top_{index:02}"),
+            format!("profiling/flamegraph_top_{index:02}.svg"),
+        );
+    }
+    artifact_paths.insert(
+        "flamegraph_top_manifest".to_owned(),
+        "profiling/flamegraph_top3.json".to_owned(),
+    );
+
     let profiling_report = ProfilingArtifactReport {
         trace_id: format!("trace-prof-{run_unix_ms}"),
         scenario_id: profiling_entry.id.clone(),
         git_sha: git_sha.clone(),
-        artifact_paths: BTreeMap::from([
-            (
-                "flamegraph".to_owned(),
-                "profiling/flamegraph.svg".to_owned(),
-            ),
-            (
-                "hyperfine".to_owned(),
-                "profiling/hyperfine.json".to_owned(),
-            ),
-            ("heaptrack".to_owned(), "profiling/heaptrack.out".to_owned()),
-            ("strace".to_owned(), "profiling/strace.txt".to_owned()),
-        ]),
+        artifact_paths,
         metadata,
     };
     validate_profiling_artifact_report(&profiling_report)

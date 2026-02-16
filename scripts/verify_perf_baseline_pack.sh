@@ -69,6 +69,40 @@ if ! jq -e '(.decisions | any(.selected == false))' "$OPPORTUNITY_JSON" >/dev/nu
     exit 1
 fi
 
+PROFILING_REPORT_JSON="$(jq -r '.profiling_report_path' "$REPORT_JSON")"
+if [[ ! -f "$PROFILING_REPORT_JSON" ]]; then
+    log_event "ERROR" "profiling" "missing profiling artifact report"
+    echo "ERROR: missing profiling artifact report: $PROFILING_REPORT_JSON" >&2
+    exit 1
+fi
+
+FLAMEGRAPH_MANIFEST="$OUTPUT_DIR/profiling/flamegraph_top3.json"
+if [[ ! -f "$FLAMEGRAPH_MANIFEST" ]]; then
+    log_event "ERROR" "flamegraph" "missing top-3 flamegraph manifest"
+    echo "ERROR: missing flamegraph manifest: $FLAMEGRAPH_MANIFEST" >&2
+    exit 1
+fi
+
+if ! jq -e \
+    '.schema_version == "fsqlite.perf.flamegraph-top3.v1"
+    and (.entries | length >= 3)
+    and (.entries | all(.rank != null and .scenario_id != null and .artifact_path != null))
+    and ((.entries | map(.scenario_id) | length) == (.entries | map(.scenario_id) | unique | length))' \
+    "$FLAMEGRAPH_MANIFEST" >/dev/null; then
+    log_event "ERROR" "flamegraph" "invalid flamegraph top-3 manifest payload"
+    echo "ERROR: invalid top-3 flamegraph manifest: $FLAMEGRAPH_MANIFEST" >&2
+    exit 1
+fi
+
+while IFS= read -r artifact_rel; do
+    artifact_abs="$OUTPUT_DIR/$artifact_rel"
+    if [[ ! -f "$artifact_abs" ]]; then
+        log_event "ERROR" "flamegraph" "missing top-3 flamegraph artifact from manifest"
+        echo "ERROR: missing flamegraph artifact: $artifact_abs" >&2
+        exit 1
+    fi
+done < <(jq -r '.entries[].artifact_path' "$FLAMEGRAPH_MANIFEST")
+
 PROMOTED_COUNT="$(jq -r '.promoted_count' "$REPORT_JSON")"
 SCENARIO_COUNT="$(jq -r '.scenario_count' "$REPORT_JSON")"
 
