@@ -157,7 +157,7 @@ Validation:
   - barrier ordering
   - multi-worker utilization
 - Deterministic e2e verifier script + artifact capture:
-  - `scripts/verify_bd_1rw_2_morsel_dispatch.sh`
+  - `scripts/bd_1rw_2_morsel_dispatch_e2e.sh`
   - emits `artifacts/bd-1rw.2/morsel_dispatch_e2e_artifact.json`
   - artifact includes `run_id`, `trace_id`, `scenario_id`, seed, replay command, and per-worker-count throughput/checksum measurements
 - Micro-benchmark scaffold:

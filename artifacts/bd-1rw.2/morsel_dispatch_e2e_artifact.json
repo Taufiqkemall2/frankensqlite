@@ -1,0 +1,14 @@
+{
+  "bead_id": "bd-1rw.2",
+  "run_id": "bd-1rw.2-seed-424242",
+  "trace_id": 424242,
+  "scenario_id": "VDBE-1",
+  "seed": 424242,
+  "deterministic_checksum": true,
+  "replay_command": "RUN_ID='bd-1rw.2-seed-424242' TRACE_ID=424242 SCENARIO_ID='VDBE-1' SEED=424242 FSQLITE_MORSEL_E2E_ARTIFACT='/data/projects/frankensqlite/artifacts/bd-1rw.2/morsel_dispatch_e2e_artifact.json' cargo test -p fsqlite-vdbe vectorized_dispatch::tests::morsel_dispatch_e2e_replay_emits_artifact -- --exact --nocapture",
+  "measurements": [
+    {"worker_threads":1,"elapsed_micros":284,"throughput_tasks_per_sec":225352,"active_workers":1,"completed_tasks":64,"checksum":"0x7958badb822148c4"},
+    {"worker_threads":2,"elapsed_micros":248,"throughput_tasks_per_sec":258064,"active_workers":2,"completed_tasks":64,"checksum":"0x7958badb822148c4"},
+    {"worker_threads":4,"elapsed_micros":371,"throughput_tasks_per_sec":172506,"active_workers":4,"completed_tasks":64,"checksum":"0x7958badb822148c4"}
+  ]
+}
