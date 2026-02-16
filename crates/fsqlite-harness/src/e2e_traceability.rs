@@ -488,6 +488,23 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
 
     scripts.push(
         ScriptEntryBuilder::new(
+            "e2e/bd_ncivz_1_parallel_wal_buffer_pilot.sh",
+            ScriptKind::ShellE2e,
+            "Parallel per-core WAL buffer pilot with deterministic replay artifacts",
+        )
+        .bead("bd-ncivz.1")
+        .command("bash e2e/bd_ncivz_1_parallel_wal_buffer_pilot.sh --json")
+        .json_output()
+        .scenarios(&["E2E-CNC-007"])
+        .storage(&[StorageMode::Wal, StorageMode::FileBacked])
+        .concurrency(&[ConcurrencyMode::ConcurrentWriters])
+        .artifacts(&["artifacts/ncivz_1_parallel_wal_buffer/"])
+        .timeout(900)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
             "e2e/fts3_compat_report.sh",
             ScriptKind::ShellE2e,
             "FTS3 extension compatibility verification",
