@@ -1451,14 +1451,41 @@ impl Connection {
             }
             Statement::Insert(ref insert) => {
                 let table_name = &insert.table.name;
+                let insert_event = fsqlite_ast::TriggerEvent::Insert;
+                let has_before_insert = self.has_matching_triggers(
+                    table_name,
+                    fsqlite_ast::TriggerTiming::Before,
+                    &insert_event,
+                );
+                let has_after_insert = self.has_matching_triggers(
+                    table_name,
+                    fsqlite_ast::TriggerTiming::After,
+                    &insert_event,
+                );
+                let trigger_new_rows = if has_before_insert || has_after_insert {
+                    self.collect_insert_trigger_rows(insert, params)?
+                } else {
+                    Vec::new()
+                };
 
                 // Phase 5G.2 (bd-iqam): Fire BEFORE INSERT triggers.
-                let skip_dml = self.fire_before_triggers(
-                    table_name,
-                    &fsqlite_ast::TriggerEvent::Insert,
-                    None, // No OLD row for INSERT
-                    None, // TODO: Pass NEW row values when pseudo-tables are implemented
-                )?;
+                let skip_dml = if has_before_insert {
+                    let mut skip = false;
+                    for new_values in &trigger_new_rows {
+                        if self.fire_before_triggers(
+                            table_name,
+                            &insert_event,
+                            None,
+                            Some(new_values),
+                        )? {
+                            skip = true;
+                            break;
+                        }
+                    }
+                    skip
+                } else {
+                    false
+                };
                 if skip_dml {
                     // RAISE(IGNORE) was called - skip the INSERT.
                     *self.last_changes.borrow_mut() = 0;
@@ -1471,12 +1498,16 @@ impl Connection {
                         let affected =
                             self.execute_insert_select_fallback(insert, select_stmt, params)?;
                         // Phase 5G.3: Fire AFTER INSERT triggers.
-                        self.fire_after_triggers(
-                            table_name,
-                            &fsqlite_ast::TriggerEvent::Insert,
-                            None,
-                            None,
-                        )?;
+                        if has_after_insert {
+                            for new_values in &trigger_new_rows {
+                                self.fire_after_triggers(
+                                    table_name,
+                                    &insert_event,
+                                    None,
+                                    Some(new_values),
+                                )?;
+                            }
+                        }
                         // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                         *self.last_changes.borrow_mut() = affected;
                         return Ok(Vec::new());
@@ -1517,12 +1548,11 @@ impl Connection {
                 let rows = self.execute_table_program(&program, params)?;
 
                 // Phase 5G.3: Fire AFTER INSERT triggers.
-                self.fire_after_triggers(
-                    table_name,
-                    &fsqlite_ast::TriggerEvent::Insert,
-                    None,
-                    None,
-                )?;
+                if has_after_insert {
+                    for new_values in &trigger_new_rows {
+                        self.fire_after_triggers(table_name, &insert_event, None, Some(new_values))?;
+                    }
+                }
 
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 *self.last_changes.borrow_mut() = affected;
@@ -1545,21 +1575,51 @@ impl Connection {
                         }
                     })
                     .collect();
+                let update_event = fsqlite_ast::TriggerEvent::Update(update_cols.clone());
+                let has_before_update = self.has_matching_triggers(
+                    table_name,
+                    fsqlite_ast::TriggerTiming::Before,
+                    &update_event,
+                );
+                let has_after_update = self.has_matching_triggers(
+                    table_name,
+                    fsqlite_ast::TriggerTiming::After,
+                    &update_event,
+                );
+                let trigger_rows = if has_before_update || has_after_update {
+                    self.collect_update_trigger_rows(update, params)?
+                } else {
+                    Vec::new()
+                };
 
                 // Phase 5G.2 (bd-iqam): Fire BEFORE UPDATE triggers.
-                let skip_dml = self.fire_before_triggers(
-                    table_name,
-                    &fsqlite_ast::TriggerEvent::Update(update_cols.clone()),
-                    None, // TODO: Pass OLD row values
-                    None, // TODO: Pass NEW row values
-                )?;
+                let skip_dml = if has_before_update {
+                    let mut skip = false;
+                    for (old_values, new_values) in &trigger_rows {
+                        if self.fire_before_triggers(
+                            table_name,
+                            &update_event,
+                            Some(old_values),
+                            Some(new_values),
+                        )? {
+                            skip = true;
+                            break;
+                        }
+                    }
+                    skip
+                } else {
+                    false
+                };
                 if skip_dml {
                     *self.last_changes.borrow_mut() = 0;
                     return Ok(Vec::new());
                 }
 
-                let affected =
-                    self.count_matching_rows(&update.table, update.where_clause.as_ref(), params)?;
+                let affected = if has_before_update || has_after_update {
+                    trigger_rows.len()
+                } else {
+                    self.count_matching_rows(&update.table, update.where_clause.as_ref(), params)?
+                };
                 let program = {
                     let plan_span = tracing::span!(
                         target: "fsqlite.plan",
@@ -1574,12 +1634,16 @@ impl Connection {
                 let rows = self.execute_table_program(&program, params)?;
 
                 // Phase 5G.3: Fire AFTER UPDATE triggers.
-                self.fire_after_triggers(
-                    table_name,
-                    &fsqlite_ast::TriggerEvent::Update(update_cols),
-                    None,
-                    None,
-                )?;
+                if has_after_update {
+                    for (old_values, new_values) in &trigger_rows {
+                        self.fire_after_triggers(
+                            table_name,
+                            &update_event,
+                            Some(old_values),
+                            Some(new_values),
+                        )?;
+                    }
+                }
 
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 *self.last_changes.borrow_mut() = affected;
@@ -1591,21 +1655,51 @@ impl Connection {
             }
             Statement::Delete(ref delete) => {
                 let table_name = &delete.table.name.name;
+                let delete_event = fsqlite_ast::TriggerEvent::Delete;
+                let has_before_delete = self.has_matching_triggers(
+                    table_name,
+                    fsqlite_ast::TriggerTiming::Before,
+                    &delete_event,
+                );
+                let has_after_delete = self.has_matching_triggers(
+                    table_name,
+                    fsqlite_ast::TriggerTiming::After,
+                    &delete_event,
+                );
+                let trigger_old_rows = if has_before_delete || has_after_delete {
+                    self.collect_delete_trigger_rows(delete, params)?
+                } else {
+                    Vec::new()
+                };
 
                 // Phase 5G.2 (bd-iqam): Fire BEFORE DELETE triggers.
-                let skip_dml = self.fire_before_triggers(
-                    table_name,
-                    &fsqlite_ast::TriggerEvent::Delete,
-                    None, // TODO: Pass OLD row values
-                    None, // No NEW row for DELETE
-                )?;
+                let skip_dml = if has_before_delete {
+                    let mut skip = false;
+                    for old_values in &trigger_old_rows {
+                        if self.fire_before_triggers(
+                            table_name,
+                            &delete_event,
+                            Some(old_values),
+                            None,
+                        )? {
+                            skip = true;
+                            break;
+                        }
+                    }
+                    skip
+                } else {
+                    false
+                };
                 if skip_dml {
                     *self.last_changes.borrow_mut() = 0;
                     return Ok(Vec::new());
                 }
 
-                let affected =
-                    self.count_matching_rows(&delete.table, delete.where_clause.as_ref(), params)?;
+                let affected = if has_before_delete || has_after_delete {
+                    trigger_old_rows.len()
+                } else {
+                    self.count_matching_rows(&delete.table, delete.where_clause.as_ref(), params)?
+                };
                 let program = {
                     let plan_span = tracing::span!(
                         target: "fsqlite.plan",
@@ -1620,7 +1714,11 @@ impl Connection {
                 let rows = self.execute_table_program(&program, params)?;
 
                 // Phase 5G.3: Fire AFTER DELETE triggers.
-                self.fire_after_triggers(table_name, &fsqlite_ast::TriggerEvent::Delete, None, None)?;
+                if has_after_delete {
+                    for old_values in &trigger_old_rows {
+                        self.fire_after_triggers(table_name, &delete_event, Some(old_values), None)?;
+                    }
+                }
 
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 *self.last_changes.borrow_mut() = affected;
@@ -2015,16 +2113,16 @@ impl Connection {
     /// Count the number of rows in `table_name` matching an optional WHERE
     /// clause.  Used by UPDATE/DELETE to compute the affected-row count
     /// without modifying the VDBE engine.
-    fn count_matching_rows(
+    fn select_matching_rows(
         &self,
         table_ref: &fsqlite_ast::QualifiedTableRef,
         where_clause: Option<&Expr>,
         params: Option<&[SqliteValue]>,
-    ) -> Result<usize> {
+    ) -> Result<Vec<Row>> {
         let alias_clause = table_ref
             .alias
             .as_ref()
-            .map_or(String::new(), |a| format!(" AS {a}"));
+            .map_or(String::new(), |alias| format!(" AS {alias}"));
         let sql = if let Some(cond) = where_clause {
             format!(
                 "SELECT * FROM {}{alias_clause} WHERE {cond}",
@@ -2033,12 +2131,220 @@ impl Connection {
         } else {
             format!("SELECT * FROM {}", table_ref.name)
         };
-        // br-22iss: Pass params through so numbered placeholders work correctly.
+
+        if let Some(params) = params {
+            self.query_with_params(&sql, params)
+        } else {
+            self.query(&sql)
+        }
+    }
+
+    fn collect_insert_trigger_rows(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<Vec<SqliteValue>>> {
+        let (table_columns, source_target_indices) =
+            self.resolve_insert_select_target_layout(insert)?;
+        let table_column_count = table_columns.len();
+        match &insert.source {
+            fsqlite_ast::InsertSource::Values(rows) => rows
+                .iter()
+                .enumerate()
+                .map(|(row_idx, row_exprs)| {
+                    let source_values = self.evaluate_insert_source_row(row_exprs, params)?;
+                    self.map_insert_source_row_to_table_row(
+                        table_column_count,
+                        &source_target_indices,
+                        &source_values,
+                        &format!("INSERT VALUES row {}", row_idx + 1),
+                    )
+                })
+                .collect(),
+            fsqlite_ast::InsertSource::Select(select) => {
+                let source_rows =
+                    self.execute_statement(Statement::Select(*select.clone()), params)?;
+                source_rows
+                    .iter()
+                    .enumerate()
+                    .map(|(row_idx, row)| {
+                        self.map_insert_source_row_to_table_row(
+                            table_column_count,
+                            &source_target_indices,
+                            row.values(),
+                            &format!("INSERT SELECT row {}", row_idx + 1),
+                        )
+                    })
+                    .collect()
+            }
+            fsqlite_ast::InsertSource::DefaultValues => {
+                Ok(vec![vec![SqliteValue::Null; table_column_count]])
+            }
+        }
+    }
+
+    fn evaluate_insert_source_row(
+        &self,
+        row_exprs: &[Expr],
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<SqliteValue>> {
+        let projection = row_exprs
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT {projection}");
         let rows = if let Some(params) = params {
             self.query_with_params(&sql, params)?
         } else {
             self.query(&sql)?
         };
+        Ok(rows
+            .first()
+            .map(|row| row.values().to_vec())
+            .unwrap_or_default())
+    }
+
+    fn map_insert_source_row_to_table_row(
+        &self,
+        table_column_count: usize,
+        source_target_indices: &[usize],
+        source_values: &[SqliteValue],
+        context: &str,
+    ) -> Result<Vec<SqliteValue>> {
+        if source_values.len() != source_target_indices.len() {
+            return Err(FrankenError::Internal(format!(
+                "{context}: column count mismatch (source has {}, target expects {})",
+                source_values.len(),
+                source_target_indices.len()
+            )));
+        }
+
+        let mut row = vec![SqliteValue::Null; table_column_count];
+        for (source_idx, target_idx) in source_target_indices.iter().copied().enumerate() {
+            row[target_idx] = source_values[source_idx].clone();
+        }
+        Ok(row)
+    }
+
+    fn collect_update_trigger_rows(
+        &self,
+        update: &fsqlite_ast::UpdateStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<(Vec<SqliteValue>, Vec<SqliteValue>)>> {
+        let matched_rows =
+            self.select_matching_rows(&update.table, update.where_clause.as_ref(), params)?;
+        if matched_rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let table_name = &update.table.name.name;
+        let schema = self.schema.borrow();
+        let table = schema
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(table_name))
+            .ok_or_else(|| FrankenError::NoSuchTable {
+                name: table_name.clone(),
+            })?;
+        let column_names: Vec<String> = table.columns.iter().map(|col| col.name.clone()).collect();
+        let table_label = update
+            .table
+            .alias
+            .as_deref()
+            .unwrap_or(table_name)
+            .to_owned();
+        drop(schema);
+
+        let col_map = column_names
+            .iter()
+            .cloned()
+            .map(|name| (table_label.clone(), name))
+            .collect::<Vec<_>>();
+
+        let mut trigger_rows = Vec::with_capacity(matched_rows.len());
+        for row in matched_rows {
+            let old_values = row.values().to_vec();
+            let mut new_values = old_values.clone();
+
+            for assignment in &update.assignments {
+                match &assignment.target {
+                    fsqlite_ast::AssignmentTarget::Column(column_name) => {
+                        let target_index =
+                            find_column_index_case_insensitive(&column_names, column_name)
+                                .ok_or_else(|| {
+                                    FrankenError::Internal(format!(
+                                        "UPDATE trigger snapshot: unknown column `{column_name}`"
+                                    ))
+                                })?;
+                        new_values[target_index] =
+                            eval_join_expr(&assignment.value, &old_values, &col_map)?;
+                    }
+                    fsqlite_ast::AssignmentTarget::ColumnList(columns) => {
+                        if columns.len() == 1 {
+                            let target_index =
+                                find_column_index_case_insensitive(&column_names, &columns[0])
+                                    .ok_or_else(|| {
+                                        FrankenError::Internal(format!(
+                                            "UPDATE trigger snapshot: unknown column `{}`",
+                                            columns[0]
+                                        ))
+                                    })?;
+                            new_values[target_index] =
+                                eval_join_expr(&assignment.value, &old_values, &col_map)?;
+                            continue;
+                        }
+
+                        match &assignment.value {
+                            Expr::RowValue(values, _) if values.len() == columns.len() => {
+                                for (column_name, value_expr) in columns.iter().zip(values) {
+                                    let target_index = find_column_index_case_insensitive(
+                                        &column_names,
+                                        column_name,
+                                    )
+                                    .ok_or_else(|| {
+                                        FrankenError::Internal(format!(
+                                            "UPDATE trigger snapshot: unknown column `{column_name}`"
+                                        ))
+                                    })?;
+                                    new_values[target_index] =
+                                        eval_join_expr(value_expr, &old_values, &col_map)?;
+                                }
+                            }
+                            _ => {
+                                return Err(FrankenError::Internal(
+                                    "UPDATE trigger snapshot: column-list assignment requires row-value expression of matching arity".to_owned(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
+            trigger_rows.push((old_values, new_values));
+        }
+        Ok(trigger_rows)
+    }
+
+    fn collect_delete_trigger_rows(
+        &self,
+        delete: &fsqlite_ast::DeleteStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<Vec<SqliteValue>>> {
+        let matched_rows =
+            self.select_matching_rows(&delete.table, delete.where_clause.as_ref(), params)?;
+        Ok(matched_rows
+            .into_iter()
+            .map(|row| row.values().to_vec())
+            .collect())
+    }
+
+    fn count_matching_rows(
+        &self,
+        table_ref: &fsqlite_ast::QualifiedTableRef,
+        where_clause: Option<&Expr>,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<usize> {
+        let rows = self.select_matching_rows(table_ref, where_clause, params)?;
         Ok(rows.len())
     }
 
@@ -2786,6 +3092,19 @@ impl Connection {
         TriggerFrameGuard {
             stack: &self.trigger_frame_stack,
         }
+    }
+
+    fn has_matching_triggers(
+        &self,
+        table_name: &str,
+        timing: fsqlite_ast::TriggerTiming,
+        event: &fsqlite_ast::TriggerEvent,
+    ) -> bool {
+        self.triggers.borrow().iter().any(|trigger| {
+            trigger.table_name.eq_ignore_ascii_case(table_name)
+                && trigger.timing == timing
+                && trigger_event_matches(&trigger.event, event)
+        })
     }
 
     /// Fire BEFORE triggers for a DML event on a table.
@@ -9806,6 +10125,12 @@ fn find_col_in_map(
             .position(|(_, col)| col.eq_ignore_ascii_case(col_name))
             .ok_or_else(|| FrankenError::Internal(format!("column not found: {col_name}")))
     }
+}
+
+fn find_column_index_case_insensitive(column_names: &[String], target: &str) -> Option<usize> {
+    column_names
+        .iter()
+        .position(|column_name| column_name.eq_ignore_ascii_case(target))
 }
 
 /// Check whether a column name is an implicit rowid alias (`rowid`, `_rowid_`, `oid`).
