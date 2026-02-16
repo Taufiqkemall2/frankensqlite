@@ -820,6 +820,75 @@ fn trigger_update_of_columns_changed(
     })
 }
 
+#[derive(Debug, Clone)]
+struct TriggerRaiseDirective {
+    action: fsqlite_ast::RaiseAction,
+    message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TriggerStatementOutcome {
+    Continue,
+    SkipDml,
+}
+
+fn trigger_statement_raise_directive(
+    statement: &Statement,
+) -> Result<Option<TriggerRaiseDirective>> {
+    let Statement::Select(select) = statement else {
+        return Ok(None);
+    };
+    if select.with.is_some() || !select.order_by.is_empty() || select.limit.is_some() {
+        return Ok(None);
+    }
+    if !select.body.compounds.is_empty() {
+        return Ok(None);
+    }
+
+    let SelectCore::Select {
+        columns,
+        from,
+        where_clause,
+        group_by,
+        having,
+        windows,
+        ..
+    } = &select.body.select
+    else {
+        return Ok(None);
+    };
+    if from.is_some() || !group_by.is_empty() || having.is_some() || !windows.is_empty() {
+        return Ok(None);
+    }
+    if columns.len() != 1 {
+        return Ok(None);
+    }
+
+    let ResultColumn::Expr {
+        expr: Expr::Raise {
+            action, message, ..
+        },
+        ..
+    } = &columns[0]
+    else {
+        return Ok(None);
+    };
+
+    if let Some(predicate) = where_clause {
+        let row: [SqliteValue; 0] = [];
+        let col_map: [(String, String); 0] = [];
+        let predicate_val = eval_join_expr(predicate, &row, &col_map)?;
+        if !is_sqlite_truthy(&predicate_val) {
+            return Ok(None);
+        }
+    }
+
+    Ok(Some(TriggerRaiseDirective {
+        action: *action,
+        message: message.clone(),
+    }))
+}
+
 /// Snapshot of the database + schema state at a point in time.
 /// Used for transaction rollback and savepoint restore.
 #[derive(Debug, Clone)]
@@ -3136,6 +3205,44 @@ impl Connection {
         })
     }
 
+    fn apply_trigger_raise(
+        &self,
+        directive: TriggerRaiseDirective,
+    ) -> Result<TriggerStatementOutcome> {
+        match directive.action {
+            fsqlite_ast::RaiseAction::Ignore => Ok(TriggerStatementOutcome::SkipDml),
+            fsqlite_ast::RaiseAction::Abort | fsqlite_ast::RaiseAction::Fail => {
+                let message = directive
+                    .message
+                    .unwrap_or_else(|| "trigger RAISE()".to_owned());
+                Err(FrankenError::FunctionError(message))
+            }
+            fsqlite_ast::RaiseAction::Rollback => {
+                let reason = directive
+                    .message
+                    .unwrap_or_else(|| "trigger requested rollback".to_owned());
+                let has_active_txn =
+                    *self.in_transaction.borrow() || self.active_txn.borrow().is_some();
+                if has_active_txn {
+                    let rollback_stmt = fsqlite_ast::RollbackStatement { to_savepoint: None };
+                    self.execute_rollback(&rollback_stmt)?;
+                }
+                Err(FrankenError::TransactionRolledBack { reason })
+            }
+        }
+    }
+
+    fn execute_bound_trigger_statement(
+        &self,
+        statement: Statement,
+    ) -> Result<TriggerStatementOutcome> {
+        if let Some(directive) = trigger_statement_raise_directive(&statement)? {
+            return self.apply_trigger_raise(directive);
+        }
+        self.execute_statement(statement, None)?;
+        Ok(TriggerStatementOutcome::Continue)
+    }
+
     /// Fire BEFORE triggers for a DML event on a table.
     ///
     /// Returns `true` if any trigger executed RAISE(IGNORE), indicating the DML
@@ -3179,11 +3286,14 @@ impl Connection {
             for stmt in &trigger.body {
                 let mut bound_stmt = stmt.clone();
                 bind_trigger_columns_in_statement(&mut bound_stmt, &frame);
-                self.execute_statement(bound_stmt, None)?;
+                match self.execute_bound_trigger_statement(bound_stmt)? {
+                    TriggerStatementOutcome::Continue => {}
+                    TriggerStatementOutcome::SkipDml => return Ok(true),
+                }
             }
         }
 
-        Ok(false) // No RAISE(IGNORE) for now
+        Ok(false)
     }
 
     /// Fire AFTER triggers for a DML event on a table.
@@ -3224,7 +3334,10 @@ impl Connection {
             for stmt in &trigger.body {
                 let mut bound_stmt = stmt.clone();
                 bind_trigger_columns_in_statement(&mut bound_stmt, &frame);
-                self.execute_statement(bound_stmt, None)?;
+                match self.execute_bound_trigger_statement(bound_stmt)? {
+                    TriggerStatementOutcome::Continue => {}
+                    TriggerStatementOutcome::SkipDml => return Ok(()),
+                }
             }
         }
 
@@ -11903,6 +12016,85 @@ mod tests {
         assert_eq!(
             row_values(&rows[0])[0],
             SqliteValue::Text("fired".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_trigger_raise_ignore_skips_before_insert_dml() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER);").unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_raise_ignore BEFORE INSERT ON t BEGIN SELECT RAISE(IGNORE); END;",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+
+        let rows = conn.query("SELECT id FROM t;").unwrap();
+        assert!(
+            rows.is_empty(),
+            "RAISE(IGNORE) in BEFORE trigger should skip INSERT"
+        );
+    }
+
+    #[test]
+    fn test_trigger_raise_abort_returns_function_error() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER);").unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_raise_abort BEFORE INSERT ON t BEGIN SELECT RAISE(ABORT, 'stop insert'); END;",
+        )
+        .unwrap();
+
+        let err = conn
+            .execute("INSERT INTO t VALUES (1);")
+            .expect_err("INSERT should fail via RAISE(ABORT)");
+        assert!(matches!(
+            err,
+            FrankenError::FunctionError(ref msg) if msg == "stop insert"
+        ));
+    }
+
+    #[test]
+    fn test_trigger_raise_fail_returns_function_error() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER);").unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_raise_fail BEFORE INSERT ON t BEGIN SELECT RAISE(FAIL, 'fail insert'); END;",
+        )
+        .unwrap();
+
+        let err = conn
+            .execute("INSERT INTO t VALUES (1);")
+            .expect_err("INSERT should fail via RAISE(FAIL)");
+        assert!(matches!(
+            err,
+            FrankenError::FunctionError(ref msg) if msg == "fail insert"
+        ));
+    }
+
+    #[test]
+    fn test_trigger_raise_rollback_aborts_transaction() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER);").unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_raise_rb BEFORE INSERT ON t BEGIN SELECT RAISE(ROLLBACK, 'rollback insert'); END;",
+        )
+        .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        let err = conn
+            .execute("INSERT INTO t VALUES (1);")
+            .expect_err("INSERT should fail via RAISE(ROLLBACK)");
+        assert!(matches!(
+            err,
+            FrankenError::TransactionRolledBack { ref reason } if reason == "rollback insert"
+        ));
+
+        let rows = conn.query("SELECT id FROM t;").unwrap();
+        assert!(
+            rows.is_empty(),
+            "transaction should be rolled back by RAISE(ROLLBACK)"
         );
     }
 
