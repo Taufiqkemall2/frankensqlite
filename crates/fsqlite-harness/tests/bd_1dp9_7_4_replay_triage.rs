@@ -12,8 +12,13 @@ use fsqlite_harness::ci_gate_matrix::{
 use fsqlite_harness::e2e_log_schema::{LogEventSchema, LogEventType, LogPhase};
 use fsqlite_harness::log_schema_validator::encode_jsonl_stream;
 use fsqlite_harness::replay_triage::{
-    REPLAY_TRIAGE_BEAD_ID, ReplayTriageConfig, ReplayTriageReport, ReplayTriageVerdict,
-    load_replay_triage_report, run_replay_triage_workflow, write_replay_triage_report,
+    BisectAttemptResult, BisectCandidateVerdict, BisectEvaluationInput, BisectRunConfig,
+    BisectRunState, BisectRunStatus, DETERMINISTIC_BISECT_BEAD_ID, REPLAY_TRIAGE_BEAD_ID,
+    ReplayTriageConfig, ReplayTriageReport, ReplayTriageVerdict, advance_bisect_step,
+    build_bisect_step_log_events, decode_bisect_step_log_jsonl, encode_bisect_step_log_jsonl,
+    load_replay_triage_report, run_bisect_until_terminal, run_deterministic_bisect,
+    run_replay_triage_workflow, validate_bisect_step_log_events, validate_bisect_step_log_jsonl,
+    write_replay_triage_report,
 };
 
 const BEAD_ID: &str = "bd-1dp9.7.4";
@@ -496,5 +501,230 @@ fn config_default_is_reasonable() {
     assert!(
         config.min_reproducibility <= 5,
         "bead_id={BEAD_ID} case=min_repro"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic Bisect Orchestrator (bd-mblr.7.6.2)
+// ---------------------------------------------------------------------------
+
+fn build_deterministic_bisect_request(
+    good_commit: &str,
+    bad_commit: &str,
+) -> fsqlite_harness::ci_gate_matrix::BisectRequest {
+    build_bisect_request(
+        BisectTrigger::GateRegression,
+        CiLane::E2eDifferential,
+        "test_mvcc_isolation",
+        good_commit,
+        bad_commit,
+        SEED,
+        "cargo test -p fsqlite-harness -- test_mvcc_isolation --exact",
+        "synthetic history for bisect orchestrator integration tests",
+    )
+}
+
+fn synthetic_commits(count: usize) -> Vec<String> {
+    (0..count)
+        .map(|index| format!("commit-{index:02}"))
+        .collect()
+}
+
+#[test]
+fn deterministic_bisect_integration_finds_first_bad() {
+    let commits = synthetic_commits(9);
+    let request = build_deterministic_bisect_request(&commits[0], &commits[8]);
+    let first_bad_index = 6;
+    let expected_bad = commits[first_bad_index].clone();
+
+    let mut evaluator = |input: BisectEvaluationInput<'_>| -> BisectAttemptResult {
+        let verdict = if input.commit_index >= first_bad_index {
+            BisectCandidateVerdict::Fail
+        } else {
+            BisectCandidateVerdict::Pass
+        };
+        BisectAttemptResult {
+            verdict,
+            runtime_ms: 8,
+            artifact_pointers: vec![format!(
+                "artifacts/integration/bisect/{}/attempt-{}",
+                input.commit_sha, input.attempt_index
+            )],
+            detail: format!("step={} idx={}", input.step_index, input.commit_index),
+        }
+    };
+
+    let report = run_deterministic_bisect(
+        &request,
+        commits,
+        "trace-integration-deterministic",
+        BisectRunConfig::default(),
+        &mut evaluator,
+    )
+    .unwrap();
+
+    assert_eq!(
+        report.bead_id, DETERMINISTIC_BISECT_BEAD_ID,
+        "bead_id={} case=report_bead",
+        DETERMINISTIC_BISECT_BEAD_ID,
+    );
+    assert_eq!(
+        report.status,
+        BisectRunStatus::Completed,
+        "bead_id={} case=integration_completed",
+        DETERMINISTIC_BISECT_BEAD_ID,
+    );
+    assert_eq!(
+        report.first_bad_index,
+        Some(first_bad_index),
+        "bead_id={} case=integration_first_bad_index",
+        DETERMINISTIC_BISECT_BEAD_ID,
+    );
+    assert_eq!(
+        report.first_bad_commit.as_deref(),
+        Some(expected_bad.as_str()),
+        "bead_id={} case=integration_first_bad_commit",
+        DETERMINISTIC_BISECT_BEAD_ID,
+    );
+}
+
+#[test]
+fn deterministic_bisect_integration_escalates_on_flaky_history() {
+    let commits = synthetic_commits(9);
+    let request = build_deterministic_bisect_request(&commits[0], &commits[8]);
+
+    let mut evaluator = |input: BisectEvaluationInput<'_>| -> BisectAttemptResult {
+        // First midpoint in [0,8] is 4; inject conflicting pass/fail attempts there.
+        let verdict = if input.commit_index == 4 {
+            if input.attempt_index == 0 {
+                BisectCandidateVerdict::Pass
+            } else {
+                BisectCandidateVerdict::Fail
+            }
+        } else {
+            BisectCandidateVerdict::Pass
+        };
+        BisectAttemptResult {
+            verdict,
+            runtime_ms: 5,
+            artifact_pointers: vec![format!(
+                "artifacts/integration/bisect/flaky/{}/attempt-{}",
+                input.commit_sha, input.attempt_index
+            )],
+            detail: "injected flaky verdict".to_owned(),
+        }
+    };
+
+    let report = run_deterministic_bisect(
+        &request,
+        commits,
+        "trace-integration-flaky",
+        BisectRunConfig {
+            max_steps: 20,
+            retries_per_step: 1,
+        },
+        &mut evaluator,
+    )
+    .unwrap();
+
+    assert_eq!(
+        report.status,
+        BisectRunStatus::Escalated,
+        "bead_id={} case=integration_flaky_escalated",
+        DETERMINISTIC_BISECT_BEAD_ID,
+    );
+    assert!(
+        report
+            .escalation_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("uncertain")),
+        "bead_id={} case=integration_flaky_reason reason={:?}",
+        DETERMINISTIC_BISECT_BEAD_ID,
+        report.escalation_reason,
+    );
+    assert_eq!(
+        report.steps[0].evaluator_verdict,
+        BisectCandidateVerdict::Uncertain,
+        "bead_id={} case=integration_flaky_step_uncertain",
+        DETERMINISTIC_BISECT_BEAD_ID,
+    );
+}
+
+#[test]
+fn deterministic_bisect_integration_resume_checkpoint_and_validate_logs() {
+    let commits = synthetic_commits(10);
+    let request = build_deterministic_bisect_request(&commits[0], &commits[9]);
+    let first_bad_index = 7;
+    let expected_bad = commits[first_bad_index].clone();
+
+    let mut state = BisectRunState::new(
+        &request,
+        commits,
+        "trace-integration-resume",
+        BisectRunConfig::default(),
+    )
+    .unwrap();
+
+    let mut evaluator = |input: BisectEvaluationInput<'_>| -> BisectAttemptResult {
+        let verdict = if input.commit_index >= first_bad_index {
+            BisectCandidateVerdict::Fail
+        } else {
+            BisectCandidateVerdict::Pass
+        };
+        BisectAttemptResult {
+            verdict,
+            runtime_ms: 6,
+            artifact_pointers: vec![format!(
+                "artifacts/integration/bisect/resume/{}/attempt-{}",
+                input.commit_sha, input.attempt_index
+            )],
+            detail: "resume integration".to_owned(),
+        }
+    };
+
+    let first_step = advance_bisect_step(&mut state, &mut evaluator).unwrap();
+    assert_eq!(
+        first_step.step_index, 0,
+        "bead_id={} case=integration_resume_first_step",
+        DETERMINISTIC_BISECT_BEAD_ID,
+    );
+
+    let checkpoint = state.to_json().unwrap();
+    let mut resumed = BisectRunState::from_json(&checkpoint).unwrap();
+    let report = run_bisect_until_terminal(&mut resumed, &mut evaluator);
+    assert_eq!(
+        report.status,
+        BisectRunStatus::Completed,
+        "bead_id={} case=integration_resume_completed",
+        DETERMINISTIC_BISECT_BEAD_ID,
+    );
+    assert_eq!(
+        report.first_bad_commit.as_deref(),
+        Some(expected_bad.as_str()),
+        "bead_id={} case=integration_resume_first_bad_commit",
+        DETERMINISTIC_BISECT_BEAD_ID,
+    );
+
+    let events = build_bisect_step_log_events(&report);
+    let schema_errors = validate_bisect_step_log_events(&events);
+    assert!(
+        schema_errors.is_empty(),
+        "bead_id={} case=integration_step_log_schema errors={schema_errors:?}",
+        DETERMINISTIC_BISECT_BEAD_ID,
+    );
+
+    let jsonl = encode_bisect_step_log_jsonl(&events).unwrap();
+    assert!(
+        validate_bisect_step_log_jsonl(&jsonl).is_ok(),
+        "bead_id={} case=integration_step_log_jsonl_validate",
+        DETERMINISTIC_BISECT_BEAD_ID,
+    );
+
+    let decoded = decode_bisect_step_log_jsonl(&jsonl).unwrap();
+    assert_eq!(
+        decoded.len(),
+        events.len(),
+        "bead_id={} case=integration_step_log_decode_count",
+        DETERMINISTIC_BISECT_BEAD_ID,
     );
 }
