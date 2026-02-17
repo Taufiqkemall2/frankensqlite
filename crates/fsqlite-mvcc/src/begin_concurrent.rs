@@ -250,7 +250,7 @@ impl ActiveTxnView for ConcurrentHandle {
 ///
 /// Per spec §5.4: page locks are NOT released on `ROLLBACK TO`.
 /// SSI witnesses are NOT rolled back (safe overapproximation).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ConcurrentSavepoint {
     /// Savepoint name.
     pub name: String,

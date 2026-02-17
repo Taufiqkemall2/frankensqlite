@@ -33,16 +33,21 @@ use fsqlite_types::{
 // ---------------------------------------------------------------------------
 
 /// Index into a [`VersionArena`] chunk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct VersionIdx {
     chunk: u32,
     offset: u32,
+    generation: u32,
 }
 
 impl VersionIdx {
     #[inline]
-    pub(crate) const fn new(chunk: u32, offset: u32) -> Self {
-        Self { chunk, offset }
+    pub(crate) const fn new(chunk: u32, offset: u32, generation: u32) -> Self {
+        Self {
+            chunk,
+            offset,
+            generation,
+        }
     }
 
     /// Chunk index within the arena.
@@ -58,17 +63,41 @@ impl VersionIdx {
     pub fn offset(&self) -> u32 {
         self.offset
     }
+
+    /// Generation counter for ABA protection.
+    #[inline]
+    #[must_use]
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
 }
 
 /// Number of page versions per arena chunk.
 const ARENA_CHUNK: usize = 4096;
 
+struct ArenaSlot {
+    generation: u32,
+    version: Option<PageVersion>,
+}
+
+impl ArenaSlot {
+    fn new(version: PageVersion) -> Self {
+        Self {
+            generation: 0,
+            version: Some(version),
+        }
+    }
+}
+
 /// Bump-allocated arena for [`PageVersion`] objects.
 ///
 /// Single-writer / multi-reader. The arena owns all page version data and
 /// hands out [`VersionIdx`] handles. Freed slots are recycled via a free list.
+///
+/// Includes generation counting to detect use-after-free/ABA bugs during
+/// concurrent reader traversal.
 pub struct VersionArena {
-    chunks: Vec<Vec<Option<PageVersion>>>,
+    chunks: Vec<Vec<ArenaSlot>>,
     free_list: Vec<VersionIdx>,
     high_water: u64,
 }
@@ -87,8 +116,11 @@ impl VersionArena {
     /// Allocate a slot for `version`, returning its index.
     pub fn alloc(&mut self, version: PageVersion) -> VersionIdx {
         if let Some(idx) = self.free_list.pop() {
-            self.chunks[idx.chunk as usize][idx.offset as usize] = Some(version);
-            return idx;
+            let slot = &mut self.chunks[idx.chunk as usize][idx.offset as usize];
+            slot.version = Some(version);
+            // Generation was incremented on free to invalidate old pointers.
+            // We use the current generation for the new allocation.
+            return VersionIdx::new(idx.chunk, idx.offset, slot.generation);
         }
 
         let last_chunk = self.chunks.len() - 1;
@@ -98,12 +130,39 @@ impl VersionArena {
 
         let chunk_idx = self.chunks.len() - 1;
         let offset = self.chunks[chunk_idx].len();
-        self.chunks[chunk_idx].push(Some(version));
+        self.chunks[chunk_idx].push(ArenaSlot::new(version));
         self.high_water += 1;
 
         let chunk_u32 = u32::try_from(chunk_idx).expect("VersionArena chunk index overflow u32");
         let offset_u32 = u32::try_from(offset).expect("VersionArena offset overflow u32");
-        VersionIdx::new(chunk_u32, offset_u32)
+        VersionIdx::new(chunk_u32, offset_u32, 0)
+    }
+
+    /// Remove and return the version at `idx`, making the slot available
+    /// for reuse.
+    ///
+    /// # Panics
+    ///
+    /// Asserts that the slot is currently occupied (catches double-free)
+    /// and that the generation matches (catches stale pointer access).
+    pub fn take(&mut self, idx: VersionIdx) -> PageVersion {
+        let slot = &mut self.chunks[idx.chunk as usize][idx.offset as usize];
+        if slot.generation != idx.generation {
+            panic!(
+                "VersionArena::take: generation mismatch for {idx:?} (slot generation {})",
+                slot.generation
+            );
+        }
+        let version = slot
+            .version
+            .take()
+            .unwrap_or_else(|| panic!("VersionArena::take: double-free of {idx:?}"));
+
+        // Increment generation on free so that any dangling VersionIdx becomes invalid.
+        slot.generation = slot.generation.wrapping_add(1);
+
+        self.free_list.push(idx);
+        version
     }
 
     /// Free the slot at `idx`, making it available for reuse.
@@ -112,27 +171,37 @@ impl VersionArena {
     ///
     /// Asserts that the slot is currently occupied (catches double-free).
     pub fn free(&mut self, idx: VersionIdx) {
-        let slot = &mut self.chunks[idx.chunk as usize][idx.offset as usize];
-        assert!(slot.is_some(), "VersionArena::free: double-free of {idx:?}");
-        *slot = None;
-        self.free_list.push(idx);
+        drop(self.take(idx));
     }
 
     /// Look up a version by index.
+    ///
+    /// Returns `None` if the slot is empty OR if the generation does not match
+    /// (stale pointer).
     #[must_use]
     pub fn get(&self, idx: VersionIdx) -> Option<&PageVersion> {
-        self.chunks
+        let slot = self
+            .chunks
             .get(idx.chunk as usize)?
-            .get(idx.offset as usize)?
-            .as_ref()
+            .get(idx.offset as usize)?;
+
+        if slot.generation != idx.generation {
+            return None;
+        }
+        slot.version.as_ref()
     }
 
     /// Look up a version mutably by index.
     pub fn get_mut(&mut self, idx: VersionIdx) -> Option<&mut PageVersion> {
-        self.chunks
+        let slot = self
+            .chunks
             .get_mut(idx.chunk as usize)?
-            .get_mut(idx.offset as usize)?
-            .as_mut()
+            .get_mut(idx.offset as usize)?;
+
+        if slot.generation != idx.generation {
+            return None;
+        }
+        slot.version.as_mut()
     }
 
     /// Total versions ever allocated (including freed).
@@ -1982,7 +2051,13 @@ mod tests {
         // Reallocate should reuse the freed slot.
         let v2 = make_page_version(2, 2);
         let idx2 = arena.alloc(v2);
-        assert_eq!(idx1, idx2, "freed slot should be reused");
+
+        // Slot reused -> same chunk/offset
+        assert_eq!(idx1.chunk(), idx2.chunk());
+        assert_eq!(idx1.offset(), idx2.offset());
+        // Generation incremented -> idx1 != idx2
+        assert_ne!(idx1.generation(), idx2.generation());
+
         assert_eq!(arena.free_count(), 0);
     }
 

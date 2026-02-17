@@ -7,18 +7,23 @@
 //! - [`prune_page_chain`]: Single-page chain severing and free-list return.
 
 use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::Instant;
 
 use fsqlite_types::{CommitSeq, PageNumber, PageNumberBuildHasher, VersionPointer};
 
 use crate::core_types::{VersionArena, VersionIdx};
+use crate::ebr::{VersionGuard, VersionGuardRegistry};
 
 /// Convert a `VersionPointer` stored in `PageVersion.prev` to a `VersionIdx`.
 #[inline]
 #[allow(clippy::cast_possible_truncation)]
 fn ptr_to_idx(ptr: VersionPointer) -> VersionIdx {
     let raw = ptr.get();
-    VersionIdx::new((raw >> 32) as u32, raw as u32)
+    let offset = (raw & 0xFFF) as u32;
+    let chunk = ((raw >> 12) & 0xF_FFFF) as u32;
+    let generation = (raw >> 32) as u32;
+    VersionIdx::new(chunk, offset, generation)
 }
 
 // ---------------------------------------------------------------------------
@@ -235,6 +240,19 @@ pub fn prune_page_chain(
     arena: &mut VersionArena,
     chain_heads: &mut std::collections::HashMap<PageNumber, VersionIdx, PageNumberBuildHasher>,
 ) -> PruneResult {
+    let guard_registry = Arc::new(VersionGuardRegistry::default());
+    prune_page_chain_with_registry(pgno, horizon, arena, chain_heads, &guard_registry)
+}
+
+/// Variant of [`prune_page_chain`] that reuses a shared EBR guard registry.
+#[must_use]
+pub fn prune_page_chain_with_registry(
+    pgno: PageNumber,
+    horizon: CommitSeq,
+    arena: &mut VersionArena,
+    chain_heads: &mut std::collections::HashMap<PageNumber, VersionIdx, PageNumberBuildHasher>,
+    guard_registry: &Arc<VersionGuardRegistry>,
+) -> PruneResult {
     let Some(&head_idx) = chain_heads.get(&pgno) else {
         return PruneResult {
             freed: 0,
@@ -285,16 +303,15 @@ pub fn prune_page_chain(
     }
 
     // Free everything from tail_idx onward, collecting pruned keys for ARC.
+    let retire_guard = VersionGuard::pin(Arc::clone(guard_registry));
     let mut freed = 0_u32;
     let mut pruned_keys = Vec::new();
     let mut current = tail_idx;
     while let Some(idx) = current {
-        let version = arena.get(idx);
-        let next = version.and_then(|v| v.prev.map(ptr_to_idx));
-        if let Some(v) = version {
-            pruned_keys.push((pgno, v.commit_seq));
-        }
-        arena.free(idx);
+        let retired = arena.take(idx);
+        let next = retired.prev.map(ptr_to_idx);
+        pruned_keys.push((pgno, retired.commit_seq));
+        retire_guard.defer_retire(retired);
         freed += 1;
         current = next;
     }
@@ -356,6 +373,19 @@ pub fn gc_tick(
     arena: &mut VersionArena,
     chain_heads: &mut std::collections::HashMap<PageNumber, VersionIdx, PageNumberBuildHasher>,
 ) -> GcTickResult {
+    let guard_registry = Arc::new(VersionGuardRegistry::default());
+    gc_tick_with_registry(todo, horizon, arena, chain_heads, &guard_registry)
+}
+
+/// Variant of [`gc_tick`] that reuses a shared EBR guard registry.
+#[must_use]
+pub fn gc_tick_with_registry(
+    todo: &mut GcTodo,
+    horizon: CommitSeq,
+    arena: &mut VersionArena,
+    chain_heads: &mut std::collections::HashMap<PageNumber, VersionIdx, PageNumberBuildHasher>,
+    guard_registry: &Arc<VersionGuardRegistry>,
+) -> GcTickResult {
     let start = Instant::now();
     let span = tracing::info_span!(
         target: "fsqlite_mvcc::gc",
@@ -373,7 +403,8 @@ pub fn gc_tick(
 
     while pages_budget > 0 && versions_budget > 0 && !todo.is_empty() {
         let pgno = todo.pop().expect("queue is not empty");
-        let result = prune_page_chain(pgno, horizon, arena, chain_heads);
+        let result =
+            prune_page_chain_with_registry(pgno, horizon, arena, chain_heads, guard_registry);
         versions_freed += result.freed;
         all_pruned_keys.extend(result.pruned_keys);
         pages_pruned += 1;
@@ -425,11 +456,13 @@ pub fn gc_tick(
 mod tests {
     use super::*;
     use crate::core_types::VersionArena;
+    use crate::ebr::{GLOBAL_EBR_METRICS, VersionGuardRegistry};
     use crate::invariants::idx_to_version_pointer;
     use fsqlite_types::{
         CommitSeq, PageData, PageNumber, PageSize, PageVersion, TxnEpoch, TxnId, TxnToken,
     };
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     const BEAD_ZCDN: &str = "bd-zcdn";
 
@@ -661,6 +694,40 @@ mod tests {
         assert!(
             v3.prev.is_none(),
             "bead_id={BEAD_ZCDN} sever point prev should be None"
+        );
+    }
+
+    #[test]
+    fn test_prune_page_chain_uses_ebr_deferral() {
+        let mut arena = VersionArena::new();
+        let pgno = PageNumber::new(4242).unwrap();
+        let (head, _) = build_chain(&mut arena, pgno, 5);
+        let mut chain_heads = HashMap::with_hasher(PageNumberBuildHasher::default());
+        chain_heads.insert(pgno, head);
+        let registry = Arc::new(VersionGuardRegistry::default());
+        let before = GLOBAL_EBR_METRICS.snapshot();
+
+        let result = prune_page_chain_with_registry(
+            pgno,
+            CommitSeq::new(3),
+            &mut arena,
+            &mut chain_heads,
+            &registry,
+        );
+
+        let after = GLOBAL_EBR_METRICS.snapshot();
+        assert_eq!(result.freed, 2, "versions 1 and 2 should be pruned");
+        assert!(
+            after.retirements_deferred_total >= before.retirements_deferred_total + 2,
+            "pruned versions should be deferred via EBR"
+        );
+        assert!(
+            after.guards_pinned_total >= before.guards_pinned_total + 1,
+            "GC prune should pin an EBR guard while retiring versions"
+        );
+        assert!(
+            after.guards_unpinned_total >= before.guards_unpinned_total + 1,
+            "GC prune guard should unpin after retirement deferral"
         );
     }
 

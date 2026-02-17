@@ -241,12 +241,15 @@ pub struct CommittedWriterInfo {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy)]
-struct IndexedTxnRecord {
+struct IndexedTxnRecord<'a> {
     token: TxnToken,
     begin_seq: CommitSeq,
     commit_seq: Option<CommitSeq>,
     source_is_active: bool,
     source_has_in_rw: bool,
+    /// The specific witness key triggering this index entry (if available).
+    /// Used for fine-grained filtering (e.g. Cell tag matching) to avoid false positives.
+    key: Option<&'a WitnessKey>,
 }
 
 fn interval_end(end: Option<CommitSeq>) -> u64 {
@@ -264,12 +267,12 @@ fn intervals_overlap(
     left_begin.get() <= right_end && right_begin.get() <= left_end
 }
 
-fn build_reader_index(
+fn build_reader_index<'a>(
     committing_txn: TxnToken,
-    active_readers: &[&dyn ActiveTxnView],
+    active_readers: &[&'a dyn ActiveTxnView],
     committed_readers: &[CommittedReaderInfo],
-) -> BTreeMap<u32, Vec<IndexedTxnRecord>> {
-    let mut index: BTreeMap<u32, Vec<IndexedTxnRecord>> = BTreeMap::new();
+) -> BTreeMap<u32, Vec<IndexedTxnRecord<'a>>> {
+    let mut index: BTreeMap<u32, Vec<IndexedTxnRecord<'a>>> = BTreeMap::new();
 
     for reader in active_readers {
         if reader.token() == committing_txn || !reader.is_active() {
@@ -285,6 +288,7 @@ fn build_reader_index(
                     commit_seq: None,
                     source_is_active: true,
                     source_has_in_rw: reader.has_in_rw(),
+                    key: Some(key),
                 });
         }
     }
@@ -300,6 +304,7 @@ fn build_reader_index(
                 commit_seq: Some(reader.commit_seq),
                 source_is_active: false,
                 source_has_in_rw: reader.had_in_rw,
+                key: None,
             });
         }
     }
@@ -307,12 +312,12 @@ fn build_reader_index(
     index
 }
 
-fn build_writer_index(
+fn build_writer_index<'a>(
     committing_txn: TxnToken,
-    active_writers: &[&dyn ActiveTxnView],
+    active_writers: &[&'a dyn ActiveTxnView],
     committed_writers: &[CommittedWriterInfo],
-) -> BTreeMap<u32, Vec<IndexedTxnRecord>> {
-    let mut index: BTreeMap<u32, Vec<IndexedTxnRecord>> = BTreeMap::new();
+) -> BTreeMap<u32, Vec<IndexedTxnRecord<'a>>> {
+    let mut index: BTreeMap<u32, Vec<IndexedTxnRecord<'a>>> = BTreeMap::new();
 
     for writer in active_writers {
         if writer.token() == committing_txn || !writer.is_active() {
@@ -328,6 +333,7 @@ fn build_writer_index(
                     commit_seq: None,
                     source_is_active: true,
                     source_has_in_rw: false,
+                    key: Some(key),
                 });
         }
     }
@@ -343,6 +349,7 @@ fn build_writer_index(
                 commit_seq: Some(writer.commit_seq),
                 source_is_active: false,
                 source_has_in_rw: false,
+                key: None,
             });
         }
     }
@@ -380,6 +387,19 @@ pub fn discover_incoming_edges(
             continue;
         };
         for candidate in candidates {
+            // Fine-grained filtering: if both keys are Cells, check tags.
+            // This prevents table-level false positives when multiple transactions
+            // touch different rows in the same table (same btree_root).
+            if let Some(reader_key) = candidate.key {
+                if let (WitnessKey::Cell { tag: t1, .. }, WitnessKey::Cell { tag: t2, .. }) =
+                    (write_key, reader_key)
+                {
+                    if t1 != t2 {
+                        continue;
+                    }
+                }
+            }
+
             let overlaps = intervals_overlap(
                 committing_begin_seq,
                 Some(committing_commit_seq),
@@ -446,6 +466,17 @@ pub fn discover_outgoing_edges(
             continue;
         };
         for candidate in candidates {
+            // Fine-grained filtering: if both keys are Cells, check tags.
+            if let Some(writer_key) = candidate.key {
+                if let (WitnessKey::Cell { tag: t1, .. }, WitnessKey::Cell { tag: t2, .. }) =
+                    (read_key, writer_key)
+                {
+                    if t1 != t2 {
+                        continue;
+                    }
+                }
+            }
+
             let overlaps = intervals_overlap(
                 committing_begin_seq,
                 Some(committing_commit_seq),
@@ -773,6 +804,27 @@ pub fn ssi_validate_and_publish(
                     reason: SsiAbortReason::CommittedPivot,
                     witness,
                 });
+            }
+        }
+    }
+    for edge in &out_edges {
+        if !edge.source_is_active {
+            continue;
+        }
+        // W is active: set W.has_in_rw = true (W now has an incoming edge from T).
+        // If W already has_out_rw: mark W for abort.
+        for writer in active_writers {
+            if writer.token() == edge.to {
+                writer.set_has_in_rw(true);
+                if writer.has_out_rw() {
+                    debug!(
+                        bead_id = "bd-31bo",
+                        pivot = ?edge.to,
+                        "T3 rule: active writer is pivot, marking for abort"
+                    );
+                    writer.set_marked_for_abort(true);
+                }
+                break;
             }
         }
     }

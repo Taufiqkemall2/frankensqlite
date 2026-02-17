@@ -8,7 +8,8 @@
 //! - `resolve_for_txn`: Write-set-aware resolution for transactions.
 //! - [`SerializedWriteMutex`]: Global write mutex for Serialized mode (INV-7).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::{Mutex, RwLock};
@@ -19,7 +20,8 @@ use fsqlite_types::{
 };
 
 use crate::core_types::{Transaction, VersionArena, VersionIdx};
-use crate::gc::{GcTickResult, GcTodo, gc_tick};
+use crate::ebr::VersionGuardRegistry;
+use crate::gc::{GcTickResult, GcTodo, gc_tick_with_registry};
 
 // ---------------------------------------------------------------------------
 // TxnManager — INV-1 (Monotonicity)
@@ -39,9 +41,21 @@ use crate::gc::{GcTickResult, GcTodo, gc_tick};
 ///
 /// `CommitSeq` is assigned only by the commit sequencer under the commit
 /// mutex, producing a strict total order.
+///
+/// # Atomicity Enforcement (INV-6)
+///
+/// To ensure "all-or-nothing" visibility, `CommitSeq`s are tracked as "active"
+/// while the write set is being published. Snapshots are bounded by the
+/// `stable_commit_seq`, which is the watermark below all currently active
+/// (incomplete) commits. This prevents a reader from taking a snapshot that
+/// includes a partial commit from a concurrent writer.
 pub struct TxnManager {
     next_txn_id: AtomicU64,
     next_commit_seq: AtomicU64,
+    /// Set of in-flight commit sequences (allocated but not yet finished).
+    active_commits: Mutex<BTreeSet<u64>>,
+    /// The highest commit sequence C such that all sequences <= C are fully finished.
+    stable_commit_seq: AtomicU64,
 }
 
 impl TxnManager {
@@ -51,6 +65,9 @@ impl TxnManager {
         Self {
             next_txn_id: AtomicU64::new(initial_txn_id),
             next_commit_seq: AtomicU64::new(initial_commit_seq),
+            active_commits: Mutex::new(BTreeSet::new()),
+            // If starting at S, then S-1 is the last stable commit.
+            stable_commit_seq: AtomicU64::new(initial_commit_seq.saturating_sub(1)),
         }
     }
 
@@ -75,14 +92,45 @@ impl TxnManager {
         }
     }
 
-    /// Allocate the next `CommitSeq`.
+    /// Allocate the next `CommitSeq` and mark it as active.
     ///
     /// This must be called only under the commit mutex to maintain
     /// strict ordering. Uses `Release` ordering so that readers using
     /// `Acquire` will see all prior version chain updates.
     pub fn alloc_commit_seq(&self) -> CommitSeq {
+        // We hold a lock to update active_commits atomically with the allocation
+        // to ensure no race allows stable_commit_seq to jump past us.
+        let mut active = self.active_commits.lock();
         let seq = self.next_commit_seq.fetch_add(1, Ordering::Release);
+        active.insert(seq);
         CommitSeq::new(seq)
+    }
+
+    /// Mark a `CommitSeq` as finished (fully published).
+    ///
+    /// This updates the stable visibility watermark.
+    pub fn finish_commit_seq(&self, seq: CommitSeq) {
+        let mut active = self.active_commits.lock();
+        let raw = seq.get();
+        let removed = active.remove(&raw);
+        debug_assert!(removed, "finished commit seq {raw} was not active");
+
+        // The stable sequence is the predecessor of the earliest active commit.
+        // If no commits are active, it is the predecessor of next_commit_seq.
+        let new_stable = if let Some(&min_active) = active.first() {
+            min_active.saturating_sub(1)
+        } else {
+            // No active commits: stable is everything up to next_commit_seq - 1.
+            self.next_commit_seq
+                .load(Ordering::Acquire)
+                .saturating_sub(1)
+        };
+
+        // Update the cached stable sequence.
+        // We use MAX here because multiple threads might call finish concurrently
+        // (if we had fine-grained locking, though currently serialized by caller).
+        // But active_commits lock ensures we see a consistent view.
+        self.stable_commit_seq.store(new_stable, Ordering::Release);
     }
 
     /// The current (not-yet-allocated) `TxnId` counter value.
@@ -91,10 +139,16 @@ impl TxnManager {
         self.next_txn_id.load(Ordering::Acquire)
     }
 
-    /// The current (not-yet-allocated) `CommitSeq` counter value.
+    /// The highest *stable* commit sequence + 1.
+    ///
+    /// Used for snapshot establishment. Returns `S+1` so that `S` is the
+    /// snapshot high watermark. This ensures snapshots only see fully
+    /// completed commits (INV-6).
     #[must_use]
     pub fn current_commit_counter(&self) -> u64 {
-        self.next_commit_seq.load(Ordering::Acquire)
+        self.stable_commit_seq
+            .load(Ordering::Acquire)
+            .saturating_add(1)
     }
 }
 
@@ -177,18 +231,35 @@ pub struct VersionStore {
     /// Visibility intervals keyed by arena index.
     visibility_ranges: RwLock<HashMap<VersionIdx, VersionVisibilityRange>>,
     page_size: PageSize,
+    guard_registry: Arc<VersionGuardRegistry>,
 }
 
 impl VersionStore {
     /// Create an empty version store.
     #[must_use]
     pub fn new(page_size: PageSize) -> Self {
+        Self::new_with_guard_registry(page_size, Arc::new(VersionGuardRegistry::default()))
+    }
+
+    /// Create an empty version store with a shared guard registry.
+    #[must_use]
+    pub fn new_with_guard_registry(
+        page_size: PageSize,
+        guard_registry: Arc<VersionGuardRegistry>,
+    ) -> Self {
         Self {
             arena: RwLock::new(VersionArena::new()),
             chain_heads: RwLock::new(HashMap::with_hasher(PageNumberBuildHasher::default())),
             visibility_ranges: RwLock::new(HashMap::new()),
             page_size,
+            guard_registry,
         }
+    }
+
+    /// Shared EBR guard registry used for transaction and GC retirements.
+    #[must_use]
+    pub fn guard_registry(&self) -> &Arc<VersionGuardRegistry> {
+        &self.guard_registry
     }
 
     /// Publish a committed version into the store.
@@ -249,63 +320,72 @@ impl VersionStore {
         page: PageNumber,
         snapshot: &Snapshot,
     ) -> SnapshotResolveTrace {
-        let heads = self.chain_heads.read();
-        let Some(&head_idx) = heads.get(&page) else {
-            return SnapshotResolveTrace {
-                version_idx: None,
-                versions_traversed: 0,
-            };
-        };
-        drop(heads);
-
-        let arena = self.arena.read();
-        let ranges = self.visibility_ranges.read();
-        let mut current_idx = head_idx;
-        let mut traversed = 0_u64;
-
         loop {
-            let Some(version) = arena.get(current_idx) else {
+            let heads = self.chain_heads.read();
+            let Some(&head_idx) = heads.get(&page) else {
                 return SnapshotResolveTrace {
                     version_idx: None,
-                    versions_traversed: traversed,
+                    versions_traversed: 0,
                 };
             };
-            traversed = traversed.saturating_add(1);
+            drop(heads);
 
-            let range = ranges.get(&current_idx).copied();
-            let begin_ts = range.map_or(version.commit_seq, |window| window.begin_ts);
-            let end_ts = range.and_then(|window| window.end_ts);
-            let is_visible = range.map_or_else(
-                || visible(version, snapshot),
-                |window| window.contains(snapshot.high),
-            );
+            let arena = self.arena.read();
+            let ranges = self.visibility_ranges.read();
+            let mut current_idx = head_idx;
+            let mut traversed = 0_u64;
+            let mut race_detected = false;
 
-            tracing::trace!(
-                page = page.get(),
-                snapshot_ts = snapshot.high.get(),
-                version_commit_ts = version.commit_seq.get(),
-                begin_ts = begin_ts.get(),
-                end_ts = end_ts.map(CommitSeq::get),
-                versions_traversed = traversed,
-                visible = is_visible,
-                "snapshot version visibility check"
-            );
-
-            if is_visible {
-                return SnapshotResolveTrace {
-                    version_idx: Some(current_idx),
-                    versions_traversed: traversed,
+            loop {
+                let Some(version) = arena.get(current_idx) else {
+                    // Race condition: the version was valid when we read the head pointer
+                    // (or prev pointer), but was GC'd before we could read it from the arena.
+                    // This implies a newer version exists (making this one stale).
+                    // We must retry the lookup from the top to find the new head.
+                    race_detected = true;
+                    break;
                 };
+                traversed = traversed.saturating_add(1);
+
+                let range = ranges.get(&current_idx).copied();
+                let begin_ts = range.map_or(version.commit_seq, |window| window.begin_ts);
+                let end_ts = range.and_then(|window| window.end_ts);
+                let is_visible = range.map_or_else(
+                    || visible(version, snapshot),
+                    |window| window.contains(snapshot.high),
+                );
+
+                tracing::trace!(
+                    page = page.get(),
+                    snapshot_ts = snapshot.high.get(),
+                    version_commit_ts = version.commit_seq.get(),
+                    begin_ts = begin_ts.get(),
+                    end_ts = end_ts.map(CommitSeq::get),
+                    versions_traversed = traversed,
+                    visible = is_visible,
+                    "snapshot version visibility check"
+                );
+
+                if is_visible {
+                    return SnapshotResolveTrace {
+                        version_idx: Some(current_idx),
+                        versions_traversed: traversed,
+                    };
+                }
+
+                // Walk backward through the chain via prev pointer.
+                let Some(prev_ptr) = version.prev else {
+                    return SnapshotResolveTrace {
+                        version_idx: None,
+                        versions_traversed: traversed,
+                    };
+                };
+                current_idx = version_pointer_to_idx(prev_ptr);
             }
 
-            // Walk backward through the chain via prev pointer.
-            let Some(prev_ptr) = version.prev else {
-                return SnapshotResolveTrace {
-                    version_idx: None,
-                    versions_traversed: traversed,
-                };
-            };
-            current_idx = version_pointer_to_idx(prev_ptr);
+            if race_detected {
+                continue;
+            }
         }
     }
 
@@ -354,26 +434,56 @@ impl VersionStore {
     #[must_use]
     #[allow(clippy::significant_drop_tightening)]
     pub fn walk_chain(&self, page: PageNumber) -> Vec<PageVersion> {
-        let heads = self.chain_heads.read();
-        let Some(&head_idx) = heads.get(&page) else {
-            return Vec::new();
-        };
-        drop(heads);
+        loop {
+            let heads = self.chain_heads.read();
+            let Some(&head_idx) = heads.get(&page) else {
+                return Vec::new();
+            };
+            drop(heads);
 
-        let arena = self.arena.read();
-        let mut result = Vec::new();
-        let mut current_idx = head_idx;
+            let arena = self.arena.read();
+            let mut result = Vec::new();
+            let mut current_idx = head_idx;
+            let mut race_detected = false;
 
-        while let Some(version) = arena.get(current_idx) {
-            let prev = version.prev;
-            result.push(version.clone());
-            match prev {
-                Some(ptr) => current_idx = version_pointer_to_idx(ptr),
-                None => break,
+            while let Some(version) = arena.get(current_idx) {
+                let prev = version.prev;
+                result.push(version.clone());
+                match prev {
+                    Some(ptr) => current_idx = version_pointer_to_idx(ptr),
+                    None => break,
+                }
             }
-        }
 
-        result
+            // If we exited the loop because `arena.get` returned `None` but we expected
+            // a version (implied by the loop condition failing unexpectedly in the middle
+            // of a chain, though `while let` handles the end-of-chain naturally, it conflates
+            // "end of chain" with "missing version"), we need to be careful.
+            //
+            // Actually, the `while let Some` loop terminates if `arena.get` returns None.
+            // This happens if:
+            // 1. We reached the end (valid termination, but `prev` would be None so loop breaks inside match).
+            // 2. We hit a GC'd version (race).
+            //
+            // To distinguish, we check if the last visited version had a `prev` pointer.
+            // If it did, and the loop terminated, it means `arena.get` failed for that pointer.
+            if let Some(last) = result.last() {
+                if last.prev.is_some() {
+                    // We had a prev pointer but the loop stopped -> race detected.
+                    race_detected = true;
+                }
+            } else {
+                // result is empty, meaning head_idx was invalid (GC'd).
+                // But heads.get returned it. So it's a race.
+                race_detected = true;
+            }
+
+            if race_detected {
+                continue;
+            }
+
+            return result;
+        }
     }
 
     /// The page size used by this store.
@@ -399,7 +509,13 @@ impl VersionStore {
     pub fn gc_tick(&self, todo: &mut GcTodo, horizon: CommitSeq) -> GcTickResult {
         let mut arena = self.arena.write();
         let mut chain_heads = self.chain_heads.write();
-        gc_tick(todo, horizon, &mut arena, &mut chain_heads)
+        gc_tick_with_registry(
+            todo,
+            horizon,
+            &mut arena,
+            &mut chain_heads,
+            self.guard_registry(),
+        )
     }
 
     /// Compute the average version chain length for GC pressure estimation.
@@ -537,23 +653,35 @@ impl std::fmt::Debug for SerializedWriteMutex {
 
 /// Convert a `VersionPointer` (packed u64) to a `VersionIdx`.
 ///
-/// The packing convention: high 32 bits = chunk, low 32 bits = offset.
+/// The packing convention:
+/// - Bits 0..12: offset (12 bits, max 4095)
+/// - Bits 12..32: chunk (20 bits, max 1,048,575)
+/// - Bits 32..64: generation (32 bits)
 #[inline]
 #[must_use]
 fn version_pointer_to_idx(ptr: VersionPointer) -> VersionIdx {
     let raw = ptr.get();
     #[allow(clippy::cast_possible_truncation)]
-    let chunk = (raw >> 32) as u32;
+    let offset = (raw & 0xFFF) as u32;
     #[allow(clippy::cast_possible_truncation)]
-    let offset = raw as u32;
-    VersionIdx::new(chunk, offset)
+    let chunk = ((raw >> 12) & 0xF_FFFF) as u32;
+    #[allow(clippy::cast_possible_truncation)]
+    let generation = (raw >> 32) as u32;
+    VersionIdx::new(chunk, offset, generation)
 }
 
 /// Convert a `VersionIdx` to a `VersionPointer` for storage in `PageVersion.prev`.
 #[inline]
 #[must_use]
 pub fn idx_to_version_pointer(idx: VersionIdx) -> VersionPointer {
-    VersionPointer::new(u64::from(idx.chunk()) << 32 | u64::from(idx.offset()))
+    let chunk = u64::from(idx.chunk());
+    let offset = u64::from(idx.offset());
+    let generation = u64::from(idx.generation());
+
+    assert!(chunk <= 0xF_FFFF, "VersionIdx chunk overflow (max 20 bits)");
+    assert!(offset <= 0xFFF, "VersionIdx offset overflow (max 12 bits)");
+
+    VersionPointer::new((generation << 32) | (chunk << 12) | offset)
 }
 
 // ---------------------------------------------------------------------------

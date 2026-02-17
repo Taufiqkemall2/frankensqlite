@@ -300,9 +300,13 @@ impl TransactionManager {
     /// Create a new transaction manager.
     #[must_use]
     pub fn new(page_size: PageSize) -> Self {
+        let version_guard_registry = Arc::new(VersionGuardRegistry::default());
         Self {
             txn_manager: TxnManager::default(),
-            version_store: VersionStore::new(page_size),
+            version_store: VersionStore::new_with_guard_registry(
+                page_size,
+                Arc::clone(&version_guard_registry),
+            ),
             lock_table: InProcessPageLockTable::new(),
             write_mutex: SerializedWriteMutex::new(),
             shm: SharedMemoryLayout::new(page_size, 128),
@@ -315,7 +319,7 @@ impl TransactionManager {
             busy_timeout_ms: DEFAULT_BUSY_TIMEOUT_MS,
             serialized_writer_lease_secs: DEFAULT_SERIALIZED_WRITER_LEASE_SECS,
             txn_max_duration_ms: 5_000,
-            version_guard_registry: Arc::new(VersionGuardRegistry::default()),
+            version_guard_registry,
         }
     }
 
@@ -890,6 +894,7 @@ impl TransactionManager {
 
         // Publish: allocate commit_seq and publish versions.
         let commit_seq = self.publish_write_set(txn);
+        self.txn_manager.finish_commit_seq(commit_seq);
         txn.commit();
         self.release_all_resources(txn);
 
@@ -994,6 +999,7 @@ impl TransactionManager {
 
         // Step 4: Publish.
         let commit_seq = self.publish_write_set(txn);
+        self.txn_manager.finish_commit_seq(commit_seq);
         txn.commit();
         self.release_all_resources(txn);
 
@@ -1069,11 +1075,15 @@ impl TransactionManager {
         let pages: Vec<PageNumber> = txn.write_set.iter().copied().collect();
         for pgno in pages {
             if let Some(data) = txn.write_set_data.get(&pgno).cloned() {
-                // Look up existing chain head for prev pointer.
-                let prev = self
-                    .version_store
-                    .chain_head(pgno)
-                    .map(crate::invariants::idx_to_version_pointer);
+                // Look up existing chain head for prev pointer and retire the
+                // superseded committed version through the transaction guard.
+                let prev_idx = self.version_store.chain_head(pgno);
+                if let Some(old_idx) = prev_idx
+                    && let Some(old_version) = self.version_store.get_version(old_idx)
+                {
+                    let _ = txn.defer_retire_version(old_version);
+                }
+                let prev = prev_idx.map(crate::invariants::idx_to_version_pointer);
 
                 let version = PageVersion {
                     pgno,
@@ -1278,6 +1288,7 @@ impl std::fmt::Debug for TransactionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ebr::GLOBAL_EBR_METRICS;
     use std::hint::black_box;
     use std::io;
     use std::sync::Arc;
@@ -5067,6 +5078,29 @@ mod tests {
     }
 
     #[test]
+    fn test_publish_write_set_retires_superseded_version_via_ebr() {
+        GLOBAL_EBR_METRICS.reset();
+        let mgr = TransactionManager::new(PageSize::new(4096).unwrap());
+        let pgno = PageNumber::new(6_001).expect("valid page number");
+
+        let mut txn1 = mgr.begin(BeginKind::Concurrent).unwrap();
+        mgr.write_page(&mut txn1, pgno, test_data(0x11)).unwrap();
+        let _ = mgr.commit(&mut txn1).unwrap();
+
+        let before = GLOBAL_EBR_METRICS.snapshot();
+        let mut txn2 = mgr.begin(BeginKind::Concurrent).unwrap();
+        mgr.write_page(&mut txn2, pgno, test_data(0x22)).unwrap();
+        let _ = mgr.commit(&mut txn2).unwrap();
+        let after = GLOBAL_EBR_METRICS.snapshot();
+
+        assert!(
+            after.retirements_deferred_total >= before.retirements_deferred_total + 1,
+            "publishing a replacement version should defer retirement of previous chain head"
+        );
+        assert_eq!(mgr.version_guard_registry().active_guard_count(), 0);
+    }
+
+    #[test]
     fn test_version_guard_defer_retire_returns_false_without_guard() {
         let txn = Transaction::new(
             TxnId::new(1).expect("TxnId::new(1) should be valid"),
@@ -5106,13 +5140,13 @@ mod tests {
         // Commit (which unpins the guard and flushes).
         let _ = mgr.commit(&mut txn);
 
-        // Drive epoch advancement to trigger deferred drops.
-        for _ in 0..64 {
+        // Drive epoch advancement to trigger deferred drops. Under parallel
+        // test load, grace-period completion can take longer than a fixed
+        // small iteration count, so poll until a bounded deadline.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while drop_count.load(AtomicOrdering::SeqCst) == 0 && Instant::now() < deadline {
             let g = epoch::pin();
             g.flush();
-            if drop_count.load(AtomicOrdering::SeqCst) > 0 {
-                break;
-            }
             std::thread::yield_now();
         }
 
