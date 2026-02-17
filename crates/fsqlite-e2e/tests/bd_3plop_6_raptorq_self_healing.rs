@@ -111,9 +111,7 @@ fn build_group(
 }
 
 /// Build all groups for the simulated database.
-fn build_all_groups(
-    original_pages: &[Vec<u8>],
-) -> Vec<(DbFecGroupMeta, Vec<(u32, Vec<u8>)>)> {
+fn build_all_groups(original_pages: &[Vec<u8>]) -> Vec<(DbFecGroupMeta, Vec<(u32, Vec<u8>)>)> {
     (0..NUM_GROUPS)
         .map(|g| {
             let start_pgno = g * GROUP_K + 1;
@@ -153,10 +151,7 @@ fn apply_corruption(data: &mut [u8], variant: CorruptionVariant, rng: &mut StdRn
 
 /// Select corruption targets: `percent`% of total pages, each assigned a
 /// round-robin corruption variant to guarantee all four variants appear.
-fn select_corruption_targets(
-    percent: f64,
-    rng: &mut StdRng,
-) -> Vec<(u32, CorruptionVariant)> {
+fn select_corruption_targets(percent: f64, rng: &mut StdRng) -> Vec<(u32, CorruptionVariant)> {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let count = ((f64::from(TOTAL_PAGES)) * percent / 100.0).ceil() as usize;
 
@@ -202,7 +197,10 @@ fn test_bd_3plop_6_five_percent_corruption_fully_repaired() {
     let mut corrupted_pages = original_pages.clone();
     let targets = select_corruption_targets(5.0, &mut rng);
     let corrupt_count = targets.len();
-    assert!(corrupt_count >= 10, "5% of {TOTAL_PAGES} must be >= 10, got {corrupt_count}");
+    assert!(
+        corrupt_count >= 10,
+        "5% of {TOTAL_PAGES} must be >= 10, got {corrupt_count}"
+    );
 
     // Verify all four variants appear.
     let variant_names: BTreeSet<&str> = targets
@@ -231,11 +229,7 @@ fn test_bd_3plop_6_five_percent_corruption_fully_repaired() {
 
     // Apply corruption.
     for &(pgno, variant) in &targets {
-        apply_corruption(
-            &mut corrupted_pages[(pgno - 1) as usize],
-            variant,
-            &mut rng,
-        );
+        apply_corruption(&mut corrupted_pages[(pgno - 1) as usize], variant, &mut rng);
     }
 
     // Confirm corruption actually changed the pages.
@@ -260,9 +254,7 @@ fn test_bd_3plop_6_five_percent_corruption_fully_repaired() {
 
         // Closure reads from the corrupted snapshot (other pages may also be corrupt).
         let corrupted_snapshot = corrupted_pages.clone();
-        let all_page_data = |p: u32| -> Vec<u8> {
-            corrupted_snapshot[(p - 1) as usize].clone()
-        };
+        let all_page_data = |p: u32| -> Vec<u8> { corrupted_snapshot[(p - 1) as usize].clone() };
 
         let outcome = detect_and_repair_page(
             pgno,
@@ -355,20 +347,12 @@ fn test_bd_3plop_6_five_percent_corruption_fully_repaired() {
         let pgnos: Vec<u32> = (start..start + GROUP_K).collect();
 
         let repaired_snapshot = repaired_pages.clone();
-        let all_page_data = |p: u32| -> Vec<u8> {
-            repaired_snapshot[(p - 1) as usize].clone()
-        };
-        let expected_blake3s = |p: u32| -> [u8; 32] {
-            blake3_page_checksum(&original_pages[(p - 1) as usize])
-        };
+        let all_page_data = |p: u32| -> Vec<u8> { repaired_snapshot[(p - 1) as usize].clone() };
+        let expected_blake3s =
+            |p: u32| -> [u8; 32] { blake3_page_checksum(&original_pages[(p - 1) as usize]) };
 
-        let outcomes = detect_and_repair_pages(
-            &pgnos,
-            meta,
-            &all_page_data,
-            &expected_blake3s,
-            repair_syms,
-        );
+        let outcomes =
+            detect_and_repair_pages(&pgnos, meta, &all_page_data, &expected_blake3s, repair_syms);
 
         for (i, outcome) in outcomes.iter().enumerate() {
             let pgno = start + u32::try_from(i).expect("index fits u32");
@@ -386,9 +370,7 @@ fn test_bd_3plop_6_five_percent_corruption_fully_repaired() {
         let expected_blake3 = blake3_page_checksum(&original_pages[(pgno - 1) as usize]);
 
         let repaired_snapshot = repaired_pages.clone();
-        let all_page_data = |p: u32| -> Vec<u8> {
-            repaired_snapshot[(p - 1) as usize].clone()
-        };
+        let all_page_data = |p: u32| -> Vec<u8> { repaired_snapshot[(p - 1) as usize].clone() };
 
         let outcome = detect_and_repair_page(
             pgno,
@@ -442,11 +424,7 @@ fn test_bd_3plop_6_ten_percent_corruption_margin() {
     );
 
     for &(pgno, variant) in &targets {
-        apply_corruption(
-            &mut corrupted_pages[(pgno - 1) as usize],
-            variant,
-            &mut rng,
-        );
+        apply_corruption(&mut corrupted_pages[(pgno - 1) as usize], variant, &mut rng);
     }
 
     // Every corrupted page must be repairable.
@@ -457,9 +435,7 @@ fn test_bd_3plop_6_ten_percent_corruption_margin() {
         let expected_blake3 = blake3_page_checksum(&original_pages[(pgno - 1) as usize]);
 
         let corrupted_snapshot = corrupted_pages.clone();
-        let all_page_data = |p: u32| -> Vec<u8> {
-            corrupted_snapshot[(p - 1) as usize].clone()
-        };
+        let all_page_data = |p: u32| -> Vec<u8> { corrupted_snapshot[(p - 1) as usize].clone() };
 
         let outcome = detect_and_repair_page(
             pgno,

@@ -1591,8 +1591,7 @@ impl VfsFile for UnixFile {
                 Self::unlock_with_level(&mut self.lock_level, &mut info, file.as_ref(), original)?;
                 return Err(FrankenError::Busy);
             }
-            if info.n_reserved == 0 && !posix_lock(&*file, libc::F_WRLCK, RESERVED_BYTE, 1)?
-            {
+            if info.n_reserved == 0 && !posix_lock(&*file, libc::F_WRLCK, RESERVED_BYTE, 1)? {
                 Self::unlock_with_level(&mut self.lock_level, &mut info, file.as_ref(), original)?;
                 return Err(FrankenError::Busy);
             }

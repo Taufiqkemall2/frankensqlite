@@ -18,7 +18,9 @@ use fsqlite_wal::{
     CheckpointMode as WalCheckpointMode, CheckpointState, CheckpointTarget, WalFile,
     execute_checkpoint,
 };
-use tracing::debug;
+use tracing::{debug, warn};
+
+use crate::wal_fec_adapter::{FecCommitHook, FecCommitResult};
 
 // ---------------------------------------------------------------------------
 // WalBackendAdapter: WalFile → WalBackend
@@ -31,13 +33,31 @@ use tracing::debug;
 /// `fsqlite-wal`.
 pub struct WalBackendAdapter<F: VfsFile> {
     wal: WalFile<F>,
+    /// Optional FEC commit hook for encoding repair symbols on commit.
+    fec_hook: Option<FecCommitHook>,
+    /// Accumulated FEC commit results (for later sidecar persistence).
+    fec_pending: Vec<FecCommitResult>,
 }
 
 impl<F: VfsFile> WalBackendAdapter<F> {
-    /// Wrap an existing [`WalFile`] in the adapter.
+    /// Wrap an existing [`WalFile`] in the adapter (FEC disabled).
     #[must_use]
     pub fn new(wal: WalFile<F>) -> Self {
-        Self { wal }
+        Self {
+            wal,
+            fec_hook: None,
+            fec_pending: Vec::new(),
+        }
+    }
+
+    /// Wrap an existing [`WalFile`] with an FEC commit hook.
+    #[must_use]
+    pub fn with_fec_hook(wal: WalFile<F>, hook: FecCommitHook) -> Self {
+        Self {
+            wal,
+            fec_hook: Some(hook),
+            fec_pending: Vec::new(),
+        }
     }
 
     /// Consume the adapter and return the inner [`WalFile`].
@@ -55,6 +75,26 @@ impl<F: VfsFile> WalBackendAdapter<F> {
     /// Mutably borrow the inner [`WalFile`].
     pub fn inner_mut(&mut self) -> &mut WalFile<F> {
         &mut self.wal
+    }
+
+    /// Take any pending FEC commit results for sidecar persistence.
+    pub fn take_fec_pending(&mut self) -> Vec<FecCommitResult> {
+        std::mem::take(&mut self.fec_pending)
+    }
+
+    /// Whether FEC encoding is active.
+    #[must_use]
+    pub fn fec_enabled(&self) -> bool {
+        self.fec_hook
+            .as_ref()
+            .is_some_and(FecCommitHook::is_enabled)
+    }
+
+    /// Discard buffered FEC pages (e.g. on transaction rollback).
+    pub fn fec_discard(&mut self) {
+        if let Some(hook) = &mut self.fec_hook {
+            hook.discard_buffered();
+        }
     }
 }
 
@@ -77,7 +117,30 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         db_size_if_commit: u32,
     ) -> Result<()> {
         self.wal
-            .append_frame(cx, page_number, page_data, db_size_if_commit)
+            .append_frame(cx, page_number, page_data, db_size_if_commit)?;
+
+        // Feed the frame to the FEC hook.  On commit, it encodes repair
+        // symbols and stores them for later sidecar persistence.
+        if let Some(hook) = &mut self.fec_hook {
+            match hook.on_frame(cx, page_number, page_data, db_size_if_commit) {
+                Ok(Some(result)) => {
+                    debug!(
+                        pages = result.page_numbers.len(),
+                        k_source = result.k_source,
+                        symbols = result.symbols.len(),
+                        "FEC commit group encoded"
+                    );
+                    self.fec_pending.push(result);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    // FEC encoding failure is non-fatal — log and continue.
+                    warn!(error = %e, "FEC encoding failed; commit proceeds without repair symbols");
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn read_page(&mut self, cx: &Cx, page_number: u32) -> Result<Option<Vec<u8>>> {
@@ -134,6 +197,26 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
 
         // Execute the checkpoint.
         let result = execute_checkpoint(cx, &mut self.wal, to_wal_mode(mode), state, &mut target)?;
+
+        // Checkpoint-aware FEC lifecycle: once frames are backfilled to the
+        // database file, their FEC symbols are no longer needed.  Clear
+        // pending FEC results for the checkpointed range.
+        if result.frames_backfilled > 0 {
+            let drained = self.fec_pending.len();
+            self.fec_pending.clear();
+            if drained > 0 {
+                debug!(
+                    drained_groups = drained,
+                    frames_backfilled = result.frames_backfilled,
+                    "FEC symbols reclaimed after checkpoint"
+                );
+            }
+        }
+
+        // If the WAL was fully reset, also discard any buffered FEC pages.
+        if result.wal_was_reset {
+            self.fec_discard();
+        }
 
         Ok(CheckpointResult {
             total_frames,
