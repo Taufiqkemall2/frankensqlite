@@ -886,6 +886,7 @@ where
             freelist_snapshot: inner.freelist.clone(),
             allocated_from_freelist_snapshot: self.allocated_from_freelist.clone(),
         });
+        drop(inner);
         Ok(())
     }
 
@@ -933,7 +934,7 @@ where
                 .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
             inner.next_page = entry.next_page_snapshot;
-            inner.freelist = entry.freelist_snapshot.clone();
+            inner.freelist.clone_from(&entry.freelist_snapshot);
         }
 
         // Discard savepoints created after the named one, but keep

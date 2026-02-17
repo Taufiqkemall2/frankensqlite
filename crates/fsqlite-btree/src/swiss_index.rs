@@ -115,24 +115,19 @@ where
         self.inner.iter_mut()
     }
 
-    /// Consumes the map, returning an iterator over the key-value pairs.
-    pub fn into_iter(self) -> hashbrown::hash_map::IntoIter<K, V> {
-        self.inner.into_iter()
-    }
-
     // --- Observability Helpers ---
 
     #[inline]
     fn record_probe(&self) {
         record_swiss_probe();
-        let _span = span!(
+        let span = span!(
             Level::TRACE,
             "hash_probe",
             probes = 1, // Simplified: hashbrown handles collision resolution internally
             items = self.len(),
             load_factor = self.load_factor_milli() as f64 / 1000.0
         );
-        _span.in_scope(|| {
+        span.in_scope(|| {
             // Trace log is handled by the span entry/exit if configured
         });
     }
@@ -153,13 +148,49 @@ where
     }
 }
 
+impl<K, V> IntoIterator for SwissIndex<K, V>
+where
+    K: Eq + Hash,
+{
+    type Item = (K, V);
+    type IntoIter = hashbrown::hash_map::IntoIter<K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.inner.into_iter()
+    }
+}
+
+impl<'a, K, V> IntoIterator for &'a SwissIndex<K, V>
+where
+    K: Eq + Hash,
+{
+    type Item = (&'a K, &'a V);
+    type IntoIter = hashbrown::hash_map::Iter<'a, K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'a, K, V> IntoIterator for &'a mut SwissIndex<K, V>
+where
+    K: Eq + Hash,
+{
+    type Item = (&'a K, &'a mut V);
+    type IntoIter = hashbrown::hash_map::IterMut<'a, K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+
 impl<K, V> FromIterator<(K, V)> for SwissIndex<K, V>
 where
     K: Eq + Hash,
 {
     fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
         let inner = HashMap::from_iter(iter);
-        let index = SwissIndex { inner };
+        let index = Self { inner };
         index.update_load_factor();
         index
     }

@@ -10770,15 +10770,13 @@ fn project_join_column(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CommitSeq, Connection, InProcessPageLockTable, MvccPageIo, Row, SchemaEpoch, Snapshot,
-    };
+    use super::{CommitSeq, Connection, InProcessPageLockTable, Row, SchemaEpoch, Snapshot};
     use fsqlite_ast::Statement;
     use fsqlite_error::FrankenError;
+    use fsqlite_types::PageNumber;
     use fsqlite_types::cx::Cx;
     use fsqlite_types::opcode::{Opcode, P4};
     use fsqlite_types::value::SqliteValue;
-    use fsqlite_types::{PageData, PageNumber};
 
     fn row_values(row: &Row) -> Vec<SqliteValue> {
         row.values().to_vec()
@@ -15463,17 +15461,9 @@ mod tests {
 
     #[test]
     fn test_mvcc_page_io_write_acquires_lock() {
-        // Test that writing through MvccPageIo acquires page locks.
-        use fsqlite_btree::cursor::PageWriter;
-        use fsqlite_mvcc::ConcurrentHandle;
-        use fsqlite_pager::traits::TransactionMode;
-        use fsqlite_types::{Snapshot, TxnEpoch, TxnId, TxnToken};
-
-        let conn = Connection::open(":memory:").unwrap();
-        let cx = Cx::new();
-
-        // Begin a pager transaction.
-        let mut txn = conn.pager.begin(&cx, TransactionMode::Deferred).unwrap();
+        // Test that writing through concurrent_write_page acquires page locks.
+        use fsqlite_mvcc::{ConcurrentHandle, concurrent_write_page};
+        use fsqlite_types::{PageData, Snapshot, TxnEpoch, TxnId, TxnToken};
 
         // Create MVCC state.
         let snapshot = Snapshot::new(CommitSeq::ZERO, SchemaEpoch::new(0));
@@ -15482,13 +15472,10 @@ mod tests {
         let mut handle = ConcurrentHandle::new(snapshot, txn_token);
         let lock_table = InProcessPageLockTable::new();
 
-        // Create MvccPageIo wrapper.
-        let mut mvcc_io = MvccPageIo::new(&mut *txn, &mut handle, &lock_table, session_id);
-
         // Write to a page.
         let page_no = PageNumber::new(2).unwrap();
-        let data = vec![0u8; 4096];
-        mvcc_io.write_page(&cx, page_no, &data).unwrap();
+        let data = PageData::from_vec(vec![0u8; 4096]);
+        concurrent_write_page(&mut handle, &lock_table, session_id, page_no, data).unwrap();
 
         // Verify page lock is held.
         assert!(handle.held_locks().contains(&page_no));
@@ -15500,16 +15487,9 @@ mod tests {
 
     #[test]
     fn test_mvcc_page_io_read_own_writes() {
-        // Test that reading through MvccPageIo sees own writes.
-        use fsqlite_btree::cursor::{PageReader, PageWriter};
-        use fsqlite_mvcc::ConcurrentHandle;
-        use fsqlite_pager::traits::TransactionMode;
-        use fsqlite_types::{Snapshot, TxnEpoch, TxnId, TxnToken};
-
-        let conn = Connection::open(":memory:").unwrap();
-        let cx = Cx::new();
-
-        let mut txn = conn.pager.begin(&cx, TransactionMode::Deferred).unwrap();
+        // Test that reading through concurrent write/read sees own writes.
+        use fsqlite_mvcc::{ConcurrentHandle, concurrent_read_page, concurrent_write_page};
+        use fsqlite_types::{PageData, Snapshot, TxnEpoch, TxnId, TxnToken};
 
         let snapshot = Snapshot::new(CommitSeq::ZERO, SchemaEpoch::new(0));
         let session_id = 1;
@@ -15517,71 +15497,74 @@ mod tests {
         let mut handle = ConcurrentHandle::new(snapshot, txn_token);
         let lock_table = InProcessPageLockTable::new();
 
-        let mut mvcc_io = MvccPageIo::new(&mut *txn, &mut handle, &lock_table, session_id);
-
         // Write distinctive data to a page.
         let page_no = PageNumber::new(2).unwrap();
         let mut data = vec![0u8; 4096];
         data[0..4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
-        mvcc_io.write_page(&cx, page_no, &data).unwrap();
+        concurrent_write_page(
+            &mut handle,
+            &lock_table,
+            session_id,
+            page_no,
+            PageData::from_vec(data),
+        )
+        .unwrap();
 
         // Read the same page - should see our write.
-        let read_data = mvcc_io.read_page(&cx, page_no).unwrap();
-        assert_eq!(&read_data[0..4], &[0xDE, 0xAD, 0xBE, 0xEF]);
+        let read_data = concurrent_read_page(&handle, page_no).unwrap();
+        assert_eq!(&read_data.as_bytes()[0..4], &[0xDE, 0xAD, 0xBE, 0xEF]);
     }
 
     #[test]
     fn test_mvcc_page_io_write_conflict_returns_busy() {
         // Test that two concurrent sessions writing same page conflicts.
-        // Use two separate connections since the simple pager is single-writer.
-        use fsqlite_btree::cursor::PageWriter;
-        use fsqlite_mvcc::ConcurrentHandle;
-        use fsqlite_pager::traits::TransactionMode;
-        use fsqlite_types::{Snapshot, TxnEpoch, TxnId, TxnToken};
-
-        let conn1 = Connection::open(":memory:").unwrap();
-        let conn2 = Connection::open(":memory:").unwrap();
-        let cx = Cx::new();
+        use fsqlite_mvcc::{ConcurrentHandle, MvccError, concurrent_write_page};
+        use fsqlite_types::{PageData, Snapshot, TxnEpoch, TxnId, TxnToken};
 
         // Single shared lock table for both sessions - this is the key for testing.
         let lock_table = InProcessPageLockTable::new();
 
         // Session 1 writes to page 2.
-        let mut txn1 = conn1.pager.begin(&cx, TransactionMode::Deferred).unwrap();
         let snapshot1 = Snapshot::new(CommitSeq::ZERO, SchemaEpoch::new(0));
         let session_id_1 = 1;
         let txn_token_1 = TxnToken::new(TxnId::new(session_id_1).unwrap(), TxnEpoch::new(1));
         let mut handle1 = ConcurrentHandle::new(snapshot1, txn_token_1);
 
-        {
-            let mut mvcc_io1 = MvccPageIo::new(&mut *txn1, &mut handle1, &lock_table, session_id_1);
-            let page_no = PageNumber::new(2).unwrap();
-            let data = vec![0u8; 4096];
-            mvcc_io1.write_page(&cx, page_no, &data).unwrap();
-        }
+        let page_no = PageNumber::new(2).unwrap();
+        concurrent_write_page(
+            &mut handle1,
+            &lock_table,
+            session_id_1,
+            page_no,
+            PageData::from_vec(vec![0u8; 4096]),
+        )
+        .unwrap();
 
         // Session 2 tries to write to the same page - should fail with Busy.
-        let mut txn2 = conn2.pager.begin(&cx, TransactionMode::Deferred).unwrap();
         let snapshot2 = Snapshot::new(CommitSeq::ZERO, SchemaEpoch::new(0));
         let session_id_2 = 2;
         let txn_token_2 = TxnToken::new(TxnId::new(session_id_2).unwrap(), TxnEpoch::new(2));
         let mut handle2 = ConcurrentHandle::new(snapshot2, txn_token_2);
 
-        {
-            let mut mvcc_io2 = MvccPageIo::new(&mut *txn2, &mut handle2, &lock_table, session_id_2);
-            let page_no = PageNumber::new(2).unwrap();
-            let data = vec![0u8; 4096];
-            let result = mvcc_io2.write_page(&cx, page_no, &data);
-            assert!(matches!(result, Err(FrankenError::Busy)));
-        }
+        let result = concurrent_write_page(
+            &mut handle2,
+            &lock_table,
+            session_id_2,
+            page_no,
+            PageData::from_vec(vec![0u8; 4096]),
+        );
+        assert!(matches!(result, Err(MvccError::Busy)));
 
         // Session 2 can write to a different page.
-        {
-            let mut mvcc_io2 = MvccPageIo::new(&mut *txn2, &mut handle2, &lock_table, session_id_2);
-            let page_no = PageNumber::new(3).unwrap();
-            let data = vec![0u8; 4096];
-            mvcc_io2.write_page(&cx, page_no, &data).unwrap();
-        }
+        let page_no_3 = PageNumber::new(3).unwrap();
+        concurrent_write_page(
+            &mut handle2,
+            &lock_table,
+            session_id_2,
+            page_no_3,
+            PageData::from_vec(vec![0u8; 4096]),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -19054,49 +19037,44 @@ mod schema_loading_tests {
 
     #[test]
     fn test_busy_error_on_page_lock() {
-        // Two concurrent sessions: second trying to write a page locked by first → SQLITE_BUSY.
-        // This is already tested by test_mvcc_concurrent_page_lock_conflict but we verify
-        // the error type is FrankenError::Busy (not BusySnapshot).
-        use fsqlite_btree::cursor::PageWriter;
-        use fsqlite_mvcc::ConcurrentHandle;
-        use fsqlite_pager::traits::TransactionMode;
-        use fsqlite_types::{Snapshot, TxnEpoch, TxnId, TxnToken};
+        // Two concurrent sessions: second trying to write a page locked by first → MvccError::Busy.
+        use fsqlite_mvcc::{ConcurrentHandle, MvccError, concurrent_write_page};
+        use fsqlite_types::{PageData, Snapshot, TxnEpoch, TxnId, TxnToken};
 
-        let conn = Connection::open(":memory:").unwrap();
-        let cx = Cx::new();
-
-        let mut txn1 = conn.pager.begin(&cx, TransactionMode::Deferred).unwrap();
         let snapshot1 = Snapshot::new(CommitSeq::ZERO, SchemaEpoch::new(0));
         let txn_token_1 = TxnToken::new(TxnId::new(1).unwrap(), TxnEpoch::new(1));
         let mut handle1 = ConcurrentHandle::new(snapshot1, txn_token_1);
         let lock_table = InProcessPageLockTable::new();
 
         // Session 1 writes page 2.
-        {
-            let mut mvcc_io1 = MvccPageIo::new(&mut *txn1, &mut handle1, &lock_table, 1);
-            let page_no = PageNumber::new(2).unwrap();
-            let data = vec![0u8; 4096];
-            mvcc_io1.write_page(&cx, page_no, &data).unwrap();
-        }
+        let page_no = PageNumber::new(2).unwrap();
+        concurrent_write_page(
+            &mut handle1,
+            &lock_table,
+            1,
+            page_no,
+            PageData::from_vec(vec![0u8; 4096]),
+        )
+        .unwrap();
 
-        // Session 2 tries to write same page → BUSY (not BUSY_SNAPSHOT).
-        let mut txn2 = conn.pager.begin(&cx, TransactionMode::Deferred).unwrap();
+        // Session 2 tries to write same page → Busy.
         let snapshot2 = Snapshot::new(CommitSeq::ZERO, SchemaEpoch::new(0));
         let txn_token_2 = TxnToken::new(TxnId::new(2).unwrap(), TxnEpoch::new(1));
         let mut handle2 = ConcurrentHandle::new(snapshot2, txn_token_2);
 
-        {
-            let mut mvcc_io2 = MvccPageIo::new(&mut *txn2, &mut handle2, &lock_table, 2);
-            let page_no = PageNumber::new(2).unwrap();
-            let data = vec![0u8; 4096];
-            let result = mvcc_io2.write_page(&cx, page_no, &data);
+        let result = concurrent_write_page(
+            &mut handle2,
+            &lock_table,
+            2,
+            page_no,
+            PageData::from_vec(vec![0u8; 4096]),
+        );
 
-            // Must be Busy, not BusySnapshot.
-            assert!(
-                matches!(result, Err(FrankenError::Busy)),
-                "expected FrankenError::Busy, got {result:?}"
-            );
-        }
+        // Must be Busy, not BusySnapshot.
+        assert!(
+            matches!(result, Err(MvccError::Busy)),
+            "expected MvccError::Busy, got {result:?}"
+        );
     }
 
     #[test]
@@ -19104,7 +19082,7 @@ mod schema_loading_tests {
         // Two concurrent transactions write the same page; second to commit gets BUSY_SNAPSHOT.
         // This tests the Connection-level error propagation from MVCC layer.
         use fsqlite_mvcc::{ConcurrentHandle, concurrent_commit};
-        use fsqlite_types::{Snapshot, TxnEpoch, TxnId, TxnToken};
+        use fsqlite_types::{PageData, Snapshot, TxnEpoch, TxnId, TxnToken};
 
         let _conn = Connection::open(":memory:").unwrap();
 

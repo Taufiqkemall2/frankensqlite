@@ -49,6 +49,8 @@ fn oltp_indexes() -> Vec<IndexInfo> {
             unique: false,
             n_pages: 100,
             source: StatsSource::Analyze,
+            partial_where: None,
+            expression_columns: vec![],
         },
         IndexInfo {
             name: "idx_orders_product_id".to_owned(),
@@ -57,6 +59,8 @@ fn oltp_indexes() -> Vec<IndexInfo> {
             unique: false,
             n_pages: 80,
             source: StatsSource::Analyze,
+            partial_where: None,
+            expression_columns: vec![],
         },
         IndexInfo {
             name: "idx_users_email".to_owned(),
@@ -65,6 +69,8 @@ fn oltp_indexes() -> Vec<IndexInfo> {
             unique: true,
             n_pages: 30,
             source: StatsSource::Analyze,
+            partial_where: None,
+            expression_columns: vec![],
         },
     ]
 }
@@ -385,6 +391,8 @@ fn access_path_selection_logged_in_contract() {
         unique: false,
         n_pages: 100,
         source: StatsSource::Analyze,
+        partial_where: None,
+        expression_columns: vec![],
     }];
 
     // Without WHERE → full table scan.

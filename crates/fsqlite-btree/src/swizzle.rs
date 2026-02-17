@@ -53,9 +53,8 @@ impl PageTemperature {
         matches!(
             (self, next),
             (Self::Hot, Self::Cooling)
-                | (Self::Cooling, Self::Hot)
+                | (Self::Cooling | Self::Cold, Self::Hot)
                 | (Self::Cooling, Self::Cold)
-                | (Self::Cold, Self::Hot)
         )
     }
 

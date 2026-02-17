@@ -1575,6 +1575,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
             let depth = cursor.stack.len();
             let needs_anchor = depth > 1 && top.header.cell_count == 1;
 
+            #[allow(clippy::items_after_statements)]
             enum Anchor {
                 Rowid(i64),
                 Key(Vec<u8>),

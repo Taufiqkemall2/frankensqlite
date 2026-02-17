@@ -660,14 +660,12 @@ mod tests {
                 n_pages: 100,
                 n_rows: 10_000,
                 source: StatsSource::Analyze,
-                detailed: None,
             },
             TableStats {
                 name: "orders".to_owned(),
                 n_pages: 500,
                 n_rows: 100_000,
                 source: StatsSource::Heuristic,
-                detailed: None,
             },
         ]
     }
@@ -680,6 +678,8 @@ mod tests {
             unique: false,
             n_pages: 50,
             source: StatsSource::Analyze,
+            partial_where: None,
+            expression_columns: vec![],
         }]
     }
 
@@ -988,7 +988,6 @@ mod tests {
             n_pages: 42,
             n_rows: 1000,
             source: StatsSource::Analyze,
-            detailed: None,
         };
         let summary = TableStatsSummary::from(&ts);
         assert_eq!(summary.name, "foo");

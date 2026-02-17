@@ -1111,6 +1111,7 @@ pub fn bm25_score(
 /// Evaluate an FTS5 expression against the inverted index, returning
 /// matching document IDs.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn evaluate_expr(index: &InvertedIndex, expr: &Fts5Expr) -> Vec<i64> {
     match expr {
         Fts5Expr::Term(term) => {
@@ -1198,6 +1199,7 @@ pub fn evaluate_expr(index: &InvertedIndex, expr: &Fts5Expr) -> Vec<i64> {
                         // Check subsequent words
                         let mut match_found = true;
                         for (offset, word) in words.iter().enumerate().skip(1) {
+                            #[allow(clippy::cast_possible_truncation)]
                             let target_pos = offset as u32; // implied start_pos = 0
                             let found = index.get_postings(&word.to_lowercase()).iter().any(|p| {
                                 p.docid == first_p.docid

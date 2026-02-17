@@ -479,6 +479,7 @@ impl VfsFile for MemoryFile {
         if storage.data.capacity() > 1024 && size < storage.data.capacity() / 2 {
             storage.data.shrink_to_fit();
         }
+        drop(storage);
         Ok(())
     }
 

@@ -608,7 +608,7 @@ pub fn best_access_path(
                 let base_rows = if idx.unique && eq_columns == idx.columns.len() {
                     1.0
                 } else {
-                    let divisor = 10.0_f64.powi(eq_columns as i32);
+                    let divisor = 10.0_f64.powi(i32::try_from(eq_columns).unwrap_or(i32::MAX));
                     (table.n_rows as f64 / divisor).max(1.0)
                 };
                 let (rows, sel) = if has_trailing_range {
@@ -1903,6 +1903,8 @@ mod tests {
             unique,
             n_pages,
             source: StatsSource::Heuristic,
+            partial_where: None,
+            expression_columns: vec![],
         }
     }
 
@@ -2428,7 +2430,6 @@ mod tests {
             n_pages: 500,
             n_rows: 10000,
             source: StatsSource::Analyze,
-            detailed: None,
         };
         assert_eq!(table.source, StatsSource::Analyze);
         let ap = best_access_path(&table, &[], &[], None);
@@ -3006,6 +3007,8 @@ mod tests {
             unique: false,
             n_pages: 10,
             source: StatsSource::Heuristic,
+            partial_where: None,
+            expression_columns: vec![],
         };
         let terms = [eq_term("a")];
         let ap = best_access_path(&table, &[idx], &terms, None);
@@ -3130,7 +3133,6 @@ mod tests {
                     n_pages,
                     n_rows,
                     source: StatsSource::Heuristic,
-                    detailed: None,
                 })
                 .boxed()
         }
@@ -3154,6 +3156,8 @@ mod tests {
                     unique,
                     n_pages,
                     source: StatsSource::Heuristic,
+                    partial_where: None,
+                    expression_columns: vec![],
                 })
                 .boxed()
         }
@@ -3346,6 +3350,8 @@ mod tests {
                     unique: false,
                     n_pages: table.n_pages / 5 + 1,
                     source: StatsSource::Heuristic,
+                    partial_where: None,
+                    expression_columns: vec![],
                 };
 
                 let with_index_path = best_access_path(

@@ -261,7 +261,7 @@ fn posix_lock(file: &impl AsFd, lock_type: i32, start: u64, len: u64) -> Result<
 
 /// Release a POSIX advisory lock.
 fn posix_unlock(file: &impl AsFd, start: u64, len: u64) -> Result<()> {
-    let ok = posix_lock(file, libc::F_UNLCK.into(), start, len)?;
+    let ok = posix_lock(file, libc::F_UNLCK, start, len)?;
     debug_assert!(ok, "F_UNLCK should never fail with EAGAIN");
     Ok(())
 }
@@ -903,7 +903,7 @@ impl UnixFile {
         }
 
         let total_shared = slot_state.shared_holders.values().copied().sum::<u32>();
-        if total_shared == 0 && !posix_lock(&*info.file, libc::F_RDLCK.into(), lock_byte, 1)? {
+        if total_shared == 0 && !posix_lock(&*info.file, libc::F_RDLCK, lock_byte, 1)? {
             Self::log_lock_conflict(
                 SQLITE_SHM_DMS_SLOT,
                 "shared",
@@ -992,7 +992,7 @@ impl UnixFile {
         }
 
         let total_shared = slot_state.shared_holders.values().copied().sum::<u32>();
-        if total_shared == 0 && !posix_lock(&*info.file, libc::F_RDLCK.into(), lock_byte, 1)? {
+        if total_shared == 0 && !posix_lock(&*info.file, libc::F_RDLCK, lock_byte, 1)? {
             Self::log_lock_conflict(slot, "shared", Self::observed_mode(slot_state), read_marks);
             return Err(FrankenError::Busy);
         }
@@ -1051,7 +1051,7 @@ impl UnixFile {
         }
 
         slot_state.shared_holders.remove(&self.shm_owner_id);
-        if !posix_lock(&*info.file, libc::F_WRLCK.into(), lock_byte, 1)? {
+        if !posix_lock(&*info.file, libc::F_WRLCK, lock_byte, 1)? {
             Self::log_lock_conflict(
                 slot,
                 "exclusive",
@@ -1147,7 +1147,7 @@ impl UnixFile {
         slot_state.exclusive_owner = None;
         if slot_state.shared_holders.is_empty() {
             posix_unlock(&*info.file, lock_byte, 1)?;
-        } else if !posix_lock(&*info.file, libc::F_RDLCK.into(), lock_byte, 1)? {
+        } else if !posix_lock(&*info.file, libc::F_RDLCK, lock_byte, 1)? {
             Self::log_lock_conflict(
                 slot,
                 "unlock-exclusive",
@@ -1410,7 +1410,7 @@ impl UnixFile {
 
             if info.n_exclusive == 0 {
                 if info.n_shared > 0 {
-                    let ok = posix_lock(file, libc::F_RDLCK.into(), SHARED_FIRST, SHARED_SIZE)?;
+                    let ok = posix_lock(file, libc::F_RDLCK, SHARED_FIRST, SHARED_SIZE)?;
                     debug_assert!(
                         ok,
                         "downgrading an exclusive lock back to shared should not block"
@@ -1562,7 +1562,7 @@ impl VfsFile for UnixFile {
             }
 
             // Check PENDING byte is not write-locked (blocks new readers).
-            if !posix_lock(&*file, libc::F_RDLCK.into(), PENDING_BYTE, 1)? {
+            if !posix_lock(&*file, libc::F_RDLCK, PENDING_BYTE, 1)? {
                 return Err(FrankenError::Busy);
             }
 
@@ -1572,7 +1572,7 @@ impl VfsFile for UnixFile {
                 debug_assert_eq!(info.n_exclusive, 0);
 
                 // Step 2: Acquire read lock on SHARED range.
-                if !posix_lock(&*file, libc::F_RDLCK.into(), SHARED_FIRST, SHARED_SIZE)? {
+                if !posix_lock(&*file, libc::F_RDLCK, SHARED_FIRST, SHARED_SIZE)? {
                     posix_unlock(&*file, PENDING_BYTE, 1)?;
                     return Err(FrankenError::Busy);
                 }
@@ -1591,7 +1591,7 @@ impl VfsFile for UnixFile {
                 Self::unlock_with_level(&mut self.lock_level, &mut info, file.as_ref(), original)?;
                 return Err(FrankenError::Busy);
             }
-            if info.n_reserved == 0 && !posix_lock(&*file, libc::F_WRLCK.into(), RESERVED_BYTE, 1)?
+            if info.n_reserved == 0 && !posix_lock(&*file, libc::F_WRLCK, RESERVED_BYTE, 1)?
             {
                 Self::unlock_with_level(&mut self.lock_level, &mut info, file.as_ref(), original)?;
                 return Err(FrankenError::Busy);
@@ -1607,7 +1607,7 @@ impl VfsFile for UnixFile {
                 Self::unlock_with_level(&mut self.lock_level, &mut info, file.as_ref(), original)?;
                 return Err(FrankenError::Busy);
             }
-            if info.n_pending == 0 && !posix_lock(&*file, libc::F_WRLCK.into(), PENDING_BYTE, 1)? {
+            if info.n_pending == 0 && !posix_lock(&*file, libc::F_WRLCK, PENDING_BYTE, 1)? {
                 Self::unlock_with_level(&mut self.lock_level, &mut info, file.as_ref(), original)?;
                 return Err(FrankenError::Busy);
             }
@@ -1623,7 +1623,7 @@ impl VfsFile for UnixFile {
                 return Err(FrankenError::Busy);
             }
             if info.n_exclusive == 0
-                && !posix_lock(&*file, libc::F_WRLCK.into(), SHARED_FIRST, SHARED_SIZE)?
+                && !posix_lock(&*file, libc::F_WRLCK, SHARED_FIRST, SHARED_SIZE)?
             {
                 Self::unlock_with_level(&mut self.lock_level, &mut info, file.as_ref(), original)?;
                 return Err(FrankenError::Busy);
@@ -1659,7 +1659,7 @@ impl VfsFile for UnixFile {
         drop(info);
 
         // Probe the RESERVED byte with a non-blocking F_WRLCK.
-        let can_lock = posix_lock(&*file, libc::F_WRLCK.into(), RESERVED_BYTE, 1)?;
+        let can_lock = posix_lock(&*file, libc::F_WRLCK, RESERVED_BYTE, 1)?;
         if can_lock {
             // We got it, meaning nobody else has it. Release immediately.
             posix_unlock(&*file, RESERVED_BYTE, 1)?;

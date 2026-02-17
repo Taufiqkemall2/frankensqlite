@@ -749,24 +749,15 @@ fn test_rfc6330_rand_determinism_and_range() {
     }
 }
 
-/// RFC 6330 degree function: output >= 1 and <= min(W, L).
+/// RFC 6330 degree function: output >= 1 and <= 30 (table-driven).
 #[test]
 fn test_rfc6330_deg_bounds() {
     let _ = BEAD_ID;
-    let cases = [
-        (0u32, 10, 15),
-        (100_000, 50, 60),
-        (500_000, 100, 120),
-        (1_000_000, 200, 230),
-    ];
-    for &(v, w, l) in &cases {
-        let d = rfc6330::deg(v, w, l);
-        assert!(d >= 1, "deg({v}, {w}, {l}) = {d}, must be >= 1");
-        assert!(
-            d <= w.min(l),
-            "deg({v}, {w}, {l}) = {d}, must be <= {}",
-            w.min(l)
-        );
+    let cases = [0u32, 100_000, 500_000, 1_000_000];
+    for &v in &cases {
+        let d = rfc6330::deg(v);
+        assert!(d >= 1, "deg({v}) = {d}, must be >= 1");
+        assert!(d <= 30, "deg({v}) = {d}, must be <= 30");
     }
 }
 

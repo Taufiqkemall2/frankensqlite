@@ -1070,19 +1070,19 @@ mod tests {
         // This test ensures that the frame offset calculation logic doesn't overflow on 32-bit systems
         // by verifying it uses u64 arithmetic.
 
-        let page_size: usize = 4096;
+        let page_size: u64 = 4096;
         let wal_header_size: u64 = 32;
         let wal_frame_header_size: u64 = 24;
-        let frame_size = wal_frame_header_size + page_size as u64;
+        let frame_size = wal_frame_header_size + page_size;
 
         // An index that would overflow if multiplied by frame_size in u32/usize(32-bit).
         // u32::MAX is 4,294,967,295.
         // frame_size is 4120.
         // 4,294,967,295 / 4120 = 1,042,467.
         // So index 1,042,468 causes overflow in 32-bit if not cast to u64.
-        let large_index: usize = 1_042_468;
+        let large_index: u64 = 1_042_468;
 
-        let idx_u64 = large_index as u64;
+        let idx_u64 = large_index;
         let expected_offset = wal_header_size + idx_u64 * frame_size;
 
         // Replicate logic from WalFile::frame_offset
