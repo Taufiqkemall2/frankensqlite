@@ -474,6 +474,39 @@ impl Batch {
         })
     }
 
+    /// Build a batch from pre-built columns and metadata.
+    ///
+    /// Used by vectorized operators (e.g. project) that construct batches from
+    /// existing column data without row-level conversion.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when column lengths don't match `row_count` or the
+    /// selection vector contains out-of-bounds indices.
+    pub fn from_columns(
+        columns: Vec<Column>,
+        row_count: usize,
+        capacity: usize,
+        selection: SelectionVector,
+    ) -> Result<Self, BatchFormatError> {
+        for column in &columns {
+            if column.len() != row_count {
+                return Err(BatchFormatError::new(format!(
+                    "column '{}' has {} rows but batch has {row_count}",
+                    column.spec.name,
+                    column.len()
+                )));
+            }
+        }
+        selection.validate_against_row_count(row_count)?;
+        Ok(Self {
+            row_count,
+            capacity,
+            columns,
+            selection,
+        })
+    }
+
     /// Replace the active row mask for this batch.
     ///
     /// # Errors
@@ -880,6 +913,91 @@ fn finalize_builders(
         columns.push(column);
     }
     Ok(columns)
+}
+
+// ── Vectorized Execution Metrics (bd-1rw.5) ─────────────────────────────────
+
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+/// Total rows processed by vectorized operators.
+static FSQLITE_VECTORIZED_ROWS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// SIMD utilization gauge in milli-percent (e.g., 850 = 85.0% SIMD path).
+///
+/// Updated by operators: ratio of operations taking SIMD path vs scalar.
+static FSQLITE_VECTORIZED_SIMD_UTILIZATION_MILLI: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of vectorized execution metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VectorizedMetricsSnapshot {
+    /// Total rows processed by vectorized operators.
+    pub vectorized_rows_total: u64,
+    /// SIMD utilization in milli-percent (0–1000).
+    pub simd_utilization_milli: u64,
+}
+
+/// Read a point-in-time snapshot of vectorized execution metrics.
+#[must_use]
+pub fn vectorized_metrics_snapshot() -> VectorizedMetricsSnapshot {
+    VectorizedMetricsSnapshot {
+        vectorized_rows_total: FSQLITE_VECTORIZED_ROWS_TOTAL.load(AtomicOrdering::Relaxed),
+        simd_utilization_milli: FSQLITE_VECTORIZED_SIMD_UTILIZATION_MILLI
+            .load(AtomicOrdering::Relaxed),
+    }
+}
+
+/// Reset vectorized metrics to zero (tests/diagnostics).
+pub fn reset_vectorized_metrics() {
+    FSQLITE_VECTORIZED_ROWS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VECTORIZED_SIMD_UTILIZATION_MILLI.store(0, AtomicOrdering::Relaxed);
+}
+
+/// Record that `row_count` rows were processed by a vectorized operator.
+pub fn record_vectorized_rows(row_count: u64) {
+    FSQLITE_VECTORIZED_ROWS_TOTAL.fetch_add(row_count, AtomicOrdering::Relaxed);
+}
+
+/// Update the SIMD utilization gauge (milli-percent, 0–1000).
+pub fn set_vectorized_simd_utilization(milli: u64) {
+    FSQLITE_VECTORIZED_SIMD_UTILIZATION_MILLI.store(milli, AtomicOrdering::Relaxed);
+}
+
+/// Detect whether the current CPU supports AVX2 (runtime check).
+#[must_use]
+pub fn simd_avx2_available() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// Detect whether the current CPU supports SSE2 (runtime check).
+#[must_use]
+pub fn simd_sse2_available() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        is_x86_feature_detected!("sse2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// Determine the best SIMD path label for tracing.
+#[must_use]
+pub fn simd_path_label() -> &'static str {
+    if simd_avx2_available() {
+        "avx2"
+    } else if simd_sse2_available() {
+        "sse2"
+    } else {
+        "scalar"
+    }
 }
 
 #[cfg(test)]
