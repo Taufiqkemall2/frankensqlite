@@ -75,6 +75,7 @@ impl Lcg {
         (self.next_u64() >> 11) as f64 / ((1_u64 << 53) as f64)
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn next_usize(&mut self, max: usize) -> usize {
         if max == 0 {
             return 0;
@@ -446,14 +447,9 @@ fn random_status(rng: &mut Lcg, exclude: ObligationStatus) -> ObligationStatus {
 
 fn classify_flip_severity(pre: GateDecision, post: GateDecision) -> CounterexampleSeverity {
     match (pre, post) {
-        // Pass → Fail is expected when degrading obligations.
-        (GateDecision::Pass, GateDecision::Fail) => CounterexampleSeverity::Low,
         // Fail → Pass after random mutations is suspicious.
         (GateDecision::Fail, GateDecision::Pass) => CounterexampleSeverity::Medium,
-        // Conditional transitions are informational.
-        (_, GateDecision::Conditional) | (GateDecision::Conditional, _) => {
-            CounterexampleSeverity::Low
-        }
+        // All other transitions (Pass→Fail, conditional transitions, etc.) are informational.
         _ => CounterexampleSeverity::Low,
     }
 }
@@ -531,7 +527,7 @@ fn run_drift_injection_phase(rng: &mut Lcg, config: &AdversarialConfig) -> Vec<C
         }
 
         // Phase 2: inject regime shift.
-        let injection_rate = 0.1 + trial_rng.next_f64() * 0.5; // 10-60%
+        let injection_rate = trial_rng.next_f64().mul_add(0.5, 0.1); // 10-60%
         for _ in 0..200 {
             monitor.observe_category(cat, trial_rng.next_bool(injection_rate));
         }
@@ -696,7 +692,7 @@ fn run_monotonicity_phase(rng: &mut Lcg, config: &AdversarialConfig) -> Vec<Coun
     let baseline_report = evaluate_gate(&catalog, &config.gate_config);
 
     // Create an improved catalog: flip all Pending→Verified.
-    let mut improved = catalog.clone();
+    let mut improved = catalog;
     for inv in improved.invariants.values_mut() {
         for obl in &mut inv.obligations {
             if obl.status == ObligationStatus::Pending {
@@ -821,10 +817,10 @@ mod tests {
         // With 100 trials and random mutations, we should find some flips.
         // (The canonical catalog has pending obligations, so flipping them
         // to verified may change the global decision.)
-        assert!(
-            !cxs.is_empty() || true,
-            "obligation flip phase should run without panic"
-        );
+        // Phase runs without panic; counterexamples are optional.
+        #[allow(clippy::overly_complex_bool_expr)]
+        let phase_ok = !cxs.is_empty() || true;
+        assert!(phase_ok, "obligation flip phase should run without panic");
     }
 
     #[test]

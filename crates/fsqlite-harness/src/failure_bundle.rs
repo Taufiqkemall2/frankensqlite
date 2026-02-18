@@ -444,6 +444,7 @@ impl Default for FailureBundleBuilder {
 /// # Errors
 ///
 /// Returns `Err` if any required field is empty.
+#[allow(clippy::too_many_arguments)]
 pub fn bundle_assertion_failure(
     bundle_id: &str,
     run_id: &str,
@@ -497,6 +498,7 @@ pub fn bundle_assertion_failure(
 /// # Errors
 ///
 /// Returns `Err` if any required field is empty.
+#[allow(clippy::too_many_arguments)]
 pub fn bundle_divergence_failure(
     bundle_id: &str,
     run_id: &str,
@@ -713,6 +715,7 @@ pub struct E2eAdoptionItem {
 /// Complements the unit-test diagnostics contract (D-1 through D-8) with
 /// E2E-specific requirements for structured failure output.
 #[must_use]
+#[allow(clippy::literal_string_with_formatting_args)]
 pub fn build_e2e_adoption_checklist() -> Vec<E2eAdoptionItem> {
     vec![
         E2eAdoptionItem {

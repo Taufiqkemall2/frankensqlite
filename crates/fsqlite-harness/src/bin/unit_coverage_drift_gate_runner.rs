@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -126,6 +127,7 @@ struct Config {
 }
 
 impl Config {
+    #[allow(clippy::too_many_lines)]
     fn parse() -> Result<Self, String> {
         let mut workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
@@ -254,9 +256,9 @@ fn is_critical_category(category: FeatureCategory) -> bool {
     )
 }
 
-fn index_evidence<'a>(
-    entries: &'a [NoMockEvidenceEntry],
-) -> BTreeMap<(String, String), Vec<&'a NoMockEvidenceEntry>> {
+fn index_evidence(
+    entries: &[NoMockEvidenceEntry],
+) -> BTreeMap<(String, String), Vec<&NoMockEvidenceEntry>> {
     let mut index: BTreeMap<(String, String), Vec<&NoMockEvidenceEntry>> = BTreeMap::new();
     for entry in entries {
         index
@@ -320,13 +322,11 @@ fn discover_unit_shard_summaries(
     let mut summaries: BTreeMap<String, UnitShardSummary> = BTreeMap::new();
 
     for file in json_files {
-        let content = match fs::read_to_string(&file) {
-            Ok(content) => content,
-            Err(_) => continue,
+        let Ok(content) = fs::read_to_string(&file) else {
+            continue;
         };
-        let parsed = match serde_json::from_str::<UnitShardSummary>(&content) {
-            Ok(parsed) => parsed,
-            Err(_) => continue,
+        let Ok(parsed) = serde_json::from_str::<UnitShardSummary>(&content) else {
+            continue;
         };
         if parsed.schema_version != SHARD_SUMMARY_SCHEMA_VERSION {
             continue;
@@ -337,6 +337,7 @@ fn discover_unit_shard_summaries(
     Ok(summaries)
 }
 
+#[allow(clippy::too_many_lines)]
 fn build_report(config: &Config) -> Result<UnitCoverageDriftReport, String> {
     fs::create_dir_all(&config.run_dir).map_err(|error| {
         format!(
@@ -570,79 +571,81 @@ fn build_report(config: &Config) -> Result<UnitCoverageDriftReport, String> {
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_human_summary(report: &UnitCoverageDriftReport) -> String {
     let mut out = String::new();
     out.push_str("# Unit Coverage Drift Gate\n\n");
-    out.push_str(&format!("- bead_id: `{}`\n", report.bead_id));
-    out.push_str(&format!("- schema_version: `{}`\n", report.schema_version));
-    out.push_str(&format!(
-        "- generated_unix_ms: `{}`\n",
-        report.generated_unix_ms
-    ));
-    out.push_str(&format!(
-        "- total_matrix_tests: `{}`\n",
-        report.total_matrix_tests
-    ));
-    out.push_str(&format!(
-        "- total_matrix_invariants: `{}`\n",
+    let _ = writeln!(out, "- bead_id: `{}`", report.bead_id);
+    let _ = writeln!(out, "- schema_version: `{}`", report.schema_version);
+    let _ = writeln!(out, "- generated_unix_ms: `{}`", report.generated_unix_ms);
+    let _ = writeln!(out, "- total_matrix_tests: `{}`", report.total_matrix_tests);
+    let _ = writeln!(
+        out,
+        "- total_matrix_invariants: `{}`",
         report.total_matrix_invariants
-    ));
-    out.push_str(&format!(
-        "- total_evidence_entries: `{}`\n",
+    );
+    let _ = writeln!(
+        out,
+        "- total_evidence_entries: `{}`",
         report.total_evidence_entries
-    ));
-    out.push_str(&format!(
-        "- unit_matrix_overall_fill_pct: `{:.4}`\n",
+    );
+    let _ = writeln!(
+        out,
+        "- unit_matrix_overall_fill_pct: `{:.4}`",
         report.unit_matrix_overall_fill_pct
-    ));
-    out.push_str(&format!(
-        "- evidence_coverage_pct: `{:.4}`\n",
+    );
+    let _ = writeln!(
+        out,
+        "- evidence_coverage_pct: `{:.4}`",
         report.evidence_coverage_pct
-    ));
-    out.push_str(&format!(
-        "- critical_invariants_with_real_evidence: `{}/{}`\n",
+    );
+    let _ = writeln!(
+        out,
+        "- critical_invariants_with_real_evidence: `{}/{}`",
         report.critical_invariants_with_real_evidence, report.critical_invariant_count
-    ));
-    out.push_str(&format!(
-        "- required_lane_count: `{}`\n",
+    );
+    let _ = writeln!(
+        out,
+        "- required_lane_count: `{}`",
         report.required_lane_count
-    ));
-    out.push_str(&format!(
-        "- discovered_lane_count: `{}`\n",
+    );
+    let _ = writeln!(
+        out,
+        "- discovered_lane_count: `{}`",
         report.discovered_lane_count
-    ));
-    out.push_str(&format!(
-        "- required_gap_count: `{}`\n",
-        report.required_gap_count
-    ));
-    out.push_str(&format!(
-        "- informational_gap_count: `{}`\n",
+    );
+    let _ = writeln!(out, "- required_gap_count: `{}`", report.required_gap_count);
+    let _ = writeln!(
+        out,
+        "- informational_gap_count: `{}`",
         report.informational_gap_count
-    ));
-    out.push_str(&format!("- overall_pass: `{}`\n", report.overall_pass));
+    );
+    let _ = writeln!(out, "- overall_pass: `{}`", report.overall_pass);
 
     if !report.per_crate_lane_deltas.is_empty() {
         out.push_str("\n## Per-Crate Delta (Required Lane Failures)\n");
         for delta in &report.per_crate_lane_deltas {
-            out.push_str(&format!(
-                "- crate=`{}` failure_count={} expected={} delta={} lanes={:?}\n",
+            let _ = writeln!(
+                out,
+                "- crate=`{}` failure_count={} expected={} delta={} lanes={:?}",
                 delta.crate_name,
                 delta.failure_count,
                 delta.expected_failure_count,
                 delta.delta_vs_expected,
                 delta.failing_lanes
-            ));
+            );
         }
     }
 
     if !report.invariant_impact_hints.is_empty() {
         out.push_str("\n## Invariant Impact Hints\n");
         for hint in &report.invariant_impact_hints {
-            out.push_str(&format!(
-                "- test_id=`{}` category=`{}` invariant=\"{}\" impact=\"{}\"\n",
+            let _ = writeln!(
+                out,
+                "- test_id=`{}` category=`{}` invariant=\"{}\" impact=\"{}\"",
                 hint.matrix_test_id, hint.category, hint.invariant, hint.impact
-            ));
-            out.push_str(&format!("  remediation: {}\n", hint.remediation));
+            );
+            let _ = writeln!(out, "  remediation: {}", hint.remediation);
         }
     }
 
@@ -655,25 +658,26 @@ fn render_human_summary(report: &UnitCoverageDriftReport) -> String {
 
     out.push_str("\n## Gap Diff\n");
     for gap in &report.gaps {
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "- reason=`{}` severity=`{:?}`",
             gap.reason, gap.severity
-        ));
+        );
         if let Some(test_id) = &gap.matrix_test_id {
-            out.push_str(&format!(" test_id=`{test_id}`"));
+            let _ = write!(out, " test_id=`{test_id}`");
         }
         if let Some(category) = &gap.category {
-            out.push_str(&format!(" category=`{category}`"));
+            let _ = write!(out, " category=`{category}`");
         }
         if let Some(invariant) = &gap.invariant {
-            out.push_str(&format!(" invariant=\"{invariant}\""));
+            let _ = write!(out, " invariant=\"{invariant}\"");
         }
         if let Some(lane_id) = &gap.lane_id {
-            out.push_str(&format!(" lane_id=`{lane_id}`"));
+            let _ = write!(out, " lane_id=`{lane_id}`");
         }
-        out.push_str(&format!(" details=\"{}\"", gap.details));
+        let _ = write!(out, " details=\"{}\"", gap.details);
         out.push('\n');
-        out.push_str(&format!("  remediation: {}\n", gap.remediation));
+        let _ = writeln!(out, "  remediation: {}", gap.remediation);
     }
 
     out

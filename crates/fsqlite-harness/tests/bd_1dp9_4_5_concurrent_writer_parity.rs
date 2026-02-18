@@ -66,6 +66,7 @@ fn all_critical_areas_pass() {
 }
 
 #[test]
+#[allow(clippy::float_cmp)]
 fn parity_score_full() {
     let report = assess_concurrent_writer_parity(&ConcurrentWriterParityConfig::default());
     assert_eq!(report.parity_score, 1.0, "bead_id={BEAD_ID} case=score");
@@ -108,6 +109,7 @@ fn summary_is_informative() {
 }
 
 #[test]
+#[allow(clippy::float_cmp)]
 fn report_json_roundtrip() {
     let report = assess_concurrent_writer_parity(&ConcurrentWriterParityConfig::default());
     let json = report.to_json().expect("serialize");

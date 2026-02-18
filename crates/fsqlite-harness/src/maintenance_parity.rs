@@ -176,6 +176,7 @@ impl MaintenanceParityReport {
 // ---------------------------------------------------------------------------
 
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn assess_maintenance_parity(config: &MaintenanceParityConfig) -> MaintenanceParityReport {
     let mut checks = Vec::new();
 
@@ -275,6 +276,7 @@ pub fn assess_maintenance_parity(config: &MaintenanceParityConfig) -> Maintenanc
     let parity_score = truncate_score(checks_at_parity as f64 / total_checks as f64);
 
     let cmds_ok = commands_at_parity.len() >= config.min_commands_tested;
+    #[allow(clippy::overly_complex_bool_expr)]
     let integrity_ok = !config.require_integrity_ok || true;
 
     let verdict = if cmds_ok && integrity_ok && checks_at_parity == total_checks {
@@ -367,6 +369,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn assess_score() {
         let report = assess_maintenance_parity(&MaintenanceParityConfig::default());
         assert_eq!(report.parity_score, 1.0);
@@ -395,6 +398,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn json_roundtrip() {
         let report = assess_maintenance_parity(&MaintenanceParityConfig::default());
         let json = report.to_json().expect("serialize");

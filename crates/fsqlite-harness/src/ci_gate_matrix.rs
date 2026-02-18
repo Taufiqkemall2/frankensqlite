@@ -1309,8 +1309,8 @@ mod tests {
         } else {
             ContractBeadStatus::FailMissingEvidence
         };
-        let failing_beads = if contract_passed { 0 } else { 1 };
-        let missing_evidence_beads = if contract_passed { 0 } else { 1 };
+        let failing_beads = usize::from(!contract_passed);
+        let missing_evidence_beads = usize::from(!contract_passed);
         let disposition = match (base_gate_passed, contract_passed) {
             (true, true) => EnforcementDisposition::Allowed,
             (false, true) => EnforcementDisposition::BlockedByBaseGate,
@@ -1354,6 +1354,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn flake_budget_all_pass() {
         let policy = FlakeBudgetPolicy::canonical();
         let outcomes = vec![TestOutcome::Pass; 100];
@@ -1444,6 +1445,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn flake_budget_empty_stream() {
         let policy = FlakeBudgetPolicy::canonical();
         let result = evaluate_flake_budget(CiLane::Unit, &[], &policy);
@@ -2005,7 +2007,7 @@ mod tests {
         let json = serde_json::to_string_pretty(&manifest).unwrap();
         let deserialized: ArtifactManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.artifacts.len(), 2);
-        assert_eq!(deserialized.gate_passed, true);
+        assert!(deserialized.gate_passed);
     }
 
     #[test]

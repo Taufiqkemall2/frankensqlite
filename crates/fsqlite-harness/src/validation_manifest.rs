@@ -221,7 +221,7 @@ pub struct ScenarioCoverageGap {
 }
 
 /// Scenario coverage drift status.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScenarioCoverageDriftStatus {
     /// Status schema version.
     pub schema_version: String,
@@ -520,16 +520,11 @@ pub fn build_validation_manifest_bundle(
         config,
         &gate_records,
         preliminary_overall_outcome,
-        &[
-            coverage_uri.clone(),
-            invariant_uri.clone(),
-            scenario_uri.clone(),
-            no_mock_uri.clone(),
-        ],
+        &[coverage_uri, invariant_uri, scenario_uri, no_mock_uri],
     );
     let log_events_jsonl = crate::log_schema_validator::encode_jsonl_stream(&log_events)
         .map_err(|error| format!("manifest_log_events_encode_failed: {error}"))?;
-    gate_artifacts.insert(log_events_uri.clone(), log_events_jsonl.clone());
+    gate_artifacts.insert(log_events_uri.clone(), log_events_jsonl);
 
     let log_validation = validate_event_stream(&log_events);
     let shell_profile = e2e_log_schema::build_shell_script_log_profile();
@@ -568,7 +563,7 @@ pub fn build_validation_manifest_bundle(
         outcome: logging_outcome(&logging_conformance),
         timestamp_unix_ms: config.generated_unix_ms,
         commit_sha: config.commit_sha.clone(),
-        artifact_uris: vec![logging_uri.clone(), log_events_uri.clone()],
+        artifact_uris: vec![logging_uri, log_events_uri],
         summary: format!(
             "logging conformance: profile_errors={} schema_errors={} warnings={} shell_errors={} shell_warnings={}",
             logging_conformance.profile_errors.len(),
@@ -691,7 +686,7 @@ fn unique_sorted_strings(mut values: Vec<String>) -> Vec<String> {
     values
 }
 
-fn normalize_gate_records(gates: &mut Vec<GateRecord>) {
+fn normalize_gate_records(gates: &mut [GateRecord]) {
     for gate in gates.iter_mut() {
         gate.artifact_uris = unique_sorted_strings(std::mem::take(&mut gate.artifact_uris));
     }
@@ -862,9 +857,9 @@ fn is_critical_category(category: FeatureCategory) -> bool {
     )
 }
 
-fn index_evidence<'a>(
-    entries: &'a [NoMockEvidenceEntry],
-) -> BTreeMap<(String, String), Vec<&'a NoMockEvidenceEntry>> {
+fn index_evidence(
+    entries: &[NoMockEvidenceEntry],
+) -> BTreeMap<(String, String), Vec<&NoMockEvidenceEntry>> {
     let mut index: BTreeMap<(String, String), Vec<&NoMockEvidenceEntry>> = BTreeMap::new();
     for entry in entries {
         index

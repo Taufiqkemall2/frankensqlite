@@ -66,6 +66,7 @@ fn all_mandatory_preserved() {
 }
 
 #[test]
+#[allow(clippy::float_cmp)]
 fn parity_score_full() {
     let report = assess_isomorphism_proof(&IsomorphismProofConfig::default());
     assert_eq!(report.parity_score, 1.0, "bead_id={BEAD_ID} case=score");
@@ -114,6 +115,7 @@ fn summary_is_informative() {
 }
 
 #[test]
+#[allow(clippy::float_cmp)]
 fn report_json_roundtrip() {
     let report = assess_isomorphism_proof(&IsomorphismProofConfig::default());
     let json = report.to_json().expect("serialize");

@@ -652,7 +652,8 @@ impl SoakExecutor {
         if !self.fault_config.profiles.is_empty() && self.fault_config.injection_probability > 0.0 {
             let fault_rand = (rand >> 32) as f64 / f64::from(u32::MAX);
             if fault_rand < self.fault_config.injection_probability {
-                let idx = (rand as usize) % self.fault_config.profiles.len();
+                #[allow(clippy::cast_possible_truncation)]
+                let idx = rand as usize % self.fault_config.profiles.len();
                 let profile = &self.fault_config.profiles[idx];
                 return (
                     false,

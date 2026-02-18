@@ -497,15 +497,14 @@ pub fn run_forensics_workflow(
 
     let text_report = render_text_report(&query_result);
 
-    let verdict = if index_run_count < config.min_runs {
-        ForensicsVerdict::Fail
-    } else if critical_event_count > config.max_critical_events {
-        ForensicsVerdict::Fail
-    } else if high_event_count > 0 {
-        ForensicsVerdict::Warning
-    } else {
-        ForensicsVerdict::Pass
-    };
+    let verdict =
+        if index_run_count < config.min_runs || critical_event_count > config.max_critical_events {
+            ForensicsVerdict::Fail
+        } else if high_event_count > 0 {
+            ForensicsVerdict::Warning
+        } else {
+            ForensicsVerdict::Pass
+        };
 
     let summary = format!(
         "Forensics: {} runs indexed, {} matched, {} critical, {} high, {} correlations",

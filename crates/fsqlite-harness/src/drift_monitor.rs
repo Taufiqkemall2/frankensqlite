@@ -167,10 +167,12 @@ pub struct RunbookEntry {
 // Per-category monitor state
 // ---------------------------------------------------------------------------
 
-/// Per-category e-process state (lightweight, no external dependency on
+/// Per-category e-process state.
+///
+/// Lightweight, no external dependency on
 /// `asupersync::lab::oracle::eprocess` — we implement the SPRT-style
 /// e-process inline to avoid coupling the parity drift monitor to the
-/// MVCC-specific crate).
+/// MVCC-specific crate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CategoryEProcess {
     /// Category name.
@@ -217,7 +219,7 @@ impl CategoryEProcess {
     fn observe(&mut self, mismatch: bool) {
         let x = if mismatch { 1.0 } else { 0.0 };
         // E_{t+1} = E_t * (1 + λ(X_t - p₀))
-        let factor = 1.0 + self.lambda * (x - self.p0);
+        let factor = self.lambda.mul_add(x - self.p0, 1.0);
         self.current *= factor.max(0.0);
         self.current = self.current.min(self.max_evalue);
 
@@ -794,7 +796,7 @@ mod tests {
         let before = ep.current;
         ep.observe(true);
         let after = ep.current;
-        let expected_factor = 1.0 + 0.8 * (1.0 - 0.05);
+        let expected_factor = 0.8_f64.mul_add(1.0 - 0.05, 1.0);
         assert!(
             ((after / before) - expected_factor).abs() < 1e-10,
             "factor mismatch: expected {expected_factor}, got {}",

@@ -1603,7 +1603,7 @@ impl Connection {
                         }
                     })
                     .collect();
-                let update_event = fsqlite_ast::TriggerEvent::Update(update_cols.clone());
+                let update_event = fsqlite_ast::TriggerEvent::Update(update_cols);
                 let has_before_update = self.has_matching_triggers(
                     table_name,
                     fsqlite_ast::TriggerTiming::Before,
@@ -2235,6 +2235,7 @@ impl Connection {
             .unwrap_or_default())
     }
 
+    #[allow(clippy::unused_self)]
     fn map_insert_source_row_to_table_row(
         &self,
         table_column_count: usize,

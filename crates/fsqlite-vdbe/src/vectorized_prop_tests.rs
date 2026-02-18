@@ -188,7 +188,7 @@ mod tests {
             let sorted = extract_int64(&result, 0);
 
             // Same multiset.
-            let mut expected = values.clone();
+            let mut expected = values;
             expected.sort_by(|a, b| match (a, b) {
                 (None, None) => std::cmp::Ordering::Equal,
                 (None, Some(_)) => std::cmp::Ordering::Less,
@@ -213,7 +213,7 @@ mod tests {
             .unwrap();
             let sorted = extract_int64(&result, 0);
 
-            let mut expected = values.clone();
+            let mut expected = values;
             expected.sort_by(|a, b| match (a, b) {
                 (None, None) => std::cmp::Ordering::Equal,
                 (None, Some(_)) => std::cmp::Ordering::Greater,
@@ -238,9 +238,9 @@ mod tests {
             .unwrap();
             let sorted = extract_int64(&result, 0);
 
-            let mut orig_sorted = values.clone();
+            let mut orig_sorted = values;
             orig_sorted.sort();
-            let mut out_sorted = sorted.clone();
+            let mut out_sorted = sorted;
             out_sorted.sort();
             prop_assert_eq!(orig_sorted, out_sorted);
         }
@@ -389,14 +389,12 @@ mod tests {
     ) -> Vec<(Option<i64>, Option<i64>, Option<i64>)> {
         let mut out = Vec::new();
         for p in probe {
-            let pk = match p.0 {
-                Some(k) => k,
-                None => continue, // NULL keys never match
+            let Some(pk) = p.0 else {
+                continue; // NULL keys never match
             };
             for b in build {
-                let bk = match b.0 {
-                    Some(k) => k,
-                    None => continue,
+                let Some(bk) = b.0 else {
+                    continue;
                 };
                 if pk == bk {
                     out.push((p.0, p.1, b.1));
@@ -464,13 +462,11 @@ mod tests {
                 .iter()
                 .filter_map(|r| r.0)
                 .collect();
-            for key in &semi_keys {
-                if let Some(k) = key {
-                    prop_assert!(
-                        build_keys.contains(k),
-                        "semi key {} not in build set", k
-                    );
-                }
+            for k in semi_keys.iter().flatten() {
+                prop_assert!(
+                    build_keys.contains(k),
+                    "semi key {} not in build set", k
+                );
             }
             // No duplicates from same probe row — output count ≤ probe count.
             prop_assert!(semi_keys.len() <= probe_rows.len());
@@ -538,7 +534,7 @@ mod tests {
 
             // Step 1: filter — keep rows where key > threshold.
             let sel = filter_batch_int64(&batch, 0, CompareOp::Gt, threshold).unwrap();
-            let mut filtered = batch.clone();
+            let mut filtered = batch;
             filtered.apply_selection(sel).unwrap();
 
             // Step 2: aggregate — SUM(val) grouped by key.
@@ -552,9 +548,8 @@ mod tests {
                 }],
             );
             // May produce empty result if filter eliminated everything.
-            let agg_batch = match agg_result {
-                Ok(b) => b,
-                Err(_) => return Ok(()),
+            let Ok(agg_batch) = agg_result else {
+                return Ok(());
             };
             if agg_batch.selection().is_empty() {
                 return Ok(());

@@ -995,8 +995,12 @@ mod tests {
     fn test_lanes_always_include_unit_tests() {
         let graph = ImpactGraph::canonical();
         let lanes = graph.lanes_for_changes(&["fsqlite-harness"]);
-        let lane_names: Vec<ValidationLane> = lanes.iter().map(|(l, _)| *l).collect();
-        assert!(lane_names.contains(&ValidationLane::UnitTests));
+        assert!(
+            lanes
+                .iter()
+                .map(|(l, _)| *l)
+                .any(|l| l == ValidationLane::UnitTests)
+        );
     }
 
     #[test]

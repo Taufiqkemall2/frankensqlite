@@ -106,6 +106,7 @@ fn sentinel_and_transition_parity() {
 }
 
 #[test]
+#[allow(clippy::float_cmp)]
 fn parity_score_bounds() {
     let report = assess_wal_journal_parity(&WalJournalParityConfig::default());
 
@@ -236,6 +237,7 @@ fn summary_is_informative() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[allow(clippy::float_cmp)]
 fn report_json_roundtrip() {
     let report = assess_wal_journal_parity(&WalJournalParityConfig::default());
 
@@ -275,6 +277,7 @@ fn report_file_roundtrip() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[allow(clippy::float_cmp)]
 fn assessment_is_deterministic() {
     let cfg = WalJournalParityConfig::default();
     let r1 = assess_wal_journal_parity(&cfg);

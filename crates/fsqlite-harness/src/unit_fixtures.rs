@@ -366,7 +366,7 @@ fn build_empty_page(page_type: PageType, page_size: u32) -> Vec<u8> {
 fn build_single_cell_leaf_page(page_size: u32, _seed: FixtureSeed) -> Vec<u8> {
     let size = page_size as usize;
     let mut page = vec![0u8; size];
-    let header_size: u16 = 8;
+    let header_size: usize = 8;
 
     // Cell content: payload_size(varint) || rowid(varint) || record
     // Record: header_size(varint=2) || serial_type(varint=1 → 8-bit int) || value(1 byte)
@@ -392,7 +392,7 @@ fn build_single_cell_leaf_page(page_size: u32, _seed: FixtureSeed) -> Vec<u8> {
     page[7] = 0; // fragmented free bytes
 
     // Cell pointer array: 2 bytes, big-endian offset to cell content.
-    let ptr_offset = header_size as usize;
+    let ptr_offset = header_size;
     page[ptr_offset] = (co >> 8) as u8;
     page[ptr_offset + 1] = (co & 0xFF) as u8;
 
@@ -407,7 +407,7 @@ fn build_single_cell_leaf_page(page_size: u32, _seed: FixtureSeed) -> Vec<u8> {
 fn build_interior_table_page(page_size: u32, left_child: u32, right_child: u32) -> Vec<u8> {
     let size = page_size as usize;
     let mut page = vec![0u8; size];
-    let header_size: u16 = 12;
+    let header_size: usize = 12;
 
     // Interior table cell: left_child_ptr(4 bytes) || rowid(varint)
     // The divider key is the maximum rowid in the left subtree.
@@ -439,7 +439,7 @@ fn build_interior_table_page(page_size: u32, left_child: u32, right_child: u32) 
     page[11] = right_child as u8;
 
     // Cell pointer array.
-    let ptr_offset = header_size as usize;
+    let ptr_offset = header_size;
     page[ptr_offset] = (co >> 8) as u8;
     page[ptr_offset + 1] = (co & 0xFF) as u8;
 
@@ -454,7 +454,7 @@ fn build_interior_table_page(page_size: u32, left_child: u32, right_child: u32) 
 fn build_multi_cell_leaf_page(page_size: u32, cell_count: u16, seed: FixtureSeed) -> Vec<u8> {
     let size = page_size as usize;
     let mut page = vec![0u8; size];
-    let header_size: u16 = 8;
+    let header_size: usize = 8;
 
     // Build cells from the end of the page backward.
     let mut cell_offsets: Vec<u16> = Vec::new();
@@ -492,7 +492,7 @@ fn build_multi_cell_leaf_page(page_size: u32, cell_count: u16, seed: FixtureSeed
     page[7] = 0;
 
     // Cell pointer array.
-    let ptr_start = header_size as usize;
+    let ptr_start = header_size;
     for (i, &offset) in cell_offsets.iter().enumerate() {
         let pos = ptr_start + i * 2;
         page[pos] = (offset >> 8) as u8;

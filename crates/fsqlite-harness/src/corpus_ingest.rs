@@ -622,9 +622,9 @@ fn compute_coverage(
         .filter(|f| {
             by_family
                 .get(&f.to_string())
-                .map_or(true, |c| c.entry_count == 0)
+                .is_none_or(|c| c.entry_count == 0)
         })
-        .map(|f| f.to_string())
+        .map(std::string::ToString::to_string)
         .collect();
 
     let underrepresented: Vec<String> = by_family
@@ -659,10 +659,10 @@ pub fn ingest_conformance_fixtures(
         .map_err(|e| format!("failed to read conformance dir {}: {e}", dir.display()))?;
 
     let mut files: Vec<_> = entries
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
         .collect();
-    files.sort_by_key(|e| e.path());
+    files.sort_by_key(std::fs::DirEntry::path);
 
     for entry in files {
         let path = entry.path();

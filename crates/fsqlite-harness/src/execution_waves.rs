@@ -269,6 +269,7 @@ pub fn load_wave_inputs_from_issues_jsonl(jsonl: &str) -> Result<Vec<WaveTaskInp
 /// - task ids are duplicated,
 /// - a dependency references an unknown task id,
 /// - the dependency graph contains a cycle.
+#[allow(clippy::too_many_lines)]
 pub fn build_execution_wave_plan(tasks: &[WaveTaskInput]) -> Result<ExecutionWavePlan, String> {
     let mut task_map: BTreeMap<String, &WaveTaskInput> = BTreeMap::new();
     for task in tasks {

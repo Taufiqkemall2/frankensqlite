@@ -166,11 +166,7 @@ impl FsLab {
                 .create_task(root, Budget::INFINITE, future)
                 .expect("FsLab: failed to create task");
 
-            runtime
-                .scheduler
-                .lock()
-                .expect("FsLab: scheduler lock poisoned")
-                .schedule(tid, 0);
+            runtime.scheduler.lock().schedule(tid, 0);
         })
     }
 
@@ -265,11 +261,7 @@ mod tests {
                 .create_task(root, Budget::INFINITE, async { 1_u64 })
                 .expect("create task");
 
-            runtime
-                .scheduler
-                .lock()
-                .expect("scheduler lock")
-                .schedule(tid, 0);
+            runtime.scheduler.lock().schedule(tid, 0);
         });
 
         assert!(
@@ -297,7 +289,7 @@ mod tests {
             let (t1, _h1) = FsLab::spawn_named(runtime, root, "reader", async { "read_done" });
             let (t2, _h2) = FsLab::spawn_named(runtime, root, "writer", async { "write_done" });
 
-            let mut sched = runtime.scheduler.lock().expect("scheduler lock");
+            let mut sched = runtime.scheduler.lock();
             sched.schedule(t1, 0);
             sched.schedule(t2, 1);
         });
@@ -338,11 +330,7 @@ mod tests {
                 })
                 .expect("create task");
 
-            runtime
-                .scheduler
-                .lock()
-                .expect("scheduler lock")
-                .schedule(tid, 0);
+            runtime.scheduler.lock().schedule(tid, 0);
         });
 
         // Key property: no obligation leaks or task leaks under chaos injection.
@@ -368,7 +356,7 @@ mod tests {
                 .create_task(root, Budget::INFINITE, async { 2_u32 })
                 .expect("task 2");
 
-            let mut sched = runtime.scheduler.lock().expect("lock");
+            let mut sched = runtime.scheduler.lock();
             sched.schedule(t1, 0);
             sched.schedule(t2, 1);
         });

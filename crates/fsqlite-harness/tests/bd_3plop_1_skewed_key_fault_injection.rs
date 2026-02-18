@@ -309,6 +309,7 @@ fn btree_order_check(conn: &Connection) -> Result<bool, String> {
     Ok(true)
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn run_thread_workload(
     path: String,
     distribution: KeyDistribution,
@@ -318,13 +319,10 @@ fn run_thread_workload(
     thread_idx: usize,
 ) -> ThreadStats {
     let mut stats = ThreadStats::default();
-    let mut state = seed ^ (u64::try_from(thread_idx).expect("thread index fits u64") << 32);
-    let conn = match Connection::open(&path) {
-        Ok(conn) => conn,
-        Err(_) => {
-            stats.aborted_ops = ops;
-            return stats;
-        }
+    let mut rng_state = seed ^ (u64::try_from(thread_idx).expect("thread index fits u64") << 32);
+    let Ok(conn) = Connection::open(&path) else {
+        stats.aborted_ops = ops;
+        return stats;
     };
     let _ = configure_connection(&conn);
 
@@ -333,12 +331,12 @@ fn run_thread_workload(
             .checked_mul(ops)
             .and_then(|base| base.checked_add(step))
             .unwrap_or(step);
-        let key = sample_key(distribution, &mut state, seq);
+        let key = sample_key(distribution, &mut rng_state, seq);
         let op_result = match workload {
             WorkloadKind::Insert => execute_insert(&conn, key),
             WorkloadKind::Update => execute_update(&conn, key),
             WorkloadKind::Mixed | WorkloadKind::Concurrent => {
-                if (lcg_next(&mut state) & 1) == 0 {
+                if (lcg_next(&mut rng_state) & 1) == 0 {
                     execute_insert(&conn, key)
                 } else {
                     execute_update(&conn, key)
@@ -375,6 +373,7 @@ fn merge_thread_stats(aggregate: &mut ThreadStats, thread_stats: ThreadStats) {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn run_concurrent_db_workload(
     path: String,
     distribution: KeyDistribution,
@@ -596,6 +595,7 @@ fn skewed_key_sampling_is_deterministic() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn test_e2e_bd_3plop_1_skewed_key_fault_injection() {
     let suite_seed = 0x5EED_3A10_u64;
     let ops = ops_per_case();

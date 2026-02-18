@@ -1454,7 +1454,6 @@ mod tests {
                 warmup_windows: 2,
                 sensitivity_threshold: 0.05,
                 ema_alpha: 0.5,
-                ..DriftDetectorConfig::default()
             },
             ..ReplayConfig::default()
         };
@@ -1673,7 +1672,7 @@ mod tests {
         assert_eq!(pass_eval.verdict, ReplayVerdict::Pass);
         assert!(pass_eval.reasons.is_empty());
 
-        let mut failing = summary.clone();
+        let mut failing = summary;
         failing.total_divergent += 1;
         let fail_eval = manifest.evaluate_summary(&failing);
         assert_eq!(fail_eval.verdict, ReplayVerdict::Fail);

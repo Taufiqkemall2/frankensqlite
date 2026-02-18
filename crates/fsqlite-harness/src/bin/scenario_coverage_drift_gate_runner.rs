@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -203,6 +203,7 @@ fn build_scenario_index() -> BTreeMap<String, ScenarioScriptIndex> {
     index
 }
 
+#[allow(clippy::too_many_lines)]
 fn build_report(config: &Config) -> Result<ScenarioCoverageDriftReport, String> {
     fs::create_dir_all(&config.run_dir).map_err(|error| {
         format!(
@@ -336,34 +337,36 @@ fn build_report(config: &Config) -> Result<ScenarioCoverageDriftReport, String> 
 fn render_human_summary(report: &ScenarioCoverageDriftReport) -> String {
     let mut out = String::new();
     out.push_str("# Scenario Coverage Drift Gate\n\n");
-    out.push_str(&format!("- bead_id: `{}`\n", report.bead_id));
-    out.push_str(&format!("- schema_version: `{}`\n", report.schema_version));
-    out.push_str(&format!("- root_seed: `{}`\n", report.root_seed));
-    out.push_str(&format!(
-        "- total_catalog_scenarios: `{}`\n",
+    let _ = writeln!(out, "- bead_id: `{}`", report.bead_id);
+    let _ = writeln!(out, "- schema_version: `{}`", report.schema_version);
+    let _ = writeln!(out, "- root_seed: `{}`", report.root_seed);
+    let _ = writeln!(
+        out,
+        "- total_catalog_scenarios: `{}`",
         report.total_catalog_scenarios
-    ));
-    out.push_str(&format!(
-        "- required_catalog_scenarios: `{}`\n",
+    );
+    let _ = writeln!(
+        out,
+        "- required_catalog_scenarios: `{}`",
         report.required_catalog_scenarios
-    ));
-    out.push_str(&format!(
-        "- total_manifest_scenarios: `{}`\n",
+    );
+    let _ = writeln!(
+        out,
+        "- total_manifest_scenarios: `{}`",
         report.total_manifest_scenarios
-    ));
-    out.push_str(&format!(
-        "- total_manifest_missing: `{}`\n",
+    );
+    let _ = writeln!(
+        out,
+        "- total_manifest_missing: `{}`",
         report.total_manifest_missing
-    ));
-    out.push_str(&format!(
-        "- required_gap_count: `{}`\n",
-        report.required_gap_count
-    ));
-    out.push_str(&format!(
-        "- informational_gap_count: `{}`\n",
+    );
+    let _ = writeln!(out, "- required_gap_count: `{}`", report.required_gap_count);
+    let _ = writeln!(
+        out,
+        "- informational_gap_count: `{}`",
         report.informational_gap_count
-    ));
-    out.push_str(&format!("- overall_pass: `{}`\n", report.overall_pass));
+    );
+    let _ = writeln!(out, "- overall_pass: `{}`", report.overall_pass);
 
     if report.gaps.is_empty() {
         out.push_str(
@@ -374,19 +377,20 @@ fn render_human_summary(report: &ScenarioCoverageDriftReport) -> String {
 
     out.push_str("\n## Gap Diff\n");
     for gap in &report.gaps {
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "- [{}] `{}` reason=`{}` severity=`{:?}`",
             gap.criticality
                 .map_or_else(|| "uncatalogued".to_owned(), |c| format!("{c:?}")),
             gap.scenario_id,
             gap.reason,
             gap.severity
-        ));
+        );
         if let Some(description) = &gap.description {
-            out.push_str(&format!(" desc=\"{}\"", description));
+            let _ = write!(out, " desc=\"{description}\"");
         }
         if !gap.covering_scripts.is_empty() {
-            out.push_str(&format!(" scripts={:?}", gap.covering_scripts));
+            let _ = write!(out, " scripts={:?}", gap.covering_scripts);
         }
         out.push('\n');
     }

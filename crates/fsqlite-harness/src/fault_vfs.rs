@@ -769,7 +769,7 @@ mod tests {
                 999_u64
             });
 
-            let mut sched = runtime.scheduler.lock().expect("lock");
+            let mut sched = runtime.scheduler.lock();
             sched.schedule(t1, 0);
             sched.schedule(t2, 1);
         });

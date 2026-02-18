@@ -352,7 +352,7 @@ mod tests {
         let data = vec![0x42_u8; 1024];
         let hash = blake3_page_checksum(&data);
         assert!(verify_page_blake3(&data, &hash));
-        let mut corrupted = data.clone();
+        let mut corrupted = data;
         corrupted[0] ^= 0xFF;
         assert!(!verify_page_blake3(&corrupted, &hash));
     }
@@ -631,7 +631,7 @@ mod tests {
         let pages = make_test_pages(k, page_size);
         let (meta, repair_symbols) = make_test_group(&pages, page_size as u32, r, 2);
 
-        let num_corrupt = ((k as f64) * (corruption_pct as f64) / 100.0).ceil() as u32;
+        let num_corrupt = (f64::from(k) * f64::from(corruption_pct) / 100.0).ceil() as u32;
         let num_corrupt = num_corrupt.max(1).min(k);
 
         let corrupted = vec![0xDD_u8; page_size];

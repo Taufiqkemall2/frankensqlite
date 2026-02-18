@@ -100,9 +100,8 @@ impl TxnManager {
     pub fn alloc_commit_seq(&self) -> CommitSeq {
         // We hold a lock to update active_commits atomically with the allocation
         // to ensure no race allows stable_commit_seq to jump past us.
-        let mut active = self.active_commits.lock();
         let seq = self.next_commit_seq.fetch_add(1, Ordering::Release);
-        active.insert(seq);
+        self.active_commits.lock().insert(seq);
         CommitSeq::new(seq)
     }
 
@@ -125,6 +124,7 @@ impl TxnManager {
                 .load(Ordering::Acquire)
                 .saturating_sub(1)
         };
+        drop(active);
 
         // Update the cached stable sequence.
         // We use MAX here because multiple threads might call finish concurrently
@@ -165,6 +165,11 @@ impl std::fmt::Debug for TxnManager {
             .field(
                 "next_commit_seq",
                 &self.next_commit_seq.load(Ordering::Relaxed),
+            )
+            .field("active_commits", &*self.active_commits.lock())
+            .field(
+                "stable_commit_seq",
+                &self.stable_commit_seq.load(Ordering::Relaxed),
             )
             .finish()
     }
@@ -566,6 +571,7 @@ impl std::fmt::Debug for VersionStore {
             .field("page_count", &heads.len())
             .field("visibility_range_count", &ranges.len())
             .field("arena_high_water", &arena.high_water())
+            .field("guard_registry", &self.guard_registry)
             .finish()
     }
 }

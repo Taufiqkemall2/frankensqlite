@@ -815,8 +815,8 @@ mod tests {
                 (false, false) => EnforcementDisposition::BlockedByBoth,
             },
             total_beads: 1,
-            failing_beads: if contract_passed { 0 } else { 1 },
-            missing_evidence_beads: if contract_passed { 0 } else { 1 },
+            failing_beads: usize::from(!contract_passed),
+            missing_evidence_beads: usize::from(!contract_passed),
             invalid_reference_beads: 0,
             bead_verdicts: vec![BeadContractVerdict {
                 bead_id: "bd-1dp9.7.7".to_owned(),
@@ -825,7 +825,7 @@ mod tests {
                 } else {
                     ContractBeadStatus::FailMissingEvidence
                 },
-                missing_evidence_count: if contract_passed { 0 } else { 1 },
+                missing_evidence_count: usize::from(!contract_passed),
                 invalid_reference_count: 0,
                 details: Vec::new(),
             }],

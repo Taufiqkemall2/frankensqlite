@@ -86,8 +86,7 @@ impl RunContext {
         let pid = std::process::id();
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_millis());
         let timestamp = format_iso8601_from_ms(now_ms);
 
         let run_id =
@@ -123,8 +122,7 @@ impl RunContext {
         let pid = std::process::id();
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_millis());
         Self {
             run_id: run_id.to_owned(),
             schema_version: LOG_SCHEMA_VERSION.to_owned(),
@@ -143,21 +141,16 @@ impl RunContext {
 // ---------------------------------------------------------------------------
 
 /// Output format for structured logging.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LogOutputFormat {
     /// Human-readable tracing output (default).
+    #[default]
     Pretty,
     /// Machine-readable JSON lines (one event per line).
     Json,
     /// Compact single-line format.
     Compact,
-}
-
-impl Default for LogOutputFormat {
-    fn default() -> Self {
-        Self::Pretty
-    }
 }
 
 impl fmt::Display for LogOutputFormat {
@@ -253,8 +246,7 @@ pub fn emit_lifecycle_event(
     let seq = EVENT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_millis());
 
     let mut context = BTreeMap::new();
     context.insert("schema_version".to_owned(), ctx.schema_version.clone());

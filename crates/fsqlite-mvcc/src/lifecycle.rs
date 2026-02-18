@@ -5168,6 +5168,117 @@ mod tests {
     }
 
     #[test]
+    fn test_version_guard_deferred_value_freed_after_abort() {
+        use crossbeam_epoch as epoch;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        #[derive(Clone)]
+        struct DropTracker(Arc<AtomicUsize>);
+        impl Drop for DropTracker {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+        }
+
+        let mgr = TransactionManager::new(PageSize::new(4096).unwrap());
+        let mut txn = mgr.begin(BeginKind::Concurrent).unwrap();
+        let drop_count = Arc::new(AtomicUsize::new(0));
+
+        assert_eq!(mgr.version_guard_registry().active_guard_count(), 1);
+        assert!(
+            txn.defer_retire_version(DropTracker(Arc::clone(&drop_count))),
+            "defer_retire_version should succeed while guard is pinned"
+        );
+
+        mgr.abort(&mut txn);
+        assert!(!txn.has_version_guard(), "abort must drop version guard");
+        assert_eq!(mgr.version_guard_registry().active_guard_count(), 0);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while drop_count.load(AtomicOrdering::SeqCst) == 0 && Instant::now() < deadline {
+            let g = epoch::pin();
+            g.flush();
+            std::thread::yield_now();
+        }
+
+        assert_eq!(
+            drop_count.load(AtomicOrdering::SeqCst),
+            1,
+            "aborted transaction retirements must be reclaimed after unpin + epoch advance"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_same_page_writers_preserve_all_committed_versions() {
+        let mgr = Arc::new(mgr_with_busy_timeout_ms(25));
+        let pgno = PageNumber::new(6_777).unwrap();
+        let workers = 8usize;
+        let writes_per_worker = 4usize;
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).unwrap();
+        mgr.write_page(&mut seed, pgno, test_data(0x00)).unwrap();
+        mgr.commit(&mut seed).unwrap();
+
+        let start = Arc::new(std::sync::Barrier::new(workers));
+        let mut handles = Vec::with_capacity(workers);
+
+        for worker in 0..workers {
+            let mgr_clone = Arc::clone(&mgr);
+            let start_clone = Arc::clone(&start);
+            handles.push(std::thread::spawn(move || {
+                start_clone.wait();
+                let mut committed = 0usize;
+
+                for step in 0..writes_per_worker {
+                    loop {
+                        let mut txn = mgr_clone.begin(BeginKind::Concurrent).unwrap();
+                        let payload =
+                            u8::try_from((worker * writes_per_worker + step) % 251).unwrap();
+
+                        match mgr_clone.write_page(&mut txn, pgno, test_data(payload)) {
+                            Ok(()) => match mgr_clone.commit(&mut txn) {
+                                Ok(_) => {
+                                    committed += 1;
+                                    break;
+                                }
+                                Err(MvccError::BusySnapshot) => {
+                                    std::thread::yield_now();
+                                }
+                                Err(err) => panic!("unexpected commit error: {err:?}"),
+                            },
+                            Err(MvccError::Busy) => {
+                                mgr_clone.abort(&mut txn);
+                                std::thread::yield_now();
+                            }
+                            Err(err) => panic!("unexpected write error: {err:?}"),
+                        }
+                    }
+                }
+
+                committed
+            }));
+        }
+
+        let total_committed = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("writer thread should not panic"))
+            .sum::<usize>();
+
+        assert_eq!(
+            total_committed,
+            workers * writes_per_worker,
+            "each worker operation should eventually commit after retries"
+        );
+
+        let chain_len = mgr.version_store().walk_chain(pgno).len();
+        assert_eq!(
+            chain_len,
+            total_committed + 1,
+            "same-page concurrent commits should retain one version per successful commit plus seed"
+        );
+    }
+
+    #[test]
     fn test_version_guard_registry_accessor() {
         let mgr = TransactionManager::new(PageSize::new(4096).unwrap());
         let registry = mgr.version_guard_registry();

@@ -172,7 +172,7 @@ fn test_waiver_registry_rejects_empty_reason() {
         bead_id: GOVERNANCE_BEAD_ID.to_owned(),
         waivers: vec![SloWaiver {
             scenario_id: "bm-test".to_owned(),
-            reason: "".to_owned(),
+            reason: String::new(),
             approved_by: "tech-lead".to_owned(),
             granted_date: "2026-02-10".to_owned(),
             expiry_date: "2026-02-20".to_owned(),

@@ -661,6 +661,7 @@ mod vdbe_tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn vdbe_op_with_real_p4() {
         let op = VdbeOp {
             opcode: Opcode::Real,
@@ -674,6 +675,7 @@ mod vdbe_tests {
             .case("real_p4")
             .invariant("Real opcode carries P4::Real");
         match op.p4 {
+            #[allow(clippy::neg_cmp_op_on_partial_ord)]
             P4::Real(v) => diag_assert!(ctx, (v - 3.14).abs() < f64::EPSILON, "value matches"),
             _ => panic!("bead_id={BEAD_ID} case=real_p4 expected P4::Real"),
         }
@@ -951,6 +953,7 @@ mod function_tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn func_typeof() {
         let reg = full_registry();
         let typeof_fn = reg.find_scalar("typeof", 1).expect("typeof registered");
@@ -966,7 +969,7 @@ mod function_tests {
             (SqliteValue::Blob(vec![1]), "blob"),
         ];
         for (val, expected) in &cases {
-            let result = typeof_fn.invoke(&[val.clone()]).unwrap();
+            let result = typeof_fn.invoke(std::slice::from_ref(val)).unwrap();
             diag_assert_eq!(
                 ctx.clone(),
                 result,
@@ -1016,6 +1019,7 @@ mod function_tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn func_abs_float() {
         let reg = full_registry();
         let func = reg.find_scalar("abs", 1).expect("abs registered");
@@ -1024,6 +1028,7 @@ mod function_tests {
             .case("abs_float")
             .invariant("abs(-3.14) = 3.14");
         match result {
+            #[allow(clippy::neg_cmp_op_on_partial_ord)]
             SqliteValue::Float(v) => diag_assert!(ctx, (v - 3.14).abs() < f64::EPSILON, "matches"),
             other => panic!("bead_id={BEAD_ID} case=abs_float expected Float, got {other:?}"),
         }

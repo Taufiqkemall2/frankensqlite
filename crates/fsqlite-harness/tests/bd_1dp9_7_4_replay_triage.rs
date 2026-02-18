@@ -22,7 +22,7 @@ use fsqlite_harness::replay_triage::{
 };
 
 const BEAD_ID: &str = "bd-1dp9.7.4";
-const SEED: u64 = 20260213;
+const SEED: u64 = 20_260_213;
 
 // ---------------------------------------------------------------------------
 // Helpers

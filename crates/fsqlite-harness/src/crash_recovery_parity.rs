@@ -124,10 +124,7 @@ impl CrashScenario {
     /// Whether committed data should survive this scenario.
     #[must_use]
     pub const fn committed_data_preserved(self) -> bool {
-        match self {
-            Self::CorruptWalHeader => false,
-            _ => true,
-        }
+        !matches!(self, Self::CorruptWalHeader)
     }
 }
 
@@ -297,6 +294,7 @@ impl CrashRecoveryParityReport {
 // ---------------------------------------------------------------------------
 
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn assess_crash_recovery_parity(
     config: &CrashRecoveryParityConfig,
 ) -> CrashRecoveryParityReport {
@@ -680,7 +678,7 @@ mod tests {
     fn scenario_as_str_unique() {
         let mut names: Vec<&str> = CrashScenario::ALL.iter().map(|s| s.as_str()).collect();
         let len = names.len();
-        names.sort();
+        names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), len, "scenario names must be unique");
     }
@@ -807,6 +805,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn assess_score() {
         let report = assess_crash_recovery_parity(&CrashRecoveryParityConfig::default());
         assert_eq!(report.parity_score, 1.0);
@@ -865,6 +864,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn json_roundtrip() {
         let report = assess_crash_recovery_parity(&CrashRecoveryParityConfig::default());
         let json = report.to_json().expect("serialize");

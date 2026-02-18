@@ -246,6 +246,7 @@ fn run_resize_pattern(
     Ok(iterations)
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn run_query_worker(path: String, loops: usize, expected: Checksum) -> Result<usize, String> {
     let conn = open_db(&path)?;
     for idx in 0..loops {
@@ -259,6 +260,7 @@ fn run_query_worker(path: String, loops: usize, expected: Checksum) -> Result<us
     Ok(loops)
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn run_writer_worker(path: String, thread_idx: usize, ops: usize) -> WriteStats {
     let Ok(conn) = open_db(&path) else {
         return WriteStats {
@@ -277,7 +279,7 @@ fn run_writer_worker(path: String, thread_idx: usize, ops: usize) -> WriteStats 
         match conn.execute(&update_sql) {
             Ok(changed) => {
                 if changed > 0 {
-                    committed += usize::try_from(changed).unwrap_or(1);
+                    committed += changed;
                 } else {
                     aborted += 1;
                 }

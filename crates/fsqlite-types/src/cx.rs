@@ -1735,6 +1735,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::redundant_clone)]
     fn test_clone_propagates_trace_ids() {
         let cx = Cx::<FullCaps>::new().with_trace_context(1, 2, 3);
         let cloned = cx.clone();

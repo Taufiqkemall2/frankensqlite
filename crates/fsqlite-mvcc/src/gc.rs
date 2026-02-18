@@ -722,11 +722,11 @@ mod tests {
             "pruned versions should be deferred via EBR"
         );
         assert!(
-            after.guards_pinned_total >= before.guards_pinned_total + 1,
+            after.guards_pinned_total > before.guards_pinned_total,
             "GC prune should pin an EBR guard while retiring versions"
         );
         assert!(
-            after.guards_unpinned_total >= before.guards_unpinned_total + 1,
+            after.guards_unpinned_total > before.guards_unpinned_total,
             "GC prune guard should unpin after retirement deferral"
         );
     }

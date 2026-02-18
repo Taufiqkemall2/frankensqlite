@@ -147,12 +147,11 @@ impl VersionArena {
     /// and that the generation matches (catches stale pointer access).
     pub fn take(&mut self, idx: VersionIdx) -> PageVersion {
         let slot = &mut self.chunks[idx.chunk as usize][idx.offset as usize];
-        if slot.generation != idx.generation {
-            panic!(
-                "VersionArena::take: generation mismatch for {idx:?} (slot generation {})",
-                slot.generation
-            );
-        }
+        assert!(
+            slot.generation == idx.generation,
+            "VersionArena::take: generation mismatch for {idx:?} (slot generation {})",
+            slot.generation
+        );
         let version = slot
             .version
             .take()
@@ -1736,6 +1735,7 @@ fn clear_slot_fields(slot: &SharedTxnSlot) {
 /// # Returns
 ///
 /// A [`SlotCleanupResult`] indicating what action was taken.
+#[allow(clippy::too_many_lines)]
 pub fn try_cleanup_orphaned_slot(
     slot: &SharedTxnSlot,
     now_epoch_secs: u64,

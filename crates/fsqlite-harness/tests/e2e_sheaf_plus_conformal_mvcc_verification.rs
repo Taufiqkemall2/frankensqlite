@@ -89,7 +89,6 @@ fn run_lab_with_20_concurrent_txns(seed: u64) {
             runtime
                 .scheduler
                 .lock()
-                .expect("scheduler lock not poisoned")
                 .schedule(task_id, u8::try_from(txn % 4).expect("priority fits in u8"));
         }
     });

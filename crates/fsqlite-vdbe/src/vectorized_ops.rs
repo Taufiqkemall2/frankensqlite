@@ -1072,6 +1072,7 @@ mod tests {
     // ── Row-at-a-time equivalence proof (bd-14vp7.3) ────────────────────
 
     #[test]
+    #[allow(clippy::cast_possible_truncation)]
     fn filter_matches_row_at_a_time_evaluation() {
         // Build a batch and compute filter result both vectorized and row-at-a-time.
         let values = [5_i64, 10, 15, 20, 25, 30, 35, 40];
@@ -1096,6 +1097,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation)]
     fn filter_text_matches_row_at_a_time() {
         let values = ["delta", "alpha", "gamma", "beta"];
         let batch = text_batch(&values);
@@ -1104,7 +1106,7 @@ mod tests {
         let row_sel: Vec<u16> = values
             .iter()
             .enumerate()
-            .filter(|&(_, v)| v.as_bytes() < "delta".as_bytes())
+            .filter(|&(_, v)| v.as_bytes() < b"delta")
             .map(|(i, _)| i as u16)
             .collect();
 
@@ -1123,7 +1125,7 @@ mod tests {
         // id > 1 AND score < 16.0
         let id_filter = filter_batch_int64(&batch, 0, CompareOp::Gt, 1).unwrap();
         // Apply id_filter as selection before score filter.
-        let mut filtered_batch = batch.clone();
+        let mut filtered_batch = batch;
         filtered_batch.apply_selection(id_filter).unwrap();
         let score_filter = filter_batch_float64(&filtered_batch, 1, CompareOp::Lt, 16.0).unwrap();
         // id=2/score=20 fails score<16, id=3/score=15.5 passes, id=4/score=5.0 passes.

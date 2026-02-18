@@ -15,7 +15,7 @@ use fsqlite_harness::log_schema_validator::{
 };
 
 const BEAD_ID: &str = "bd-1dp9.7.6";
-const SEED: u64 = 20260213;
+const SEED: u64 = 20_260_213;
 
 /// Build a realistic E2E event stream simulating a multi-phase parity test run.
 fn build_realistic_event_stream() -> Vec<LogEventSchema> {

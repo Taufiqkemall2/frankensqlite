@@ -688,8 +688,7 @@ fn parse_skipped_jobs_line(line: &str) -> Option<u64> {
 fn category_target_pass_rate(category: TclConformanceCategory) -> Option<f64> {
     match category {
         TclConformanceCategory::CoreSql => Some(95.0),
-        TclConformanceCategory::Transactions => Some(90.0),
-        TclConformanceCategory::ErrorHandling => Some(90.0),
+        TclConformanceCategory::Transactions | TclConformanceCategory::ErrorHandling => Some(90.0),
         TclConformanceCategory::Extensions | TclConformanceCategory::Wal => None,
     }
 }
@@ -807,6 +806,7 @@ struct ScenarioProcessStatus {
     elapsed_ms: u64,
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn execute_scenario(
     scenario: &TclHarnessScenario,
     runner_path: &Path,
@@ -1019,6 +1019,7 @@ fn classify_process_result(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_scenario_result(
     scenario: &TclHarnessScenario,
     command: &str,

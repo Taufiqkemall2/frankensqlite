@@ -543,6 +543,41 @@ mod tests {
     }
 
     #[test]
+    fn nested_version_guards_pin_and_unpin_independently() {
+        let registry = Arc::new(VersionGuardRegistry::default());
+        let before = GLOBAL_EBR_METRICS.snapshot();
+
+        {
+            let outer = VersionGuard::pin(Arc::clone(&registry));
+            assert_eq!(registry.active_guard_count(), 1);
+            assert!(outer.pinned_for() < Duration::from_secs(1));
+
+            {
+                let inner = VersionGuard::pin(Arc::clone(&registry));
+                assert_eq!(registry.active_guard_count(), 2);
+                assert!(inner.pinned_for() < Duration::from_secs(1));
+            }
+
+            assert_eq!(
+                registry.active_guard_count(),
+                1,
+                "dropping inner guard must keep outer guard active"
+            );
+        }
+
+        assert_eq!(registry.active_guard_count(), 0);
+        let after = GLOBAL_EBR_METRICS.snapshot();
+        assert!(
+            after.guards_pinned_total >= before.guards_pinned_total + 2,
+            "nested guards should register two pin events"
+        );
+        assert!(
+            after.guards_unpinned_total >= before.guards_unpinned_total + 2,
+            "nested guards should register two unpin events"
+        );
+    }
+
+    #[test]
     fn stale_reader_snapshots_report_long_pins() {
         let registry = Arc::new(VersionGuardRegistry::new(StaleReaderConfig {
             warn_after: Duration::from_millis(5),

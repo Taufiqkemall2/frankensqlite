@@ -222,9 +222,8 @@ mod tests {
             for (is_insert, rowid) in &ops {
                 if *is_insert || !expected.contains(rowid) {
                     // Insert (or try to insert if not yet present).
-                    if !expected.contains(rowid) {
+                    if expected.insert(*rowid) {
                         cursor.table_insert(&cx, *rowid, &payload).unwrap();
-                        expected.insert(*rowid);
                     }
                 } else {
                     // Delete.
@@ -285,7 +284,7 @@ mod tests {
             if cache.access(pgno) {
                 hits += 1;
             } else {
-                cache.insert(pgno);
+                let _ = cache.insert(pgno);
             }
         }
         (hits, total)
@@ -354,7 +353,7 @@ mod tests {
         // Insert 100 pages.
         for i in 1_u32..=100 {
             let pgno = PageNumber::new(i).unwrap();
-            cache.insert(pgno);
+            let _ = cache.insert(pgno);
             assert!(
                 cache.resident_len() <= capacity,
                 "resident {} > capacity {} after inserting page {}",
@@ -372,7 +371,7 @@ mod tests {
             }
             let new_page = 101 + round;
             let pgno = PageNumber::new(new_page).unwrap();
-            cache.insert(pgno);
+            let _ = cache.insert(pgno);
             assert!(
                 cache.resident_len() <= capacity,
                 "resident {} > capacity {} in round {}",
@@ -394,7 +393,7 @@ mod tests {
         // Insert 20 pages (overflows small and main).
         for i in 1_u32..=20 {
             let pgno = PageNumber::new(i).unwrap();
-            cache.insert(pgno);
+            let _ = cache.insert(pgno);
         }
 
         // Some early pages should now be in ghost.

@@ -9,6 +9,7 @@
 //! gate fails only when new critical-path completeness failures are introduced.
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -105,39 +106,43 @@ impl BacklogQualityGateReport {
     pub fn render_markdown(&self) -> String {
         let mut out = String::new();
         out.push_str("# Backlog Quality Gate Report\n\n");
-        out.push_str(&format!("- overall_pass: `{}`\n", self.overall_pass));
-        out.push_str(&format!(
-            "- scanned_active_beads: `{}`\n",
+        let _ = writeln!(out, "- overall_pass: `{}`", self.overall_pass);
+        let _ = writeln!(
+            out,
+            "- scanned_active_beads: `{}`",
             self.summary.scanned_active_beads
-        ));
-        out.push_str(&format!(
-            "- scanned_critical_beads: `{}`\n",
+        );
+        let _ = writeln!(
+            out,
+            "- scanned_critical_beads: `{}`",
             self.summary.scanned_critical_beads
-        ));
-        out.push_str(&format!(
-            "- total_failures: `{}`\n",
-            self.summary.total_failures
-        ));
-        out.push_str(&format!(
-            "- critical_failures: `{}`\n",
+        );
+        let _ = writeln!(out, "- total_failures: `{}`", self.summary.total_failures);
+        let _ = writeln!(
+            out,
+            "- critical_failures: `{}`",
             self.summary.critical_failures
-        ));
-        out.push_str(&format!(
-            "- regression_failures: `{}`\n",
+        );
+        let _ = writeln!(
+            out,
+            "- regression_failures: `{}`",
             self.summary.regression_failures
-        ));
-        out.push_str(&format!(
-            "- missing_unit_property_count: `{}`\n",
+        );
+        let _ = writeln!(
+            out,
+            "- missing_unit_property_count: `{}`",
             self.summary.missing_unit_property_count
-        ));
-        out.push_str(&format!(
-            "- missing_deterministic_e2e_count: `{}`\n",
+        );
+        let _ = writeln!(
+            out,
+            "- missing_deterministic_e2e_count: `{}`",
             self.summary.missing_deterministic_e2e_count
-        ));
-        out.push_str(&format!(
-            "- missing_structured_logging_count: `{}`\n",
+        );
+        let _ = writeln!(
+            out,
+            "- missing_structured_logging_count: `{}`",
             self.summary.missing_structured_logging_count
-        ));
+        );
         out.push('\n');
 
         if self.regression_failures.is_empty() {
@@ -145,8 +150,9 @@ impl BacklogQualityGateReport {
         } else {
             out.push_str("## Regression Failures\n\n");
             for failure in &self.regression_failures {
-                out.push_str(&format!(
-                    "- `{}` (P{} {}) missing: {}\n",
+                let _ = writeln!(
+                    out,
+                    "- `{}` (P{} {}) missing: {}",
                     failure.issue_id,
                     failure.priority,
                     if failure.is_critical {
@@ -155,21 +161,22 @@ impl BacklogQualityGateReport {
                         "non-critical"
                     },
                     join_requirements(&failure.missing_requirements)
-                ));
+                );
             }
         }
 
         if !self.failures.is_empty() {
             out.push_str("\n## All Failures\n\n");
             for failure in &self.failures {
-                out.push_str(&format!(
-                    "- `{}` ({}) missing: {}\n",
+                let _ = writeln!(
+                    out,
+                    "- `{}` ({}) missing: {}",
                     failure.issue_id,
                     failure.title,
                     join_requirements(&failure.missing_requirements)
-                ));
+                );
                 for item in &failure.remediation {
-                    out.push_str(&format!("  - remediation: {item}\n"));
+                    let _ = writeln!(out, "  - remediation: {item}");
                 }
             }
         }

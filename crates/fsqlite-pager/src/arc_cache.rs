@@ -1340,6 +1340,14 @@ impl std::fmt::Debug for ArcCacheInner {
             .field("page_versions_len", &self.page_versions.len())
             .field("gc_horizon", &self.gc_horizon)
             .field("capacity_overflow_events", &self.capacity_overflow_events)
+            .field("hits", &self.hits)
+            .field("misses", &self.misses)
+            .field("ghost_hits_b1", &self.ghost_hits_b1)
+            .field("ghost_hits_b2", &self.ghost_hits_b2)
+            .field("evictions_t1", &self.evictions_t1)
+            .field("evictions_t2", &self.evictions_t2)
+            .field("version_coalesce_count", &self.version_coalesce_count)
+            .field("admits", &self.admits)
             .finish()
     }
 }

@@ -88,6 +88,7 @@ fn scorecard_is_computable() {
 }
 
 #[test]
+#[allow(clippy::float_cmp)]
 fn scorecard_is_deterministic() {
     let universe = build_canonical_universe();
     let config = ScoreEngineConfig::default();
@@ -514,6 +515,7 @@ fn credible_interval_narrows_with_more_data() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[allow(clippy::float_cmp)]
 fn beta_quantile_boundaries() {
     let b = BetaParams::new(3.0, 5.0);
     assert_eq!(b.quantile(0.0), 0.0);
@@ -540,6 +542,7 @@ fn beta_credible_interval_wider_at_higher_confidence() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[allow(clippy::float_cmp)]
 fn scorecard_json_roundtrip() {
     let universe = build_canonical_universe();
     let config = ScoreEngineConfig::default();

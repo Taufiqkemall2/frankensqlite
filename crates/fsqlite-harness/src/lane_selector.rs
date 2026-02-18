@@ -143,10 +143,11 @@ const fn ci_lanes_for_validation_lane(lane: ValidationLane) -> &'static [CiLane]
         ValidationLane::UnitTests => &[CiLane::Unit],
         ValidationLane::StorageIntegration => &[CiLane::E2eCorrectness],
         ValidationLane::SqlPipeline => &[CiLane::E2eDifferential, CiLane::E2eCorrectness],
-        ValidationLane::ConcurrencyStress => &[CiLane::E2eDifferential],
+        ValidationLane::ConcurrencyStress | ValidationLane::MetamorphicDifferential => {
+            &[CiLane::E2eDifferential]
+        }
         ValidationLane::RecoveryDurability => &[CiLane::E2eRecovery],
         ValidationLane::SoakEndurance => &[CiLane::CoverageDrift],
-        ValidationLane::MetamorphicDifferential => &[CiLane::E2eDifferential],
         ValidationLane::PerformanceRegression => &[CiLane::Performance],
         ValidationLane::FullE2e => &[
             CiLane::E2eDifferential,
@@ -197,6 +198,7 @@ fn map_path_to_code_area(path: &str) -> Option<&'static str> {
     }
 }
 
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
 fn is_non_code_path(path: &str) -> bool {
     path.starts_with("docs/")
         || path.starts_with(".beads/")
@@ -209,6 +211,7 @@ fn is_non_code_path(path: &str) -> bool {
         || path == "AGENTS.md"
 }
 
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
 fn looks_like_code_path(path: &str) -> bool {
     path.starts_with("crates/")
         || path.starts_with("src/")
@@ -247,7 +250,11 @@ fn apply_coverage_gate_policy(
 }
 
 fn validate_area_ids(graph: &ImpactGraph, area_ids: &BTreeSet<String>) -> BTreeSet<String> {
-    let known: BTreeSet<String> = graph.code_areas.iter().map(|area| area.id()).collect();
+    let known: BTreeSet<String> = graph
+        .code_areas
+        .iter()
+        .map(super::impact_graph::CodeArea::id)
+        .collect();
     area_ids
         .iter()
         .filter(|id| known.contains((*id).as_str()))
@@ -540,11 +547,10 @@ pub fn run_lane_selection_audit(config: &LaneSelectionAuditConfig) -> LaneSelect
         });
     }
 
-    let verdict = if !graph_errors.is_empty() {
-        LaneSelectionVerdict::Fail
-    } else if total_unresolved > config.max_unresolved_paths {
-        LaneSelectionVerdict::Fail
-    } else if !config.allow_fallback && total_fallbacks > 0 {
+    let verdict = if !graph_errors.is_empty()
+        || total_unresolved > config.max_unresolved_paths
+        || (!config.allow_fallback && total_fallbacks > 0)
+    {
         LaneSelectionVerdict::Fail
     } else if total_unresolved > 0 || total_fallbacks > 0 {
         LaneSelectionVerdict::Warning

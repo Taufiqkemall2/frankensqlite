@@ -884,6 +884,7 @@ fn push_shell_issue(
 /// # Errors
 ///
 /// Returns an error when the workspace root or `e2e/` directory cannot be read.
+#[allow(clippy::too_many_lines)]
 pub fn assess_shell_script_profile_conformance(
     workspace_root: &Path,
     traceability: &TraceabilityMatrix,
@@ -904,7 +905,10 @@ pub fn assess_shell_script_profile_conformance(
         let Some(file_name) = file_name.to_str() else {
             continue;
         };
-        if !file_name.ends_with(".sh") {
+        if !std::path::Path::new(&file_name)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("sh"))
+        {
             continue;
         }
         discovered_shell_paths.push(format!("e2e/{file_name}"));

@@ -1548,7 +1548,7 @@ mod tests {
     use crate::e2e_log_schema::LogPhase;
     use proptest::prelude::*;
 
-    const SEED: u64 = 20260213;
+    const SEED: u64 = 20_260_213;
 
     fn build_test_manifest(with_bisect: bool) -> ArtifactManifest {
         let bisect = if with_bisect {
@@ -1935,7 +1935,7 @@ mod tests {
         let context = render_divergence_context(&decoded.events, div, 1);
         let lines: Vec<&str> = context.lines().collect();
         // Header + 3 event lines + 1 divergence annotation = 5
-        let event_lines: Vec<&&str> = lines.iter().filter(|l| l.contains("[")).collect();
+        let event_lines: Vec<&&str> = lines.iter().filter(|l| l.contains('[')).collect();
         assert_eq!(
             event_lines.len(),
             3,

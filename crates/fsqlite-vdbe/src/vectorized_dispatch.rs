@@ -1229,7 +1229,7 @@ mod tests {
         );
 
         let reports = dispatcher
-            .execute_with_barriers(&[tasks.clone()], |task, worker_id| {
+            .execute_with_barriers(std::slice::from_ref(&tasks), |task, worker_id| {
                 let spin = synthetic_e2e_task_cost(task.task_id, worker_id, MORSEL_E2E_SEED);
                 std::hint::black_box(spin);
                 task.task_id
@@ -1272,6 +1272,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn morsel_dispatch_e2e_replay_emits_artifact() {
         let run_id = std::env::var("RUN_ID")
             .unwrap_or_else(|_| format!("{MORSEL_BEAD_ID}-seed-{MORSEL_E2E_SEED}"));
@@ -1289,8 +1290,7 @@ mod tests {
             .expect("bead_id={MORSEL_BEAD_ID} context should be valid");
 
         let artifact_path = std::env::var("FSQLITE_MORSEL_E2E_ARTIFACT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| default_e2e_artifact_path());
+            .map_or_else(|_| default_e2e_artifact_path(), PathBuf::from);
         if let Some(parent) = artifact_path.parent() {
             std::fs::create_dir_all(parent)
                 .expect("bead_id={MORSEL_BEAD_ID} artifact directory should be writable");

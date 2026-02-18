@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -270,9 +271,7 @@ fn derive_opportunity_entry(sample: &BaselineSample) -> OpportunityMatrixEntry {
     let confidence = if sample.tier == "micro" { 4 } else { 3 };
 
     let effort = match sample.family.as_str() {
-        "write-contention" => 2,
-        "checkpoint" => 2,
-        "recovery" => 3,
+        "write-contention" | "checkpoint" => 2,
         _ => 3,
     };
 
@@ -325,26 +324,25 @@ fn write_pretty_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String>
 fn render_human_summary(report: &PerfBaselinePackReport) -> String {
     let mut out = String::new();
     out.push_str("# Perf Baseline Pack Runner\n\n");
-    out.push_str(&format!("- bead_id: `{}`\n", report.bead_id));
-    out.push_str(&format!("- run_id: `{}`\n", report.run_id));
-    out.push_str(&format!("- root_seed: `{}`\n", report.root_seed));
-    out.push_str(&format!("- scenario_count: `{}`\n", report.scenario_count));
-    out.push_str(&format!("- promoted_count: `{}`\n", report.promoted_count));
-    out.push_str(&format!("- baseline_path: `{}`\n", report.baseline_path));
-    out.push_str(&format!(
-        "- smoke_report_path: `{}`\n",
-        report.smoke_report_path
-    ));
-    out.push_str(&format!("- hyperfine_path: `{}`\n", report.hyperfine_path));
-    out.push_str(&format!(
-        "- profiling_report_path: `{}`\n",
+    let _ = writeln!(out, "- bead_id: `{}`", report.bead_id);
+    let _ = writeln!(out, "- run_id: `{}`", report.run_id);
+    let _ = writeln!(out, "- root_seed: `{}`", report.root_seed);
+    let _ = writeln!(out, "- scenario_count: `{}`", report.scenario_count);
+    let _ = writeln!(out, "- promoted_count: `{}`", report.promoted_count);
+    let _ = writeln!(out, "- baseline_path: `{}`", report.baseline_path);
+    let _ = writeln!(out, "- smoke_report_path: `{}`", report.smoke_report_path);
+    let _ = writeln!(out, "- hyperfine_path: `{}`", report.hyperfine_path);
+    let _ = writeln!(
+        out,
+        "- profiling_report_path: `{}`",
         report.profiling_report_path
-    ));
-    out.push_str(&format!(
-        "- opportunity_matrix_path: `{}`\n",
+    );
+    let _ = writeln!(
+        out,
+        "- opportunity_matrix_path: `{}`",
         report.opportunity_matrix_path
-    ));
-    out.push_str(&format!("- overall_pass: `{}`\n", report.overall_pass));
+    );
+    let _ = writeln!(out, "- overall_pass: `{}`", report.overall_pass);
 
     if report.promoted_hotspots.is_empty() {
         out.push_str("\nNo opportunities met threshold >= 2.0.\n");
@@ -353,12 +351,13 @@ fn render_human_summary(report: &PerfBaselinePackReport) -> String {
 
     out.push_str("\n## Promoted Opportunities\n");
     for hotspot in &report.promoted_hotspots {
-        out.push_str(&format!("- `{hotspot}`\n"));
+        let _ = writeln!(out, "- `{hotspot}`");
     }
 
     out
 }
 
+#[allow(clippy::too_many_lines)]
 fn run() -> Result<PerfBaselinePackReport, String> {
     let config = Config::parse()?;
 
@@ -440,7 +439,7 @@ fn run() -> Result<PerfBaselinePackReport, String> {
             baseline_path: format!("baselines/criterion/{BASELINE_FILENAME}"),
             latest_path: format!("baselines/criterion/{BASELINE_LATEST_FILENAME}"),
         },
-        env: env_metadata.clone(),
+        env: env_metadata,
         system: PerfSmokeSystem {
             os: env::consts::OS.to_owned(),
             arch: env::consts::ARCH.to_owned(),
@@ -603,7 +602,7 @@ fn run() -> Result<PerfBaselinePackReport, String> {
     let profiling_report = ProfilingArtifactReport {
         trace_id: format!("trace-prof-{run_unix_ms}"),
         scenario_id: profiling_entry.id.clone(),
-        git_sha: git_sha.clone(),
+        git_sha,
         artifact_paths,
         metadata,
     };

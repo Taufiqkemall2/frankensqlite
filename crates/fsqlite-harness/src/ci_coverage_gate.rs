@@ -357,6 +357,7 @@ pub fn evaluate_coverage_gate(thresholds: &CoverageThresholds) -> CoverageGateRe
 ///
 /// This variant is useful for testing with synthetic data.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn evaluate_coverage_gate_with(
     thresholds: &CoverageThresholds,
     matrix: &UnitMatrix,

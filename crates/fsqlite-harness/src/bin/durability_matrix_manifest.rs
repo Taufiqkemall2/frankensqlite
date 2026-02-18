@@ -105,7 +105,7 @@ fn parse_args(args: &[String]) -> Result<CliConfig, String> {
             }
             "--workflow" => set_mode(&mut config.mode, OutputMode::Workflow, "--workflow")?,
             "--probe-dry-run" => {
-                set_mode(&mut config.mode, OutputMode::ProbeDryRun, "--probe-dry-run")?
+                set_mode(&mut config.mode, OutputMode::ProbeDryRun, "--probe-dry-run")?;
             }
             "--probe-execute" => set_mode(
                 &mut config.mode,

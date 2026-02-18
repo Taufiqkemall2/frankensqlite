@@ -1839,14 +1839,13 @@ mod tests {
     #[test]
     fn literal_family_contains_expected_transforms() {
         let reg = TransformRegistry::new();
-        let lit_names: Vec<&str> = reg
-            .transforms()
-            .iter()
-            .filter(|t| t.family() == TransformFamily::Literal)
-            .map(|t| t.name())
-            .collect();
-
-        assert!(lit_names.contains(&"cast_literal_identity"));
+        assert!(
+            reg.transforms()
+                .iter()
+                .filter(|t| t.family() == TransformFamily::Literal)
+                .map(|t| t.name())
+                .any(|n| n == "cast_literal_identity")
+        );
     }
 
     #[test]

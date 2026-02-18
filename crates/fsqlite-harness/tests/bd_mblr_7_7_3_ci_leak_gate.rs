@@ -102,6 +102,7 @@ fn gate_fail_decision(warning_count: usize, critical_count: usize) -> bool {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn ci_leak_gate_enforces_budget_and_emits_actionable_diagnostics() -> Result<(), String> {
     let records = vec![
         make_record(0, "HEALTHY", TelemetryBoundary::Startup, 1_000_000, 10),

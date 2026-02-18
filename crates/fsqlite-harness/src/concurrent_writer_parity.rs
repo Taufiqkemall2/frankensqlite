@@ -208,6 +208,7 @@ impl ConcurrentWriterParityReport {
 // ---------------------------------------------------------------------------
 
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn assess_concurrent_writer_parity(
     config: &ConcurrentWriterParityConfig,
 ) -> ConcurrentWriterParityReport {
@@ -557,7 +558,7 @@ mod tests {
             .map(|a| a.as_str())
             .collect();
         let len = names.len();
-        names.sort();
+        names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), len, "area names must be unique");
     }
@@ -618,6 +619,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn assess_score() {
         let report = assess_concurrent_writer_parity(&ConcurrentWriterParityConfig::default());
         assert_eq!(report.parity_score, 1.0);
@@ -647,6 +649,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn json_roundtrip() {
         let report = assess_concurrent_writer_parity(&ConcurrentWriterParityConfig::default());
         let json = report.to_json().expect("serialize");

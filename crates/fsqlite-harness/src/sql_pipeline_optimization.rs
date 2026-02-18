@@ -75,8 +75,11 @@ impl OptimizationDomain {
         match self {
             Self::Parser => "fsqlite-parser",
             Self::Resolver | Self::Planner => "fsqlite-planner",
-            Self::Codegen | Self::VdbeExecution | Self::Expression => "fsqlite-vdbe",
-            Self::Sorting | Self::Aggregation => "fsqlite-vdbe",
+            Self::Codegen
+            | Self::VdbeExecution
+            | Self::Expression
+            | Self::Sorting
+            | Self::Aggregation => "fsqlite-vdbe",
         }
     }
 }
@@ -194,6 +197,7 @@ impl SqlPipelineOptReport {
 // ---------------------------------------------------------------------------
 
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn assess_sql_pipeline_optimization(config: &SqlPipelineOptConfig) -> SqlPipelineOptReport {
     let mut checks = Vec::new();
 
@@ -401,7 +405,7 @@ mod tests {
     fn domain_as_str_unique() {
         let mut names: Vec<&str> = OptimizationDomain::ALL.iter().map(|d| d.as_str()).collect();
         let len = names.len();
-        names.sort();
+        names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), len);
     }
@@ -427,6 +431,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn default_config() {
         let cfg = SqlPipelineOptConfig::default();
         assert_eq!(cfg.min_domains_profiled, 8);
@@ -450,6 +455,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn assess_score() {
         let report = assess_sql_pipeline_optimization(&SqlPipelineOptConfig::default());
         assert_eq!(report.parity_score, 1.0);

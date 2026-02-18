@@ -606,6 +606,7 @@ pub struct GovernanceReport {
 }
 
 /// Evaluate governance across all scenarios using baselines, candidates, SLO policy, and waivers.
+#[allow(clippy::too_many_lines)]
 pub fn evaluate_governance(
     baseline_samples: &[BenchmarkSample],
     candidates: &[BenchmarkSample],
@@ -642,9 +643,8 @@ pub fn evaluate_governance(
     let mut overall = SloVerdict::Pass;
 
     for candidate in candidates {
-        let slo = match policy.find_slo(&candidate.scenario_id) {
-            Some(s) => s,
-            None => continue, // scenario not governed
+        let Some(slo) = policy.find_slo(&candidate.scenario_id) else {
+            continue; // scenario not governed
         };
 
         let assessment =
@@ -693,10 +693,8 @@ pub fn evaluate_governance(
             {
                 verdict = SloVerdict::Waived;
                 reasons.push(format!("waiver active: {}", w.reason));
-                (true, Some(w.reason.clone()))
-            } else {
-                (true, Some(w.reason.clone()))
             }
+            (true, Some(w.reason.clone()))
         } else {
             (false, None)
         };

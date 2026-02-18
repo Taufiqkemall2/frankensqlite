@@ -77,8 +77,7 @@ impl RealdbCommand {
     #[must_use]
     pub const fn default_phase(self) -> LogPhase {
         match self {
-            Self::Run | Self::Corrupt => LogPhase::Execute,
-            Self::Bench => LogPhase::Execute,
+            Self::Run | Self::Corrupt | Self::Bench => LogPhase::Execute,
             Self::Compare => LogPhase::Validate,
         }
     }

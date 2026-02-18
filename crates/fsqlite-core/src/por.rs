@@ -274,7 +274,10 @@ mod tests {
             .map(|i| {
                 let mut page = vec![0u8; 4096];
                 for (j, b) in page.iter_mut().enumerate() {
-                    *b = ((i as usize * 37 + j) % 256) as u8;
+                    #[allow(clippy::cast_possible_truncation)]
+                    {
+                        *b = ((i as usize * 37 + j) % 256) as u8;
+                    }
                 }
                 page
             })

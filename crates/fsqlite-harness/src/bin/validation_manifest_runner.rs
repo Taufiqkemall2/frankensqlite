@@ -29,6 +29,7 @@ struct Config {
 }
 
 impl Config {
+    #[allow(clippy::too_many_lines)]
     fn parse() -> Result<Self, String> {
         let mut workspace_root = default_workspace_root()?;
         let mut output_dir = workspace_root.join(DEFAULT_ARTIFACT_PREFIX);
@@ -100,7 +101,7 @@ impl Config {
                     let value = args
                         .get(index)
                         .ok_or_else(|| "missing value for --scenario-id".to_owned())?;
-                    scenario_id = value.to_owned();
+                    value.clone_into(&mut scenario_id);
                 }
                 "--root-seed" => {
                     index += 1;
@@ -129,7 +130,7 @@ impl Config {
                     let value = args
                         .get(index)
                         .ok_or_else(|| "missing value for --artifact-uri-prefix".to_owned())?;
-                    artifact_uri_prefix = value.to_owned();
+                    value.clone_into(&mut artifact_uri_prefix);
                 }
                 "--help" | "-h" => {
                     print_help();

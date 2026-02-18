@@ -3010,6 +3010,7 @@ mod tests {
             let inner = pager.inner.lock().unwrap();
             assert_eq!(inner.freelist.len(), 1);
             assert_eq!(inner.freelist[0], p);
+            drop(inner);
         }
 
         // 3. Allocate the page again (pops from freelist).
@@ -3021,6 +3022,7 @@ mod tests {
         {
             let inner = pager.inner.lock().unwrap();
             assert!(inner.freelist.is_empty());
+            drop(inner);
         }
 
         // 4. Rollback.
@@ -3035,10 +3037,12 @@ mod tests {
                 "bead_id={BEAD_ID} case=freelist_leak_on_rollback"
             );
             assert_eq!(inner.freelist[0], p);
+            drop(inner);
         }
     }
 
     #[test]
+    #[allow(clippy::similar_names, clippy::cast_possible_truncation)]
     fn test_cache_eviction_under_pressure() {
         // Verify that SimplePager can handle more pages than the cache capacity.
         // PageCache is initialized with 256 pages. We write 300 pages.

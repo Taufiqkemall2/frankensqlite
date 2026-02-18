@@ -759,7 +759,7 @@ mod tests {
         }
 
         // Release one permit, then one more should succeed.
-        permits.pop().unwrap().release_to(&bulkhead);
+        permits.pop().unwrap().release();
         let recovered = bulkhead.try_acquire(1);
         assert!(
             recovered.is_some(),

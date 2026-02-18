@@ -1615,6 +1615,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn coverage_computation_is_deterministic() {
         let matrix = ExtensionParityMatrix::canonical();
         let cov1 = compute_extension_coverage(&matrix);
@@ -1756,6 +1757,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn coverage_json_round_trip() {
         let matrix = ExtensionParityMatrix::canonical();
         let coverage = compute_extension_coverage(&matrix);

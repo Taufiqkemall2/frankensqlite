@@ -11,6 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::fmt::Write as _;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -135,41 +136,41 @@ impl T6sv2ChecklistReport {
     pub fn render_markdown(&self) -> String {
         let mut out = String::new();
         out.push_str("# t6sv2 Evidence Checklist Report\n\n");
-        out.push_str(&format!("- bead_id: `{}`\n", self.bead_id));
-        out.push_str(&format!(
-            "- overall_pass: `{}`\n",
-            self.summary.overall_pass
-        ));
-        out.push_str(&format!("- child_count: `{}`\n", self.summary.child_count));
-        out.push_str(&format!("- open_count: `{}`\n", self.summary.open_count));
-        out.push_str(&format!(
-            "- in_progress_count: `{}`\n",
+        let _ = writeln!(out, "- bead_id: `{}`", self.bead_id);
+        let _ = writeln!(out, "- overall_pass: `{}`", self.summary.overall_pass);
+        let _ = writeln!(out, "- child_count: `{}`", self.summary.child_count);
+        let _ = writeln!(out, "- open_count: `{}`", self.summary.open_count);
+        let _ = writeln!(
+            out,
+            "- in_progress_count: `{}`",
             self.summary.in_progress_count
-        ));
-        out.push_str(&format!(
-            "- closed_count: `{}`\n",
-            self.summary.closed_count
-        ));
-        out.push_str(&format!(
-            "- missing_unit_count: `{}`\n",
+        );
+        let _ = writeln!(out, "- closed_count: `{}`", self.summary.closed_count);
+        let _ = writeln!(
+            out,
+            "- missing_unit_count: `{}`",
             self.summary.missing_unit_count
-        ));
-        out.push_str(&format!(
-            "- missing_e2e_count: `{}`\n",
+        );
+        let _ = writeln!(
+            out,
+            "- missing_e2e_count: `{}`",
             self.summary.missing_e2e_count
-        ));
-        out.push_str(&format!(
-            "- missing_log_count: `{}`\n",
+        );
+        let _ = writeln!(
+            out,
+            "- missing_log_count: `{}`",
             self.summary.missing_log_count
-        ));
-        out.push_str(&format!(
-            "- stale_link_count: `{}`\n",
+        );
+        let _ = writeln!(
+            out,
+            "- stale_link_count: `{}`",
             self.summary.stale_link_count
-        ));
-        out.push_str(&format!(
-            "- violation_count: `{}`\n\n",
+        );
+        let _ = writeln!(
+            out,
+            "- violation_count: `{}`\n",
             self.summary.violation_count
-        ));
+        );
 
         out.push_str("## Rows\n\n");
         out.push_str("| Bead | Status | Owner | Missing | Stale Links |\n");
@@ -184,14 +185,15 @@ impl T6sv2ChecklistReport {
                     .collect::<Vec<_>>()
                     .join(",")
             };
-            out.push_str(&format!(
-                "| `{}` | {} | {} | {} | {} |\n",
+            let _ = writeln!(
+                out,
+                "| `{}` | {} | {} | {} | {} |",
                 row.bead_id,
                 row.status,
                 row.owner,
                 missing,
                 row.stale_links.len()
-            ));
+            );
         }
 
         if self.violations.is_empty() {
@@ -199,14 +201,15 @@ impl T6sv2ChecklistReport {
         } else {
             out.push_str("\n## Violations\n\n");
             for violation in &self.violations {
-                out.push_str(&format!(
-                    "- `{}` owner={} kind={} detail={} cmd=`{}`\n",
+                let _ = writeln!(
+                    out,
+                    "- `{}` owner={} kind={} detail={} cmd=`{}`",
                     violation.bead_id,
                     violation.owner,
                     violation.kind,
                     violation.detail,
                     violation.triage_command
-                ));
+                );
             }
         }
 
@@ -538,11 +541,7 @@ fn collect_violations(rows: &[T6sv2ChecklistRow]) -> Vec<T6sv2ChecklistViolation
 
     for row in rows {
         let triage_command = row.triage_command.clone();
-        if row
-            .missing
-            .iter()
-            .any(|kind| *kind == ChecklistMissingKind::UnitEvidence)
-        {
+        if row.missing.contains(&ChecklistMissingKind::UnitEvidence) {
             violations.push(T6sv2ChecklistViolation {
                 bead_id: row.bead_id.clone(),
                 owner: row.owner.clone(),
@@ -551,11 +550,7 @@ fn collect_violations(rows: &[T6sv2ChecklistRow]) -> Vec<T6sv2ChecklistViolation
                 triage_command: triage_command.clone(),
             });
         }
-        if row
-            .missing
-            .iter()
-            .any(|kind| *kind == ChecklistMissingKind::E2eEvidence)
-        {
+        if row.missing.contains(&ChecklistMissingKind::E2eEvidence) {
             violations.push(T6sv2ChecklistViolation {
                 bead_id: row.bead_id.clone(),
                 owner: row.owner.clone(),
@@ -564,11 +559,7 @@ fn collect_violations(rows: &[T6sv2ChecklistRow]) -> Vec<T6sv2ChecklistViolation
                 triage_command: triage_command.clone(),
             });
         }
-        if row
-            .missing
-            .iter()
-            .any(|kind| *kind == ChecklistMissingKind::LogEvidence)
-        {
+        if row.missing.contains(&ChecklistMissingKind::LogEvidence) {
             violations.push(T6sv2ChecklistViolation {
                 bead_id: row.bead_id.clone(),
                 owner: row.owner.clone(),
@@ -623,25 +614,13 @@ fn build_summary(
             "closed" => closed_count = closed_count.saturating_add(1),
             _ => other_status_count = other_status_count.saturating_add(1),
         }
-        if row
-            .missing
-            .iter()
-            .any(|kind| *kind == ChecklistMissingKind::UnitEvidence)
-        {
+        if row.missing.contains(&ChecklistMissingKind::UnitEvidence) {
             missing_unit_count = missing_unit_count.saturating_add(1);
         }
-        if row
-            .missing
-            .iter()
-            .any(|kind| *kind == ChecklistMissingKind::E2eEvidence)
-        {
+        if row.missing.contains(&ChecklistMissingKind::E2eEvidence) {
             missing_e2e_count = missing_e2e_count.saturating_add(1);
         }
-        if row
-            .missing
-            .iter()
-            .any(|kind| *kind == ChecklistMissingKind::LogEvidence)
-        {
+        if row.missing.contains(&ChecklistMissingKind::LogEvidence) {
             missing_log_count = missing_log_count.saturating_add(1);
         }
         stale_link_count = stale_link_count.saturating_add(row.stale_links.len());

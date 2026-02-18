@@ -597,10 +597,7 @@ fn dpor_hot_witness_epoch_install_has_no_lost_bits() {
             })
             .expect("spawn B");
 
-        let mut sched = rt
-            .scheduler
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut sched = rt.scheduler.lock();
         sched.schedule(t_a, 0);
         sched.schedule(t_b, 0);
         drop(sched);
@@ -704,7 +701,7 @@ fn dpor_outgoing_edges_cover_committed_and_freed_writers() {
             .expect("spawn W");
 
         {
-            let mut sched = rt.scheduler.lock().expect("scheduler lock");
+            let mut sched = rt.scheduler.lock();
             sched.schedule(t_t, 0);
             sched.schedule(t_w, 0);
         }
@@ -751,10 +748,7 @@ fn chaos_cancel_does_not_leak_hot_witness_epoch_lock() {
             })
             .expect("spawn B");
 
-        let mut sched = rt
-            .scheduler
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut sched = rt.scheduler.lock();
         sched.schedule(t_a, 0);
         sched.schedule(t_b, 0);
         drop(sched);
@@ -874,7 +868,7 @@ fn dpor_incoming_edges_cover_committed_pivots_via_committed_readers_index() {
             .expect("spawn T");
 
         {
-            let mut sched = rt.scheduler.lock().expect("scheduler lock");
+            let mut sched = rt.scheduler.lock();
             sched.schedule(t_r, 0);
             sched.schedule(t_t, 0);
         }

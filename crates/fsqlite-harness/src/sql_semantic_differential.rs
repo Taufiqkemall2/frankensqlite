@@ -73,12 +73,13 @@ impl SemanticTestLayer {
     #[must_use]
     pub const fn pipeline_coverage(self) -> &'static [&'static str] {
         match self {
-            Self::OracleDifferential => &["parse", "resolve", "plan", "execute"],
+            Self::OracleDifferential | Self::SqlPipelineSuites => {
+                &["parse", "resolve", "plan", "execute"]
+            }
             Self::MismatchMinimizer => &["attribute", "minimize", "deduplicate"],
             Self::SemanticGapMap => &["parse", "resolve", "plan", "codegen", "execute"],
             Self::PlannerVdbeClosure => &["plan", "execute"],
             Self::MetamorphicRewrite => &["parse", "plan", "execute"],
-            Self::SqlPipelineSuites => &["parse", "resolve", "plan", "execute"],
             Self::StructuredLogging => &["logging", "traceability"],
             Self::ArtifactBundles => &["reproduction", "artifact"],
         }
@@ -197,6 +198,7 @@ impl SqlSemanticDiffReport {
 // ---------------------------------------------------------------------------
 
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn assess_sql_semantic_differential(config: &SqlSemanticDiffConfig) -> SqlSemanticDiffReport {
     let mut checks = Vec::new();
 
@@ -507,7 +509,7 @@ mod tests {
     fn layer_as_str_unique() {
         let mut names: Vec<&str> = SemanticTestLayer::ALL.iter().map(|l| l.as_str()).collect();
         let len = names.len();
-        names.sort();
+        names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), len, "layer names must be unique");
     }
@@ -569,6 +571,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn assess_score() {
         let report = assess_sql_semantic_differential(&SqlSemanticDiffConfig::default());
         assert_eq!(report.parity_score, 1.0);
@@ -592,6 +595,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn json_roundtrip() {
         let report = assess_sql_semantic_differential(&SqlSemanticDiffConfig::default());
         let json = report.to_json().expect("serialize");

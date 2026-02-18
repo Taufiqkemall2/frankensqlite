@@ -288,6 +288,7 @@ impl WalJournalParityReport {
 ///
 /// This function catalogs the tested behaviors and evaluates overall parity.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn assess_wal_journal_parity(config: &WalJournalParityConfig) -> WalJournalParityReport {
     let mut checks = Vec::new();
 
@@ -556,6 +557,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn assess_parity_score_is_one() {
         let cfg = WalJournalParityConfig::default();
         let report = assess_wal_journal_parity(&cfg);
@@ -603,6 +605,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn json_roundtrip() {
         let cfg = WalJournalParityConfig::default();
         let report = assess_wal_journal_parity(&cfg);
@@ -630,6 +633,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn deterministic() {
         let cfg = WalJournalParityConfig::default();
         let r1 = assess_wal_journal_parity(&cfg);

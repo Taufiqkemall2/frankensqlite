@@ -150,6 +150,7 @@ pub struct StructuredCrashEvent {
 }
 
 impl StructuredCrashEvent {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         config: &CrossProcessCrashConfig,
         scenario_id: &str,
@@ -178,6 +179,7 @@ impl StructuredCrashEvent {
 
 /// Per-cycle outcome.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ScenarioOutcome {
     pub scenario_id: String,
     pub cycle: usize,
@@ -203,6 +205,7 @@ pub struct CrashHarnessMetrics {
 
 /// Full report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct CrossProcessCrashReport {
     pub schema_version: u32,
     pub bead_id: String,
@@ -391,6 +394,7 @@ fn choose_matrix_case(cycle: usize) -> (ProcessRole, CrashPoint) {
     (ProcessRole::ALL[role_index], CrashPoint::ALL[point_index])
 }
 
+#[allow(clippy::too_many_lines)]
 fn execute_cycle(
     state: &mut SimulationState,
     config: &CrossProcessCrashConfig,
