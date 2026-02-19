@@ -14,11 +14,13 @@ pub mod decision_contract;
 
 use decision_contract::access_path_kind_label;
 use fsqlite_ast::{
-    BinaryOp as AstBinaryOp, ColumnRef, CompoundOp, Expr, FromClause, InSet, LikeOp, Literal,
-    NullsOrder, OrderingTerm, ResultColumn, SelectBody, SelectCore, SortDirection, Span,
+    BinaryOp as AstBinaryOp, ColumnRef, CompoundOp, Expr, FromClause, InSet, IndexHint, LikeOp,
+    Literal, NullsOrder, OrderingTerm, ResultColumn, SelectBody, SelectCore, SortDirection, Span,
     TableOrSubquery,
 };
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::sync::{LazyLock, Mutex};
 
 // ---------------------------------------------------------------------------
 // Compound ORDER BY resolution (§19 quirk: first SELECT wins)
@@ -530,30 +532,219 @@ pub fn estimate_cost(kind: &AccessPathKind, table_pages: u64, index_pages: u64) 
     }
 }
 
+const ADAPTIVE_HINT_COST_BIAS: f64 = 0.90;
+
+static INDEX_SELECTION_TOTAL: LazyLock<Mutex<HashMap<&'static str, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn access_path_metric_label(kind: &AccessPathKind) -> &'static str {
+    match kind {
+        AccessPathKind::FullTableScan => "full_table_scan",
+        AccessPathKind::IndexScanRange { .. } => "index_scan_range",
+        AccessPathKind::IndexScanEquality => "index_scan_equality",
+        AccessPathKind::CoveringIndexScan { .. } => "covering_index_scan",
+        AccessPathKind::RowidLookup => "rowid_lookup",
+    }
+}
+
+fn increment_index_selection_total(kind: &AccessPathKind) -> u64 {
+    let label = access_path_metric_label(kind);
+    let mut counters = INDEX_SELECTION_TOTAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let updated_count = {
+        let entry = counters.entry(label).or_insert(0);
+        *entry += 1;
+        *entry
+    };
+    drop(counters);
+    updated_count
+}
+
+#[must_use]
+pub fn snapshot_index_selection_totals() -> BTreeMap<String, u64> {
+    let counters = INDEX_SELECTION_TOTAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    counters
+        .iter()
+        .map(|(label, count)| ((*label).to_owned(), *count))
+        .collect()
+}
+
+fn canonical_table_key(table_name: &str) -> String {
+    table_name.to_ascii_lowercase()
+}
+
+fn lookup_table_index_hint<'a>(
+    table_name: &str,
+    table_index_hints: Option<&'a BTreeMap<String, IndexHint>>,
+) -> Option<&'a IndexHint> {
+    table_index_hints.and_then(|hints| hints.get(&canonical_table_key(table_name)))
+}
+
+/// Minimal adaptive hint cache keyed by table name.
+///
+/// The planner records the last chosen index for each table and can reuse it as
+/// a soft preference on subsequent planning passes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CrackingHintStore {
+    preferred_index_by_table: HashMap<String, String>,
+}
+
+impl CrackingHintStore {
+    #[must_use]
+    pub fn preferred_index(&self, table_name: &str) -> Option<&str> {
+        self.preferred_index_by_table
+            .get(&canonical_table_key(table_name))
+            .map(String::as_str)
+    }
+
+    pub fn record_access_path(&mut self, access_path: &AccessPath) {
+        if let Some(index_name) = &access_path.index {
+            self.preferred_index_by_table
+                .insert(canonical_table_key(&access_path.table), index_name.clone());
+        }
+    }
+}
+
+fn collect_table_index_hints_inner(
+    from_clause: &FromClause,
+    output: &mut BTreeMap<String, IndexHint>,
+) {
+    fn collect_source(source: &TableOrSubquery, output: &mut BTreeMap<String, IndexHint>) {
+        match source {
+            TableOrSubquery::Table {
+                name,
+                alias,
+                index_hint,
+            } => {
+                if let Some(hint) = index_hint {
+                    output.insert(canonical_table_key(&name.name), hint.clone());
+                    if let Some(alias_name) = alias {
+                        output.insert(canonical_table_key(alias_name), hint.clone());
+                    }
+                }
+            }
+            TableOrSubquery::ParenJoin(inner) => {
+                collect_table_index_hints_inner(inner, output);
+            }
+            TableOrSubquery::Subquery { .. } | TableOrSubquery::TableFunction { .. } => {}
+        }
+    }
+
+    collect_source(&from_clause.source, output);
+    for join in &from_clause.joins {
+        collect_source(&join.table, output);
+    }
+}
+
+/// Extract per-table index hints from a FROM clause.
+///
+/// Keys are normalized to ASCII-lowercase table names and aliases.
+#[must_use]
+pub fn collect_table_index_hints(from_clause: &FromClause) -> BTreeMap<String, IndexHint> {
+    let mut hints = BTreeMap::new();
+    collect_table_index_hints_inner(from_clause, &mut hints);
+    hints
+}
+
 /// Build the cheapest [`AccessPath`] for a table given available indexes and
 /// WHERE terms. Returns the lowest-cost option.
 #[must_use]
-#[allow(clippy::too_many_lines)]
 pub fn best_access_path(
     table: &TableStats,
     indexes: &[IndexInfo],
     where_terms: &[WhereTerm<'_>],
     needed_columns: Option<&[String]>,
 ) -> AccessPath {
+    best_access_path_with_hints(table, indexes, where_terms, needed_columns, None, None)
+}
+
+/// Build the cheapest [`AccessPath`] while applying explicit index hints and
+/// optional adaptive cracking hint reuse.
+#[must_use]
+pub fn best_access_path_with_hints(
+    table: &TableStats,
+    indexes: &[IndexInfo],
+    where_terms: &[WhereTerm<'_>],
+    needed_columns: Option<&[String]>,
+    index_hint: Option<&IndexHint>,
+    cracking_hints: Option<&mut CrackingHintStore>,
+) -> AccessPath {
+    let adaptive_preferred_index = cracking_hints
+        .as_deref()
+        .and_then(|store| store.preferred_index(&table.name))
+        .map(ToOwned::to_owned);
+
+    let best = best_access_path_internal(
+        table,
+        indexes,
+        where_terms,
+        needed_columns,
+        index_hint,
+        adaptive_preferred_index.as_deref(),
+    );
+
+    if let Some(store) = cracking_hints {
+        store.record_access_path(&best);
+    }
+
+    best
+}
+
+/// Build the cheapest [`AccessPath`] with optional explicit and adaptive hints.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+fn best_access_path_internal(
+    table: &TableStats,
+    indexes: &[IndexInfo],
+    where_terms: &[WhereTerm<'_>],
+    needed_columns: Option<&[String]>,
+    index_hint: Option<&IndexHint>,
+    adaptive_preferred_index: Option<&str>,
+) -> AccessPath {
+    let started = std::time::Instant::now();
+    let explicit_indexed_by = match index_hint {
+        Some(IndexHint::IndexedBy(index_name)) => Some(index_name.as_str()),
+        _ => None,
+    };
+    let not_indexed = matches!(index_hint, Some(IndexHint::NotIndexed));
+
     let mut best = AccessPath {
         table: table.name.clone(),
         kind: AccessPathKind::FullTableScan,
         index: None,
-        estimated_cost: estimate_cost(&AccessPathKind::FullTableScan, table.n_pages, 0),
+        estimated_cost: if explicit_indexed_by.is_some() {
+            f64::INFINITY
+        } else {
+            estimate_cost(&AccessPathKind::FullTableScan, table.n_pages, 0)
+        },
         estimated_rows: table.n_rows as f64,
     };
 
     let mut candidates_considered: usize = 0;
+    let mut partial_indexes_pruned: usize = 0;
+    let mut hint_filtered_indexes: usize = 0;
+    let mut adaptive_hint_applied = false;
+    let mut explicit_hint_applied = false;
+    let mut explicit_hint_missing = explicit_indexed_by.is_some();
 
     // Check each index for usability.
     for idx in indexes {
         if !idx.table.eq_ignore_ascii_case(&table.name) {
             continue;
+        }
+        if not_indexed {
+            hint_filtered_indexes += 1;
+            continue;
+        }
+        if let Some(hinted_name) = explicit_indexed_by {
+            if !idx.name.eq_ignore_ascii_case(hinted_name) {
+                hint_filtered_indexes += 1;
+                continue;
+            }
+            explicit_hint_missing = false;
         }
 
         // Partial index gate: skip unless the query's WHERE implies the
@@ -561,6 +752,7 @@ pub fn best_access_path(
         // the index predicate must appear as a conjunct in the query WHERE.
         if let Some(ref partial_pred) = idx.partial_where {
             if !where_terms_imply_predicate(where_terms, partial_pred) {
+                partial_indexes_pruned += 1;
                 continue;
             }
         }
@@ -658,7 +850,21 @@ pub fn best_access_path(
             IndexUsability::NotUsable => unreachable!(),
         };
 
-        let cost = estimate_cost(&kind, table.n_pages, idx.n_pages) * cost_multiplier;
+        let mut cost = estimate_cost(&kind, table.n_pages, idx.n_pages) * cost_multiplier;
+
+        if let Some(hinted_name) = explicit_indexed_by {
+            if idx.name.eq_ignore_ascii_case(hinted_name) {
+                // Respect explicit INDEXED BY by strongly preferring that index.
+                cost *= 0.01;
+                explicit_hint_applied = true;
+            }
+        } else if let Some(adaptive_hint) = adaptive_preferred_index {
+            if idx.name.eq_ignore_ascii_case(adaptive_hint) {
+                cost *= ADAPTIVE_HINT_COST_BIAS;
+                adaptive_hint_applied = true;
+            }
+        }
+
         if cost < best.estimated_cost {
             best = AccessPath {
                 table: table.name.clone(),
@@ -671,7 +877,7 @@ pub fn best_access_path(
     }
 
     // Check rowid lookup.
-    if has_rowid_equality(where_terms) {
+    if !not_indexed && explicit_indexed_by.is_none() && has_rowid_equality(where_terms) {
         let kind = AccessPathKind::RowidLookup;
         let cost = estimate_cost(&kind, table.n_pages, 0);
         if cost < best.estimated_cost {
@@ -685,6 +891,16 @@ pub fn best_access_path(
         }
     }
 
+    if !best.estimated_cost.is_finite() {
+        best = AccessPath {
+            table: table.name.clone(),
+            kind: AccessPathKind::FullTableScan,
+            index: None,
+            estimated_cost: estimate_cost(&AccessPathKind::FullTableScan, table.n_pages, 0),
+            estimated_rows: table.n_rows as f64,
+        };
+    }
+
     let chosen_index = best.index.as_deref().unwrap_or("(none)");
     let selectivity = match &best.kind {
         AccessPathKind::IndexScanRange { selectivity }
@@ -694,6 +910,35 @@ pub fn best_access_path(
         }
         AccessPathKind::FullTableScan => 1.0,
     };
+    let metric_index_type = access_path_metric_label(&best.kind);
+    let metric_total = increment_index_selection_total(&best.kind);
+    let explicit_hint = match index_hint {
+        Some(IndexHint::IndexedBy(index_name)) => format!("indexed_by:{index_name}"),
+        Some(IndexHint::NotIndexed) => "not_indexed".to_owned(),
+        None => "(none)".to_owned(),
+    };
+    let run_id = std::env::var("RUN_ID").unwrap_or_else(|_| "(none)".to_owned());
+    let trace_id = std::env::var("TRACE_ID")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let scenario_id = std::env::var("SCENARIO_ID").unwrap_or_else(|_| "(none)".to_owned());
+    let selection_elapsed_us = started.elapsed().as_micros().max(1);
+    let adaptive_hint = adaptive_preferred_index.unwrap_or("(none)");
+    let hint_applied = explicit_hint_applied || adaptive_hint_applied;
+    let span = tracing::info_span!(
+        "index_select",
+        run_id = %run_id,
+        trace_id,
+        scenario_id = %scenario_id,
+        table = %table.name,
+        explicit_hint = %explicit_hint,
+        adaptive_hint = %adaptive_hint,
+        candidates = candidates_considered,
+        partial_pruned = partial_indexes_pruned,
+        hint_filtered = hint_filtered_indexes
+    );
+    let _span_guard = span.enter();
 
     tracing::info!(
         table = %table.name,
@@ -703,7 +948,15 @@ pub fn best_access_path(
         access_path = %access_path_kind_label(&best.kind),
         estimated_cost = best.estimated_cost,
         estimated_rows = best.estimated_rows,
-        "index_select"
+        selection_elapsed_us,
+        run_id = %run_id,
+        trace_id,
+        scenario_id = %scenario_id,
+        index_type = metric_index_type,
+        fsqlite_index_selection_total = metric_total,
+        hint_applied,
+        explicit_hint_missing,
+        "planner.index_select.choice"
     );
 
     best
@@ -1233,13 +1486,56 @@ struct PartialPath {
 /// - `needed_columns`: Columns needed in the result (for covering index detection).
 /// - `cross_join_pairs`: Pairs of tables that are `CROSS JOIN`ed (prevents reordering).
 #[must_use]
-#[allow(clippy::too_many_lines)]
 pub fn order_joins(
     tables: &[TableStats],
     indexes: &[IndexInfo],
     where_terms: &[WhereTerm<'_>],
     needed_columns: Option<&[String]>,
     cross_join_pairs: &[(String, String)],
+) -> QueryPlan {
+    order_joins_with_hints(
+        tables,
+        indexes,
+        where_terms,
+        needed_columns,
+        cross_join_pairs,
+        None,
+        None,
+    )
+}
+
+fn join_access_path(
+    table: &TableStats,
+    indexes: &[IndexInfo],
+    where_terms: &[WhereTerm<'_>],
+    needed_columns: Option<&[String]>,
+    table_index_hints: Option<&BTreeMap<String, IndexHint>>,
+    cracking_hints: Option<&CrackingHintStore>,
+) -> AccessPath {
+    let explicit_hint = lookup_table_index_hint(&table.name, table_index_hints);
+    let adaptive_hint = cracking_hints.and_then(|store| store.preferred_index(&table.name));
+    best_access_path_internal(
+        table,
+        indexes,
+        where_terms,
+        needed_columns,
+        explicit_hint,
+        adaptive_hint,
+    )
+}
+
+/// Order tables using bounded beam search while honoring table-level
+/// `INDEXED BY`/`NOT INDEXED` hints and optional adaptive cracking hints.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn order_joins_with_hints(
+    tables: &[TableStats],
+    indexes: &[IndexInfo],
+    where_terms: &[WhereTerm<'_>],
+    needed_columns: Option<&[String]>,
+    cross_join_pairs: &[(String, String)],
+    table_index_hints: Option<&BTreeMap<String, IndexHint>>,
+    cracking_hints: Option<&mut CrackingHintStore>,
 ) -> QueryPlan {
     let n = tables.len();
 
@@ -1252,12 +1548,25 @@ pub fn order_joins(
     }
 
     if n == 1 {
-        let ap = best_access_path(&tables[0], indexes, where_terms, needed_columns);
-        return QueryPlan {
+        let ap = join_access_path(
+            &tables[0],
+            indexes,
+            where_terms,
+            needed_columns,
+            table_index_hints,
+            cracking_hints.as_deref(),
+        );
+        let plan = QueryPlan {
             join_order: vec![tables[0].name.clone()],
             access_paths: vec![ap.clone()],
             total_cost: ap.estimated_cost,
         };
+        if let Some(store) = cracking_hints {
+            for access_path in &plan.access_paths {
+                store.record_access_path(access_path);
+            }
+        }
+        return plan;
     }
 
     let is_star = detect_star_query(tables, where_terms);
@@ -1271,7 +1580,14 @@ pub fn order_joins(
         if !cross_join_allowed(&[], &t.name, cross_join_pairs) {
             continue;
         }
-        let ap = best_access_path(t, indexes, where_terms, needed_columns);
+        let ap = join_access_path(
+            t,
+            indexes,
+            where_terms,
+            needed_columns,
+            table_index_hints,
+            cracking_hints.as_deref(),
+        );
         let cumulative_rows = ap.estimated_rows;
         paths.push(PartialPath {
             tables: vec![t.name.clone()],
@@ -1308,7 +1624,14 @@ pub fn order_joins(
                     continue;
                 }
 
-                let ap = best_access_path(t, indexes, where_terms, needed_columns);
+                let ap = join_access_path(
+                    t,
+                    indexes,
+                    where_terms,
+                    needed_columns,
+                    table_index_hints,
+                    cracking_hints.as_deref(),
+                );
                 // Scale inner table cost by the cumulative cardinality of
                 // all outer tables (nested loop model).  For a 3-table join
                 // T1⋈T2⋈T3, T3 executes once per (T1, T2) pair.
@@ -1345,7 +1668,14 @@ pub fn order_joins(
     // guard defensively), fall back to seeding every table.
     if paths.is_empty() {
         for t in tables {
-            let ap = best_access_path(t, indexes, where_terms, needed_columns);
+            let ap = join_access_path(
+                t,
+                indexes,
+                where_terms,
+                needed_columns,
+                table_index_hints,
+                cracking_hints.as_deref(),
+            );
             paths.push(PartialPath {
                 tables: vec![t.name.clone()],
                 access_paths: vec![ap.clone()],
@@ -1370,12 +1700,19 @@ pub fn order_joins(
         total_cost: best.cost,
     };
 
+    if let Some(store) = cracking_hints {
+        for access_path in &plan.access_paths {
+            store.record_access_path(access_path);
+        }
+    }
+
     tracing::debug!(
         join_order = ?plan.join_order,
         total_cost = plan.total_cost,
         beam_width = mx_choice,
         star_query = is_star,
         table_count = n,
+        index_hint_entries = table_index_hints.map_or(0, BTreeMap::len),
         "planner.order_joins.complete"
     );
 
@@ -1408,9 +1745,11 @@ fn cross_join_allowed(
 mod tests {
     use super::*;
     use fsqlite_ast::{
-        ColumnRef, CompoundOp, Distinctness, Expr, FromClause, InSet, Literal, OrderingTerm,
-        QualifiedName, ResultColumn, SelectBody, SelectCore, SortDirection, Span, TableOrSubquery,
+        ColumnRef, CompoundOp, Distinctness, Expr, FromClause, InSet, IndexHint, Literal,
+        OrderingTerm, QualifiedName, ResultColumn, SelectBody, SelectCore, SortDirection, Span,
+        TableOrSubquery,
     };
+    use std::{path::PathBuf, time::Instant};
 
     /// Helper: build a SELECT core with named result columns.
     fn select_core_with_aliases(aliases: &[&str]) -> SelectCore {
@@ -1908,15 +2247,19 @@ mod tests {
         }
     }
 
-    fn eq_term(col: &str) -> WhereTerm<'static> {
+    fn eq_term_value(col: &str, value: i64) -> WhereTerm<'static> {
         // Leaked for convenience in tests — we just need the lifetime.
         let expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
             left: Box::new(Expr::Column(ColumnRef::bare(col), Span::ZERO)),
             op: AstBinaryOp::Eq,
-            right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            right: Box::new(Expr::Literal(Literal::Integer(value), Span::ZERO)),
             span: Span::ZERO,
         }));
         classify_where_term(expr)
+    }
+
+    fn eq_term(col: &str) -> WhereTerm<'static> {
+        eq_term_value(col, 1)
     }
 
     fn range_term(col: &str) -> WhereTerm<'static> {
@@ -2358,6 +2701,115 @@ mod tests {
         // Despite t2 being smaller, CROSS JOIN forces t1 first.
         assert_eq!(plan.join_order[0], "t1");
         assert_eq!(plan.join_order[1], "t2");
+    }
+
+    #[test]
+    fn test_collect_table_index_hints_from_clause_includes_aliases() {
+        use fsqlite_ast::{JoinClause, JoinKind, JoinType};
+
+        let from = FromClause {
+            source: TableOrSubquery::Table {
+                name: QualifiedName::bare("users"),
+                alias: Some("u".to_owned()),
+                index_hint: Some(IndexHint::IndexedBy("idx_users_email".to_owned())),
+            },
+            joins: vec![JoinClause {
+                join_type: JoinType {
+                    kind: JoinKind::Inner,
+                    natural: false,
+                },
+                table: TableOrSubquery::Table {
+                    name: QualifiedName::bare("events"),
+                    alias: Some("e".to_owned()),
+                    index_hint: Some(IndexHint::NotIndexed),
+                },
+                constraint: None,
+            }],
+        };
+
+        let hints = collect_table_index_hints(&from);
+        assert!(matches!(
+            hints.get("users"),
+            Some(IndexHint::IndexedBy(name)) if name == "idx_users_email"
+        ));
+        assert!(matches!(
+            hints.get("u"),
+            Some(IndexHint::IndexedBy(name)) if name == "idx_users_email"
+        ));
+        assert!(matches!(hints.get("events"), Some(IndexHint::NotIndexed)));
+        assert!(matches!(hints.get("e"), Some(IndexHint::NotIndexed)));
+    }
+
+    #[test]
+    fn test_order_joins_with_hints_respects_not_indexed() {
+        let tables = [table_stats("t1", 1000, 50000)];
+        let idx = index_info("idx_t1_a", "t1", &["a"], false, 100);
+        let terms = [eq_term("a")];
+        let hints = BTreeMap::from([(canonical_table_key("t1"), IndexHint::NotIndexed)]);
+
+        let plan = order_joins_with_hints(&tables, &[idx], &terms, None, &[], Some(&hints), None);
+        assert_eq!(plan.join_order, vec!["t1".to_owned()]);
+        assert_eq!(plan.access_paths.len(), 1);
+        assert!(matches!(
+            plan.access_paths[0].kind,
+            AccessPathKind::FullTableScan
+        ));
+    }
+
+    #[test]
+    fn test_order_joins_with_hints_respects_indexed_by() {
+        let tables = [table_stats("t1", 2000, 100_000)];
+        let fast = index_info("idx_fast", "t1", &["a"], false, 10);
+        let slow = index_info("idx_slow", "t1", &["a"], false, 600);
+        let terms = [eq_term("a")];
+        let hints = BTreeMap::from([(
+            canonical_table_key("t1"),
+            IndexHint::IndexedBy("idx_slow".to_owned()),
+        )]);
+
+        let plan = order_joins_with_hints(
+            &tables,
+            &[fast, slow],
+            &terms,
+            None,
+            &[],
+            Some(&hints),
+            None,
+        );
+        assert_eq!(plan.access_paths.len(), 1);
+        assert_eq!(plan.access_paths[0].index.as_deref(), Some("idx_slow"));
+    }
+
+    #[test]
+    fn test_order_joins_with_hints_reuses_cracking_store() {
+        let tables = [table_stats("t1", 1000, 50000)];
+        let idx_a = index_info("idx_a", "t1", &["a"], false, 40);
+        let idx_b = index_info("idx_b", "t1", &["a"], false, 40);
+        let terms = [eq_term("a")];
+        let mut store = CrackingHintStore::default();
+
+        let first = order_joins_with_hints(
+            &tables,
+            &[idx_a.clone(), idx_b.clone()],
+            &terms,
+            None,
+            &[],
+            None,
+            Some(&mut store),
+        );
+        assert_eq!(first.access_paths[0].index.as_deref(), Some("idx_a"));
+        assert_eq!(store.preferred_index("t1"), Some("idx_a"));
+
+        let second = order_joins_with_hints(
+            &tables,
+            &[idx_b, idx_a],
+            &terms,
+            None,
+            &[],
+            None,
+            Some(&mut store),
+        );
+        assert_eq!(second.access_paths[0].index.as_deref(), Some("idx_a"));
     }
 
     #[test]
@@ -3013,6 +3465,343 @@ mod tests {
         let terms = [eq_term("a")];
         let ap = best_access_path(&table, &[idx], &terms, None);
         assert!(matches!(ap.kind, AccessPathKind::FullTableScan));
+    }
+
+    #[test]
+    fn test_best_access_path_partial_index_requires_implied_predicate() {
+        let table = table_stats("t1", 100, 1000);
+        let mut partial_idx = index_info("idx_partial_a", "t1", &["a"], false, 20);
+        partial_idx.partial_where = Some(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            span: Span::ZERO,
+        });
+
+        let ap_not_implied = best_access_path(
+            &table,
+            &[partial_idx.clone()],
+            &[eq_term_value("a", 2)],
+            None,
+        );
+        assert!(matches!(ap_not_implied.kind, AccessPathKind::FullTableScan));
+
+        let ap_implied = best_access_path(&table, &[partial_idx], &[eq_term_value("a", 1)], None);
+        assert!(matches!(
+            ap_implied.kind,
+            AccessPathKind::IndexScanEquality | AccessPathKind::CoveringIndexScan { .. }
+        ));
+    }
+
+    #[test]
+    fn test_best_access_path_respects_indexed_by_hint() {
+        let table = table_stats("t1", 2000, 100_000);
+        let fast = index_info("idx_fast", "t1", &["a"], false, 10);
+        let slow = index_info("idx_slow", "t1", &["a"], false, 600);
+        let terms = [eq_term("a")];
+        let hint = IndexHint::IndexedBy("idx_slow".to_owned());
+
+        let ap =
+            best_access_path_with_hints(&table, &[fast, slow], &terms, None, Some(&hint), None);
+        assert_eq!(ap.index.as_deref(), Some("idx_slow"));
+        assert!(matches!(
+            ap.kind,
+            AccessPathKind::IndexScanEquality
+                | AccessPathKind::IndexScanRange { .. }
+                | AccessPathKind::CoveringIndexScan { .. }
+        ));
+    }
+
+    #[test]
+    fn test_best_access_path_respects_not_indexed_hint() {
+        let table = table_stats("t1", 1024, 50000);
+        let idx = index_info("idx_a", "t1", &["a"], false, 20);
+        let rowid_expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Literal(Literal::Integer(42), Span::ZERO)),
+            span: Span::ZERO,
+        }));
+        let rowid_term = classify_where_term(rowid_expr);
+        let hint = IndexHint::NotIndexed;
+
+        let ap =
+            best_access_path_with_hints(&table, &[idx], &[rowid_term], None, Some(&hint), None);
+        assert!(matches!(ap.kind, AccessPathKind::FullTableScan));
+        assert!(ap.index.is_none());
+    }
+
+    #[test]
+    fn test_cracking_hint_store_reuses_prior_index_choice() {
+        let table = table_stats("t1", 1000, 50000);
+        let idx_a = index_info("idx_a", "t1", &["a"], false, 40);
+        let idx_b = index_info("idx_b", "t1", &["a"], false, 40);
+        let terms = [eq_term("a")];
+        let mut hint_store = CrackingHintStore::default();
+
+        let first = best_access_path_with_hints(
+            &table,
+            &[idx_a.clone(), idx_b.clone()],
+            &terms,
+            None,
+            None,
+            Some(&mut hint_store),
+        );
+        assert_eq!(first.index.as_deref(), Some("idx_a"));
+        assert_eq!(hint_store.preferred_index("t1"), Some("idx_a"));
+
+        // Reverse candidate order; adaptive hint should bias back to idx_a.
+        let second = best_access_path_with_hints(
+            &table,
+            &[idx_b, idx_a],
+            &terms,
+            None,
+            None,
+            Some(&mut hint_store),
+        );
+        assert_eq!(second.index.as_deref(), Some("idx_a"));
+    }
+
+    #[test]
+    fn test_index_selection_metric_counter_advances() {
+        let table = table_stats("t1", 500, 10000);
+        let idx = index_info("idx_a", "t1", &["a"], false, 20);
+        let terms = [eq_term("a")];
+        let before = snapshot_index_selection_totals()
+            .get("index_scan_equality")
+            .copied()
+            .unwrap_or(0);
+
+        let _ = best_access_path(&table, &[idx], &terms, None);
+
+        let after = snapshot_index_selection_totals()
+            .get("index_scan_equality")
+            .copied()
+            .unwrap_or(0);
+        assert!(after > before);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn planner_index_selection_e2e_replay_emits_artifact() {
+        use fsqlite_ast::{JoinClause, JoinKind, JoinType};
+
+        const BEAD_ID: &str = "bd-1as.4";
+        const DEFAULT_SCENARIO_ID: &str = "PLANNER-INDEX-1";
+        const DEFAULT_SEED: u64 = 20_260_219;
+
+        let run_id =
+            std::env::var("RUN_ID").unwrap_or_else(|_| format!("{BEAD_ID}-seed-{DEFAULT_SEED}"));
+        let trace_id = std::env::var("TRACE_ID")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_SEED);
+        let scenario_id =
+            std::env::var("SCENARIO_ID").unwrap_or_else(|_| DEFAULT_SCENARIO_ID.to_owned());
+        let seed = std::env::var("SEED")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_SEED);
+
+        let artifact_path = std::env::var("FSQLITE_PLANNER_INDEX_E2E_ARTIFACT").map_or_else(
+            |_| {
+                PathBuf::from("artifacts")
+                    .join(BEAD_ID)
+                    .join("planner_index_selection_e2e_artifact.json")
+            },
+            PathBuf::from,
+        );
+        if let Some(parent) = artifact_path.parent() {
+            std::fs::create_dir_all(parent)
+                .expect("bead_id={BEAD_ID} artifact directory should be writable");
+        }
+
+        let started = Instant::now();
+        let mut cracking_hints = CrackingHintStore::default();
+        let before_metrics = snapshot_index_selection_totals();
+
+        let from = FromClause {
+            source: TableOrSubquery::Table {
+                name: QualifiedName::bare("users"),
+                alias: Some("u".to_owned()),
+                index_hint: Some(IndexHint::IndexedBy("idx_users_email".to_owned())),
+            },
+            joins: vec![JoinClause {
+                join_type: JoinType {
+                    kind: JoinKind::Inner,
+                    natural: false,
+                },
+                table: TableOrSubquery::Table {
+                    name: QualifiedName::bare("events"),
+                    alias: Some("e".to_owned()),
+                    index_hint: Some(IndexHint::NotIndexed),
+                },
+                constraint: None,
+            }],
+        };
+        let table_hints = collect_table_index_hints(&from);
+
+        let tables = [
+            table_stats("users", 2_048, 120_000),
+            table_stats("events", 8_192, 1_200_000),
+            table_stats("sessions", 4_096, 900_000),
+        ];
+        let indexes = [
+            index_info("idx_users_email", "users", &["email"], true, 120),
+            index_info("idx_users_id", "users", &["id"], true, 240),
+            index_info("idx_events_user_id", "events", &["user_id"], false, 110),
+            index_info(
+                "idx_sessions_user_id_a",
+                "sessions",
+                &["user_id"],
+                false,
+                90,
+            ),
+            index_info(
+                "idx_sessions_user_id_b",
+                "sessions",
+                &["user_id"],
+                false,
+                90,
+            ),
+        ];
+        let where_terms = [
+            eq_term("email"),
+            eq_term("user_id"),
+            join_term("events", "user_id", "users", "id"),
+        ];
+
+        let first_plan = order_joins_with_hints(
+            &tables[..2],
+            &indexes,
+            &where_terms,
+            Some(&["email".to_owned(), "user_id".to_owned()]),
+            &[],
+            Some(&table_hints),
+            Some(&mut cracking_hints),
+        );
+        let users_path = first_plan
+            .access_paths
+            .iter()
+            .find(|path| path.table.eq_ignore_ascii_case("users"))
+            .expect("bead_id={BEAD_ID} users path should exist");
+        assert_eq!(users_path.index.as_deref(), Some("idx_users_email"));
+        let events_path = first_plan
+            .access_paths
+            .iter()
+            .find(|path| path.table.eq_ignore_ascii_case("events"))
+            .expect("bead_id={BEAD_ID} events path should exist");
+        assert!(
+            matches!(events_path.kind, AccessPathKind::FullTableScan),
+            "bead_id={BEAD_ID} NOT INDEXED must force full scan for events",
+        );
+
+        let first_session_path = best_access_path_with_hints(
+            &tables[2],
+            &indexes[3..5],
+            &where_terms,
+            None,
+            None,
+            Some(&mut cracking_hints),
+        );
+        let second_session_path = best_access_path_with_hints(
+            &tables[2],
+            &[indexes[4].clone(), indexes[3].clone()],
+            &where_terms,
+            None,
+            None,
+            Some(&mut cracking_hints),
+        );
+        assert_eq!(
+            first_session_path.index.as_deref(),
+            second_session_path.index.as_deref(),
+            "bead_id={BEAD_ID} adaptive cracking hint should keep stable index preference",
+        );
+
+        let after_metrics = snapshot_index_selection_totals();
+        let metric_delta = after_metrics
+            .iter()
+            .map(|(label, after)| {
+                let before = before_metrics.get(label).copied().unwrap_or(0);
+                (label.clone(), after.saturating_sub(before))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let elapsed_us = started.elapsed().as_micros().max(1);
+        let replay_command = format!(
+            "RUN_ID='{}' TRACE_ID={} SCENARIO_ID='{}' SEED={} FSQLITE_PLANNER_INDEX_E2E_ARTIFACT='{}' cargo test -p fsqlite-planner planner_index_selection_e2e_replay_emits_artifact -- --exact --nocapture",
+            run_id,
+            trace_id,
+            scenario_id,
+            seed,
+            artifact_path.display(),
+        );
+
+        let plan_fingerprint = blake3::hash(
+            format!(
+                "{}|{}|{}|{}|{:?}|{:?}",
+                first_plan.join_order.join(","),
+                users_path.index.clone().unwrap_or_default(),
+                access_path_metric_label(&events_path.kind),
+                second_session_path.index.clone().unwrap_or_default(),
+                first_session_path.kind,
+                second_session_path.kind,
+            )
+            .as_bytes(),
+        )
+        .to_hex()
+        .to_string();
+        let artifact = serde_json::json!({
+            "bead_id": BEAD_ID,
+            "run_id": run_id,
+            "trace_id": trace_id,
+            "scenario_id": scenario_id,
+            "seed": seed,
+            "overall_status": "pass",
+            "timing": {
+                "selection_elapsed_us": elapsed_us,
+            },
+            "checks": [
+                {
+                    "id": "indexed_by_respected",
+                    "status": "pass",
+                    "detail": "users path honors INDEXED BY idx_users_email"
+                },
+                {
+                    "id": "not_indexed_respected",
+                    "status": "pass",
+                    "detail": "events path honors NOT INDEXED by forcing full scan"
+                },
+                {
+                    "id": "adaptive_hint_reuse",
+                    "status": "pass",
+                    "detail": "sessions path reuses prior cracking hint under candidate reordering"
+                }
+            ],
+            "metric_delta": metric_delta,
+            "plan_fingerprint_blake3": plan_fingerprint,
+            "observability": {
+                "required_fields": [
+                    "run_id",
+                    "trace_id",
+                    "scenario_id",
+                    "selection_elapsed_us",
+                    "table",
+                    "chosen_index",
+                    "index_type",
+                    "candidates"
+                ],
+                "event_name": "planner.index_select.choice"
+            },
+            "replay_command": replay_command,
+        });
+        let artifact_bytes = serde_json::to_vec_pretty(&artifact)
+            .expect("bead_id={BEAD_ID} artifact serialization should succeed");
+        std::fs::write(&artifact_path, artifact_bytes)
+            .expect("bead_id={BEAD_ID} artifact write should succeed");
+        assert!(
+            artifact_path.exists(),
+            "bead_id={BEAD_ID} e2e artifact path should exist"
+        );
     }
 
     #[test]

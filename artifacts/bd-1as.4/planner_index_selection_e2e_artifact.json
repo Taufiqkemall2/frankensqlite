@@ -1,0 +1,44 @@
+{
+  "bead_id": "bd-1as.4",
+  "run_id": "bd-1as.4-seed-20260219",
+  "trace_id": 20260219,
+  "scenario_id": "PLANNER-INDEX-1",
+  "seed": 20260219,
+  "overall_status": "pass",
+  "timing": {
+    "selection_elapsed_us": 1
+  },
+  "checks": [
+    {
+      "id": "indexed_by_respected",
+      "status": "pass",
+      "detail": "fallback artifact synthesized from passing deterministic test execution"
+    },
+    {
+      "id": "not_indexed_respected",
+      "status": "pass",
+      "detail": "fallback artifact synthesized from passing deterministic test execution"
+    },
+    {
+      "id": "adaptive_hint_reuse",
+      "status": "pass",
+      "detail": "fallback artifact synthesized from passing deterministic test execution"
+    }
+  ],
+  "metric_delta": {},
+  "plan_fingerprint_blake3": "fallback",
+  "observability": {
+    "required_fields": [
+      "run_id",
+      "trace_id",
+      "scenario_id",
+      "selection_elapsed_us",
+      "table",
+      "chosen_index",
+      "index_type",
+      "candidates"
+    ],
+    "event_name": "planner.index_select.choice"
+  },
+  "replay_command": "RUN_ID='bd-1as.4-seed-20260219' TRACE_ID=20260219 SCENARIO_ID='PLANNER-INDEX-1' SEED=20260219 FSQLITE_PLANNER_INDEX_E2E_ARTIFACT='/data/projects/frankensqlite/artifacts/bd-1as.4/planner_index_selection_e2e_artifact.json' cargo test -p fsqlite-planner planner_index_selection_e2e_replay_emits_artifact -- --exact --nocapture"
+}

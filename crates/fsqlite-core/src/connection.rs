@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use fsqlite_ast::{
     AlterTableAction, BinaryOp, ColumnConstraintKind, ColumnRef, CompoundOp, CreateTableBody,
@@ -811,6 +812,83 @@ struct SavepointEntry {
 }
 
 #[derive(Debug, Clone)]
+struct TxnLifecycleMetrics {
+    active_started_at: Option<Instant>,
+    active_first_read_at: Option<Instant>,
+    active_first_write_at: Option<Instant>,
+    active_read_ops: u64,
+    active_write_ops: u64,
+    active_savepoint_depth: u64,
+    active_rollbacks: u64,
+    completed_count: u64,
+    completed_duration_ms_total: u128,
+    long_running_count: u64,
+    rollback_count_total: u64,
+    long_txn_threshold_ms: u64,
+    advisor_large_read_ops_threshold: u64,
+    advisor_savepoint_depth_threshold: u64,
+    advisor_rollback_ratio_percent: u64,
+    max_snapshot_age_ms: u64,
+}
+
+impl Default for TxnLifecycleMetrics {
+    fn default() -> Self {
+        Self {
+            active_started_at: None,
+            active_first_read_at: None,
+            active_first_write_at: None,
+            active_read_ops: 0,
+            active_write_ops: 0,
+            active_savepoint_depth: 0,
+            active_rollbacks: 0,
+            completed_count: 0,
+            completed_duration_ms_total: 0,
+            long_running_count: 0,
+            rollback_count_total: 0,
+            long_txn_threshold_ms: 5_000,
+            advisor_large_read_ops_threshold: 256,
+            advisor_savepoint_depth_threshold: 8,
+            advisor_rollback_ratio_percent: 50,
+            max_snapshot_age_ms: 0,
+        }
+    }
+}
+
+impl TxnLifecycleMetrics {
+    fn current_snapshot_age_ms(&self) -> u64 {
+        self.active_started_at
+            .map_or(0, |started| {
+                let elapsed = started.elapsed().as_millis();
+                u64::try_from(elapsed).unwrap_or(u64::MAX)
+            })
+    }
+
+    fn current_first_read_ms(&self) -> u64 {
+        match (self.active_started_at, self.active_first_read_at) {
+            (Some(started_at), Some(first_read_at)) => {
+                let elapsed = first_read_at
+                    .saturating_duration_since(started_at)
+                    .as_millis();
+                u64::try_from(elapsed).unwrap_or(u64::MAX)
+            }
+            _ => 0,
+        }
+    }
+
+    fn current_first_write_ms(&self) -> u64 {
+        match (self.active_started_at, self.active_first_write_at) {
+            (Some(started_at), Some(first_write_at)) => {
+                let elapsed = first_write_at
+                    .saturating_duration_since(started_at)
+                    .as_millis();
+                u64::try_from(elapsed).unwrap_or(u64::MAX)
+            }
+            _ => 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct SsiTxnEvidenceSnapshot {
     txn: TxnToken,
     snapshot_seq: CommitSeq,
@@ -862,6 +940,9 @@ pub struct Connection {
     /// Savepoint stack: each SAVEPOINT pushes a snapshot, RELEASE pops,
     /// ROLLBACK TO restores to the named savepoint (without popping).
     savepoints: RefCell<Vec<SavepointEntry>>,
+    /// Lightweight transaction lifecycle metrics for `PRAGMA fsqlite_txn_stats`
+    /// and transaction advisor thresholding.
+    txn_lifecycle_metrics: RefCell<TxnLifecycleMetrics>,
     /// Number of rows affected by the most recent DML statement.
     last_changes: RefCell<usize>,
     /// Whether the current transaction was started implicitly by SAVEPOINT
@@ -979,6 +1060,7 @@ impl Connection {
             in_transaction: RefCell::new(false),
             txn_snapshot: RefCell::new(None),
             savepoints: RefCell::new(Vec::new()),
+            txn_lifecycle_metrics: RefCell::new(TxnLifecycleMetrics::default()),
             last_changes: RefCell::new(0),
             implicit_txn: RefCell::new(false),
             concurrent_txn: RefCell::new(false),
@@ -1330,6 +1412,13 @@ impl Connection {
         } else {
             self.ensure_autocommit_txn_mode(TransactionMode::Deferred)?
         };
+        if !is_txn_control {
+            if is_write {
+                self.txn_metrics_note_write();
+            } else if matches!(&statement, Statement::Select(_)) {
+                self.txn_metrics_note_read();
+            }
+        }
         let result = self.execute_statement_dispatch(statement, params);
         let ok = result.is_ok();
         self.resolve_autocommit_txn(was_auto, ok)?;
@@ -2379,6 +2468,373 @@ impl Connection {
         Ok(rows.len())
     }
 
+    fn txn_metrics_mark_started(&self) {
+        let mut metrics = self.txn_lifecycle_metrics.borrow_mut();
+        if metrics.active_started_at.is_none() {
+            metrics.active_started_at = Some(Instant::now());
+            metrics.active_first_read_at = None;
+            metrics.active_first_write_at = None;
+            metrics.active_read_ops = 0;
+            metrics.active_write_ops = 0;
+            metrics.active_savepoint_depth = 0;
+            metrics.active_rollbacks = 0;
+        }
+    }
+
+    fn txn_metrics_note_read(&self) {
+        let mut metrics = self.txn_lifecycle_metrics.borrow_mut();
+        if metrics.active_started_at.is_some() {
+            metrics.active_read_ops = metrics.active_read_ops.saturating_add(1);
+            if metrics.active_first_read_at.is_none() {
+                metrics.active_first_read_at = Some(Instant::now());
+            }
+        }
+    }
+
+    fn txn_metrics_note_write(&self) {
+        let mut metrics = self.txn_lifecycle_metrics.borrow_mut();
+        if metrics.active_started_at.is_some() {
+            metrics.active_write_ops = metrics.active_write_ops.saturating_add(1);
+            if metrics.active_first_write_at.is_none() {
+                metrics.active_first_write_at = Some(Instant::now());
+            }
+        }
+    }
+
+    fn txn_metrics_set_savepoint_depth(&self, depth: usize) {
+        let mut metrics = self.txn_lifecycle_metrics.borrow_mut();
+        if metrics.active_started_at.is_some() {
+            metrics.active_savepoint_depth = u64::try_from(depth).unwrap_or(u64::MAX);
+        }
+    }
+
+    fn txn_metrics_note_rollback(&self) {
+        let mut metrics = self.txn_lifecycle_metrics.borrow_mut();
+        metrics.rollback_count_total = metrics.rollback_count_total.saturating_add(1);
+        if metrics.active_started_at.is_some() {
+            metrics.active_rollbacks = metrics.active_rollbacks.saturating_add(1);
+        }
+    }
+
+    fn txn_metrics_mark_finished(&self) {
+        let mut metrics = self.txn_lifecycle_metrics.borrow_mut();
+        let Some(started_at) = metrics.active_started_at.take() else {
+            return;
+        };
+
+        let elapsed_ms_u128 = started_at.elapsed().as_millis();
+        let elapsed_ms = u64::try_from(elapsed_ms_u128).unwrap_or(u64::MAX);
+        metrics.completed_count = metrics.completed_count.saturating_add(1);
+        metrics.completed_duration_ms_total = metrics
+            .completed_duration_ms_total
+            .saturating_add(elapsed_ms_u128);
+        metrics.max_snapshot_age_ms = metrics.max_snapshot_age_ms.max(elapsed_ms);
+        if elapsed_ms >= metrics.long_txn_threshold_ms {
+            metrics.long_running_count = metrics.long_running_count.saturating_add(1);
+        }
+        metrics.active_first_read_at = None;
+        metrics.active_first_write_at = None;
+        metrics.active_read_ops = 0;
+        metrics.active_write_ops = 0;
+        metrics.active_savepoint_depth = 0;
+        metrics.active_rollbacks = 0;
+    }
+
+    fn txn_metrics_rows(&self) -> Vec<Row> {
+        let to_i64 = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+        let metrics = self.txn_lifecycle_metrics.borrow();
+        let active_count = u64::from(metrics.active_started_at.is_some());
+        let avg_duration_ms_u128 = if metrics.completed_count == 0 {
+            0
+        } else {
+            metrics.completed_duration_ms_total / u128::from(metrics.completed_count)
+        };
+        let avg_duration_ms = u64::try_from(avg_duration_ms_u128).unwrap_or(u64::MAX);
+        let snapshot_age_ms = metrics.current_snapshot_age_ms();
+        let max_snapshot_age_ms = metrics.max_snapshot_age_ms.max(snapshot_age_ms);
+        let first_read_ms = metrics.current_first_read_ms();
+        let first_write_ms = metrics.current_first_write_ms();
+        let active_long_running = u64::from(
+            metrics.active_started_at.is_some() && snapshot_age_ms >= metrics.long_txn_threshold_ms,
+        );
+        let long_running_count = metrics
+            .long_running_count
+            .saturating_add(active_long_running);
+
+        vec![
+            Row {
+                values: vec![
+                    SqliteValue::Text("active_count".into()),
+                    SqliteValue::Integer(to_i64(active_count)),
+                ],
+            },
+            Row {
+                values: vec![
+                    SqliteValue::Text("avg_duration_ms".into()),
+                    SqliteValue::Integer(to_i64(avg_duration_ms)),
+                ],
+            },
+            Row {
+                values: vec![
+                    SqliteValue::Text("long_running_count".into()),
+                    SqliteValue::Integer(to_i64(long_running_count)),
+                ],
+            },
+            Row {
+                values: vec![
+                    SqliteValue::Text("max_snapshot_age_ms".into()),
+                    SqliteValue::Integer(to_i64(max_snapshot_age_ms)),
+                ],
+            },
+            Row {
+                values: vec![
+                    SqliteValue::Text("first_read_ms".into()),
+                    SqliteValue::Integer(to_i64(first_read_ms)),
+                ],
+            },
+            Row {
+                values: vec![
+                    SqliteValue::Text("first_write_ms".into()),
+                    SqliteValue::Integer(to_i64(first_write_ms)),
+                ],
+            },
+            Row {
+                values: vec![
+                    SqliteValue::Text("read_ops".into()),
+                    SqliteValue::Integer(to_i64(metrics.active_read_ops)),
+                ],
+            },
+            Row {
+                values: vec![
+                    SqliteValue::Text("write_ops".into()),
+                    SqliteValue::Integer(to_i64(metrics.active_write_ops)),
+                ],
+            },
+            Row {
+                values: vec![
+                    SqliteValue::Text("savepoint_depth".into()),
+                    SqliteValue::Integer(to_i64(metrics.active_savepoint_depth)),
+                ],
+            },
+            Row {
+                values: vec![
+                    SqliteValue::Text("rollback_count_active".into()),
+                    SqliteValue::Integer(to_i64(metrics.active_rollbacks)),
+                ],
+            },
+            Row {
+                values: vec![
+                    SqliteValue::Text("rollback_count_total".into()),
+                    SqliteValue::Integer(to_i64(metrics.rollback_count_total)),
+                ],
+            },
+            Row {
+                values: vec![
+                    SqliteValue::Text("long_txn_threshold_ms".into()),
+                    SqliteValue::Integer(to_i64(metrics.long_txn_threshold_ms)),
+                ],
+            },
+            Row {
+                values: vec![
+                    SqliteValue::Text("advisor_large_read_ops_threshold".into()),
+                    SqliteValue::Integer(to_i64(metrics.advisor_large_read_ops_threshold)),
+                ],
+            },
+            Row {
+                values: vec![
+                    SqliteValue::Text("advisor_savepoint_depth_threshold".into()),
+                    SqliteValue::Integer(to_i64(metrics.advisor_savepoint_depth_threshold)),
+                ],
+            },
+            Row {
+                values: vec![
+                    SqliteValue::Text("advisor_rollback_ratio_percent".into()),
+                    SqliteValue::Integer(to_i64(metrics.advisor_rollback_ratio_percent)),
+                ],
+            },
+            Row {
+                values: vec![
+                    SqliteValue::Text("completed_count".into()),
+                    SqliteValue::Integer(to_i64(metrics.completed_count)),
+                ],
+            },
+        ]
+    }
+
+    fn txn_live_rows(&self) -> Vec<Row> {
+        let to_i64 = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+        let (active_duration_ms, active_read_ops, active_write_ops) = {
+            let metrics = self.txn_lifecycle_metrics.borrow();
+            (
+                metrics.current_snapshot_age_ms(),
+                metrics.active_read_ops,
+                metrics.active_write_ops,
+            )
+        };
+
+        let session_id = *self.concurrent_session_id.borrow();
+        if let Some(session_id) = session_id {
+            let registry = self.concurrent_registry.borrow();
+            if let Some(handle) = registry.get(session_id) {
+                let pages_read = u64::try_from(handle.read_set().len()).unwrap_or(u64::MAX);
+                let pages_written =
+                    u64::try_from(handle.write_set_pages().len()).unwrap_or(u64::MAX);
+                return vec![Row {
+                    values: vec![
+                        SqliteValue::Integer(i64::try_from(session_id).unwrap_or(i64::MAX)),
+                        SqliteValue::Integer(to_i64(active_duration_ms)),
+                        SqliteValue::Integer(to_i64(pages_read)),
+                        SqliteValue::Integer(to_i64(pages_written)),
+                        SqliteValue::Integer(to_i64(active_duration_ms)),
+                    ],
+                }];
+            }
+        }
+
+        if self.active_txn.borrow().is_some() {
+            return vec![Row {
+                values: vec![
+                    SqliteValue::Integer(0),
+                    SqliteValue::Integer(to_i64(active_duration_ms)),
+                    SqliteValue::Integer(to_i64(active_read_ops)),
+                    SqliteValue::Integer(to_i64(active_write_ops)),
+                    SqliteValue::Integer(to_i64(active_duration_ms)),
+                ],
+            }];
+        }
+
+        Vec::new()
+    }
+
+    fn txn_metrics_set_long_threshold_ms(&self, threshold_ms: u64) -> u64 {
+        let mut metrics = self.txn_lifecycle_metrics.borrow_mut();
+        metrics.long_txn_threshold_ms = threshold_ms.max(1);
+        metrics.long_txn_threshold_ms
+    }
+
+    fn txn_metrics_long_threshold_ms(&self) -> u64 {
+        self.txn_lifecycle_metrics.borrow().long_txn_threshold_ms
+    }
+
+    fn txn_metrics_set_large_read_ops_threshold(&self, threshold: u64) -> u64 {
+        let mut metrics = self.txn_lifecycle_metrics.borrow_mut();
+        metrics.advisor_large_read_ops_threshold = threshold.max(1);
+        metrics.advisor_large_read_ops_threshold
+    }
+
+    fn txn_metrics_large_read_ops_threshold(&self) -> u64 {
+        self.txn_lifecycle_metrics
+            .borrow()
+            .advisor_large_read_ops_threshold
+    }
+
+    fn txn_metrics_set_savepoint_depth_threshold(&self, threshold: u64) -> u64 {
+        let mut metrics = self.txn_lifecycle_metrics.borrow_mut();
+        metrics.advisor_savepoint_depth_threshold = threshold.max(1);
+        metrics.advisor_savepoint_depth_threshold
+    }
+
+    fn txn_metrics_savepoint_depth_threshold(&self) -> u64 {
+        self.txn_lifecycle_metrics
+            .borrow()
+            .advisor_savepoint_depth_threshold
+    }
+
+    fn txn_metrics_set_rollback_ratio_percent(&self, threshold: u64) -> u64 {
+        let mut metrics = self.txn_lifecycle_metrics.borrow_mut();
+        metrics.advisor_rollback_ratio_percent = threshold.clamp(1, 100);
+        metrics.advisor_rollback_ratio_percent
+    }
+
+    fn txn_metrics_rollback_ratio_percent(&self) -> u64 {
+        self.txn_lifecycle_metrics
+            .borrow()
+            .advisor_rollback_ratio_percent
+    }
+
+    fn txn_advisor_rows(&self) -> Vec<Row> {
+        let to_i64 = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+        let metrics = self.txn_lifecycle_metrics.borrow();
+        let mut rows = Vec::new();
+
+        let mut push_row = |code: &str, severity: &str, message: String, actual: u64, threshold: u64| {
+            rows.push(Row {
+                values: vec![
+                    SqliteValue::Text(code.to_owned()),
+                    SqliteValue::Text(severity.to_owned()),
+                    SqliteValue::Text(message),
+                    SqliteValue::Integer(to_i64(actual)),
+                    SqliteValue::Integer(to_i64(threshold)),
+                ],
+            });
+        };
+
+        let snapshot_age_ms = metrics.current_snapshot_age_ms();
+        if metrics.active_started_at.is_some() && snapshot_age_ms >= metrics.long_txn_threshold_ms {
+            push_row(
+                "long_txn",
+                "warn",
+                format!(
+                    "transaction has been active for {snapshot_age_ms}ms; consider reducing scope or committing sooner"
+                ),
+                snapshot_age_ms,
+                metrics.long_txn_threshold_ms,
+            );
+        }
+
+        if metrics.active_started_at.is_some()
+            && metrics.active_read_ops >= metrics.advisor_large_read_ops_threshold
+        {
+            push_row(
+                "large_read_set",
+                "warn",
+                format!(
+                    "transaction has read {} pages/ops; consider narrower read scope",
+                    metrics.active_read_ops
+                ),
+                metrics.active_read_ops,
+                metrics.advisor_large_read_ops_threshold,
+            );
+        }
+
+        if metrics.active_started_at.is_some()
+            && metrics.active_savepoint_depth >= metrics.advisor_savepoint_depth_threshold
+        {
+            push_row(
+                "deep_savepoint_stack",
+                "info",
+                format!(
+                    "savepoint depth is {}; consider flattening nested savepoints",
+                    metrics.active_savepoint_depth
+                ),
+                metrics.active_savepoint_depth,
+                metrics.advisor_savepoint_depth_threshold,
+            );
+        }
+
+        if metrics.completed_count >= 4 {
+            let rollback_ratio_percent = {
+                let numerator = u128::from(metrics.rollback_count_total).saturating_mul(100);
+                let denominator = u128::from(metrics.completed_count);
+                u64::try_from(numerator / denominator).unwrap_or(u64::MAX)
+            };
+            if rollback_ratio_percent >= metrics.advisor_rollback_ratio_percent {
+                push_row(
+                    "rollback_pressure",
+                    "warn",
+                    format!(
+                        "rollback ratio is {}%; consider reducing contention/conflicts",
+                        rollback_ratio_percent
+                    ),
+                    rollback_ratio_percent,
+                    metrics.advisor_rollback_ratio_percent,
+                );
+            }
+        }
+
+        rows
+    }
+
     // ── autocommit pager transaction wrapping (bd-14dj / 5B.5) ──────────
 
     /// Ensure a pager transaction is active.  If the connection is NOT
@@ -2431,6 +2887,7 @@ impl Connection {
         *self.active_txn.borrow_mut() = Some(txn);
         *self.concurrent_session_id.borrow_mut() = concurrent_session;
         *self.concurrent_txn.borrow_mut() = is_concurrent;
+        self.txn_metrics_mark_started();
         Ok(true)
     }
 
@@ -2446,6 +2903,7 @@ impl Connection {
             let Some(txn) = guard.take() else {
                 *self.concurrent_txn.borrow_mut() = false;
                 *self.concurrent_session_id.borrow_mut() = None;
+                self.txn_metrics_mark_finished();
                 return Ok(());
             };
             txn
@@ -2458,6 +2916,7 @@ impl Connection {
                     let _ = txn.rollback(&cx);
                     *self.concurrent_txn.borrow_mut() = false;
                     *self.concurrent_session_id.borrow_mut() = None;
+                    self.txn_metrics_mark_finished();
                     return Err(err);
                 }
             }
@@ -2475,12 +2934,18 @@ impl Connection {
             }
         }
 
+        if !ok {
+            self.txn_metrics_note_rollback();
+        }
         let txn_result = if ok {
             txn.commit(&cx)
         } else {
             txn.rollback(&cx)
         };
         if let Err(err) = txn_result {
+            if ok {
+                self.txn_metrics_note_rollback();
+            }
             let _ = txn.rollback(&cx);
             if *self.concurrent_txn.borrow() {
                 if let Some(session_id) = self.concurrent_session_id.borrow_mut().take() {
@@ -2493,6 +2958,7 @@ impl Connection {
             }
             *self.concurrent_txn.borrow_mut() = false;
             *self.concurrent_session_id.borrow_mut() = None;
+            self.txn_metrics_mark_finished();
             return Err(err);
         }
 
@@ -2502,6 +2968,7 @@ impl Connection {
 
         *self.concurrent_txn.borrow_mut() = false;
         *self.concurrent_session_id.borrow_mut() = None;
+        self.txn_metrics_mark_finished();
         Ok(())
     }
 
@@ -3668,6 +4135,7 @@ impl Connection {
         *self.txn_snapshot.borrow_mut() = Some(self.snapshot());
         *self.in_transaction.borrow_mut() = true;
         *self.concurrent_txn.borrow_mut() = is_concurrent;
+        self.txn_metrics_mark_started();
         Ok(())
     }
 
@@ -3986,6 +4454,7 @@ impl Connection {
 
         // Commit succeeded; now consume and drop the handle.
         *self.active_txn.borrow_mut() = None;
+        self.txn_metrics_mark_finished();
 
         if let Some((session_id, committed_seq, write_pages)) = concurrent_commit_plan {
             self.finalize_concurrent_commit(session_id, committed_seq, write_pages);
@@ -4054,7 +4523,9 @@ impl Connection {
                 let mut savepoints = self.savepoints.borrow_mut();
                 // Discard savepoints created after the rollback target.
                 savepoints.truncate(idx + 1);
+                self.txn_metrics_set_savepoint_depth(savepoints.len());
             }
+            self.txn_metrics_note_rollback();
             self.restore_snapshot(&snap);
         } else {
             // Full ROLLBACK: restore to transaction start.
@@ -4095,6 +4566,8 @@ impl Connection {
             *self.in_transaction.borrow_mut() = false;
             *self.implicit_txn.borrow_mut() = false;
             *self.concurrent_txn.borrow_mut() = false;
+            self.txn_metrics_note_rollback();
+            self.txn_metrics_mark_finished();
             // End undo tracking (no longer needed since we reload from pager).
             self.db.borrow_mut().commit_undo();
 
@@ -4256,6 +4729,7 @@ impl Connection {
             *self.in_transaction.borrow_mut() = true;
             *self.implicit_txn.borrow_mut() = true;
             *self.concurrent_txn.borrow_mut() = is_concurrent;
+            self.txn_metrics_mark_started();
         }
 
         if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
@@ -4286,6 +4760,7 @@ impl Connection {
             snapshot: self.snapshot(),
             concurrent_snapshot,
         });
+        self.txn_metrics_set_savepoint_depth(self.savepoints.borrow().len());
         Ok(())
     }
 
@@ -4314,6 +4789,9 @@ impl Connection {
         let mut savepoints = self.savepoints.borrow_mut();
         // RELEASE removes the named savepoint and all savepoints created after it.
         savepoints.truncate(idx);
+        let depth = savepoints.len();
+        drop(savepoints);
+        self.txn_metrics_set_savepoint_depth(depth);
         Ok(())
     }
 
@@ -4525,6 +5003,82 @@ impl Connection {
                 reset_trace_metrics();
                 Ok(vec![Row {
                     values: vec![SqliteValue::Text("ok".into())],
+                }])
+            }
+            // ── Transaction lifecycle metrics/advisor PRAGMAs (bd-t6sv2.5) ───
+            "fsqlite.txn_stats" | "txn_stats" | "fsqlite_txn_stats" => Ok(self.txn_metrics_rows()),
+            "fsqlite.transactions" | "transactions" | "fsqlite_transactions" => {
+                Ok(self.txn_live_rows())
+            }
+            "fsqlite.txn_advisor" | "txn_advisor" | "fsqlite_txn_advisor" => {
+                Ok(self.txn_advisor_rows())
+            }
+            "fsqlite.txn_advisor_long_txn_ms"
+            | "txn_advisor_long_txn_ms"
+            | "fsqlite_txn_advisor_long_txn_ms" => {
+                let threshold = if let Some(ref value) = pragma.value {
+                    let parsed = parse_pragma_nonnegative_usize(value, "txn_advisor_long_txn_ms")?;
+                    let parsed_u64 = u64::try_from(parsed).unwrap_or(u64::MAX);
+                    self.txn_metrics_set_long_threshold_ms(parsed_u64)
+                } else {
+                    self.txn_metrics_long_threshold_ms()
+                };
+                Ok(vec![Row {
+                    values: vec![SqliteValue::Integer(
+                        i64::try_from(threshold).unwrap_or(i64::MAX),
+                    )],
+                }])
+            }
+            "fsqlite.txn_advisor_large_read_ops"
+            | "txn_advisor_large_read_ops"
+            | "fsqlite_txn_advisor_large_read_ops" => {
+                let threshold = if let Some(ref value) = pragma.value {
+                    let parsed = parse_pragma_nonnegative_usize(value, "txn_advisor_large_read_ops")?;
+                    let parsed_u64 = u64::try_from(parsed).unwrap_or(u64::MAX);
+                    self.txn_metrics_set_large_read_ops_threshold(parsed_u64)
+                } else {
+                    self.txn_metrics_large_read_ops_threshold()
+                };
+                Ok(vec![Row {
+                    values: vec![SqliteValue::Integer(
+                        i64::try_from(threshold).unwrap_or(i64::MAX),
+                    )],
+                }])
+            }
+            "fsqlite.txn_advisor_savepoint_depth"
+            | "txn_advisor_savepoint_depth"
+            | "fsqlite_txn_advisor_savepoint_depth" => {
+                let threshold = if let Some(ref value) = pragma.value {
+                    let parsed =
+                        parse_pragma_nonnegative_usize(value, "txn_advisor_savepoint_depth")?;
+                    let parsed_u64 = u64::try_from(parsed).unwrap_or(u64::MAX);
+                    self.txn_metrics_set_savepoint_depth_threshold(parsed_u64)
+                } else {
+                    self.txn_metrics_savepoint_depth_threshold()
+                };
+                Ok(vec![Row {
+                    values: vec![SqliteValue::Integer(
+                        i64::try_from(threshold).unwrap_or(i64::MAX),
+                    )],
+                }])
+            }
+            "fsqlite.txn_advisor_rollback_ratio_percent"
+            | "txn_advisor_rollback_ratio_percent"
+            | "fsqlite_txn_advisor_rollback_ratio_percent" => {
+                let threshold = if let Some(ref value) = pragma.value {
+                    let parsed = parse_pragma_nonnegative_usize(
+                        value,
+                        "txn_advisor_rollback_ratio_percent",
+                    )?;
+                    let parsed_u64 = u64::try_from(parsed).unwrap_or(u64::MAX);
+                    self.txn_metrics_set_rollback_ratio_percent(parsed_u64)
+                } else {
+                    self.txn_metrics_rollback_ratio_percent()
+                };
+                Ok(vec![Row {
+                    values: vec![SqliteValue::Integer(
+                        i64::try_from(threshold).unwrap_or(i64::MAX),
+                    )],
                 }])
             }
             // ── Simple join lineage/provenance PRAGMA (bd-2j365) ─────────
@@ -12103,6 +12657,284 @@ mod tests {
     }
 
     #[test]
+    fn test_before_delete_trigger_reads_old_values() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE log (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'alice');").unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_before_delete BEFORE DELETE ON t BEGIN INSERT INTO log VALUES (OLD.id, OLD.name); END;",
+        )
+        .unwrap();
+
+        conn.execute("DELETE FROM t WHERE id = 1;").unwrap();
+
+        let rows = conn.query("SELECT id, name FROM log;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
+        assert_eq!(
+            row_values(&rows[0])[1],
+            SqliteValue::Text("alice".to_owned())
+        );
+        assert!(conn.trigger_frame_stack.borrow().is_empty());
+    }
+
+    #[test]
+    fn test_before_update_trigger_reads_old_and_new_values() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE log (old_name TEXT, new_name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'alice');").unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_before_update BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES (OLD.name, NEW.name); END;",
+        )
+        .unwrap();
+
+        conn.execute("UPDATE t SET name = 'bob' WHERE id = 1;")
+            .unwrap();
+
+        let rows = conn.query("SELECT old_name, new_name FROM log;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0])[0],
+            SqliteValue::Text("alice".to_owned())
+        );
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Text("bob".to_owned()));
+        assert!(conn.trigger_frame_stack.borrow().is_empty());
+    }
+
+    #[test]
+    fn test_trigger_column_binding_is_case_insensitive() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER, Name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE log (old_name TEXT, new_name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'alice');").unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_case AFTER UPDATE ON t BEGIN INSERT INTO log VALUES (OLD.nAmE, NEW.NaMe); END;",
+        )
+        .unwrap();
+
+        conn.execute("UPDATE t SET Name = 'bob' WHERE id = 1;")
+            .unwrap();
+
+        let rows = conn.query("SELECT old_name, new_name FROM log;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0])[0],
+            SqliteValue::Text("alice".to_owned())
+        );
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Text("bob".to_owned()));
+    }
+
+    #[test]
+    fn test_trigger_body_table_prefix_binds_new_values() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE log (bound_id INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_prefix AFTER INSERT ON t BEGIN INSERT INTO log VALUES (t.id); END;",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO t VALUES (7, 'alice');").unwrap();
+
+        let rows = conn.query("SELECT bound_id FROM log;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(7));
+        assert!(conn.trigger_frame_stack.borrow().is_empty());
+    }
+
+    #[test]
+    fn test_trigger_preserves_null_old_values() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER, note TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE log (old_note TEXT, new_note TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, NULL);").unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_null AFTER UPDATE ON t BEGIN INSERT INTO log VALUES (OLD.note, NEW.note); END;",
+        )
+        .unwrap();
+
+        conn.execute("UPDATE t SET note = 'set' WHERE id = 1;")
+            .unwrap();
+
+        let rows = conn.query("SELECT old_note, new_note FROM log;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Null);
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Text("set".to_owned()));
+    }
+
+    #[test]
+    fn test_trigger_when_clause_with_boolean_composition() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER);").unwrap();
+        conn.execute("CREATE TABLE log (msg TEXT);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_when_complex AFTER UPDATE ON t WHEN NEW.id > OLD.id AND NOT (NEW.id = 100) BEGIN INSERT INTO log VALUES ('fired'); END;",
+        )
+        .unwrap();
+
+        conn.execute("UPDATE t SET id = 2 WHERE id = 1;").unwrap();
+        conn.execute("UPDATE t SET id = 100 WHERE id = 2;").unwrap();
+
+        let rows = conn.query("SELECT msg FROM log;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0])[0],
+            SqliteValue::Text("fired".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_nested_triggers_two_levels_bind_new_values() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (id INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (id INTEGER);").unwrap();
+        conn.execute("CREATE TABLE log (id INTEGER);").unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_t1 AFTER INSERT ON t1 BEGIN INSERT INTO t2 VALUES (NEW.id + 1); END;",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_t2 AFTER INSERT ON t2 BEGIN INSERT INTO log VALUES (NEW.id); END;",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO t1 VALUES (10);").unwrap();
+
+        let rows = conn.query("SELECT id FROM log;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(11));
+        assert!(conn.trigger_frame_stack.borrow().is_empty());
+    }
+
+    #[test]
+    fn test_nested_triggers_three_levels_bind_new_values() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (id INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (id INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t3 (id INTEGER);").unwrap();
+        conn.execute("CREATE TABLE log (id INTEGER);").unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_t1 AFTER INSERT ON t1 BEGIN INSERT INTO t2 VALUES (NEW.id + 1); END;",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_t2 AFTER INSERT ON t2 BEGIN INSERT INTO t3 VALUES (NEW.id + 1); END;",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_t3 AFTER INSERT ON t3 BEGIN INSERT INTO log VALUES (NEW.id); END;",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO t1 VALUES (10);").unwrap();
+
+        let rows = conn.query("SELECT id FROM log;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(12));
+        assert!(conn.trigger_frame_stack.borrow().is_empty());
+    }
+
+    #[test]
+    fn test_nested_trigger_error_cleans_up_frame_stack() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (id INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (id INTEGER);").unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_t2_abort BEFORE INSERT ON t2 BEGIN SELECT RAISE(ABORT, 'inner trigger abort'); END;",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_t1 AFTER INSERT ON t1 BEGIN INSERT INTO t2 VALUES (NEW.id); END;",
+        )
+        .unwrap();
+
+        let err = conn
+            .execute("INSERT INTO t1 VALUES (10);")
+            .expect_err("nested trigger should propagate inner RAISE(ABORT)");
+        assert!(matches!(
+            err,
+            FrankenError::FunctionError(ref msg) if msg == "inner trigger abort"
+        ));
+        assert!(conn.trigger_frame_stack.borrow().is_empty());
+    }
+
+    #[test]
+    fn test_trigger_large_table_column_binding_100_columns() {
+        let conn = Connection::open(":memory:").unwrap();
+
+        let mut create_table_sql = String::from("CREATE TABLE t (");
+        for idx in 1..=100 {
+            if idx > 1 {
+                create_table_sql.push_str(", ");
+            }
+            create_table_sql.push('c');
+            create_table_sql.push_str(&idx.to_string());
+            create_table_sql.push_str(" INTEGER");
+        }
+        create_table_sql.push_str(");");
+        conn.execute(&create_table_sql).unwrap();
+        conn.execute("CREATE TABLE log (v INTEGER);").unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_large AFTER INSERT ON t BEGIN INSERT INTO log VALUES (NEW.c100); END;",
+        )
+        .unwrap();
+
+        let mut insert_sql = String::from("INSERT INTO t VALUES (");
+        for idx in 1..=100 {
+            if idx > 1 {
+                insert_sql.push_str(", ");
+            }
+            insert_sql.push_str(&idx.to_string());
+        }
+        insert_sql.push_str(");");
+        conn.execute(&insert_sql).unwrap();
+
+        let rows = conn.query("SELECT v FROM log;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(100));
+        assert!(conn.trigger_frame_stack.borrow().is_empty());
+    }
+
+    #[test]
+    fn test_trigger_begin_concurrent_mode_with_old_new_bindings() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE log (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_concurrent AFTER INSERT ON t BEGIN INSERT INTO log VALUES (NEW.id, NEW.name); END;",
+        )
+        .unwrap();
+
+        conn.execute("BEGIN CONCURRENT;").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'alice');").unwrap();
+        conn.execute("COMMIT;").unwrap();
+
+        let rows = conn.query("SELECT id, name FROM log;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
+        assert_eq!(
+            row_values(&rows[0])[1],
+            SqliteValue::Text("alice".to_owned())
+        );
+        assert!(conn.trigger_frame_stack.borrow().is_empty());
+    }
+
+    #[test]
     fn test_create_trigger_persists_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("trigger_round_trip.db");
@@ -19349,6 +20181,316 @@ mod schema_loading_tests {
             )
             .unwrap();
         assert_eq!(affected, 1, "UPDATE WHERE name = ?1 should affect 1 row");
+    }
+
+    fn txn_metrics_map(rows: &[Row]) -> HashMap<String, i64> {
+        rows.iter()
+            .filter_map(|row| {
+                let name = match row.values().first() {
+                    Some(SqliteValue::Text(name)) => name.clone(),
+                    _ => return None,
+                };
+                let value = match row.values().get(1) {
+                    Some(SqliteValue::Integer(value)) => *value,
+                    _ => return None,
+                };
+                Some((name, value))
+            })
+            .collect()
+    }
+
+    fn txn_advisor_codes(rows: &[Row]) -> HashSet<String> {
+        rows.iter()
+            .filter_map(|row| match row.values().first() {
+                Some(SqliteValue::Text(code)) => Some(code.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_pragma_txn_stats_reports_active_and_completed_counts() {
+        let conn = Connection::open(":memory:").unwrap();
+
+        let initial = conn.query("PRAGMA fsqlite_txn_stats;").unwrap();
+        let initial_map = txn_metrics_map(&initial);
+        assert_eq!(initial_map.get("active_count"), Some(&0));
+        assert_eq!(initial_map.get("completed_count"), Some(&0));
+
+        conn.execute("BEGIN;").unwrap();
+        let in_txn = conn.query("PRAGMA txn_stats;").unwrap();
+        let in_txn_map = txn_metrics_map(&in_txn);
+        assert_eq!(in_txn_map.get("active_count"), Some(&1));
+
+        conn.execute("COMMIT;").unwrap();
+        let after_commit = conn.query("PRAGMA fsqlite.txn_stats;").unwrap();
+        let after_commit_map = txn_metrics_map(&after_commit);
+        assert_eq!(after_commit_map.get("active_count"), Some(&0));
+        assert_eq!(after_commit_map.get("completed_count"), Some(&1));
+    }
+
+    #[test]
+    fn test_pragma_txn_stats_tracks_autocommit_lifecycle() {
+        let conn = Connection::open(":memory:").unwrap();
+
+        let baseline_rows = conn.query("PRAGMA txn_stats;").unwrap();
+        let baseline = txn_metrics_map(&baseline_rows)
+            .get("completed_count")
+            .copied()
+            .unwrap_or(0);
+
+        conn.query("SELECT 1;").unwrap();
+
+        let after_rows = conn.query("PRAGMA txn_stats;").unwrap();
+        let after = txn_metrics_map(&after_rows)
+            .get("completed_count")
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(
+            after,
+            baseline + 1,
+            "autocommit read should increment completed transaction count"
+        );
+    }
+
+    #[test]
+    fn test_pragma_txn_advisor_long_txn_threshold_round_trip_and_long_counter() {
+        let conn = Connection::open(":memory:").unwrap();
+
+        let default_threshold = conn.query("PRAGMA txn_advisor_long_txn_ms;").unwrap();
+        assert_eq!(
+            default_threshold[0].values(),
+            &[SqliteValue::Integer(5_000)],
+            "default long transaction threshold should be 5000ms"
+        );
+
+        let clamped_threshold = conn
+            .query("PRAGMA fsqlite.txn_advisor_long_txn_ms=0;")
+            .unwrap();
+        assert_eq!(
+            clamped_threshold[0].values(),
+            &[SqliteValue::Integer(1)],
+            "threshold should clamp to 1ms when set to 0"
+        );
+
+        conn.execute("BEGIN;").unwrap();
+        {
+            let mut metrics = conn.txn_lifecycle_metrics.borrow_mut();
+            let now = Instant::now();
+            metrics.active_started_at = Some(
+                now.checked_sub(std::time::Duration::from_millis(15))
+                    .unwrap_or(now),
+            );
+        }
+        let active_stats_rows = conn.query("PRAGMA fsqlite_txn_stats;").unwrap();
+        let active_stats = txn_metrics_map(&active_stats_rows);
+        assert_eq!(active_stats.get("active_count"), Some(&1));
+        assert_eq!(active_stats.get("long_running_count"), Some(&1));
+
+        conn.execute("COMMIT;").unwrap();
+
+        let stats_rows = conn.query("PRAGMA fsqlite_txn_stats;").unwrap();
+        let stats = txn_metrics_map(&stats_rows);
+        assert_eq!(stats.get("completed_count"), Some(&1));
+        assert_eq!(stats.get("long_running_count"), Some(&1));
+        assert_eq!(stats.get("long_txn_threshold_ms"), Some(&1));
+    }
+
+    #[test]
+    fn test_pragma_txn_advisor_emits_long_read_and_savepoint_advisories() {
+        let conn = Connection::open(":memory:").unwrap();
+
+        assert_eq!(
+            conn.query("PRAGMA fsqlite.txn_advisor_large_read_ops=1;")
+                .unwrap()[0]
+                .values(),
+            &[SqliteValue::Integer(1)]
+        );
+        assert_eq!(
+            conn.query("PRAGMA fsqlite.txn_advisor_savepoint_depth=1;")
+                .unwrap()[0]
+                .values(),
+            &[SqliteValue::Integer(1)]
+        );
+        assert_eq!(
+            conn.query("PRAGMA fsqlite.txn_advisor_long_txn_ms=1;")
+                .unwrap()[0]
+                .values(),
+            &[SqliteValue::Integer(1)]
+        );
+
+        conn.execute("BEGIN;").unwrap();
+        {
+            let mut metrics = conn.txn_lifecycle_metrics.borrow_mut();
+            let now = Instant::now();
+            metrics.active_started_at = Some(
+                now.checked_sub(std::time::Duration::from_millis(20))
+                    .unwrap_or(now),
+            );
+        }
+
+        conn.query("SELECT 1;").unwrap();
+        conn.execute("SAVEPOINT s1;").unwrap();
+
+        let advisor_rows = conn.query("PRAGMA txn_advisor;").unwrap();
+        let advisor_codes = txn_advisor_codes(&advisor_rows);
+        assert!(
+            advisor_codes.contains("long_txn"),
+            "expected long_txn advisor after forcing old start timestamp"
+        );
+        assert!(
+            advisor_codes.contains("large_read_set"),
+            "expected large_read_set advisor after SELECT with threshold=1"
+        );
+        assert!(
+            advisor_codes.contains("deep_savepoint_stack"),
+            "expected deep_savepoint_stack advisor at depth=1 with threshold=1"
+        );
+
+        conn.execute("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn test_pragma_txn_advisor_rollback_ratio_threshold_and_signal() {
+        let conn = Connection::open(":memory:").unwrap();
+
+        assert_eq!(
+            conn.query("PRAGMA fsqlite.txn_advisor_rollback_ratio_percent=0;")
+                .unwrap()[0]
+                .values(),
+            &[SqliteValue::Integer(1)],
+            "rollback ratio threshold should clamp to 1%"
+        );
+        assert_eq!(
+            conn.query("PRAGMA fsqlite.txn_advisor_rollback_ratio_percent=60;")
+                .unwrap()[0]
+                .values(),
+            &[SqliteValue::Integer(60)]
+        );
+
+        for _ in 0..4 {
+            conn.execute("BEGIN;").unwrap();
+            conn.execute("ROLLBACK;").unwrap();
+        }
+
+        let advisor_rows = conn.query("PRAGMA fsqlite_txn_advisor;").unwrap();
+        let advisor_codes = txn_advisor_codes(&advisor_rows);
+        assert!(
+            advisor_codes.contains("rollback_pressure"),
+            "expected rollback_pressure when rollback ratio exceeds configured threshold"
+        );
+
+        let rollback_row = advisor_rows
+            .iter()
+            .find(|row| match row.values().first() {
+                Some(SqliteValue::Text(code)) => code == "rollback_pressure",
+                _ => false,
+            })
+            .expect("rollback_pressure row should be present");
+
+        let actual_ratio = match rollback_row.values().get(3) {
+            Some(SqliteValue::Integer(value)) => *value,
+            other => panic!("expected integer actual ratio in column 4, got {other:?}"),
+        };
+        let configured_threshold = match rollback_row.values().get(4) {
+            Some(SqliteValue::Integer(value)) => *value,
+            other => panic!("expected integer threshold in column 5, got {other:?}"),
+        };
+
+        assert!(actual_ratio >= 60);
+        assert_eq!(configured_threshold, 60);
+    }
+
+    #[test]
+    fn test_pragma_fsqlite_transactions_reports_live_txn_rows() {
+        let conn = Connection::open(":memory:").unwrap();
+
+        let empty_rows = conn.query("PRAGMA fsqlite_transactions;").unwrap();
+        assert!(empty_rows.is_empty(), "no transaction should yield no rows");
+
+        conn.execute("BEGIN;").unwrap();
+        let live_rows = conn.query("PRAGMA fsqlite.transactions;").unwrap();
+        assert_eq!(live_rows.len(), 1, "active transaction should expose one row");
+        assert_eq!(live_rows[0].values().len(), 5, "row shape should be stable");
+
+        let duration = match live_rows[0].values().get(1) {
+            Some(SqliteValue::Integer(value)) => *value,
+            other => panic!("expected duration integer in column 2, got {other:?}"),
+        };
+        let pages_read = match live_rows[0].values().get(2) {
+            Some(SqliteValue::Integer(value)) => *value,
+            other => panic!("expected pages_read integer in column 3, got {other:?}"),
+        };
+        let pages_written = match live_rows[0].values().get(3) {
+            Some(SqliteValue::Integer(value)) => *value,
+            other => panic!("expected pages_written integer in column 4, got {other:?}"),
+        };
+        let snapshot_age = match live_rows[0].values().get(4) {
+            Some(SqliteValue::Integer(value)) => *value,
+            other => panic!("expected snapshot_age integer in column 5, got {other:?}"),
+        };
+
+        assert!(duration >= 0);
+        assert!(pages_read >= 0);
+        assert!(pages_written >= 0);
+        assert!(snapshot_age >= 0);
+
+        conn.execute("COMMIT;").unwrap();
+        let after_rows = conn.query("PRAGMA fsqlite_transactions;").unwrap();
+        assert!(after_rows.is_empty(), "committed transaction should disappear");
+    }
+
+    #[test]
+    fn test_pragma_txn_stats_captures_read_write_savepoint_and_rollback_signals() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE txn_metrics_t (id INTEGER, v INTEGER);")
+            .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        let initial = txn_metrics_map(&conn.query("PRAGMA fsqlite_txn_stats;").unwrap());
+        assert_eq!(initial.get("read_ops"), Some(&0));
+        assert_eq!(initial.get("write_ops"), Some(&0));
+        assert_eq!(initial.get("savepoint_depth"), Some(&0));
+        assert_eq!(initial.get("rollback_count_active"), Some(&0));
+
+        conn.query("SELECT 1;").unwrap();
+        conn.execute("INSERT INTO txn_metrics_t VALUES (1, 10);")
+            .unwrap();
+        conn.execute("SAVEPOINT s1;").unwrap();
+        conn.execute("ROLLBACK TO SAVEPOINT s1;").unwrap();
+
+        let in_txn = txn_metrics_map(&conn.query("PRAGMA txn_stats;").unwrap());
+        assert!(
+            in_txn.get("read_ops").copied().unwrap_or_default() >= 1,
+            "expected at least one read op recorded"
+        );
+        assert!(
+            in_txn.get("write_ops").copied().unwrap_or_default() >= 1,
+            "expected at least one write op recorded"
+        );
+        assert_eq!(in_txn.get("savepoint_depth"), Some(&1));
+        assert_eq!(in_txn.get("rollback_count_active"), Some(&1));
+        assert_eq!(in_txn.get("rollback_count_total"), Some(&1));
+
+        conn.execute("RELEASE SAVEPOINT s1;").unwrap();
+        let after_release = txn_metrics_map(&conn.query("PRAGMA txn_stats;").unwrap());
+        assert_eq!(after_release.get("savepoint_depth"), Some(&0));
+
+        conn.execute("COMMIT;").unwrap();
+        let after_commit = txn_metrics_map(&conn.query("PRAGMA txn_stats;").unwrap());
+        assert_eq!(after_commit.get("rollback_count_active"), Some(&0));
+        assert_eq!(after_commit.get("rollback_count_total"), Some(&1));
+    }
+
+    #[test]
+    fn test_pragma_txn_stats_tracks_full_rollback_totals() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("ROLLBACK;").unwrap();
+
+        let stats = txn_metrics_map(&conn.query("PRAGMA fsqlite_txn_stats;").unwrap());
+        assert_eq!(stats.get("rollback_count_total"), Some(&1));
+        assert_eq!(stats.get("active_count"), Some(&0));
     }
 
     #[test]

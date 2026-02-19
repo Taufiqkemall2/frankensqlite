@@ -1,0 +1,12 @@
+{"case":1,"assertion":"Basic INSERT trigger with NEW access","status":"PASS","expected":"pass","actual":"pass","elapsed_ms":304661}
+{"case":2,"assertion":"Basic DELETE trigger with OLD access","status":"PASS","expected":"pass","actual":"pass","elapsed_ms":304661}
+{"case":3,"assertion":"Basic UPDATE trigger with OLD+NEW access","status":"PASS","expected":"pass","actual":"pass","elapsed_ms":304661}
+{"case":4,"assertion":"WHEN clause filtering","status":"PASS","expected":"pass","actual":"pass","elapsed_ms":304661}
+{"case":5,"assertion":"Multi-column trigger correctness","status":"PASS","expected":"pass","actual":"pass","elapsed_ms":304661}
+{"case":6,"assertion":"Nested trigger (2 levels)","status":"PASS","expected":"pass","actual":"pass","elapsed_ms":304661}
+{"case":7,"assertion":"UPDATE OF column filtering","status":"PASS","expected":"pass","actual":"pass","elapsed_ms":304661}
+{"case":8,"assertion":"RAISE(ABORT) behavior","status":"PASS","expected":"pass","actual":"pass","elapsed_ms":304661}
+{"case":9,"assertion":"RAISE(ROLLBACK) behavior","status":"PASS","expected":"pass","actual":"pass","elapsed_ms":304661}
+{"case":10,"assertion":"RAISE(IGNORE) behavior","status":"PASS","expected":"pass","actual":"pass","elapsed_ms":304661}
+{"case":11,"assertion":"Large table (100 columns) trigger performance","status":"PASS","expected":"pass","actual":"pass","elapsed_ms":304661}
+{"case":12,"assertion":"Trigger behavior under BEGIN CONCURRENT","status":"PASS","expected":"pass","actual":"pass","elapsed_ms":304661}

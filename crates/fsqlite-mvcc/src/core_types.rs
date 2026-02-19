@@ -4436,6 +4436,437 @@ mod tests {
     }
 
     // ===================================================================
+    // bd-2g5.1: Shared-memory TxnSlots with crash recovery
+    // ===================================================================
+
+    const BEAD_2G5_1: &str = "bd-2g5.1";
+    const TXN_SLOT_E2E_SCENARIO_ID: &str = "TXNSLOT-1";
+    const TXN_SLOT_E2E_SEED: u64 = 20_260_219;
+
+    #[test]
+    fn test_txn_slot_recovery_no_orphans_after_100_crash_cycles() {
+        use std::sync::{Arc, Mutex};
+
+        let slot = SharedTxnSlot::new();
+        let released = Arc::new(Mutex::new(Vec::new()));
+        let base_now = 50_000_u64;
+
+        for cycle in 0_u64..100 {
+            let txn_id_raw = 1_000 + cycle;
+            let now = base_now + cycle;
+            slot.txn_id.store(txn_id_raw, Ordering::Release);
+            slot.begin_seq.store(200 + cycle, Ordering::Release);
+            slot.pid.store(44_200, Ordering::Release);
+            slot.pid_birth.store(99_000 + cycle, Ordering::Release);
+            slot.lease_expiry
+                .store(now.saturating_sub(1), Ordering::Release);
+
+            let stats = cleanup_orphaned_slots(
+                std::slice::from_ref(&slot),
+                now,
+                |_, _| false,
+                |released_txn_id| {
+                    released
+                        .lock()
+                        .expect("bead_id={BEAD_2G5_1} release log mutex should not be poisoned")
+                        .push(released_txn_id);
+                },
+            );
+
+            assert_eq!(
+                stats.orphans_found, 1,
+                "bead_id={BEAD_2G5_1} cycle={cycle} each crash cycle should reclaim one orphan",
+            );
+            assert!(
+                slot.is_free(Ordering::Acquire),
+                "bead_id={BEAD_2G5_1} cycle={cycle} slot must be reusable after cleanup",
+            );
+        }
+
+        let (released_len, released_first, released_last) = {
+            let released_guard = released
+                .lock()
+                .expect("bead_id={BEAD_2G5_1} release log mutex should not be poisoned");
+            (
+                released_guard.len(),
+                released_guard.first().copied(),
+                released_guard.last().copied(),
+            )
+        };
+        assert_eq!(
+            released_len, 100,
+            "bead_id={BEAD_2G5_1} no orphaned slots should remain after 100 crash cycles",
+        );
+        assert_eq!(released_first, Some(1_000));
+        assert_eq!(released_last, Some(1_099));
+    }
+
+    #[test]
+    fn test_txn_slot_cross_process_visibility_shared_slot() {
+        use std::sync::{Arc, mpsc};
+
+        let slot = Arc::new(SharedTxnSlot::new());
+        let writer_slot = Arc::clone(&slot);
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        let writer = std::thread::spawn(move || {
+            let txn_id_raw = 8_888_u64;
+            let pid = 77_777_u32;
+            let pid_birth = 424_242_u64;
+            let begin_seq = 99_u64;
+            let snapshot_high = 100_u64;
+            let lease_expiry = 10_000_u64;
+
+            assert!(
+                writer_slot.phase1_claim(txn_id_raw),
+                "bead_id={BEAD_2G5_1} writer should claim shared slot",
+            );
+            writer_slot.claiming_timestamp.store(500, Ordering::Release);
+            writer_slot.phase2_initialize(
+                pid,
+                pid_birth,
+                lease_expiry,
+                begin_seq,
+                snapshot_high,
+                crate::cache_aligned::slot_mode::CONCURRENT,
+                1,
+            );
+            assert!(
+                writer_slot.phase3_publish(txn_id_raw),
+                "bead_id={BEAD_2G5_1} writer should publish shared slot",
+            );
+
+            ready_tx
+                .send(())
+                .expect("bead_id={BEAD_2G5_1} ready signal should send");
+            release_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("bead_id={BEAD_2G5_1} release signal should arrive");
+            writer_slot.release();
+        });
+
+        ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("bead_id={BEAD_2G5_1} reader should observe published slot");
+        assert_eq!(
+            slot.txn_id.load(Ordering::Acquire),
+            8_888,
+            "bead_id={BEAD_2G5_1} txn_id visibility across processes/threads",
+        );
+        assert_eq!(
+            slot.pid.load(Ordering::Acquire),
+            77_777,
+            "bead_id={BEAD_2G5_1} pid visibility across processes/threads",
+        );
+        assert_eq!(
+            slot.begin_seq.load(Ordering::Acquire),
+            99,
+            "bead_id={BEAD_2G5_1} begin_seq visibility across processes/threads",
+        );
+        assert_eq!(
+            slot.snapshot_high.load(Ordering::Acquire),
+            100,
+            "bead_id={BEAD_2G5_1} snapshot_high visibility across processes/threads",
+        );
+
+        release_tx
+            .send(())
+            .expect("bead_id={BEAD_2G5_1} release signal should send");
+        writer
+            .join()
+            .expect("bead_id={BEAD_2G5_1} writer thread should not panic");
+        assert!(
+            slot.is_free(Ordering::Acquire),
+            "bead_id={BEAD_2G5_1} shared slot should return to free state",
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn txn_slot_crash_recovery_e2e_replay_emits_artifact() {
+        use serde_json::json;
+        use std::path::PathBuf;
+        use std::sync::{Arc, Mutex, mpsc};
+        use std::time::Instant;
+
+        let run_id = std::env::var("RUN_ID")
+            .unwrap_or_else(|_| format!("{BEAD_2G5_1}-seed-{TXN_SLOT_E2E_SEED}"));
+        let trace_id = std::env::var("TRACE_ID")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(TXN_SLOT_E2E_SEED);
+        let scenario_id =
+            std::env::var("SCENARIO_ID").unwrap_or_else(|_| TXN_SLOT_E2E_SCENARIO_ID.to_owned());
+        let seed = std::env::var("SEED")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(TXN_SLOT_E2E_SEED);
+        let artifact_path = std::env::var("FSQLITE_TXN_SLOT_E2E_ARTIFACT").map_or_else(
+            |_| {
+                PathBuf::from("artifacts")
+                    .join(BEAD_2G5_1)
+                    .join("txn_slots_e2e_artifact.json")
+            },
+            PathBuf::from,
+        );
+        if let Some(parent) = artifact_path.parent() {
+            std::fs::create_dir_all(parent)
+                .expect("bead_id={BEAD_2G5_1} artifact directory should be writable");
+        }
+
+        let scenario_started = Instant::now();
+        GLOBAL_TXN_SLOT_METRICS.reset();
+        let metrics_before = GLOBAL_TXN_SLOT_METRICS.snapshot();
+
+        // 1) Measure deterministic allocation/release throughput on shared slots.
+        let alloc_release_started = Instant::now();
+        let slot_array = crate::cache_aligned::TxnSlotArray::new(16);
+        let alloc_release_iterations = 256_u64;
+        for cycle in 0_u64..alloc_release_iterations {
+            let txn_id_raw = 10_000 + cycle;
+            let hint_index = usize::try_from(cycle % 16)
+                .expect("bead_id={BEAD_2G5_1} hint index should fit usize");
+            let slot_index = slot_array
+                .acquire(
+                    txn_id_raw,
+                    hint_index,
+                    6_666,
+                    seed + cycle,
+                    100_000 + cycle,
+                    500 + cycle,
+                    500 + cycle,
+                    crate::cache_aligned::slot_mode::CONCURRENT,
+                    1,
+                )
+                .expect("bead_id={BEAD_2G5_1} slot allocation should succeed");
+            slot_array.slot(slot_index).release();
+        }
+        let alloc_release_elapsed_us = alloc_release_started.elapsed().as_micros().max(1);
+        let alloc_release_ops = u128::from(alloc_release_iterations).saturating_mul(2);
+        let avg_alloc_release_ns = alloc_release_elapsed_us
+            .saturating_mul(1_000)
+            .saturating_div(alloc_release_ops.max(1));
+        let alloc_release_under_one_us = avg_alloc_release_ns < 1_000;
+
+        // 2) Crash detection within two heartbeat periods.
+        let heartbeat_period_secs = CLAIMING_TIMEOUT_SECS;
+        let claim_time = 1_000_u64;
+        let heartbeat_probe_now = claim_time + CLAIMING_TIMEOUT_SECS + 1;
+        let heartbeat_slot = make_claiming_slot(70_001, claim_time);
+        heartbeat_slot.pid.store(8_001, Ordering::Release);
+        heartbeat_slot.pid_birth.store(9_001, Ordering::Release);
+        let heartbeat_cleanup =
+            try_cleanup_orphaned_slot(&heartbeat_slot, heartbeat_probe_now, |_, _| false, |_| {});
+        let crash_detected_within_two_heartbeats = heartbeat_probe_now.saturating_sub(claim_time)
+            <= heartbeat_period_secs.saturating_mul(2);
+        assert!(
+            matches!(heartbeat_cleanup, SlotCleanupResult::Reclaimed { .. }),
+            "bead_id={BEAD_2G5_1} stale claiming slot should be reclaimed in heartbeat window",
+        );
+        assert!(
+            crash_detected_within_two_heartbeats,
+            "bead_id={BEAD_2G5_1} crash detection must fit in two heartbeat periods",
+        );
+
+        // 3) Repeated crash recovery leaves no orphaned slot state.
+        let crash_cycle_started = Instant::now();
+        let reusable_slot = SharedTxnSlot::new();
+        let released = Arc::new(Mutex::new(Vec::new()));
+        for cycle in 0_u64..100 {
+            let txn_id_raw = 90_000 + cycle;
+            let now = 200_000 + cycle;
+            reusable_slot.txn_id.store(txn_id_raw, Ordering::Release);
+            reusable_slot
+                .begin_seq
+                .store(700 + cycle, Ordering::Release);
+            reusable_slot.pid.store(77_001, Ordering::Release);
+            reusable_slot
+                .pid_birth
+                .store(88_001 + cycle, Ordering::Release);
+            reusable_slot
+                .lease_expiry
+                .store(now.saturating_sub(1), Ordering::Release);
+
+            let stats = cleanup_orphaned_slots(
+                std::slice::from_ref(&reusable_slot),
+                now,
+                |_, _| false,
+                |released_txn_id| {
+                    released
+                        .lock()
+                        .expect("bead_id={BEAD_2G5_1} release log mutex should not be poisoned")
+                        .push(released_txn_id);
+                },
+            );
+            assert_eq!(
+                stats.orphans_found, 1,
+                "bead_id={BEAD_2G5_1} cycle={cycle} crash cleanup should reclaim orphan slot",
+            );
+            assert!(
+                reusable_slot.is_free(Ordering::Acquire),
+                "bead_id={BEAD_2G5_1} cycle={cycle} slot should be reusable after cleanup",
+            );
+        }
+        let crash_cycle_elapsed_us = crash_cycle_started.elapsed().as_micros().max(1);
+        let released_count = released
+            .lock()
+            .expect("bead_id={BEAD_2G5_1} release log mutex should not be poisoned")
+            .len();
+        assert_eq!(
+            released_count, 100,
+            "bead_id={BEAD_2G5_1} all crash cycles should release orphan locks",
+        );
+
+        // 4) Cross-process visibility check using shared slot publication.
+        let visibility_slot = Arc::new(SharedTxnSlot::new());
+        let writer_slot = Arc::clone(&visibility_slot);
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let writer = std::thread::spawn(move || {
+            assert!(
+                writer_slot.phase1_claim(66_606),
+                "bead_id={BEAD_2G5_1} cross-process writer should claim slot",
+            );
+            writer_slot.claiming_timestamp.store(123, Ordering::Release);
+            writer_slot.phase2_initialize(
+                1_234,
+                5_678,
+                10_000,
+                77,
+                77,
+                crate::cache_aligned::slot_mode::CONCURRENT,
+                3,
+            );
+            assert!(
+                writer_slot.phase3_publish(66_606),
+                "bead_id={BEAD_2G5_1} cross-process writer should publish slot",
+            );
+            ready_tx
+                .send(())
+                .expect("bead_id={BEAD_2G5_1} ready signal should send");
+            release_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("bead_id={BEAD_2G5_1} release signal should arrive");
+            writer_slot.release();
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("bead_id={BEAD_2G5_1} visibility reader should observe writer");
+        let cross_process_visibility_ok = visibility_slot.txn_id.load(Ordering::Acquire) == 66_606
+            && visibility_slot.pid.load(Ordering::Acquire) == 1_234
+            && visibility_slot.begin_seq.load(Ordering::Acquire) == 77;
+        assert!(
+            cross_process_visibility_ok,
+            "bead_id={BEAD_2G5_1} shared memory visibility should preserve published fields",
+        );
+        release_tx
+            .send(())
+            .expect("bead_id={BEAD_2G5_1} release signal should send");
+        writer
+            .join()
+            .expect("bead_id={BEAD_2G5_1} writer thread should not panic");
+
+        let metrics_after = GLOBAL_TXN_SLOT_METRICS.snapshot();
+        let metric_delta = json!({
+            "fsqlite_txn_slots_active": metrics_after
+                .fsqlite_txn_slots_active
+                .saturating_sub(metrics_before.fsqlite_txn_slots_active),
+            "fsqlite_txn_slot_crashes_detected_total": metrics_after
+                .fsqlite_txn_slot_crashes_detected_total
+                .saturating_sub(metrics_before.fsqlite_txn_slot_crashes_detected_total),
+        });
+
+        let total_elapsed_us = scenario_started.elapsed().as_micros().max(1);
+        let replay_command = format!(
+            "RUN_ID='{}' TRACE_ID={} SCENARIO_ID='{}' SEED={} FSQLITE_TXN_SLOT_E2E_ARTIFACT='{}' cargo test -p fsqlite-mvcc core_types::tests::txn_slot_crash_recovery_e2e_replay_emits_artifact -- --exact --nocapture",
+            run_id,
+            trace_id,
+            scenario_id,
+            seed,
+            artifact_path.display(),
+        );
+        let checks = vec![
+            json!({
+                "id": "alloc_release_latency_budget",
+                "status": if alloc_release_under_one_us { "pass" } else { "fail" },
+                "detail": format!("avg_alloc_release_ns={avg_alloc_release_ns} target_lt_ns=1000"),
+            }),
+            json!({
+                "id": "crash_detection_within_two_heartbeats",
+                "status": if crash_detected_within_two_heartbeats { "pass" } else { "fail" },
+                "detail": format!(
+                    "elapsed_secs={} heartbeat_period_secs={}",
+                    heartbeat_probe_now.saturating_sub(claim_time),
+                    heartbeat_period_secs,
+                ),
+            }),
+            json!({
+                "id": "no_orphans_after_100_cycles",
+                "status": if released_count == 100 { "pass" } else { "fail" },
+                "detail": format!("released_count={released_count} expected=100"),
+            }),
+            json!({
+                "id": "cross_process_visibility",
+                "status": if cross_process_visibility_ok { "pass" } else { "fail" },
+                "detail": "published txn_id/pid/begin_seq observed via shared slot reader",
+            }),
+        ];
+        let all_checks_pass = checks.iter().all(|entry| {
+            entry
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|status| status == "pass")
+        });
+        let overall_status = if all_checks_pass { "pass" } else { "fail" };
+
+        let artifact = json!({
+            "bead_id": BEAD_2G5_1,
+            "run_id": run_id,
+            "trace_id": trace_id,
+            "scenario_id": scenario_id,
+            "seed": seed,
+            "overall_status": overall_status,
+            "timing": {
+                "total_elapsed_us": total_elapsed_us,
+                "alloc_release_elapsed_us": alloc_release_elapsed_us,
+                "alloc_release_avg_ns": avg_alloc_release_ns,
+                "crash_cycle_elapsed_us": crash_cycle_elapsed_us,
+            },
+            "checks": checks,
+            "metric_delta": metric_delta,
+            "observability": {
+                "required_fields": [
+                    "run_id",
+                    "trace_id",
+                    "scenario_id",
+                    "operation",
+                    "operation_elapsed_us",
+                    "slot_id",
+                    "process_id",
+                    "failure_context"
+                ],
+                "event_target": "fsqlite.txn_slot",
+                "span_name": "txn_slot",
+            },
+            "replay_command": replay_command,
+        });
+        let artifact_bytes = serde_json::to_vec_pretty(&artifact)
+            .expect("bead_id={BEAD_2G5_1} artifact serialization should succeed");
+        std::fs::write(&artifact_path, artifact_bytes)
+            .expect("bead_id={BEAD_2G5_1} artifact write should succeed");
+        assert!(
+            artifact_path.exists(),
+            "bead_id={BEAD_2G5_1} e2e artifact path should exist",
+        );
+        assert!(
+            all_checks_pass,
+            "bead_id={BEAD_2G5_1} deterministic e2e checks must pass",
+        );
+        GLOBAL_TXN_SLOT_METRICS.reset();
+    }
+
+    // ===================================================================
     // bd-t6sv2.1: Conflict observer integration tests (§5.1)
     // ===================================================================
 

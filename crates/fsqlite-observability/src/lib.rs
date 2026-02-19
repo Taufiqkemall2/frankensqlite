@@ -303,6 +303,16 @@ impl TxnSlotMetrics {
         }
     }
 
+    fn log_context_from_env() -> (String, u64, String) {
+        let run_id = std::env::var("RUN_ID").unwrap_or_else(|_| "(none)".to_owned());
+        let trace_id = std::env::var("TRACE_ID")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let scenario_id = std::env::var("SCENARIO_ID").unwrap_or_else(|_| "(none)".to_owned());
+        (run_id, trace_id, scenario_id)
+    }
+
     fn decrement_active_slots_saturating(&self) -> u64 {
         loop {
             let prev = self.fsqlite_txn_slots_active.load(Ordering::Relaxed);
@@ -319,40 +329,62 @@ impl TxnSlotMetrics {
 
     /// Record a successful slot allocation/publish.
     pub fn record_slot_allocated(&self, slot_id: usize, process_id: u32) {
+        let started_at = Instant::now();
         let active_after = self
             .fsqlite_txn_slots_active
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
+        let operation_elapsed_us = started_at.elapsed().as_micros().max(1);
+        let (run_id, trace_id, scenario_id) = Self::log_context_from_env();
         let span = tracing::span!(
             target: "fsqlite.txn_slot",
             tracing::Level::INFO,
             "txn_slot",
             slot_id,
             process_id,
+            run_id = %run_id.as_str(),
+            trace_id,
+            scenario_id = %scenario_id.as_str(),
             operation = "alloc"
         );
         let _guard = span.enter();
         tracing::info!(
             fsqlite_txn_slots_active = active_after,
+            operation_elapsed_us,
+            run_id = %run_id.as_str(),
+            trace_id,
+            scenario_id = %scenario_id.as_str(),
+            failure_context = "none",
             "transaction slot allocated"
         );
     }
 
     /// Record a slot release/free operation.
     pub fn record_slot_released(&self, slot_id: Option<usize>, process_id: u32) {
+        let started_at = Instant::now();
         let active_after = self.decrement_active_slots_saturating();
         let slot_id = Self::normalize_slot_id(slot_id);
+        let operation_elapsed_us = started_at.elapsed().as_micros().max(1);
+        let (run_id, trace_id, scenario_id) = Self::log_context_from_env();
         let span = tracing::span!(
             target: "fsqlite.txn_slot",
             tracing::Level::INFO,
             "txn_slot",
             slot_id,
             process_id,
+            run_id = %run_id.as_str(),
+            trace_id,
+            scenario_id = %scenario_id.as_str(),
             operation = "release"
         );
         let _guard = span.enter();
         tracing::info!(
             fsqlite_txn_slots_active = active_after,
+            operation_elapsed_us,
+            run_id = %run_id.as_str(),
+            trace_id,
+            scenario_id = %scenario_id.as_str(),
+            failure_context = "none",
             "transaction slot released"
         );
     }
@@ -364,23 +396,34 @@ impl TxnSlotMetrics {
         process_id: u32,
         orphan_txn_id: u64,
     ) {
+        let started_at = Instant::now();
         let total = self
             .fsqlite_txn_slot_crashes_detected_total
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
         let slot_id = Self::normalize_slot_id(slot_id);
+        let operation_elapsed_us = started_at.elapsed().as_micros().max(1);
+        let (run_id, trace_id, scenario_id) = Self::log_context_from_env();
         let span = tracing::span!(
             target: "fsqlite.txn_slot",
             tracing::Level::WARN,
             "txn_slot",
             slot_id,
             process_id,
+            run_id = %run_id.as_str(),
+            trace_id,
+            scenario_id = %scenario_id.as_str(),
             operation = "crash_detect"
         );
         let _guard = span.enter();
         tracing::warn!(
             orphan_txn_id,
             fsqlite_txn_slot_crashes_detected_total = total,
+            operation_elapsed_us,
+            run_id = %run_id.as_str(),
+            trace_id,
+            scenario_id = %scenario_id.as_str(),
+            failure_context = "orphan_slot_reclaimed_during_cleanup",
             "orphaned transaction slot crash detected"
         );
     }

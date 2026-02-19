@@ -13,6 +13,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/fsqlite-core/**"
+      - "crates/fsqlite-planner/**"
       - "crates/fsqlite-harness/src/backlog_quality_gate.rs"
       - "crates/fsqlite-harness/src/bin/backlog_quality_gate_runner.rs"
       - "crates/fsqlite-harness/src/bin/perf_baseline_pack_runner.rs"
@@ -20,11 +21,14 @@ on:
       - "crates/fsqlite-harness/src/perf_loop.rs"
       - "crates/fsqlite-harness/src/performance_regression_detector.rs"
       - "crates/fsqlite-harness/src/validation_manifest.rs"
+      - "crates/fsqlite-mvcc/**"
       - "crates/fsqlite-vdbe/**"
       - "scripts/verify_backlog_quality_gate.sh"
       - "scripts/verify_ci_artifact_gates.sh"
       - "scripts/verify_perf_baseline_pack.sh"
       - "scripts/verify_validation_manifest.sh"
+      - "scripts/bd_1as_4_index_selection_e2e.sh"
+      - "scripts/bd_2g5_1_txn_slots_e2e.sh"
       - "scripts/coverage.sh"
       - "baselines/criterion/bd-1dp9.6.1-baseline.json"
 
@@ -332,6 +336,20 @@ jobs:
           mkdir -p artifacts/validation-manifest-e2e
           bash ./scripts/verify_validation_manifest.sh --json > artifacts/validation-manifest-e2e/report.json
 
+      - name: Run planner index-selection deterministic replay gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/planner-index-selection-e2e
+          bash ./scripts/bd_1as_4_index_selection_e2e.sh --json > artifacts/planner-index-selection-e2e/report.json
+
+      - name: Run txn-slot deterministic replay gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/txn-slot-e2e
+          bash ./scripts/bd_2g5_1_txn_slots_e2e.sh --json > artifacts/txn-slot-e2e/report.json
+
       - name: Publish validation-manifest replay summary
         if: always()
         shell: bash
@@ -355,6 +373,46 @@ jobs:
             echo "Validation-manifest replay report missing at ${report_path}" >> "${GITHUB_STEP_SUMMARY}"
           fi
 
+      - name: Publish planner index-selection replay summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          report_path="artifacts/planner-index-selection-e2e/report.json"
+          if [[ -f "${report_path}" ]]; then
+            echo "### Planner Index Selection Deterministic Replay Gate" >> "${GITHUB_STEP_SUMMARY}"
+            jq -r '
+              "- overall_status: \(.overall_status)",
+              "- run_id: `\(.run_id)`",
+              "- trace_id: \(.trace_id)",
+              "- scenario_id: `\(.scenario_id)`",
+              "- artifact_path: `\(.artifact_path)`",
+              "- replay_command: `\(.replay_command)`"
+            ' "${report_path}" >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo "Planner replay report missing at ${report_path}" >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Publish txn-slot replay summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          report_path="artifacts/txn-slot-e2e/report.json"
+          if [[ -f "${report_path}" ]]; then
+            echo "### TxnSlot Crash Recovery Deterministic Replay Gate" >> "${GITHUB_STEP_SUMMARY}"
+            jq -r '
+              "- overall_status: \(.overall_status)",
+              "- run_id: `\(.run_id)`",
+              "- trace_id: \(.trace_id)",
+              "- scenario_id: `\(.scenario_id)`",
+              "- artifact_path: `\(.artifact_path)`",
+              "- replay_command: `\(.replay_command)`"
+            ' "${report_path}" >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo "Txn-slot replay report missing at ${report_path}" >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
       - name: Publish CI artifact gate summary
         if: always()
         shell: bash
@@ -375,6 +433,10 @@ jobs:
           path: |
             artifacts/ci-artifact-gates/
             artifacts/validation-manifest-e2e/
+            artifacts/planner-index-selection-e2e/
+            artifacts/txn-slot-e2e/
+            artifacts/bd-1as.4/
+            artifacts/bd-2g5.1/
             artifacts/perf/bd-1dp9.6.1/
             target/coverage/
           retention-days: 21
