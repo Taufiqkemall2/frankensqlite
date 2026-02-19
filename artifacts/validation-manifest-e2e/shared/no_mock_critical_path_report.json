@@ -1,0 +1,46 @@
+{
+  "schema_version": "1.0.0",
+  "bead_id": "bd-mblr.3.4.1",
+  "verdict": "pass",
+  "total_critical_invariants": 57,
+  "real_evidence_count": 57,
+  "exception_count": 0,
+  "missing_evidence_count": 0,
+  "coverage_pct": 1.0,
+  "categories": [
+    {
+      "category": "SqlGrammar",
+      "display_name": "SQL Grammar",
+      "total_invariants": 21,
+      "real_evidence_count": 21,
+      "exception_count": 0,
+      "missing_count": 0,
+      "coverage_pct": 1.0,
+      "passes": true
+    },
+    {
+      "category": "VdbeOpcodes",
+      "display_name": "VDBE Opcodes",
+      "total_invariants": 18,
+      "real_evidence_count": 18,
+      "exception_count": 0,
+      "missing_count": 0,
+      "coverage_pct": 1.0,
+      "passes": true
+    },
+    {
+      "category": "StorageTransaction",
+      "display_name": "Storage & Transactions",
+      "total_invariants": 18,
+      "real_evidence_count": 18,
+      "exception_count": 0,
+      "missing_count": 0,
+      "coverage_pct": 1.0,
+      "passes": true
+    }
+  ],
+  "violations": [],
+  "blocking_count": 0,
+  "warning_count": 0,
+  "summary": "No-mock critical-path gate: PASS — 57 critical invariants, 57 with real evidence, 0 exceptions, 0 missing (0 blocking, 0 warnings)"
+}

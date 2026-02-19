@@ -1,0 +1,466 @@
+{
+  "schema_version": "1.0.0",
+  "bead_id": "bd-mblr.3.5.1",
+  "run_id": "bd-mblr.3.5.1-seed-424242",
+  "trace_id": "trace-dde11f1184376ebf",
+  "scenario_id": "QUALITY-351",
+  "generated_unix_ms": 1700000000000,
+  "commit_sha": "b289f41d5395f88c7bdac348582201cc8fb7e656",
+  "overall_outcome": "fail",
+  "overall_pass": false,
+  "replay": {
+    "command": "cargo run -p fsqlite-harness --bin validation_manifest_runner -- --root-seed 424242 --generated-unix-ms 1700000000000 --commit-sha 'b289f41d5395f88c7bdac348582201cc8fb7e656' --run-id 'bd-mblr.3.5.1-seed-424242' --trace-id 'trace-dde11f1184376ebf' --scenario-id 'QUALITY-351' --artifact-uri-prefix 'artifacts/validation-manifest-e2e/shared'",
+    "root_seed": 424242,
+    "scenario_id": "QUALITY-351"
+  },
+  "artifact_uris": [
+    "artifacts/validation-manifest-e2e/shared/coverage_gate_report.json",
+    "artifacts/validation-manifest-e2e/shared/invariant_drift_report.json",
+    "artifacts/validation-manifest-e2e/shared/logging_conformance_report.json",
+    "artifacts/validation-manifest-e2e/shared/no_mock_critical_path_report.json",
+    "artifacts/validation-manifest-e2e/shared/scenario_coverage_drift_report.json",
+    "artifacts/validation-manifest-e2e/shared/validation_manifest_events.jsonl"
+  ],
+  "gates": [
+    {
+      "gate_id": "bd-mblr.3.1.1",
+      "gate_family": "coverage",
+      "bead_id": "bd-mblr.3.1.1",
+      "outcome": "pass_with_warnings",
+      "timestamp_unix_ms": 1700000000000,
+      "commit_sha": "b289f41d5395f88c7bdac348582201cc8fb7e656",
+      "artifact_uris": [
+        "artifacts/validation-manifest-e2e/shared/coverage_gate_report.json"
+      ],
+      "summary": "Coverage gate PASS_WITH_WARNINGS: 41 tests, 124 invariants, global fill 61.5%, evidence 10000.0%, 0 blocking, 1 warnings"
+    },
+    {
+      "gate_id": "bd-mblr.3.1.2",
+      "gate_family": "invariant_drift",
+      "bead_id": "bd-mblr.3.1.2",
+      "outcome": "pass",
+      "timestamp_unix_ms": 1700000000000,
+      "commit_sha": "b289f41d5395f88c7bdac348582201cc8fb7e656",
+      "artifact_uris": [
+        "artifacts/validation-manifest-e2e/shared/invariant_drift_report.json"
+      ],
+      "summary": "invariant drift: required_gap_count=0 critical_real=57/57"
+    },
+    {
+      "gate_id": "bd-mblr.3.2.2",
+      "gate_family": "scenario_drift",
+      "bead_id": "bd-mblr.3.2.2",
+      "outcome": "fail",
+      "timestamp_unix_ms": 1700000000000,
+      "commit_sha": "b289f41d5395f88c7bdac348582201cc8fb7e656",
+      "artifact_uris": [
+        "artifacts/validation-manifest-e2e/shared/scenario_coverage_drift_report.json"
+      ],
+      "summary": "scenario drift: required_gap_count=3 manifest_missing=3"
+    },
+    {
+      "gate_id": "bd-mblr.3.4.1",
+      "gate_family": "no_mock_critical_path",
+      "bead_id": "bd-mblr.3.4.1",
+      "outcome": "pass",
+      "timestamp_unix_ms": 1700000000000,
+      "commit_sha": "b289f41d5395f88c7bdac348582201cc8fb7e656",
+      "artifact_uris": [
+        "artifacts/validation-manifest-e2e/shared/no_mock_critical_path_report.json"
+      ],
+      "summary": "No-mock critical-path gate: PASS — 57 critical invariants, 57 with real evidence, 0 exceptions, 0 missing (0 blocking, 0 warnings)"
+    },
+    {
+      "gate_id": "bd-mblr.5.5.1",
+      "gate_family": "logging_conformance",
+      "bead_id": "bd-mblr.5.5.1",
+      "outcome": "pass",
+      "timestamp_unix_ms": 1700000000000,
+      "commit_sha": "b289f41d5395f88c7bdac348582201cc8fb7e656",
+      "artifact_uris": [
+        "artifacts/validation-manifest-e2e/shared/logging_conformance_report.json",
+        "artifacts/validation-manifest-e2e/shared/validation_manifest_events.jsonl"
+      ],
+      "summary": "logging conformance: profile_errors=0 schema_errors=0 warnings=0 shell_errors=0 shell_warnings=11"
+    }
+  ],
+  "coverage_gate": {
+    "schema_version": "1.0.0",
+    "bead_id": "bd-mblr.3.1.1",
+    "verdict": "pass_with_warnings",
+    "total_tests": 41,
+    "total_invariants": 124,
+    "global_fill_pct": 0.6152243902439025,
+    "evidence_coverage_pct": 100.0,
+    "property_test_count": 2,
+    "categories": [
+      {
+        "category": "SqlGrammar",
+        "display_name": "SQL Grammar",
+        "fill_pct": 0.6666,
+        "test_count": 8,
+        "invariant_count": 21,
+        "property_test_count": 1,
+        "is_critical": true,
+        "passes": true,
+        "missing_areas": [
+          "CTE (common table expressions)",
+          "Window functions",
+          "UPSERT (INSERT ON CONFLICT)",
+          "ALTER TABLE variants"
+        ]
+      },
+      {
+        "category": "VdbeOpcodes",
+        "display_name": "VDBE Opcodes",
+        "fill_pct": 0.6,
+        "test_count": 6,
+        "invariant_count": 18,
+        "property_test_count": 0,
+        "is_critical": true,
+        "passes": true,
+        "missing_areas": [
+          "String opcodes (Concat, Function)",
+          "Index opcodes (IdxInsert, IdxDelete)",
+          "Bloom filter opcodes",
+          "Virtual table opcodes"
+        ]
+      },
+      {
+        "category": "StorageTransaction",
+        "display_name": "Storage & Transactions",
+        "fill_pct": 0.6,
+        "test_count": 6,
+        "invariant_count": 18,
+        "property_test_count": 0,
+        "is_critical": true,
+        "passes": true,
+        "missing_areas": [
+          "WAL FEC repair cycle",
+          "Deadlock-free lock ordering",
+          "Shared lock table contention",
+          "Page recycling (freelist)"
+        ]
+      },
+      {
+        "category": "Pragma",
+        "display_name": "PRAGMAs",
+        "fill_pct": 0.5,
+        "test_count": 3,
+        "invariant_count": 9,
+        "property_test_count": 0,
+        "is_critical": false,
+        "passes": true,
+        "missing_areas": [
+          "wal_autocheckpoint",
+          "foreign_keys enforcement",
+          "compile_options listing"
+        ]
+      },
+      {
+        "category": "BuiltinFunctions",
+        "display_name": "Built-in Functions",
+        "fill_pct": 0.625,
+        "test_count": 5,
+        "invariant_count": 15,
+        "property_test_count": 0,
+        "is_critical": false,
+        "passes": true,
+        "missing_areas": [
+          "Hex/unhex/zeroblob",
+          "Unicode functions",
+          "Random/randomblob"
+        ]
+      },
+      {
+        "category": "Extensions",
+        "display_name": "Extensions",
+        "fill_pct": 0.6666,
+        "test_count": 4,
+        "invariant_count": 12,
+        "property_test_count": 0,
+        "is_critical": false,
+        "passes": true,
+        "missing_areas": [
+          "Session extension changeset",
+          "ICU collation"
+        ]
+      },
+      {
+        "category": "TypeSystem",
+        "display_name": "Type System",
+        "fill_pct": 0.6,
+        "test_count": 3,
+        "invariant_count": 11,
+        "property_test_count": 0,
+        "is_critical": false,
+        "passes": true,
+        "missing_areas": [
+          "UTF-16 encoding paths",
+          "Numeric text recognition"
+        ]
+      },
+      {
+        "category": "FileFormat",
+        "display_name": "File Format",
+        "fill_pct": 0.6,
+        "test_count": 3,
+        "invariant_count": 10,
+        "property_test_count": 1,
+        "is_critical": false,
+        "passes": true,
+        "missing_areas": [
+          "Freelist page format",
+          "Pointer map pages"
+        ]
+      },
+      {
+        "category": "ApiCli",
+        "display_name": "API & CLI",
+        "fill_pct": 0.6,
+        "test_count": 3,
+        "invariant_count": 10,
+        "property_test_count": 0,
+        "is_critical": false,
+        "passes": true,
+        "missing_areas": [
+          "Blob I/O API",
+          "Unlock notification"
+        ]
+      }
+    ],
+    "violations": [
+      {
+        "check": "min_property_tests_global",
+        "severity": "warning",
+        "category": null,
+        "observed": "2",
+        "required": "5",
+        "remediation": "Add property-based tests (proptest) to improve coverage breadth."
+      }
+    ],
+    "blocking_count": 0,
+    "warning_count": 1,
+    "summary": "Coverage gate PASS_WITH_WARNINGS: 41 tests, 124 invariants, global fill 61.5%, evidence 10000.0%, 0 blocking, 1 warnings"
+  },
+  "invariant_drift": {
+    "schema_version": "1.0.0",
+    "gate_id": "bd-mblr.3.1.2",
+    "unit_matrix_schema_version": "1.0.0",
+    "evidence_schema_version": "1.0.0",
+    "total_matrix_tests": 41,
+    "total_matrix_invariants": 124,
+    "unit_matrix_overall_fill_pct": 0.6064,
+    "total_evidence_entries": 124,
+    "evidence_coverage_pct": 100.0,
+    "critical_invariant_count": 57,
+    "critical_invariants_with_real_evidence": 57,
+    "required_gap_count": 0,
+    "overall_pass": true,
+    "gaps": []
+  },
+  "scenario_coverage_drift": {
+    "schema_version": "1.0.0",
+    "gate_id": "bd-mblr.3.2.2",
+    "root_seed": 424242,
+    "total_catalog_scenarios": 50,
+    "required_catalog_scenarios": 40,
+    "total_manifest_scenarios": 105,
+    "total_manifest_missing": 3,
+    "required_gap_count": 3,
+    "overall_pass": false,
+    "gaps": [
+      {
+        "scenario_id": "INFRA-2",
+        "reason": "missing_catalog_entry_for_manifest_scenario",
+        "severity": "required",
+        "criticality": null,
+        "description": null,
+        "covering_scripts": [
+          "scripts/test_inventory.sh"
+        ],
+        "replay_command": "bash scripts/test_inventory.sh"
+      },
+      {
+        "scenario_id": "INFRA-3",
+        "reason": "missing_catalog_entry_for_manifest_scenario",
+        "severity": "required",
+        "criticality": null,
+        "description": null,
+        "covering_scripts": [
+          "scripts/coverage.sh"
+        ],
+        "replay_command": "bash scripts/coverage.sh"
+      },
+      {
+        "scenario_id": "PARITY-1",
+        "reason": "missing_catalog_entry_for_manifest_scenario",
+        "severity": "required",
+        "criticality": null,
+        "description": null,
+        "covering_scripts": [
+          "scripts/verify_parity_taxonomy.sh"
+        ],
+        "replay_command": "bash scripts/verify_parity_taxonomy.sh --json"
+      }
+    ]
+  },
+  "no_mock_critical_path": {
+    "schema_version": "1.0.0",
+    "bead_id": "bd-mblr.3.4.1",
+    "verdict": "pass",
+    "total_critical_invariants": 57,
+    "real_evidence_count": 57,
+    "exception_count": 0,
+    "missing_evidence_count": 0,
+    "coverage_pct": 1.0,
+    "categories": [
+      {
+        "category": "SqlGrammar",
+        "display_name": "SQL Grammar",
+        "total_invariants": 21,
+        "real_evidence_count": 21,
+        "exception_count": 0,
+        "missing_count": 0,
+        "coverage_pct": 1.0,
+        "passes": true
+      },
+      {
+        "category": "VdbeOpcodes",
+        "display_name": "VDBE Opcodes",
+        "total_invariants": 18,
+        "real_evidence_count": 18,
+        "exception_count": 0,
+        "missing_count": 0,
+        "coverage_pct": 1.0,
+        "passes": true
+      },
+      {
+        "category": "StorageTransaction",
+        "display_name": "Storage & Transactions",
+        "total_invariants": 18,
+        "real_evidence_count": 18,
+        "exception_count": 0,
+        "missing_count": 0,
+        "coverage_pct": 1.0,
+        "passes": true
+      }
+    ],
+    "violations": [],
+    "blocking_count": 0,
+    "warning_count": 0,
+    "summary": "No-mock critical-path gate: PASS — 57 critical invariants, 57 with real evidence, 0 exceptions, 0 missing (0 blocking, 0 warnings)"
+  },
+  "logging_conformance": {
+    "schema_version": "1.0.0",
+    "gate_id": "bd-mblr.5.5.1",
+    "profile_doc_path": "docs/e2e_shell_script_log_profile.json",
+    "profile_version": "1.0.0",
+    "profile_errors": [],
+    "log_validation": {
+      "bead_id": "bd-1dp9.7.6",
+      "schema_version": "1.0.0",
+      "diagnostics": [],
+      "stats": {
+        "total_events": 6,
+        "valid_events": 6,
+        "invalid_events": 0,
+        "error_count": 0,
+        "warning_count": 0,
+        "info_count": 0,
+        "unique_run_ids": 1,
+        "phases_observed": [
+          "report",
+          "setup"
+        ],
+        "event_types_observed": [
+          "artifact_generated",
+          "fail",
+          "start"
+        ]
+      },
+      "passed": true
+    },
+    "shell_script_conformance": {
+      "schema_version": "1.0.0",
+      "bead_id": "bd-mblr.5.5",
+      "profile_version": "1.0.0",
+      "total_shell_scripts": 18,
+      "profiled_shell_scripts": 7,
+      "compliant_profiled_scripts": 7,
+      "warning_count": 11,
+      "error_count": 0,
+      "issues": [
+        {
+          "script_path": "e2e/arc_warmup_report.sh",
+          "issue_code": "script_not_profiled",
+          "severity": "warning",
+          "detail": "script lacks log_schema_version=1.0.0 and is treated as migration backlog"
+        },
+        {
+          "script_path": "e2e/bd_2v8x_compliance.sh",
+          "issue_code": "script_not_profiled",
+          "severity": "warning",
+          "detail": "script lacks log_schema_version=1.0.0 and is treated as migration backlog"
+        },
+        {
+          "script_path": "e2e/bd_bca_1_compliance.sh",
+          "issue_code": "script_not_profiled",
+          "severity": "warning",
+          "detail": "script lacks log_schema_version=1.0.0 and is treated as migration backlog"
+        },
+        {
+          "script_path": "e2e/bd_i0m5_networking_stack_replication_under_loss.sh",
+          "issue_code": "script_not_profiled",
+          "severity": "warning",
+          "detail": "script lacks log_schema_version=1.0.0 and is treated as migration backlog"
+        },
+        {
+          "script_path": "e2e/bd_ncivz_1_parallel_wal_buffer_pilot.sh",
+          "issue_code": "script_not_profiled",
+          "severity": "warning",
+          "detail": "script lacks log_schema_version=1.0.0 and is treated as migration backlog"
+        },
+        {
+          "script_path": "e2e/build_matrix.sh",
+          "issue_code": "script_not_profiled",
+          "severity": "warning",
+          "detail": "script lacks log_schema_version=1.0.0 and is treated as migration backlog"
+        },
+        {
+          "script_path": "e2e/fts3_compat_report.sh",
+          "issue_code": "script_not_profiled",
+          "severity": "warning",
+          "detail": "script lacks log_schema_version=1.0.0 and is treated as migration backlog"
+        },
+        {
+          "script_path": "e2e/future_work_report.sh",
+          "issue_code": "script_not_profiled",
+          "severity": "warning",
+          "detail": "script lacks log_schema_version=1.0.0 and is treated as migration backlog"
+        },
+        {
+          "script_path": "e2e/reference_index_audit.sh",
+          "issue_code": "script_not_profiled",
+          "severity": "warning",
+          "detail": "script lacks log_schema_version=1.0.0 and is treated as migration backlog"
+        },
+        {
+          "script_path": "e2e/risk_register_report.sh",
+          "issue_code": "script_not_profiled",
+          "severity": "warning",
+          "detail": "script lacks log_schema_version=1.0.0 and is treated as migration backlog"
+        },
+        {
+          "script_path": "e2e/spec_viz_smoke.sh",
+          "issue_code": "script_not_profiled",
+          "severity": "warning",
+          "detail": "script lacks log_schema_version=1.0.0 and is treated as migration backlog"
+        }
+      ],
+      "overall_pass": true
+    },
+    "overall_pass": true
+  },
+  "summary": "Validation manifest bd-mblr.3.5.1: outcome=FAIL gates=5 artifacts=6 commit_sha=b289f41d5395f88c7bdac348582201cc8fb7e656"
+}

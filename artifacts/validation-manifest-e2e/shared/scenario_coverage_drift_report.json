@@ -1,0 +1,46 @@
+{
+  "schema_version": "1.0.0",
+  "gate_id": "bd-mblr.3.2.2",
+  "root_seed": 424242,
+  "total_catalog_scenarios": 50,
+  "required_catalog_scenarios": 40,
+  "total_manifest_scenarios": 105,
+  "total_manifest_missing": 3,
+  "required_gap_count": 3,
+  "overall_pass": false,
+  "gaps": [
+    {
+      "scenario_id": "INFRA-2",
+      "reason": "missing_catalog_entry_for_manifest_scenario",
+      "severity": "required",
+      "criticality": null,
+      "description": null,
+      "covering_scripts": [
+        "scripts/test_inventory.sh"
+      ],
+      "replay_command": "bash scripts/test_inventory.sh"
+    },
+    {
+      "scenario_id": "INFRA-3",
+      "reason": "missing_catalog_entry_for_manifest_scenario",
+      "severity": "required",
+      "criticality": null,
+      "description": null,
+      "covering_scripts": [
+        "scripts/coverage.sh"
+      ],
+      "replay_command": "bash scripts/coverage.sh"
+    },
+    {
+      "scenario_id": "PARITY-1",
+      "reason": "missing_catalog_entry_for_manifest_scenario",
+      "severity": "required",
+      "criticality": null,
+      "description": null,
+      "covering_scripts": [
+        "scripts/verify_parity_taxonomy.sh"
+      ],
+      "replay_command": "bash scripts/verify_parity_taxonomy.sh --json"
+    }
+  ]
+}

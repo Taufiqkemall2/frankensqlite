@@ -1,0 +1,159 @@
+{
+  "schema_version": "1.0.0",
+  "bead_id": "bd-mblr.3.1.1",
+  "verdict": "pass_with_warnings",
+  "total_tests": 41,
+  "total_invariants": 124,
+  "global_fill_pct": 0.6152243902439025,
+  "evidence_coverage_pct": 100.0,
+  "property_test_count": 2,
+  "categories": [
+    {
+      "category": "SqlGrammar",
+      "display_name": "SQL Grammar",
+      "fill_pct": 0.6666,
+      "test_count": 8,
+      "invariant_count": 21,
+      "property_test_count": 1,
+      "is_critical": true,
+      "passes": true,
+      "missing_areas": [
+        "CTE (common table expressions)",
+        "Window functions",
+        "UPSERT (INSERT ON CONFLICT)",
+        "ALTER TABLE variants"
+      ]
+    },
+    {
+      "category": "VdbeOpcodes",
+      "display_name": "VDBE Opcodes",
+      "fill_pct": 0.6,
+      "test_count": 6,
+      "invariant_count": 18,
+      "property_test_count": 0,
+      "is_critical": true,
+      "passes": true,
+      "missing_areas": [
+        "String opcodes (Concat, Function)",
+        "Index opcodes (IdxInsert, IdxDelete)",
+        "Bloom filter opcodes",
+        "Virtual table opcodes"
+      ]
+    },
+    {
+      "category": "StorageTransaction",
+      "display_name": "Storage & Transactions",
+      "fill_pct": 0.6,
+      "test_count": 6,
+      "invariant_count": 18,
+      "property_test_count": 0,
+      "is_critical": true,
+      "passes": true,
+      "missing_areas": [
+        "WAL FEC repair cycle",
+        "Deadlock-free lock ordering",
+        "Shared lock table contention",
+        "Page recycling (freelist)"
+      ]
+    },
+    {
+      "category": "Pragma",
+      "display_name": "PRAGMAs",
+      "fill_pct": 0.5,
+      "test_count": 3,
+      "invariant_count": 9,
+      "property_test_count": 0,
+      "is_critical": false,
+      "passes": true,
+      "missing_areas": [
+        "wal_autocheckpoint",
+        "foreign_keys enforcement",
+        "compile_options listing"
+      ]
+    },
+    {
+      "category": "BuiltinFunctions",
+      "display_name": "Built-in Functions",
+      "fill_pct": 0.625,
+      "test_count": 5,
+      "invariant_count": 15,
+      "property_test_count": 0,
+      "is_critical": false,
+      "passes": true,
+      "missing_areas": [
+        "Hex/unhex/zeroblob",
+        "Unicode functions",
+        "Random/randomblob"
+      ]
+    },
+    {
+      "category": "Extensions",
+      "display_name": "Extensions",
+      "fill_pct": 0.6666,
+      "test_count": 4,
+      "invariant_count": 12,
+      "property_test_count": 0,
+      "is_critical": false,
+      "passes": true,
+      "missing_areas": [
+        "Session extension changeset",
+        "ICU collation"
+      ]
+    },
+    {
+      "category": "TypeSystem",
+      "display_name": "Type System",
+      "fill_pct": 0.6,
+      "test_count": 3,
+      "invariant_count": 11,
+      "property_test_count": 0,
+      "is_critical": false,
+      "passes": true,
+      "missing_areas": [
+        "UTF-16 encoding paths",
+        "Numeric text recognition"
+      ]
+    },
+    {
+      "category": "FileFormat",
+      "display_name": "File Format",
+      "fill_pct": 0.6,
+      "test_count": 3,
+      "invariant_count": 10,
+      "property_test_count": 1,
+      "is_critical": false,
+      "passes": true,
+      "missing_areas": [
+        "Freelist page format",
+        "Pointer map pages"
+      ]
+    },
+    {
+      "category": "ApiCli",
+      "display_name": "API & CLI",
+      "fill_pct": 0.6,
+      "test_count": 3,
+      "invariant_count": 10,
+      "property_test_count": 0,
+      "is_critical": false,
+      "passes": true,
+      "missing_areas": [
+        "Blob I/O API",
+        "Unlock notification"
+      ]
+    }
+  ],
+  "violations": [
+    {
+      "check": "min_property_tests_global",
+      "severity": "warning",
+      "category": null,
+      "observed": "2",
+      "required": "5",
+      "remediation": "Add property-based tests (proptest) to improve coverage breadth."
+    }
+  ],
+  "blocking_count": 0,
+  "warning_count": 1,
+  "summary": "Coverage gate PASS_WITH_WARNINGS: 41 tests, 124 invariants, global fill 61.5%, evidence 10000.0%, 0 blocking, 1 warnings"
+}

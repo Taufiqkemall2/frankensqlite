@@ -1,0 +1,16 @@
+{
+  "schema_version": "1.0.0",
+  "gate_id": "bd-mblr.3.1.2",
+  "unit_matrix_schema_version": "1.0.0",
+  "evidence_schema_version": "1.0.0",
+  "total_matrix_tests": 41,
+  "total_matrix_invariants": 124,
+  "unit_matrix_overall_fill_pct": 0.6064,
+  "total_evidence_entries": 124,
+  "evidence_coverage_pct": 100.0,
+  "critical_invariant_count": 57,
+  "critical_invariants_with_real_evidence": 57,
+  "required_gap_count": 0,
+  "overall_pass": true,
+  "gaps": []
+}

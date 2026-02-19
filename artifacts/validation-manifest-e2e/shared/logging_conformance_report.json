@@ -1,0 +1,111 @@
+{
+  "schema_version": "1.0.0",
+  "gate_id": "bd-mblr.5.5.1",
+  "profile_doc_path": "docs/e2e_shell_script_log_profile.json",
+  "profile_version": "1.0.0",
+  "profile_errors": [],
+  "log_validation": {
+    "bead_id": "bd-1dp9.7.6",
+    "schema_version": "1.0.0",
+    "diagnostics": [],
+    "stats": {
+      "total_events": 6,
+      "valid_events": 6,
+      "invalid_events": 0,
+      "error_count": 0,
+      "warning_count": 0,
+      "info_count": 0,
+      "unique_run_ids": 1,
+      "phases_observed": [
+        "report",
+        "setup"
+      ],
+      "event_types_observed": [
+        "artifact_generated",
+        "fail",
+        "start"
+      ]
+    },
+    "passed": true
+  },
+  "shell_script_conformance": {
+    "schema_version": "1.0.0",
+    "bead_id": "bd-mblr.5.5",
+    "profile_version": "1.0.0",
+    "total_shell_scripts": 18,
+    "profiled_shell_scripts": 7,
+    "compliant_profiled_scripts": 7,
+    "warning_count": 11,
+    "error_count": 0,
+    "issues": [
+      {
+        "script_path": "e2e/arc_warmup_report.sh",
+        "issue_code": "script_not_profiled",
+        "severity": "warning",
+        "detail": "script lacks log_schema_version=1.0.0 and is treated as migration backlog"
+      },
+      {
+        "script_path": "e2e/bd_2v8x_compliance.sh",
+        "issue_code": "script_not_profiled",
+        "severity": "warning",
+        "detail": "script lacks log_schema_version=1.0.0 and is treated as migration backlog"
+      },
+      {
+        "script_path": "e2e/bd_bca_1_compliance.sh",
+        "issue_code": "script_not_profiled",
+        "severity": "warning",
+        "detail": "script lacks log_schema_version=1.0.0 and is treated as migration backlog"
+      },
+      {
+        "script_path": "e2e/bd_i0m5_networking_stack_replication_under_loss.sh",
+        "issue_code": "script_not_profiled",
+        "severity": "warning",
+        "detail": "script lacks log_schema_version=1.0.0 and is treated as migration backlog"
+      },
+      {
+        "script_path": "e2e/bd_ncivz_1_parallel_wal_buffer_pilot.sh",
+        "issue_code": "script_not_profiled",
+        "severity": "warning",
+        "detail": "script lacks log_schema_version=1.0.0 and is treated as migration backlog"
+      },
+      {
+        "script_path": "e2e/build_matrix.sh",
+        "issue_code": "script_not_profiled",
+        "severity": "warning",
+        "detail": "script lacks log_schema_version=1.0.0 and is treated as migration backlog"
+      },
+      {
+        "script_path": "e2e/fts3_compat_report.sh",
+        "issue_code": "script_not_profiled",
+        "severity": "warning",
+        "detail": "script lacks log_schema_version=1.0.0 and is treated as migration backlog"
+      },
+      {
+        "script_path": "e2e/future_work_report.sh",
+        "issue_code": "script_not_profiled",
+        "severity": "warning",
+        "detail": "script lacks log_schema_version=1.0.0 and is treated as migration backlog"
+      },
+      {
+        "script_path": "e2e/reference_index_audit.sh",
+        "issue_code": "script_not_profiled",
+        "severity": "warning",
+        "detail": "script lacks log_schema_version=1.0.0 and is treated as migration backlog"
+      },
+      {
+        "script_path": "e2e/risk_register_report.sh",
+        "issue_code": "script_not_profiled",
+        "severity": "warning",
+        "detail": "script lacks log_schema_version=1.0.0 and is treated as migration backlog"
+      },
+      {
+        "script_path": "e2e/spec_viz_smoke.sh",
+        "issue_code": "script_not_profiled",
+        "severity": "warning",
+        "detail": "script lacks log_schema_version=1.0.0 and is treated as migration backlog"
+      }
+    ],
+    "overall_pass": true
+  },
+  "overall_pass": true
+}
