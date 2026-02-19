@@ -142,6 +142,34 @@ This README describes the target end-state architecture. The runnable code today
 
 ---
 
+## Transaction Lifecycle Introspection (bd-t6sv2.5)
+
+`fsqlite-core::Connection` exposes transaction lifecycle observability through PRAGMA surfaces that are safe to query during active workloads:
+
+- `PRAGMA fsqlite_txn_stats` (aliases: `txn_stats`, `fsqlite.txn_stats`)
+  - Key/value counters for active/completed lifecycle state, snapshot age, read/write ops, savepoint depth, rollback counters, and advisor thresholds.
+- `PRAGMA fsqlite_transactions` (aliases: `transactions`, `fsqlite.transactions`)
+  - Per-active-transaction rows (duration/snapshot age and read/write activity shape).
+- `PRAGMA fsqlite_txn_advisor` (aliases: `txn_advisor`, `fsqlite.txn_advisor`)
+  - Actionable advisory rows for anti-patterns:
+    - `long_txn`
+    - `large_read_set`
+    - `deep_savepoint_stack`
+    - `rollback_pressure`
+- `PRAGMA fsqlite_txn_timeline_json` (aliases: `txn_timeline_json`, `fsqlite.txn_timeline_json`)
+  - JSON snapshot intended for timeline/visualizer tooling, including active state, first-read/first-write timing, savepoint/rollback counters, and advisor thresholds.
+
+Advisor thresholds are tunable:
+
+- `PRAGMA fsqlite.txn_advisor_long_txn_ms = <ms>`
+- `PRAGMA fsqlite.txn_advisor_large_read_ops = <count>`
+- `PRAGMA fsqlite.txn_advisor_savepoint_depth = <depth>`
+- `PRAGMA fsqlite.txn_advisor_rollback_ratio_percent = <percent>`
+
+All threshold PRAGMAs clamp invalid low values to safe minimums.
+
+---
+
 ## MVCC: How Concurrent Writers Work
 
 ### The Write Path
