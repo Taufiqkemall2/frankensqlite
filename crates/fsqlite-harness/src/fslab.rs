@@ -113,7 +113,11 @@ impl FsLab {
     /// ```ignore
     /// let report = lab.run_with_setup(|runtime, root| {
     ///     let (tid, _) = runtime.state.create_task(root, Budget::INFINITE, async { 42 }).unwrap();
-    ///     runtime.scheduler.lock().unwrap().schedule(tid, 0);
+    ///     runtime
+    ///         .scheduler
+    ///         .lock()
+    ///         .expect("FsLab: scheduler lock poisoned")
+    ///         .schedule(tid, 0);
     /// });
     /// assert!(report.oracle_report.all_passed());
     /// ```
@@ -166,7 +170,11 @@ impl FsLab {
                 .create_task(root, Budget::INFINITE, future)
                 .expect("FsLab: failed to create task");
 
-            runtime.scheduler.lock().schedule(tid, 0);
+            runtime
+                .scheduler
+                .lock()
+                .expect("FsLab: scheduler lock poisoned")
+                .schedule(tid, 0);
         })
     }
 
@@ -176,7 +184,7 @@ impl FsLab {
     /// logs the task name for trace correlation.
     ///
     /// Returns `(TaskId, TaskHandle<T>)` — you must schedule the `TaskId`
-    /// via `runtime.scheduler.lock().unwrap().schedule(tid, lane)`.
+    /// via `runtime.scheduler.lock().expect(...).schedule(tid, lane)`.
     pub fn spawn_named<F, T>(
         runtime: &mut LabRuntime,
         region: RegionId,
@@ -261,7 +269,11 @@ mod tests {
                 .create_task(root, Budget::INFINITE, async { 1_u64 })
                 .expect("create task");
 
-            runtime.scheduler.lock().schedule(tid, 0);
+            runtime
+                .scheduler
+                .lock()
+                .expect("FsLab: scheduler lock poisoned")
+                .schedule(tid, 0);
         });
 
         assert!(
@@ -289,7 +301,10 @@ mod tests {
             let (t1, _h1) = FsLab::spawn_named(runtime, root, "reader", async { "read_done" });
             let (t2, _h2) = FsLab::spawn_named(runtime, root, "writer", async { "write_done" });
 
-            let mut sched = runtime.scheduler.lock();
+            let mut sched = runtime
+                .scheduler
+                .lock()
+                .expect("FsLab: scheduler lock poisoned");
             sched.schedule(t1, 0);
             sched.schedule(t2, 1);
         });
@@ -330,7 +345,11 @@ mod tests {
                 })
                 .expect("create task");
 
-            runtime.scheduler.lock().schedule(tid, 0);
+            runtime
+                .scheduler
+                .lock()
+                .expect("FsLab: scheduler lock poisoned")
+                .schedule(tid, 0);
         });
 
         // Key property: no obligation leaks or task leaks under chaos injection.
@@ -356,7 +375,10 @@ mod tests {
                 .create_task(root, Budget::INFINITE, async { 2_u32 })
                 .expect("task 2");
 
-            let mut sched = runtime.scheduler.lock();
+            let mut sched = runtime
+                .scheduler
+                .lock()
+                .expect("FsLab: scheduler lock poisoned");
             sched.schedule(t1, 0);
             sched.schedule(t2, 1);
         });

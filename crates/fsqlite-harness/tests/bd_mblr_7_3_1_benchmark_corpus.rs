@@ -97,10 +97,7 @@ fn test_manifest_cli_emits_json() {
     let payload: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("parse manifest JSON");
     assert_eq!(payload["bead_id"], BEAD_ID);
-    let entry_count = payload["entries"]
-        .as_array()
-        .map(std::vec::Vec::len)
-        .unwrap_or(0);
+    let entry_count = payload["entries"].as_array().map_or(0, std::vec::Vec::len);
     assert!(
         entry_count >= 6,
         "expected representative corpus entry set, got {entry_count}"

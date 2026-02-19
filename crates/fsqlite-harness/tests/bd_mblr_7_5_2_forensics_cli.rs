@@ -154,7 +154,8 @@ fn test_query_builds_correlations_and_replay_command() {
         "planner",
         InvariantVerdict::Violated,
         vec![
-            artifact(ArtifactKind::ReplayManifest, "artifacts/run-1/replay.json"),
+            artifact(ArtifactKind::ReplayManifest, "artifacts/run-1/replay-02.json"),
+            artifact(ArtifactKind::ReplayManifest, "artifacts/run-1/replay-01.json"),
             artifact(ArtifactKind::FailureBundle, "artifacts/run-1/failure.json"),
         ],
     ));
@@ -171,12 +172,25 @@ fn test_query_builds_correlations_and_replay_command() {
 
     let result = query_index(&index, &QueryFilters::default());
     assert_eq!(result.matched_run_count, 2);
-    assert!(result.timeline.iter().any(|event| {
-        event
-            .replay_command
-            .as_deref()
-            .is_some_and(|command| command.contains("replay_harness"))
-    }));
+
+    let run_1 = result
+        .timeline
+        .iter()
+        .find(|event| event.run_id == "run-1")
+        .expect("run-1 in timeline");
+    assert_eq!(
+        run_1.replay_command.as_deref(),
+        Some(
+            "cargo run -p fsqlite-harness --bin replay_harness -- --manifest artifacts/run-1/replay-01.json"
+        )
+    );
+
+    let run_2 = result
+        .timeline
+        .iter()
+        .find(|event| event.run_id == "run-2")
+        .expect("run-2 in timeline");
+    assert_eq!(run_2.replay_command, None);
 
     let planner = result
         .correlations

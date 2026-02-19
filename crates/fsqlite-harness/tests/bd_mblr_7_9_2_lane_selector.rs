@@ -8,7 +8,7 @@ use fsqlite_harness::impact_graph::ImpactGraph;
 use fsqlite_harness::lane_selector::select_ci_lanes_for_paths;
 
 const BEAD_ID: &str = "bd-mblr.7.9.2";
-const SEED: u64 = 20260213;
+const SEED: u64 = 20_260_213;
 
 fn assert_contains_lane(lanes: &[CiLane], lane: CiLane, case: &str) {
     assert!(

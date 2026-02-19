@@ -769,7 +769,10 @@ mod tests {
                 999_u64
             });
 
-            let mut sched = runtime.scheduler.lock();
+            let mut sched = runtime
+                .scheduler
+                .lock()
+                .expect("FsLab: scheduler lock poisoned");
             sched.schedule(t1, 0);
             sched.schedule(t2, 1);
         });

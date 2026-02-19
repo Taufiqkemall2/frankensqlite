@@ -580,15 +580,7 @@ pub fn build_validation_manifest_bundle(
 
     let root_seed = config.root_seed.unwrap_or(424_242);
     let replay = ReplayContract {
-        command: format!(
-            "cargo run -p fsqlite-harness --bin validation_manifest_runner -- \
---root-seed {root_seed} --generated-unix-ms {} --commit-sha {} --run-id {} --trace-id {} --scenario-id {}",
-            config.generated_unix_ms,
-            config.commit_sha,
-            config.run_id,
-            config.trace_id,
-            config.scenario_id
-        ),
+        command: build_replay_command(config, root_seed, &artifact_prefix),
         root_seed,
         scenario_id: config.scenario_id.clone(),
     };
@@ -680,10 +672,40 @@ fn normalize_artifact_prefix(prefix: &str) -> String {
     prefix.trim_matches('/').to_owned()
 }
 
+fn shell_single_quote(value: &str) -> String {
+    if value.is_empty() {
+        "''".to_owned()
+    } else {
+        let escaped = value.replace('\'', "'\"'\"'");
+        format!("'{escaped}'")
+    }
+}
+
+fn build_replay_command(
+    config: &ValidationManifestConfig,
+    root_seed: u64,
+    artifact_prefix: &str,
+) -> String {
+    format!(
+        "cargo run -p fsqlite-harness --bin validation_manifest_runner -- \
+--root-seed {root_seed} --generated-unix-ms {} --commit-sha {} --run-id {} --trace-id {} --scenario-id {} --artifact-uri-prefix {}",
+        config.generated_unix_ms,
+        shell_single_quote(&config.commit_sha),
+        shell_single_quote(&config.run_id),
+        shell_single_quote(&config.trace_id),
+        shell_single_quote(&config.scenario_id),
+        shell_single_quote(artifact_prefix),
+    )
+}
+
 fn unique_sorted_strings(mut values: Vec<String>) -> Vec<String> {
     values.sort();
     values.dedup();
     values
+}
+
+fn is_sorted_unique(values: &[String]) -> bool {
+    values.windows(2).all(|pair| pair[0] < pair[1])
 }
 
 fn normalize_gate_records(gates: &mut [GateRecord]) {
@@ -1139,6 +1161,15 @@ pub fn evaluate_scenario_coverage_drift_status(
 /// Validate top-level manifest contract invariants.
 #[must_use]
 pub fn validate_manifest_contract(manifest: &ValidationManifest) -> Vec<String> {
+    let mut errors = validate_manifest_top_level_fields(manifest);
+    errors.extend(validate_manifest_replay_contract(manifest));
+    errors.extend(validate_manifest_gate_records(manifest));
+    errors.extend(validate_manifest_embedded_reports(manifest));
+    errors.extend(validate_manifest_gate_artifact_refs(manifest));
+    errors
+}
+
+fn validate_manifest_top_level_fields(manifest: &ValidationManifest) -> Vec<String> {
     let mut errors = Vec::new();
     if manifest.schema_version.trim().is_empty() {
         errors.push("schema_version must be non-empty".to_owned());
@@ -1167,12 +1198,67 @@ pub fn validate_manifest_contract(manifest: &ValidationManifest) -> Vec<String> 
     if manifest.artifact_uris.is_empty() {
         errors.push("artifact_uris must not be empty".to_owned());
     }
+    if !is_sorted_unique(&manifest.artifact_uris) {
+        errors.push("artifact_uris must be sorted and unique".to_owned());
+    }
+    errors
+}
 
+fn validate_manifest_replay_contract(manifest: &ValidationManifest) -> Vec<String> {
+    let mut errors = Vec::new();
+    if manifest.replay.command.trim().is_empty() {
+        errors.push("replay.command must be non-empty".to_owned());
+    } else {
+        for required_fragment in [
+            "validation_manifest_runner",
+            "--root-seed",
+            "--generated-unix-ms",
+            "--commit-sha",
+            "--run-id",
+            "--trace-id",
+            "--scenario-id",
+            "--artifact-uri-prefix",
+        ] {
+            if !manifest.replay.command.contains(required_fragment) {
+                errors.push(format!(
+                    "replay.command missing required fragment '{}'",
+                    required_fragment
+                ));
+            }
+        }
+    }
+    if manifest.replay.scenario_id != manifest.scenario_id {
+        errors.push("replay.scenario_id must equal manifest.scenario_id".to_owned());
+    }
+    errors
+}
+
+fn validate_manifest_gate_records(manifest: &ValidationManifest) -> Vec<String> {
+    let mut errors = Vec::new();
     let mut gate_ids = BTreeSet::new();
     let mut previous_gate: Option<&str> = None;
+
     for gate in &manifest.gates {
         if gate.gate_id.trim().is_empty() {
             errors.push("gate_id must be non-empty".to_owned());
+        }
+        if gate.gate_family.trim().is_empty() {
+            errors.push(format!(
+                "gate {} gate_family must be non-empty",
+                gate.gate_id
+            ));
+        }
+        if gate.bead_id.trim().is_empty() {
+            errors.push(format!("gate {} bead_id must be non-empty", gate.gate_id));
+        }
+        if gate.summary.trim().is_empty() {
+            errors.push(format!("gate {} summary must be non-empty", gate.gate_id));
+        }
+        if gate.timestamp_unix_ms != manifest.generated_unix_ms {
+            errors.push(format!(
+                "gate {} timestamp_unix_ms {} must equal generated_unix_ms {}",
+                gate.gate_id, gate.timestamp_unix_ms, manifest.generated_unix_ms
+            ));
         }
         if gate.commit_sha.trim().is_empty() {
             errors.push(format!(
@@ -1180,8 +1266,20 @@ pub fn validate_manifest_contract(manifest: &ValidationManifest) -> Vec<String> 
                 gate.gate_id
             ));
         }
+        if gate.commit_sha != manifest.commit_sha {
+            errors.push(format!(
+                "gate {} commit_sha '{}' must equal manifest commit_sha '{}'",
+                gate.gate_id, gate.commit_sha, manifest.commit_sha
+            ));
+        }
         if gate.artifact_uris.is_empty() {
             errors.push(format!("gate {} must have artifact URIs", gate.gate_id));
+        }
+        if !is_sorted_unique(&gate.artifact_uris) {
+            errors.push(format!(
+                "gate {} artifact_uris must be sorted and unique",
+                gate.gate_id
+            ));
         }
         if !gate_ids.insert(gate.gate_id.clone()) {
             errors.push(format!("duplicate gate_id '{}'", gate.gate_id));
@@ -1194,6 +1292,11 @@ pub fn validate_manifest_contract(manifest: &ValidationManifest) -> Vec<String> 
         previous_gate = Some(gate.gate_id.as_str());
     }
 
+    errors
+}
+
+fn validate_manifest_embedded_reports(manifest: &ValidationManifest) -> Vec<String> {
+    let mut errors = Vec::new();
     if manifest.invariant_drift.gate_id != INVARIANT_DRIFT_GATE_ID {
         errors.push("invariant_drift gate_id mismatch".to_owned());
     }
@@ -1203,12 +1306,7 @@ pub fn validate_manifest_contract(manifest: &ValidationManifest) -> Vec<String> 
     if manifest.logging_conformance.gate_id != LOGGING_GATE_ID {
         errors.push("logging_conformance gate_id mismatch".to_owned());
     }
-    if manifest
-        .logging_conformance
-        .shell_script_conformance
-        .bead_id
-        != "bd-mblr.5.5"
-    {
+    if manifest.logging_conformance.shell_script_conformance.bead_id != "bd-mblr.5.5" {
         errors.push("logging_conformance shell_script_conformance bead_id mismatch".to_owned());
     }
     if manifest.logging_conformance.overall_pass
@@ -1222,12 +1320,17 @@ pub fn validate_manifest_contract(manifest: &ValidationManifest) -> Vec<String> 
                 .to_owned(),
         );
     }
+    errors
+}
 
+fn validate_manifest_gate_artifact_refs(manifest: &ValidationManifest) -> Vec<String> {
     let artifact_set = manifest
         .artifact_uris
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>();
+    let mut errors = Vec::new();
+
     for gate in &manifest.gates {
         for uri in &gate.artifact_uris {
             if !artifact_set.contains(uri) {
@@ -1388,6 +1491,98 @@ mod tests {
                 "logging_conformance overall_pass inconsistent with shell_script_conformance",
             )
         }));
+    }
+
+    #[test]
+    fn contract_validator_flags_gate_commit_sha_mismatch() {
+        let bundle = build_validation_manifest_bundle(&fixed_config())
+            .unwrap_or_else(|error| panic!("bundle build failed: {error}"));
+        let mut manifest = bundle.manifest;
+        manifest.gates[0].commit_sha = "mismatch".to_owned();
+        let errors = validate_manifest_contract(&manifest);
+        assert!(errors.iter().any(|error| {
+            error.contains("must equal manifest commit_sha")
+                && error.contains(&manifest.gates[0].gate_id)
+        }));
+    }
+
+    #[test]
+    fn contract_validator_flags_gate_timestamp_mismatch() {
+        let bundle = build_validation_manifest_bundle(&fixed_config())
+            .unwrap_or_else(|error| panic!("bundle build failed: {error}"));
+        let mut manifest = bundle.manifest;
+        manifest.gates[0].timestamp_unix_ms = manifest.generated_unix_ms.saturating_add(1);
+        let errors = validate_manifest_contract(&manifest);
+        assert!(errors.iter().any(|error| {
+            error.contains("timestamp_unix_ms") && error.contains(&manifest.gates[0].gate_id)
+        }));
+    }
+
+    #[test]
+    fn contract_validator_flags_unsorted_artifact_uris() {
+        let bundle = build_validation_manifest_bundle(&fixed_config())
+            .unwrap_or_else(|error| panic!("bundle build failed: {error}"));
+        let mut manifest = bundle.manifest;
+        let gate_id = manifest.gates[0].gate_id.clone();
+        manifest.artifact_uris = vec!["z.json".to_owned(), "a.json".to_owned()];
+        manifest.gates[0].artifact_uris = vec!["b.json".to_owned(), "a.json".to_owned()];
+        let errors = validate_manifest_contract(&manifest);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("artifact_uris must be sorted and unique"))
+        );
+        assert!(errors.iter().any(|error| {
+            error.contains("artifact_uris must be sorted and unique") && error.contains(&gate_id)
+        }));
+    }
+
+    #[test]
+    fn replay_command_contains_required_fragments() {
+        let bundle = build_validation_manifest_bundle(&fixed_config())
+            .unwrap_or_else(|error| panic!("bundle build failed: {error}"));
+        let replay = &bundle.manifest.replay.command;
+        for required_fragment in [
+            "validation_manifest_runner",
+            "--root-seed",
+            "--generated-unix-ms",
+            "--commit-sha",
+            "--run-id",
+            "--trace-id",
+            "--scenario-id",
+            "--artifact-uri-prefix",
+        ] {
+            assert!(
+                replay.contains(required_fragment),
+                "missing required replay fragment: {required_fragment}"
+            );
+        }
+        assert!(
+            replay.contains("'artifacts/validation-manifest'"),
+            "artifact uri prefix should be shell-quoted in replay command"
+        );
+    }
+
+    #[test]
+    fn replay_command_shell_quotes_dynamic_values() {
+        let config = ValidationManifestConfig {
+            commit_sha: "sha with spaces and 'quote'".to_owned(),
+            run_id: "run id with spaces".to_owned(),
+            trace_id: "trace'xyz".to_owned(),
+            scenario_id: "QUALITY 'SCENARIO'".to_owned(),
+            generated_unix_ms: 1_700_000_000_111,
+            root_seed: Some(7),
+            artifact_uri_prefix: "artifacts/manifest special".to_owned(),
+        };
+        let bundle = build_validation_manifest_bundle(&config)
+            .unwrap_or_else(|error| panic!("bundle build failed: {error}"));
+        let replay = &bundle.manifest.replay.command;
+
+        assert!(replay.contains("'sha with spaces and '\"'\"'quote'\"'\"''"));
+        assert!(replay.contains("'run id with spaces'"));
+        assert!(replay.contains("'trace'\"'\"'xyz'"));
+        assert!(replay.contains("'QUALITY '\"'\"'SCENARIO'\"'\"''"));
+        assert!(replay.contains("'artifacts/manifest special'"));
     }
 
     #[test]

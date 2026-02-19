@@ -25,7 +25,7 @@ use fsqlite_harness::realdb_e2e_logging::{
 };
 
 const BEAD_ID: &str = "bd-mblr.5.4.1";
-const SEED: u64 = 20260213;
+const SEED: u64 = 20_260_213;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ContractViolation {
@@ -64,16 +64,23 @@ fn add_failure_context(event: &mut LogEventSchema, reason: &str) {
 }
 
 fn validate_log_contract(events: &[LogEventSchema]) -> Vec<ContractViolation> {
-    let mut violations = Vec::new();
-
     if events.is_empty() {
-        violations.push(ContractViolation {
+        return vec![ContractViolation {
             path: "stream".to_owned(),
             message: "stream must contain at least one event".to_owned(),
-        });
-        return violations;
+        }];
     }
 
+    let mut violations = collect_base_stream_violations(events);
+    violations.extend(collect_stream_envelope_violations(events));
+    violations.extend(collect_event_level_violations(events));
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+fn collect_base_stream_violations(events: &[LogEventSchema]) -> Vec<ContractViolation> {
+    let mut violations = Vec::new();
     let base_report = validate_event_stream(events);
     for diag in base_report
         .diagnostics
@@ -89,7 +96,11 @@ fn validate_log_contract(events: &[LogEventSchema]) -> Vec<ContractViolation> {
             message: diag.message.clone(),
         });
     }
+    violations
+}
 
+fn collect_stream_envelope_violations(events: &[LogEventSchema]) -> Vec<ContractViolation> {
+    let mut violations = Vec::new();
     if events[0].phase != LogPhase::Setup {
         violations.push(ContractViolation {
             path: "event[0].phase".to_owned(),
@@ -102,14 +113,17 @@ fn validate_log_contract(events: &[LogEventSchema]) -> Vec<ContractViolation> {
             message: "first event must be start event".to_owned(),
         });
     }
-
     if !events.iter().any(|event| event.phase == LogPhase::Report) {
         violations.push(ContractViolation {
             path: "stream".to_owned(),
             message: "stream must include at least one report-phase event".to_owned(),
         });
     }
+    violations
+}
 
+fn collect_event_level_violations(events: &[LogEventSchema]) -> Vec<ContractViolation> {
+    let mut violations = Vec::new();
     let root_run_id = events[0].run_id.clone();
     let mut previous_sequence: Option<u64> = None;
 
@@ -124,15 +138,15 @@ fn validate_log_contract(events: &[LogEventSchema]) -> Vec<ContractViolation> {
         match event.context.get("event_sequence") {
             Some(raw_sequence) => match raw_sequence.parse::<u64>() {
                 Ok(sequence) => {
-                    if let Some(previous) = previous_sequence {
-                        if sequence <= previous {
-                            violations.push(ContractViolation {
-                                path: format!("event[{index}].context.event_sequence"),
-                                message: format!(
-                                    "event_sequence must be strictly increasing: previous={previous}, current={sequence}"
-                                ),
-                            });
-                        }
+                    if let Some(previous) = previous_sequence
+                        && sequence <= previous
+                    {
+                        violations.push(ContractViolation {
+                            path: format!("event[{index}].context.event_sequence"),
+                            message: format!(
+                                "event_sequence must be strictly increasing: previous={previous}, current={sequence}"
+                            ),
+                        });
                     }
                     previous_sequence = Some(sequence);
                 }
@@ -195,8 +209,6 @@ fn validate_log_contract(events: &[LogEventSchema]) -> Vec<ContractViolation> {
         }
     }
 
-    violations.sort();
-    violations.dedup();
     violations
 }
 
