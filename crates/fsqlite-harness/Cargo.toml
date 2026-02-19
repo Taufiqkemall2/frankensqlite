@@ -3,7 +3,7 @@ name = "fsqlite-harness"
 version = "0.1.0"
 description = "Conformance test runner and golden file comparison"
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 

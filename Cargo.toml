@@ -31,7 +31,7 @@ members = [
 
 [workspace.package]
 edition = "2024"
-license = "MIT"
+license-file = "LICENSE"
 repository = "https://github.com/Dicklesworthstone/frankensqlite"
 rust-version = "1.85"
 
