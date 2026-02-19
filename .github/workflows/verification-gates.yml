@@ -16,12 +16,15 @@ on:
       - "crates/fsqlite-harness/src/backlog_quality_gate.rs"
       - "crates/fsqlite-harness/src/bin/backlog_quality_gate_runner.rs"
       - "crates/fsqlite-harness/src/bin/perf_baseline_pack_runner.rs"
+      - "crates/fsqlite-harness/src/bin/validation_manifest_runner.rs"
       - "crates/fsqlite-harness/src/perf_loop.rs"
       - "crates/fsqlite-harness/src/performance_regression_detector.rs"
+      - "crates/fsqlite-harness/src/validation_manifest.rs"
       - "crates/fsqlite-vdbe/**"
       - "scripts/verify_backlog_quality_gate.sh"
       - "scripts/verify_ci_artifact_gates.sh"
       - "scripts/verify_perf_baseline_pack.sh"
+      - "scripts/verify_validation_manifest.sh"
       - "scripts/coverage.sh"
       - "baselines/criterion/bd-1dp9.6.1-baseline.json"
 
@@ -322,6 +325,36 @@ jobs:
           set -euo pipefail
           bash ./scripts/verify_ci_artifact_gates.sh
 
+      - name: Run validation-manifest deterministic replay gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/validation-manifest-e2e
+          bash ./scripts/verify_validation_manifest.sh --json > artifacts/validation-manifest-e2e/report.json
+
+      - name: Publish validation-manifest replay summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          report_path="artifacts/validation-manifest-e2e/report.json"
+          if [[ -f "${report_path}" ]]; then
+            echo "### Validation Manifest Deterministic Replay Gate" >> "${GITHUB_STEP_SUMMARY}"
+            jq -r '
+              "- deterministic_match: \(.deterministic_match)",
+              "- overall_outcome: \(.overall_outcome)",
+              "- run_a_exit_code: \(.run_a_exit_code)",
+              "- run_b_exit_code: \(.run_b_exit_code)",
+              "- gate_count: \(.gate_count)",
+              "- artifact_count: \(.artifact_count)",
+              "- manifest_a: `\(.manifest_a)`",
+              "- manifest_b: `\(.manifest_b)`",
+              "- replay_command: `\(.replay_command)`"
+            ' "${report_path}" >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo "Validation-manifest replay report missing at ${report_path}" >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
       - name: Publish CI artifact gate summary
         if: always()
         shell: bash
@@ -341,6 +374,7 @@ jobs:
           name: ci-artifact-gates-artifacts
           path: |
             artifacts/ci-artifact-gates/
+            artifacts/validation-manifest-e2e/
             artifacts/perf/bd-1dp9.6.1/
             target/coverage/
           retention-days: 21
