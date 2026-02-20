@@ -98,13 +98,13 @@ failures=0
 run_phase \
     "EXEC-WAVES-UNIT" \
     "unit_determinism" \
-    cargo test -p fsqlite-harness execution_waves::tests::plan_builds_deterministic_waves_and_milestones -- --nocapture \
+    cargo test -p fsqlite-harness --lib execution_waves::tests::plan_builds_deterministic_waves_and_milestones -- --nocapture \
     || failures=$((failures + 1))
 
 run_phase \
     "EXEC-WAVES-ARTIFACT" \
     "artifact_emission" \
-    cargo test -p fsqlite-harness execution_waves::tests::test_execution_wave_report_emits_structured_artifact -- --nocapture \
+    cargo test -p fsqlite-harness --lib execution_waves::tests::test_execution_wave_report_emits_structured_artifact -- --nocapture \
     || failures=$((failures + 1))
 
 summary_sha256="$(sha256sum "${REPORT_JSONL}" | awk '{print $1}')"

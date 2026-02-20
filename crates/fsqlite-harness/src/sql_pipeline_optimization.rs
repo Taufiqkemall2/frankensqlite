@@ -5,8 +5,9 @@
 //! verification. Each optimization must demonstrate measurable gain with
 //! zero behavior drift.
 
+use std::collections::BTreeSet;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -125,6 +126,10 @@ pub struct SqlPipelineOptConfig {
     pub require_isomorphism_proof: bool,
     /// Minimum opportunity score threshold.
     pub min_opportunity_score: f64,
+    /// Minimum number of SQL hotspots selected from the opportunity matrix.
+    pub min_selected_sql_hotspots: usize,
+    /// Path to the baseline opportunity matrix artifact.
+    pub opportunity_matrix_path: PathBuf,
 }
 
 impl Default for SqlPipelineOptConfig {
@@ -133,6 +138,8 @@ impl Default for SqlPipelineOptConfig {
             min_domains_profiled: 8,
             require_isomorphism_proof: true,
             min_opportunity_score: 2.0,
+            min_selected_sql_hotspots: 1,
+            opportunity_matrix_path: default_opportunity_matrix_path(),
         }
     }
 }
@@ -165,8 +172,39 @@ pub struct SqlPipelineOptReport {
     pub parity_score: f64,
     pub total_checks: usize,
     pub checks_at_parity: usize,
+    pub selected_sql_hotspots: Vec<String>,
+    pub opportunity_matrix_threshold: f64,
+    pub opportunity_matrix_scenario_id: String,
     pub checks: Vec<SqlPipelineOptCheck>,
     pub summary: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpportunityMatrixDocument {
+    matrix: OpportunityMatrixPayload,
+    decisions: Vec<OpportunityDecisionPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpportunityMatrixPayload {
+    scenario_id: String,
+    threshold: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpportunityDecisionPayload {
+    hotspot: String,
+    score: f64,
+    threshold: f64,
+    selected: bool,
+}
+
+#[derive(Debug)]
+struct SqlOpportunitySelection {
+    selected_sql_hotspots: Vec<String>,
+    threshold: f64,
+    scenario_id: String,
+    detail: String,
 }
 
 impl SqlPipelineOptReport {
@@ -195,6 +233,70 @@ impl SqlPipelineOptReport {
 // ---------------------------------------------------------------------------
 // Assessment
 // ---------------------------------------------------------------------------
+
+fn default_opportunity_matrix_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../artifacts/perf/bd-1dp9.6.1/opportunity_matrix.json")
+}
+
+fn evaluate_sql_opportunity_selection(
+    config: &SqlPipelineOptConfig,
+) -> Result<SqlOpportunitySelection, String> {
+    let payload = std::fs::read_to_string(&config.opportunity_matrix_path).map_err(|error| {
+        format!(
+            "bead_id={SQL_PIPELINE_OPT_BEAD_ID} case=opportunity_matrix_read_failed path={} error={error}",
+            config.opportunity_matrix_path.display()
+        )
+    })?;
+    let document: OpportunityMatrixDocument =
+        serde_json::from_str(&payload).map_err(|error| {
+            format!(
+                "bead_id={SQL_PIPELINE_OPT_BEAD_ID} case=opportunity_matrix_parse_failed path={} error={error}",
+                config.opportunity_matrix_path.display()
+            )
+        })?;
+
+    let sql_decisions: Vec<&OpportunityDecisionPayload> = document
+        .decisions
+        .iter()
+        .filter(|decision| decision.hotspot.starts_with("sql-"))
+        .collect();
+    if sql_decisions.is_empty() {
+        return Err(format!(
+            "bead_id={SQL_PIPELINE_OPT_BEAD_ID} case=opportunity_matrix_no_sql_hotspots path={} scenario_id={}",
+            config.opportunity_matrix_path.display(),
+            document.matrix.scenario_id
+        ));
+    }
+
+    let threshold = config.min_opportunity_score.max(document.matrix.threshold);
+    let selected_sql_hotspots: Vec<String> = sql_decisions
+        .iter()
+        .filter(|decision| {
+            let decision_threshold = threshold.max(decision.threshold);
+            decision.selected && decision.score >= decision_threshold
+        })
+        .map(|decision| decision.hotspot.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    let detail = format!(
+        "scenario_id={} sql_decisions={} selected_sql_hotspots={} required_selected={} threshold={:.3}",
+        document.matrix.scenario_id,
+        sql_decisions.len(),
+        selected_sql_hotspots.len(),
+        config.min_selected_sql_hotspots,
+        threshold
+    );
+
+    Ok(SqlOpportunitySelection {
+        selected_sql_hotspots,
+        threshold,
+        scenario_id: document.matrix.scenario_id,
+        detail,
+    })
+}
 
 #[must_use]
 #[allow(clippy::too_many_lines)]
@@ -339,6 +441,51 @@ pub fn assess_sql_pipeline_optimization(config: &SqlPipelineOptConfig) -> SqlPip
     });
     domains_at_parity.push("aggregation".to_owned());
 
+    let (selected_sql_hotspots, opportunity_matrix_threshold, opportunity_matrix_scenario_id) =
+        match evaluate_sql_opportunity_selection(config) {
+            Ok(selection) => {
+                let meets_selection_gate =
+                    selection.selected_sql_hotspots.len() >= config.min_selected_sql_hotspots;
+                checks.push(SqlPipelineOptCheck {
+                    check_name: "sql_hotspot_opportunity_gate".to_owned(),
+                    domain: "planner".to_owned(),
+                    target_crate: "fsqlite-planner".to_owned(),
+                    parity_achieved: meets_selection_gate,
+                    detail: selection.detail,
+                });
+                (
+                    selection.selected_sql_hotspots,
+                    selection.threshold,
+                    selection.scenario_id,
+                )
+            }
+            Err(error) => {
+                checks.push(SqlPipelineOptCheck {
+                    check_name: "sql_hotspot_opportunity_gate".to_owned(),
+                    domain: "planner".to_owned(),
+                    target_crate: "fsqlite-planner".to_owned(),
+                    parity_achieved: false,
+                    detail: error,
+                });
+                (
+                    Vec::new(),
+                    config.min_opportunity_score,
+                    "unavailable".to_owned(),
+                )
+            }
+        };
+    checks.push(SqlPipelineOptCheck {
+        check_name: "isomorphism_proof_enforced".to_owned(),
+        domain: "planner".to_owned(),
+        target_crate: "fsqlite-harness".to_owned(),
+        parity_achieved: config.require_isomorphism_proof,
+        detail: if config.require_isomorphism_proof {
+            "isomorphism proof requirement is enabled".to_owned()
+        } else {
+            "isomorphism proof requirement is disabled; optimization gate cannot pass".to_owned()
+        },
+    });
+
     // Scores
     let total_checks = checks.len();
     let checks_at_parity = checks.iter().filter(|c| c.parity_achieved).count();
@@ -357,10 +504,13 @@ pub fn assess_sql_pipeline_optimization(config: &SqlPipelineOptConfig) -> SqlPip
     let summary = format!(
         "SQL pipeline optimization parity: {verdict}. \
          {checks_at_parity}/{total_checks} checks at parity (score={parity_score:.4}). \
-         Domains: {}/{} profiled. Opportunity threshold: {:.1}.",
+         Domains: {}/{} profiled. Selected SQL hotspots: {} (required {}). \
+         Opportunity threshold: {:.1}.",
         domains_at_parity.len(),
         domains_profiled.len(),
-        config.min_opportunity_score,
+        selected_sql_hotspots.len(),
+        config.min_selected_sql_hotspots,
+        opportunity_matrix_threshold,
     );
 
     SqlPipelineOptReport {
@@ -373,6 +523,9 @@ pub fn assess_sql_pipeline_optimization(config: &SqlPipelineOptConfig) -> SqlPip
         parity_score,
         total_checks,
         checks_at_parity,
+        selected_sql_hotspots,
+        opportunity_matrix_threshold,
+        opportunity_matrix_scenario_id,
         checks,
         summary,
     }
@@ -395,6 +548,28 @@ pub fn load_sql_pipeline_opt_report(path: &Path) -> Result<SqlPipelineOptReport,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+
+    fn write_matrix_fixture(
+        fixture_dir: &Path,
+        matrix_json: &str,
+        filename: &str,
+    ) -> Result<PathBuf, String> {
+        std::fs::create_dir_all(fixture_dir).map_err(|error| {
+            format!(
+                "bead_id={SQL_PIPELINE_OPT_BEAD_ID} case=fixture_dir_create_failed path={} error={error}",
+                fixture_dir.display()
+            )
+        })?;
+        let fixture_path = fixture_dir.join(filename);
+        std::fs::write(&fixture_path, matrix_json).map_err(|error| {
+            format!(
+                "bead_id={SQL_PIPELINE_OPT_BEAD_ID} case=fixture_write_failed path={} error={error}",
+                fixture_path.display()
+            )
+        })?;
+        Ok(fixture_path)
+    }
 
     #[test]
     fn domain_all_eight() {
@@ -437,6 +612,11 @@ mod tests {
         assert_eq!(cfg.min_domains_profiled, 8);
         assert!(cfg.require_isomorphism_proof);
         assert_eq!(cfg.min_opportunity_score, 2.0);
+        assert_eq!(cfg.min_selected_sql_hotspots, 1);
+        assert!(cfg
+            .opportunity_matrix_path
+            .to_string_lossy()
+            .contains("bd-1dp9.6.1/opportunity_matrix.json"));
     }
 
     #[test]
@@ -452,6 +632,66 @@ mod tests {
         let report = assess_sql_pipeline_optimization(&SqlPipelineOptConfig::default());
         assert_eq!(report.domains_profiled.len(), 8);
         assert_eq!(report.domains_at_parity.len(), 8);
+        assert!(report
+            .checks
+            .iter()
+            .any(|check| check.check_name == "sql_hotspot_opportunity_gate"));
+    }
+
+    #[test]
+    fn opportunity_gate_fails_when_sql_hotspots_not_selected() -> Result<(), String> {
+        let fixture_dir = std::env::temp_dir().join("fsqlite-sql-opt-matrix-gate");
+        let matrix = r#"{
+  "matrix": {"scenario_id":"sql-gate-fixture","threshold":2.0},
+  "decisions": [
+    {"hotspot":"sql-operator-mix::bm-sql-operator-mix-macro","score":1.2,"threshold":2.0,"selected":false}
+  ]
+}"#;
+        let matrix_path = write_matrix_fixture(&fixture_dir, matrix, "matrix_fail.json")?;
+
+        let cfg = SqlPipelineOptConfig {
+            opportunity_matrix_path: matrix_path,
+            ..SqlPipelineOptConfig::default()
+        };
+        let report = assess_sql_pipeline_optimization(&cfg);
+        assert_eq!(
+            report.verdict,
+            SqlPipelineOptVerdict::Partial,
+            "bead_id={SQL_PIPELINE_OPT_BEAD_ID} case=expected_partial_when_opportunity_gate_fails"
+        );
+
+        let gate_check = report
+            .checks
+            .iter()
+            .find(|check| check.check_name == "sql_hotspot_opportunity_gate")
+            .expect("bead_id=bd-1dp9.6.2 case=missing_opportunity_gate_check");
+        assert!(!gate_check.parity_achieved);
+        Ok(())
+    }
+
+    #[test]
+    fn opportunity_gate_passes_with_selected_sql_hotspot() -> Result<(), String> {
+        let fixture_dir = std::env::temp_dir().join("fsqlite-sql-opt-matrix-pass");
+        let matrix = r#"{
+  "matrix": {"scenario_id":"sql-gate-pass","threshold":2.0},
+  "decisions": [
+    {"hotspot":"sql-operator-mix::bm-sql-operator-mix-macro","score":3.0,"threshold":2.0,"selected":true}
+  ]
+}"#;
+        let matrix_path = write_matrix_fixture(&fixture_dir, matrix, "matrix_pass.json")?;
+
+        let cfg = SqlPipelineOptConfig {
+            opportunity_matrix_path: matrix_path,
+            ..SqlPipelineOptConfig::default()
+        };
+        let report = assess_sql_pipeline_optimization(&cfg);
+        assert_eq!(report.verdict, SqlPipelineOptVerdict::Parity);
+        assert_eq!(
+            report.selected_sql_hotspots,
+            vec!["sql-operator-mix::bm-sql-operator-mix-macro".to_owned()]
+        );
+        assert_eq!(report.opportunity_matrix_scenario_id, "sql-gate-pass");
+        Ok(())
     }
 
     #[test]
@@ -484,6 +724,7 @@ mod tests {
         let json = report.to_json().expect("serialize");
         let parsed = SqlPipelineOptReport::from_json(&json).expect("parse");
         assert_eq!(parsed.verdict, report.verdict);
+        assert_eq!(parsed.selected_sql_hotspots, report.selected_sql_hotspots);
     }
 
     #[test]
@@ -514,5 +755,78 @@ mod tests {
             let restored: OptimizationDomain = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(restored, d);
         }
+    }
+
+    #[test]
+    fn test_sql_pipeline_opt_report_emits_structured_artifact() -> Result<(), String> {
+        let run_id = format!("bd-1dp9.6.2-sql-opt-seed-{}", 1_091_901_u64);
+        let report = assess_sql_pipeline_optimization(&SqlPipelineOptConfig::default());
+        let runtime = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join("bd_1dp9_6_2_runtime");
+        std::fs::create_dir_all(&runtime).map_err(|error| {
+            format!(
+                "bead_id={SQL_PIPELINE_OPT_BEAD_ID} case=runtime_dir_create_failed path={} error={error}",
+                runtime.display()
+            )
+        })?;
+        let artifact_path = runtime.join("bd_1dp9_6_2_sql_pipeline_optimization_report.json");
+        write_sql_pipeline_opt_report(&artifact_path, &report)?;
+
+        let payload = std::fs::read_to_string(&artifact_path).map_err(|error| {
+            format!(
+                "bead_id={SQL_PIPELINE_OPT_BEAD_ID} case=artifact_read_failed path={} error={error}",
+                artifact_path.display()
+            )
+        })?;
+        let mut hasher = Sha256::new();
+        hasher.update(payload.as_bytes());
+        let digest = format!("{:x}", hasher.finalize());
+
+        eprintln!(
+            "DEBUG bead_id={SQL_PIPELINE_OPT_BEAD_ID} phase=artifact_written run_id={run_id} path={}",
+            artifact_path.display()
+        );
+        eprintln!(
+            "INFO bead_id={SQL_PIPELINE_OPT_BEAD_ID} phase=summary run_id={run_id} verdict={} parity={}/{} selected_sql_hotspots={} artifact_sha256={digest}",
+            report.verdict,
+            report.checks_at_parity,
+            report.total_checks,
+            report.selected_sql_hotspots.len()
+        );
+        eprintln!(
+            "WARN bead_id={SQL_PIPELINE_OPT_BEAD_ID} phase=opportunity run_id={run_id} scenario_id={} threshold={:.3}",
+            report.opportunity_matrix_scenario_id,
+            report.opportunity_matrix_threshold
+        );
+        eprintln!(
+            "ERROR bead_id={SQL_PIPELINE_OPT_BEAD_ID} phase=gate run_id={run_id} opportunity_gate={:?}",
+            report
+                .checks
+                .iter()
+                .find(|check| check.check_name == "sql_hotspot_opportunity_gate")
+                .map(|check| check.parity_achieved)
+        );
+        eprintln!(
+            "SQL_PIPELINE_OPT_ARTIFACT_JSON:{{\"run_id\":\"{run_id}\",\"path\":\"{}\",\"sha256\":\"{digest}\",\"verdict\":\"{}\"}}",
+            artifact_path.display(),
+            report.verdict
+        );
+        let compact_payload = serde_json::to_string(&report).map_err(|error| {
+            format!(
+                "bead_id={SQL_PIPELINE_OPT_BEAD_ID} case=artifact_compact_serialize_failed error={error}"
+            )
+        })?;
+        eprintln!("SQL_PIPELINE_OPT_REPORT_JSON:{compact_payload}");
+
+        let parsed = SqlPipelineOptReport::from_json(&payload).map_err(|error| {
+            format!(
+                "bead_id={SQL_PIPELINE_OPT_BEAD_ID} case=artifact_parse_failed path={} error={error}",
+                artifact_path.display()
+            )
+        })?;
+        assert_eq!(parsed.schema_version, SQL_PIPELINE_OPT_SCHEMA_VERSION);
+        assert_eq!(parsed.bead_id, SQL_PIPELINE_OPT_BEAD_ID);
+        Ok(())
     }
 }
