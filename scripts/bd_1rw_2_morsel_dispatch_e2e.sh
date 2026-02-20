@@ -35,20 +35,49 @@ SCENARIO_ID="${SCENARIO_ID:-VDBE-1}"
 SEED="${SEED:-424242}"
 TRACE_ID="${TRACE_ID:-$SEED}"
 RUN_ID="${RUN_ID:-${BEAD_ID}-seed-${SEED}}"
-MIN_SPEEDUP="${MIN_SPEEDUP:-0.60}"
+MIN_SPEEDUP="${MIN_SPEEDUP:-2.00}"
 
-ARTIFACT_DIR="$WORKSPACE_ROOT/artifacts/bd-1rw.2"
-ARTIFACT_PATH="${FSQLITE_MORSEL_E2E_ARTIFACT:-$ARTIFACT_DIR/morsel_dispatch_e2e_artifact.json}"
+ARTIFACT_DIR="$WORKSPACE_ROOT/target/test-results/bd-1rw.2"
+ARTIFACT_PATH="${FSQLITE_MORSEL_E2E_ARTIFACT:-$ARTIFACT_DIR/morsel_dispatch_e2e_artifact_${RUN_ID}.json}"
 mkdir -p "$(dirname "$ARTIFACT_PATH")"
 
 export RUN_ID TRACE_ID SCENARIO_ID SEED
 export FSQLITE_MORSEL_E2E_ARTIFACT="$ARTIFACT_PATH"
 
 TEST_NAME="vectorized_dispatch::tests::morsel_dispatch_e2e_replay_emits_artifact"
+TEST_OUTPUT=""
 if ! $NO_RCH && command -v rch >/dev/null 2>&1; then
-  rch exec -- cargo test -p fsqlite-vdbe "$TEST_NAME" -- --exact --nocapture
+  if ! TEST_OUTPUT="$(
+    rch exec -- env \
+      RUN_ID="$RUN_ID" \
+      TRACE_ID="$TRACE_ID" \
+      SCENARIO_ID="$SCENARIO_ID" \
+      SEED="$SEED" \
+      FSQLITE_MORSEL_E2E_ARTIFACT="$ARTIFACT_PATH" \
+      cargo test -p fsqlite-vdbe "$TEST_NAME" -- --exact --nocapture 2>&1
+  )"; then
+    printf '%s\n' "$TEST_OUTPUT" >&2
+    exit 1
+  fi
 else
-  cargo test -p fsqlite-vdbe "$TEST_NAME" -- --exact --nocapture
+  if ! TEST_OUTPUT="$(
+    env \
+      RUN_ID="$RUN_ID" \
+      TRACE_ID="$TRACE_ID" \
+      SCENARIO_ID="$SCENARIO_ID" \
+      SEED="$SEED" \
+      FSQLITE_MORSEL_E2E_ARTIFACT="$ARTIFACT_PATH" \
+      cargo test -p fsqlite-vdbe "$TEST_NAME" -- --exact --nocapture 2>&1
+  )"; then
+    printf '%s\n' "$TEST_OUTPUT" >&2
+    exit 1
+  fi
+fi
+printf '%s\n' "$TEST_OUTPUT"
+
+INLINE_ARTIFACT_JSON="$(printf '%s\n' "$TEST_OUTPUT" | sed -n 's/^MORSEL_E2E_ARTIFACT_JSON://p' | tail -n 1)"
+if [[ -n "$INLINE_ARTIFACT_JSON" ]]; then
+  printf '%s\n' "$INLINE_ARTIFACT_JSON" > "$ARTIFACT_PATH"
 fi
 
 if [[ ! -f "$ARTIFACT_PATH" ]]; then

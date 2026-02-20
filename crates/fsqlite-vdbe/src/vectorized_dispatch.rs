@@ -803,6 +803,8 @@ mod tests {
     const MORSEL_BEAD_ID: &str = "bd-1rw.2";
     const MORSEL_SCENARIO_ID: &str = "VDBE-1";
     const MORSEL_E2E_SEED: u64 = 424_242;
+    const MORSEL_SYNTHETIC_BASE_ROUNDS: u64 = 512;
+    const MORSEL_SYNTHETIC_E2E_ROUNDS: u64 = 262_144;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct E2eMeasurement {
@@ -815,6 +817,15 @@ mod tests {
     }
 
     fn synthetic_e2e_task_cost(task_id: usize, worker_id: usize, seed: u64) -> u64 {
+        synthetic_e2e_task_cost_with_rounds(task_id, worker_id, seed, MORSEL_SYNTHETIC_BASE_ROUNDS)
+    }
+
+    fn synthetic_e2e_task_cost_with_rounds(
+        task_id: usize,
+        worker_id: usize,
+        seed: u64,
+        rounds: u64,
+    ) -> u64 {
         let task_id_u64 =
             u64::try_from(task_id).expect("bead_id={MORSEL_BEAD_ID} task id should fit in u64");
         let worker_u64 =
@@ -822,7 +833,7 @@ mod tests {
         let mut state = task_id_u64
             .wrapping_mul(6_364_136_223_846_793_005_u64)
             .wrapping_add(seed ^ worker_u64.rotate_left(7));
-        for round in 0_u64..512_u64 {
+        for round in 0_u64..rounds {
             state = state
                 .wrapping_mul(2_862_933_555_777_941_757_u64)
                 .wrapping_add(round ^ seed);
@@ -1328,7 +1339,14 @@ mod tests {
                 .execute_with_barriers_with_context(
                     std::slice::from_ref(&tasks),
                     &context,
-                    move |task, _worker_id| synthetic_e2e_task_cost(task.task_id, 0, seed),
+                    move |task, _worker_id| {
+                        synthetic_e2e_task_cost_with_rounds(
+                            task.task_id,
+                            0,
+                            seed,
+                            MORSEL_SYNTHETIC_E2E_ROUNDS,
+                        )
+                    },
                 )
                 .expect("bead_id={MORSEL_BEAD_ID} dispatch should succeed");
             let elapsed_micros = start.elapsed().as_micros().max(1);
@@ -1381,7 +1399,7 @@ mod tests {
             "bead_id={MORSEL_BEAD_ID} 4-worker run should activate at least two workers",
         );
 
-        let measurement_lines = measurements
+        let measurement_lines_pretty = measurements
             .iter()
             .map(|measurement| {
                 format!(
@@ -1396,6 +1414,21 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join(",\n");
+        let measurement_lines_compact = measurements
+            .iter()
+            .map(|measurement| {
+                format!(
+                    "{{\"worker_threads\":{},\"elapsed_micros\":{},\"throughput_tasks_per_sec\":{},\"active_workers\":{},\"completed_tasks\":{},\"checksum\":\"0x{:016x}\"}}",
+                    measurement.worker_threads,
+                    measurement.elapsed_micros,
+                    measurement.throughput_tasks_per_sec,
+                    measurement.active_workers,
+                    measurement.completed_tasks,
+                    measurement.checksum
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
 
         let artifact_json = format!(
             "{{\n  \"bead_id\": \"{bead_id}\",\n  \"run_id\": \"{run_id}\",\n  \"trace_id\": {trace_id},\n  \"scenario_id\": \"{scenario_id}\",\n  \"seed\": {seed},\n  \"deterministic_checksum\": true,\n  \"replay_command\": \"{replay_command}\",\n  \"measurements\": [\n{measurements}\n  ]\n}}\n",
@@ -1405,7 +1438,17 @@ mod tests {
             scenario_id = escape_json(&context.scenario_id),
             seed = seed,
             replay_command = escape_json(&replay_command),
-            measurements = measurement_lines,
+            measurements = measurement_lines_pretty,
+        );
+        let artifact_json_compact = format!(
+            "{{\"bead_id\":\"{bead_id}\",\"run_id\":\"{run_id}\",\"trace_id\":{trace_id},\"scenario_id\":\"{scenario_id}\",\"seed\":{seed},\"deterministic_checksum\":true,\"replay_command\":\"{replay_command}\",\"measurements\":[{measurements}]}}",
+            bead_id = MORSEL_BEAD_ID,
+            run_id = escape_json(&context.run_id),
+            trace_id = context.trace_id,
+            scenario_id = escape_json(&context.scenario_id),
+            seed = seed,
+            replay_command = escape_json(&replay_command),
+            measurements = measurement_lines_compact,
         );
         std::fs::write(&artifact_path, artifact_json)
             .expect("bead_id={MORSEL_BEAD_ID} expected artifact write to succeed");
@@ -1422,5 +1465,6 @@ mod tests {
             seed,
             artifact_path.display()
         );
+        eprintln!("MORSEL_E2E_ARTIFACT_JSON:{artifact_json_compact}");
     }
 }
