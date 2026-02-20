@@ -802,6 +802,8 @@ mod tests {
     const BEAD_ID: &str = "bd-14vp7.6";
     const MORSEL_BEAD_ID: &str = "bd-1rw.2";
     const MORSEL_SCENARIO_ID: &str = "VDBE-1";
+    const MORSEL_QUERY_ID: &str = "TPC-H-Q1";
+    const MORSEL_QUERY_SHAPE: &str = "scan_filter_project_then_aggregate_update";
     const MORSEL_E2E_SEED: u64 = 424_242;
     const MORSEL_SYNTHETIC_BASE_ROUNDS: u64 = 512;
     const MORSEL_SYNTHETIC_E2E_ROUNDS: u64 = 262_144;
@@ -840,6 +842,22 @@ mod tests {
             state ^= state.rotate_left(11);
         }
         state
+    }
+
+    fn synthetic_tpch_q1_task_cost_with_rounds(
+        task: &PipelineTask,
+        worker_id: usize,
+        seed: u64,
+        rounds: u64,
+    ) -> u64 {
+        let stage_bias = match task.kind {
+            PipelineKind::ScanFilterProject => 0x9E37_79B9_7F4A_7C15_u64,
+            PipelineKind::AggregateUpdate => 0xD6E8_FD9B_E8B5_41C3_u64,
+            PipelineKind::HashJoinProbe => 0x94D0_49BB_1331_11EB_u64,
+            PipelineKind::PipelineBreaker => 0xBF58_476D_1CE4_E5B9_u64,
+        };
+        let seeded = seed ^ stage_bias;
+        synthetic_e2e_task_cost_with_rounds(task.task_id, worker_id, seeded, rounds)
     }
 
     fn default_e2e_artifact_path() -> PathBuf {
@@ -1315,7 +1333,20 @@ mod tests {
             2,
         )
         .expect("bead_id={MORSEL_BEAD_ID} auto-tuned partition should succeed");
-        let tasks = build_pipeline_tasks(PipelineId(0), PipelineKind::ScanFilterProject, &morsels);
+        let scan_tasks =
+            build_pipeline_tasks(PipelineId(0), PipelineKind::ScanFilterProject, &morsels);
+        let aggregate_morsels = morsels.iter().step_by(4).copied().collect::<Vec<_>>();
+        assert!(
+            !aggregate_morsels.is_empty(),
+            "bead_id={MORSEL_BEAD_ID} expected non-empty aggregate morsel set",
+        );
+        let aggregate_tasks = build_pipeline_tasks(
+            PipelineId(1),
+            PipelineKind::AggregateUpdate,
+            &aggregate_morsels,
+        );
+        let pipelines = vec![scan_tasks, aggregate_tasks];
+        let total_pipeline_tasks = pipelines.iter().map(std::vec::Vec::len).sum::<usize>();
         let replay_command = format!(
             "RUN_ID='{}' TRACE_ID={} SCENARIO_ID='{}' SEED={} FSQLITE_MORSEL_E2E_ARTIFACT='{}' cargo test -p fsqlite-vdbe vectorized_dispatch::tests::morsel_dispatch_e2e_replay_emits_artifact -- --exact --nocapture",
             context.run_id,
@@ -1326,7 +1357,7 @@ mod tests {
         );
 
         let mut measurements = Vec::new();
-        let mut canonical_results = None::<Vec<(usize, u64)>>;
+        let mut canonical_results = None::<Vec<(usize, usize, u64)>>;
         for worker_threads in [1_usize, 2, 4] {
             let dispatcher = WorkStealingDispatcher::try_new(DispatcherConfig {
                 worker_threads,
@@ -1337,11 +1368,11 @@ mod tests {
             let start = Instant::now();
             let reports = dispatcher
                 .execute_with_barriers_with_context(
-                    std::slice::from_ref(&tasks),
+                    &pipelines,
                     &context,
                     move |task, _worker_id| {
-                        synthetic_e2e_task_cost_with_rounds(
-                            task.task_id,
+                        synthetic_tpch_q1_task_cost_with_rounds(
+                            task,
                             0,
                             seed,
                             MORSEL_SYNTHETIC_E2E_ROUNDS,
@@ -1350,13 +1381,29 @@ mod tests {
                 )
                 .expect("bead_id={MORSEL_BEAD_ID} dispatch should succeed");
             let elapsed_micros = start.elapsed().as_micros().max(1);
-            let report = reports
-                .first()
-                .expect("bead_id={MORSEL_BEAD_ID} expected one pipeline report");
-            let ordered_results = report
-                .completed
+            assert_eq!(
+                reports.len(),
+                2,
+                "bead_id={MORSEL_BEAD_ID} expected two pipeline reports for Q1-shaped execution",
+            );
+            assert_eq!(
+                reports[0].pipeline,
+                PipelineId(0),
+                "bead_id={MORSEL_BEAD_ID} expected scan/filter/project wave first",
+            );
+            assert_eq!(
+                reports[1].pipeline,
+                PipelineId(1),
+                "bead_id={MORSEL_BEAD_ID} expected aggregate-update wave second",
+            );
+            let ordered_results = reports
                 .iter()
-                .map(|entry| (entry.task_id, entry.result))
+                .flat_map(|report| {
+                    report
+                        .completed
+                        .iter()
+                        .map(move |entry| (report.pipeline.0, entry.task_id, entry.result))
+                })
                 .collect::<Vec<_>>();
             if let Some(expected) = &canonical_results {
                 assert_eq!(
@@ -1370,21 +1417,29 @@ mod tests {
 
             let checksum = ordered_results
                 .iter()
-                .fold(0_u64, |acc, (_, result)| acc ^ *result);
-            let completed_tasks_u128 = u128::try_from(report.completed.len())
+                .fold(0_u64, |acc, (_, _, result)| acc ^ *result);
+            let completed_tasks = reports
+                .iter()
+                .map(|report| report.completed.len())
+                .sum::<usize>();
+            assert_eq!(
+                completed_tasks, total_pipeline_tasks,
+                "bead_id={MORSEL_BEAD_ID} expected all Q1-shaped tasks to complete",
+            );
+            let completed_tasks_u128 = u128::try_from(completed_tasks)
                 .expect("bead_id={MORSEL_BEAD_ID} completed task count should fit in u128");
             let throughput_tasks_per_sec = (completed_tasks_u128 * 1_000_000) / elapsed_micros;
-            let active_workers = report
-                .per_worker_task_counts
+            let active_workers = reports
                 .iter()
-                .filter(|&&count| count > 0)
-                .count();
+                .flat_map(|report| report.completed.iter().map(|entry| entry.worker_id))
+                .collect::<BTreeSet<_>>()
+                .len();
             measurements.push(E2eMeasurement {
                 worker_threads,
                 elapsed_micros,
                 throughput_tasks_per_sec,
                 active_workers,
-                completed_tasks: report.completed.len(),
+                completed_tasks,
                 checksum,
             });
         }
@@ -1431,21 +1486,25 @@ mod tests {
             .join(",");
 
         let artifact_json = format!(
-            "{{\n  \"bead_id\": \"{bead_id}\",\n  \"run_id\": \"{run_id}\",\n  \"trace_id\": {trace_id},\n  \"scenario_id\": \"{scenario_id}\",\n  \"seed\": {seed},\n  \"deterministic_checksum\": true,\n  \"replay_command\": \"{replay_command}\",\n  \"measurements\": [\n{measurements}\n  ]\n}}\n",
+            "{{\n  \"bead_id\": \"{bead_id}\",\n  \"run_id\": \"{run_id}\",\n  \"trace_id\": {trace_id},\n  \"scenario_id\": \"{scenario_id}\",\n  \"query_id\": \"{query_id}\",\n  \"query_shape\": \"{query_shape}\",\n  \"seed\": {seed},\n  \"deterministic_checksum\": true,\n  \"replay_command\": \"{replay_command}\",\n  \"measurements\": [\n{measurements}\n  ]\n}}\n",
             bead_id = MORSEL_BEAD_ID,
             run_id = escape_json(&context.run_id),
             trace_id = context.trace_id,
             scenario_id = escape_json(&context.scenario_id),
+            query_id = MORSEL_QUERY_ID,
+            query_shape = MORSEL_QUERY_SHAPE,
             seed = seed,
             replay_command = escape_json(&replay_command),
             measurements = measurement_lines_pretty,
         );
         let artifact_json_compact = format!(
-            "{{\"bead_id\":\"{bead_id}\",\"run_id\":\"{run_id}\",\"trace_id\":{trace_id},\"scenario_id\":\"{scenario_id}\",\"seed\":{seed},\"deterministic_checksum\":true,\"replay_command\":\"{replay_command}\",\"measurements\":[{measurements}]}}",
+            "{{\"bead_id\":\"{bead_id}\",\"run_id\":\"{run_id}\",\"trace_id\":{trace_id},\"scenario_id\":\"{scenario_id}\",\"query_id\":\"{query_id}\",\"query_shape\":\"{query_shape}\",\"seed\":{seed},\"deterministic_checksum\":true,\"replay_command\":\"{replay_command}\",\"measurements\":[{measurements}]}}",
             bead_id = MORSEL_BEAD_ID,
             run_id = escape_json(&context.run_id),
             trace_id = context.trace_id,
             scenario_id = escape_json(&context.scenario_id),
+            query_id = MORSEL_QUERY_ID,
+            query_shape = MORSEL_QUERY_SHAPE,
             seed = seed,
             replay_command = escape_json(&replay_command),
             measurements = measurement_lines_compact,

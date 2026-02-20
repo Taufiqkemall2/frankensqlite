@@ -32,6 +32,7 @@ done
 
 BEAD_ID="bd-1rw.2"
 SCENARIO_ID="${SCENARIO_ID:-VDBE-1}"
+QUERY_ID="${QUERY_ID:-TPC-H-Q1}"
 SEED="${SEED:-424242}"
 TRACE_ID="${TRACE_ID:-$SEED}"
 RUN_ID="${RUN_ID:-${BEAD_ID}-seed-${SEED}}"
@@ -93,6 +94,8 @@ fi
 jq -e --arg bead "$BEAD_ID" '.bead_id == $bead' "$ARTIFACT_PATH" >/dev/null
 jq -e --arg run_id "$RUN_ID" '.run_id == $run_id' "$ARTIFACT_PATH" >/dev/null
 jq -e --arg scenario_id "$SCENARIO_ID" '.scenario_id == $scenario_id' "$ARTIFACT_PATH" >/dev/null
+jq -e --arg query_id "$QUERY_ID" '.query_id == $query_id' "$ARTIFACT_PATH" >/dev/null
+jq -e '.query_shape == "scan_filter_project_then_aggregate_update"' "$ARTIFACT_PATH" >/dev/null
 jq -e --argjson trace_id "$TRACE_ID" '.trace_id == $trace_id' "$ARTIFACT_PATH" >/dev/null
 jq -e '.deterministic_checksum == true' "$ARTIFACT_PATH" >/dev/null
 jq -e '.measurements | length == 3' "$ARTIFACT_PATH" >/dev/null
@@ -120,6 +123,8 @@ if $JSON_OUTPUT; then
   "run_id": "$RUN_ID",
   "trace_id": $TRACE_ID,
   "scenario_id": "$SCENARIO_ID",
+  "query_id": "$QUERY_ID",
+  "query_shape": "$(jq -r '.query_shape' "$ARTIFACT_PATH")",
   "seed": $SEED,
   "artifact_path": "${ARTIFACT_PATH#$WORKSPACE_ROOT/}",
   "base_throughput_tasks_per_sec": $BASE_TPS,
@@ -135,6 +140,8 @@ else
   echo "Run ID:                     $RUN_ID"
   echo "Trace ID:                   $TRACE_ID"
   echo "Scenario ID:                $SCENARIO_ID"
+  echo "Query ID:                   $QUERY_ID"
+  echo "Query Shape:                $(jq -r '.query_shape' "$ARTIFACT_PATH")"
   echo "Seed:                       $SEED"
   echo "Artifact:                   ${ARTIFACT_PATH#$WORKSPACE_ROOT/}"
   echo "Throughput (1 worker):      $BASE_TPS tasks/sec"

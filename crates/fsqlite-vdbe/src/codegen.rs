@@ -2443,7 +2443,11 @@ pub fn codegen_insert(
 ///
 /// # Arguments
 /// * `oe_flag` - Conflict resolution flag (OE_ABORT, OE_IGNORE, OE_REPLACE, etc.)
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::too_many_arguments
+)]
 fn codegen_insert_values(
     b: &mut ProgramBuilder,
     rows: &[Vec<Expr>],
