@@ -11,10 +11,12 @@ mod tests {
     };
     use crate::vectorized_agg::{AggregateOp, AggregateSpec, aggregate_batch_hash};
     use crate::vectorized_hash_join::{JoinType, hash_join_build, hash_join_probe};
+    use crate::vectorized_join::{TrieRelation, TrieRow, leapfrog_join};
     use crate::vectorized_ops::{CompareOp, filter_batch_int64};
     use crate::vectorized_sort::{NullOrdering, SortDirection, SortKeySpec, sort_batch};
     use fsqlite_types::value::SqliteValue;
     use proptest::prelude::*;
+    use std::collections::BTreeMap;
 
     // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -101,6 +103,125 @@ mod tests {
 
     fn join_vec(max_len: usize) -> impl Strategy<Value = Vec<(Option<i64>, Option<i64>)>> {
         prop::collection::vec(join_row(), 0..=max_len)
+    }
+
+    fn non_empty_join_keys(max_len: usize) -> impl Strategy<Value = Vec<Option<i64>>> {
+        prop::collection::vec(join_key(), 1..=max_len)
+    }
+
+    fn relation_key_sets() -> impl Strategy<Value = Vec<Vec<Option<i64>>>> {
+        let regular = prop::collection::vec(non_empty_join_keys(6), 2..=6);
+        let all_empty = (2_usize..=6).prop_map(|relation_count| vec![Vec::new(); relation_count]);
+        let all_same = (2_usize..=6, 1_usize..=6, join_key()).prop_map(
+            |(relation_count, rows_per_relation, shared_key)| {
+                vec![vec![shared_key; rows_per_relation]; relation_count]
+            },
+        );
+        prop_oneof![
+            8 => regular,
+            1 => all_empty,
+            1 => all_same,
+        ]
+    }
+
+    fn make_key_payload_batch(keys: &[Option<i64>], relation_index: usize) -> Batch {
+        let specs = vec![
+            ColumnSpec::new("key", ColumnVectorType::Int64),
+            ColumnSpec::new("payload", ColumnVectorType::Int64),
+        ];
+        let relation_offset = i64::try_from(relation_index)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(1_000_000);
+        let rows: Vec<Vec<SqliteValue>> = keys
+            .iter()
+            .enumerate()
+            .map(|(row_index, key)| {
+                let payload =
+                    relation_offset.saturating_add(i64::try_from(row_index).unwrap_or(i64::MAX));
+                vec![
+                    key.map_or(SqliteValue::Null, SqliteValue::Integer),
+                    SqliteValue::Integer(payload),
+                ]
+            })
+            .collect();
+        Batch::from_rows(&rows, &specs, DEFAULT_BATCH_ROW_CAPACITY).expect("batch")
+    }
+
+    fn sorted_trie_rows(keys: &[Option<i64>]) -> Vec<TrieRow> {
+        let mut rows: Vec<TrieRow> = keys
+            .iter()
+            .enumerate()
+            .map(|(row_index, key)| {
+                TrieRow::new(
+                    vec![key.map_or(SqliteValue::Null, SqliteValue::Integer)],
+                    row_index,
+                )
+            })
+            .collect();
+        rows.sort_by(|left, right| {
+            left.key
+                .partial_cmp(&right.key)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        rows
+    }
+
+    fn sqlite_key_to_option_i64(value: &SqliteValue) -> Option<i64> {
+        match value {
+            SqliteValue::Integer(v) => Some(*v),
+            SqliteValue::Null => None,
+            other => panic!("expected integer/null join key, got {other:?}"),
+        }
+    }
+
+    fn leapfrog_join_multiplicity_by_key(
+        relations: &[Vec<Option<i64>>],
+    ) -> BTreeMap<Option<i64>, u64> {
+        let tries: Vec<TrieRelation> = relations
+            .iter()
+            .map(|keys| TrieRelation::from_sorted_rows(sorted_trie_rows(keys)).expect("trie"))
+            .collect();
+        let relation_refs: Vec<&TrieRelation> = tries.iter().collect();
+        let matches = leapfrog_join(&relation_refs).expect("leapfrog should execute");
+
+        let mut counts: BTreeMap<Option<i64>, u64> = BTreeMap::new();
+        for join_match in matches {
+            let Some(key_value) = join_match.key.first() else {
+                continue;
+            };
+            let key = sqlite_key_to_option_i64(key_value);
+            let entry = counts.entry(key).or_insert(0);
+            *entry = (*entry).saturating_add(join_match.tuple_multiplicity());
+        }
+        counts
+    }
+
+    fn pairwise_hash_join_multiplicity_by_key(
+        relations: &[Vec<Option<i64>>],
+    ) -> BTreeMap<Option<i64>, u64> {
+        let Some((first_relation, rest)) = relations.split_first() else {
+            return BTreeMap::new();
+        };
+
+        let mut current = make_key_payload_batch(first_relation, 0);
+        for (offset, relation_keys) in rest.iter().enumerate() {
+            if current.selection().is_empty() {
+                break;
+            }
+            let probe = make_key_payload_batch(relation_keys, offset + 1);
+            if probe.selection().is_empty() {
+                return BTreeMap::new();
+            }
+            let table = hash_join_build(current, &[0]).expect("hash build");
+            current = hash_join_probe(&table, &probe, &[0], JoinType::Inner).expect("hash probe");
+        }
+
+        let mut counts: BTreeMap<Option<i64>, u64> = BTreeMap::new();
+        for key in extract_int64(&current, 0) {
+            let entry = counts.entry(key).or_insert(0);
+            *entry = (*entry).saturating_add(1);
+        }
+        counts
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -501,7 +622,37 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────
-    // 5. END-TO-END PIPELINE PROPERTY
+    // 5. LEAPFROG EQUIVALENCE PROPERTY
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn leapfrog_equivalence_handles_disjoint_keys() {
+        let relations = vec![
+            vec![Some(1), Some(1), Some(2)],
+            vec![Some(3), Some(3), Some(4)],
+            vec![Some(5), Some(6)],
+        ];
+        let leapfrog = leapfrog_join_multiplicity_by_key(&relations);
+        let pairwise_hash = pairwise_hash_join_multiplicity_by_key(&relations);
+        assert_eq!(leapfrog, pairwise_hash);
+        assert!(leapfrog.is_empty());
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(10_000))]
+
+        #[test]
+        fn prop_leapfrog_matches_pairwise_hash_join_multiplicity(
+            relations in relation_key_sets(),
+        ) {
+            let leapfrog = leapfrog_join_multiplicity_by_key(&relations);
+            let pairwise_hash = pairwise_hash_join_multiplicity_by_key(&relations);
+            prop_assert_eq!(leapfrog, pairwise_hash);
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // 6. END-TO-END PIPELINE PROPERTY
     //    scan → filter → aggregate → sort
     // ────────────────────────────────────────────────────────────────────
 

@@ -18,7 +18,7 @@ use fsqlite_btree::swiss_index::SwissIndex;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use fsqlite_btree::{BtCursor, BtreeCursorOps, MemPageStore, PageReader, PageWriter, SeekResult};
 use fsqlite_error::{ErrorCode, FrankenError, Result};
@@ -532,6 +532,8 @@ struct ConcurrentContext {
     registry: Arc<Mutex<ConcurrentRegistry>>,
     /// Shared reference to the page-level lock table.
     lock_table: Arc<InProcessPageLockTable>,
+    /// Busy-timeout budget used when contending on page-level locks.
+    busy_timeout_ms: u64,
 }
 
 /// Shared wrapper around a boxed [`TransactionHandle`] so multiple
@@ -570,6 +572,7 @@ impl SharedTxnPageIo {
         session_id: u64,
         registry: Arc<Mutex<ConcurrentRegistry>>,
         lock_table: Arc<InProcessPageLockTable>,
+        busy_timeout_ms: u64,
     ) -> Self {
         Self {
             txn: Rc::new(RefCell::new(txn)),
@@ -577,6 +580,7 @@ impl SharedTxnPageIo {
                 session_id,
                 registry,
                 lock_table,
+                busy_timeout_ms,
             }),
         }
     }
@@ -596,15 +600,26 @@ impl SharedTxnPageIo {
 
 impl PageReader for SharedTxnPageIo {
     fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
-        // bd-kivg / 5E.2: The write set is used for page-level locking and FCW
-        // validation, not for read-your-own-writes. The pager's transaction
-        // handles read-your-own-writes through its page cache, which also
-        // correctly handles savepoint rollbacks.
-        //
-        // Note: concurrent_read_page is not called here because the pager
-        // provides correct read-your-own-writes semantics, and checking the
-        // write set would bypass savepoint rollback semantics.
-        Ok(self.txn.borrow().get_page(cx, page_no)?.into_vec())
+        let page = self.txn.borrow().get_page(cx, page_no)?.into_vec();
+
+        // bd-kivg / 5E.2 + SSI: every page read in a concurrent transaction
+        // must be tracked so commit-time SSI edge detection can identify
+        // dangerous structures and abort pivots when required.
+        if let Some(ctx) = &self.concurrent {
+            let mut registry = ctx
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let handle = registry.get_mut(ctx.session_id).ok_or_else(|| {
+                FrankenError::Internal(format!(
+                    "MVCC session {} not found in registry during read",
+                    ctx.session_id
+                ))
+            })?;
+            handle.record_read(page_no);
+        }
+
+        Ok(page)
     }
 }
 
@@ -612,24 +627,56 @@ impl PageWriter for SharedTxnPageIo {
     fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
         // bd-kivg / 5E.2: Acquire page-level lock and record in write set if concurrent.
         if let Some(ref ctx) = self.concurrent {
-            {
-                let mut registry = ctx
-                    .registry
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let handle = registry.get_mut(ctx.session_id).ok_or_else(|| {
-                    FrankenError::Internal(format!(
-                        "MVCC session {} not found in registry during write",
-                        ctx.session_id
-                    ))
-                })?;
-                let page_data = PageData::from_vec(data.to_vec());
-                concurrent_write_page(handle, &ctx.lock_table, ctx.session_id, page_no, page_data)
-                    .map_err(|e| match e {
-                        MvccError::Busy => FrankenError::Busy,
-                        _ => FrankenError::Internal(format!("MVCC write_page failed: {e}")),
+            let started = Instant::now();
+            let deadline = Duration::from_millis(ctx.busy_timeout_ms);
+            let mut backoff = Duration::from_micros(50);
+
+            loop {
+                let write_result = {
+                    let mut registry = ctx
+                        .registry
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let handle = registry.get_mut(ctx.session_id).ok_or_else(|| {
+                        FrankenError::Internal(format!(
+                            "MVCC session {} not found in registry during write",
+                            ctx.session_id
+                        ))
                     })?;
-                drop(registry);
+                    let page_data = PageData::from_vec(data.to_vec());
+                    concurrent_write_page(
+                        handle,
+                        &ctx.lock_table,
+                        ctx.session_id,
+                        page_no,
+                        page_data,
+                    )
+                };
+
+                match write_result {
+                    Ok(()) => break,
+                    Err(MvccError::Busy) => {
+                        if deadline.is_zero() || started.elapsed() >= deadline {
+                            return Err(FrankenError::Busy);
+                        }
+
+                        let remaining = deadline
+                            .checked_sub(started.elapsed())
+                            .unwrap_or(Duration::ZERO);
+                        let sleep_for = if backoff < remaining {
+                            backoff
+                        } else {
+                            remaining
+                        };
+                        if !sleep_for.is_zero() {
+                            std::thread::sleep(sleep_for);
+                        }
+                        backoff = (backoff * 2).min(Duration::from_millis(5));
+                    }
+                    Err(e) => {
+                        return Err(FrankenError::Internal(format!("MVCC write_page failed: {e}")));
+                    }
+                }
             }
         }
         // Persist to the underlying transaction.
@@ -1284,9 +1331,14 @@ impl VdbeEngine {
         session_id: u64,
         registry: Arc<Mutex<ConcurrentRegistry>>,
         lock_table: Arc<InProcessPageLockTable>,
+        busy_timeout_ms: u64,
     ) {
         self.txn_page_io = Some(SharedTxnPageIo::with_concurrent(
-            txn, session_id, registry, lock_table,
+            txn,
+            session_id,
+            registry,
+            lock_table,
+            busy_timeout_ms,
         ));
         self.storage_cursors_enabled = true;
     }
@@ -3443,18 +3495,34 @@ impl VdbeEngine {
             return false;
         };
 
-        // Phase 5C.1 (bd-35my): Route through pager when available, UNLESS
-        // this is an ephemeral table that only exists in MemDatabase (not
-        // backed by pager pages). Ephemeral tables are created by
-        // OpenEphemeral and have uninitialized pager pages (0x00 type flag).
+        // Phase 5C.1 (bd-35my): Route through pager when available.
+        //
+        // Critical safety rule:
+        // If a pager transaction exists, NEVER fall back to MemPageStore. A
+        // fallback can silently route writes to a non-durable in-memory copy
+        // and create divergence/corruption under concurrency.
+        //
+        // The only acceptable writable "bootstrap" case is a truly
+        // zero-initialized root page that we can initialize in-place.
         if let Some(ref mut page_io) = self.txn_page_io {
             let cx = Cx::new();
-            // Check if the page has valid B-tree header (type byte != 0x00).
-            // Real tables have initialized pages; ephemeral tables don't.
-            let page_data = page_io.read_page(&cx, root_pgno).ok();
-            let is_valid_btree = page_data
-                .as_ref()
-                .is_some_and(|p| !p.is_empty() && p[0] != 0x00);
+            // Check if the page has a valid B-tree header (type byte != 0x00).
+            // If the pager read itself fails, fail cursor open instead of
+            // treating it as an uninitialized page.
+            let page_data = match page_io.read_page(&cx, root_pgno) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    tracing::warn!(
+                        root_page,
+                        writable,
+                        error = %err,
+                        "failed to read root page for storage cursor open"
+                    );
+                    return false;
+                }
+            };
+            let is_valid_btree = !page_data.is_empty() && page_data[0] != 0x00;
+            let is_zero_page = page_data.iter().all(|&byte| byte == 0);
 
             if is_valid_btree {
                 // Real table backed by pager: open cursor on EXISTING page data.
@@ -3471,9 +3539,9 @@ impl VdbeEngine {
                 return true;
             }
 
-            // For writable cursors on uninitialized pages (e.g., newly created
-            // tables via CREATE TABLE AS SELECT), initialize an empty root page.
-            if writable {
+            // For writable cursors on truly zeroed pages (e.g., freshly
+            // allocated roots), initialize an empty root page.
+            if writable && is_zero_page {
                 // Initialize empty leaf table page (type 0x0D) - matches
                 // MemPageStore::with_empty_table format.
                 let mut page = vec![0u8; PAGE_SIZE as usize];
@@ -3507,7 +3575,17 @@ impl VdbeEngine {
                 );
                 return true;
             }
-            // Fall through to MemPageStore for ephemeral/read-only uninitialized tables.
+
+            // If a transaction-backed page exists but isn't a valid B-tree
+            // root (or a zero page we can initialize), refuse to open.
+            tracing::warn!(
+                root_page,
+                writable,
+                first_byte = page_data.first().copied().unwrap_or_default(),
+                is_zero_page,
+                "refusing storage cursor open on invalid transaction-backed root page"
+            );
+            return false;
         }
 
         // Fallback: build a transient B-tree snapshot (Phase 4 path used by
@@ -7199,7 +7277,7 @@ mod tests {
         // SharedTxnPageIo::write_page will fail before touching pager state.
         let registry = Arc::new(Mutex::new(ConcurrentRegistry::new()));
         let lock_table = Arc::new(InProcessPageLockTable::new());
-        engine.set_transaction_concurrent(Box::new(txn), 999, registry, lock_table);
+        engine.set_transaction_concurrent(Box::new(txn), 999, registry, lock_table, 5000);
 
         let opened = engine.open_storage_cursor(0, root, true);
         assert!(
@@ -7228,6 +7306,30 @@ mod tests {
         let opened = engine.open_storage_cursor(0, root, false);
         assert!(opened);
         assert!(engine.storage_cursors.contains_key(&0));
+    }
+
+    #[test]
+    fn test_open_storage_cursor_zero_page_with_txn_does_not_fallback_to_mem() {
+        use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
+
+        let pager = MockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+
+        let mut engine = VdbeEngine::new(8);
+        engine.set_transaction(Box::new(txn));
+
+        // MockTransaction synthesizes page bytes from the page number; page 256
+        // yields first byte 0x00, simulating an uninitialized root page.
+        let opened = engine.open_storage_cursor(0, 256, false);
+        assert!(
+            !opened,
+            "transaction-backed opens must not silently fall back to MemPageStore"
+        );
+        assert!(
+            !engine.storage_cursors.contains_key(&0),
+            "failed open must not leave a cursor installed"
+        );
     }
 
     #[test]

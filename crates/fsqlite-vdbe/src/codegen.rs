@@ -2900,14 +2900,23 @@ pub fn codegen_update(
     let col_regs = b.alloc_regs(n_cols as i32);
     for i in 0..n_cols {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        b.emit_op(
-            Opcode::Column,
-            table_cursor,
-            i as i32,
-            col_regs + i as i32,
-            P4::None,
-            0,
-        );
+        let target_reg = col_regs + i as i32;
+        if table.columns.get(i).is_some_and(|col| col.is_ipk) {
+            // INTEGER PRIMARY KEY columns alias rowid and are not stored in
+            // the record payload. Materialize from Rowid so unchanged UPDATE
+            // rewrites preserve the original key instead of generating a new
+            // rowid.
+            b.emit_op(Opcode::Rowid, table_cursor, target_reg, 0, P4::None, 0);
+        } else {
+            b.emit_op(
+                Opcode::Column,
+                table_cursor,
+                i as i32,
+                target_reg,
+                P4::None,
+                0,
+            );
+        }
     }
 
     // Index maintenance (bd-2f9t): Delete OLD index entries BEFORE updating values.
