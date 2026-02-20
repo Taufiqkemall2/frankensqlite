@@ -14,11 +14,11 @@ pub mod decision_contract;
 
 use decision_contract::access_path_kind_label;
 use fsqlite_ast::{
-    BinaryOp as AstBinaryOp, ColumnRef, CompoundOp, Expr, FromClause, InSet, IndexHint, LikeOp,
-    Literal, NullsOrder, OrderingTerm, ResultColumn, SelectBody, SelectCore, SortDirection, Span,
-    TableOrSubquery,
+    BinaryOp as AstBinaryOp, ColumnRef, CompoundOp, Expr, FromClause, InSet, IndexHint,
+    JoinConstraint, JoinKind, LikeOp, Literal, NullsOrder, OrderingTerm, ResultColumn, SelectBody,
+    SelectCore, SortDirection, Span, TableOrSubquery,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::{LazyLock, Mutex};
 
@@ -482,8 +482,50 @@ pub struct QueryPlan {
     pub join_order: Vec<String>,
     /// Access path for each table (parallel to `join_order`).
     pub access_paths: Vec<AccessPath>,
+    /// Join operator segments selected for execution/explain.
+    pub join_segments: Vec<JoinPlanSegment>,
     /// Total estimated cost in page reads.
     pub total_cost: f64,
+}
+
+/// Planner feature toggles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PlannerFeatureFlags {
+    /// Enable Leapfrog Triejoin routing for compatible 3+ relation equi-joins.
+    pub leapfrog_join: bool,
+}
+
+/// Join operator chosen for a segment of the join plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinOperator {
+    /// Pairwise hash join execution.
+    HashJoin,
+    /// Multi-way Leapfrog Triejoin execution.
+    LeapfrogTriejoin,
+}
+
+impl JoinOperator {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::HashJoin => "HASH JOIN",
+            Self::LeapfrogTriejoin => "LEAPFROG TRIEJOIN",
+        }
+    }
+}
+
+/// One join-operator decision segment.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+pub struct JoinPlanSegment {
+    /// Relations covered by this segment in execution order.
+    pub relations: Vec<String>,
+    /// Operator chosen for this segment.
+    pub operator: JoinOperator,
+    /// Estimated operator cost.
+    pub estimated_cost: f64,
+    /// Human-readable decision reason.
+    pub reason: String,
 }
 
 impl fmt::Display for QueryPlan {
@@ -499,6 +541,19 @@ impl fmt::Display for QueryPlan {
                 "  {i}: SCAN {}{idx_str} (~{:.0} rows, cost {:.1})",
                 ap.table, ap.estimated_rows, ap.estimated_cost
             )?;
+        }
+        if !self.join_segments.is_empty() {
+            writeln!(f, "JOIN OPERATORS:")?;
+            for segment in &self.join_segments {
+                writeln!(
+                    f,
+                    "  {} {} (est. {:.1}) [{}]",
+                    segment.operator.label(),
+                    segment.relations.join(" JOIN "),
+                    segment.estimated_cost,
+                    segment.reason
+                )?;
+            }
         }
         Ok(())
     }
@@ -1460,6 +1515,575 @@ fn has_join_predicate(table_a: &str, table_b: &str, terms: &[WhereTerm<'_>]) -> 
     false
 }
 
+const HASH_JOIN_SELECTIVITY_HEURISTIC: f64 = 0.25;
+const LEAPFROG_SEEK_OVERHEAD_FACTOR: f64 = 0.20;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ColumnKey {
+    table: String,
+    column: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EquiJoinPredicate {
+    left: ColumnKey,
+    right: ColumnKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrieHypergraph {
+    relation_variables: Vec<Vec<usize>>,
+    variable_count: usize,
+    arity: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnionFind {
+    parent: Vec<usize>,
+    rank: Vec<usize>,
+}
+
+impl UnionFind {
+    fn new(size: usize) -> Self {
+        Self {
+            parent: (0..size).collect(),
+            rank: vec![0; size],
+        }
+    }
+
+    fn find(&mut self, idx: usize) -> usize {
+        if self.parent[idx] != idx {
+            let root = self.find(self.parent[idx]);
+            self.parent[idx] = root;
+        }
+        self.parent[idx]
+    }
+
+    fn union(&mut self, left: usize, right: usize) {
+        let left_root = self.find(left);
+        let right_root = self.find(right);
+        if left_root == right_root {
+            return;
+        }
+        let left_rank = self.rank[left_root];
+        let right_rank = self.rank[right_root];
+        match left_rank.cmp(&right_rank) {
+            std::cmp::Ordering::Less => {
+                self.parent[left_root] = right_root;
+            }
+            std::cmp::Ordering::Greater => {
+                self.parent[right_root] = left_root;
+            }
+            std::cmp::Ordering::Equal => {
+                self.parent[right_root] = left_root;
+                self.rank[left_root] = left_rank + 1;
+            }
+        }
+    }
+}
+
+/// Select join operator segments for a query plan.
+///
+/// This function is additive to `order_joins`: it annotates a chosen join order
+/// with hash vs Leapfrog routing decisions and can be called directly by higher
+/// layers that have `FROM`-clause shape information.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn choose_join_segments(
+    join_order: &[String],
+    tables: &[TableStats],
+    where_terms: &[WhereTerm<'_>],
+    from_clause: Option<&FromClause>,
+    feature_flags: PlannerFeatureFlags,
+) -> Vec<JoinPlanSegment> {
+    if join_order.len() < 2 {
+        return vec![];
+    }
+
+    let join_order_canonical = join_order
+        .iter()
+        .map(|table| canonical_table_key(table))
+        .collect::<Vec<_>>();
+
+    let canonical_to_original = join_order
+        .iter()
+        .map(|table| (canonical_table_key(table), table.clone()))
+        .collect::<HashMap<_, _>>();
+
+    let join_table_set = join_order_canonical.iter().cloned().collect::<HashSet<_>>();
+    let rows_by_table = build_table_row_map(tables, &join_order_canonical);
+    let (equi_predicates, theta_join_tables) =
+        collect_join_predicates(where_terms, &join_table_set);
+    let leapfrog_shape_supported = from_clause_supports_leapfrog(from_clause);
+
+    let mut selected_components: Vec<(Vec<String>, f64, f64, usize)> = vec![];
+    let mut selected_tables = HashSet::<String>::new();
+
+    if feature_flags.leapfrog_join && leapfrog_shape_supported {
+        let leapfrog_candidates = join_order_canonical
+            .iter()
+            .filter(|table| !theta_join_tables.contains(*table))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for component in connected_components(&leapfrog_candidates, &equi_predicates) {
+            if component.len() < 3 {
+                continue;
+            }
+            let component_set = component.iter().cloned().collect::<HashSet<_>>();
+            let ordered_component = ordered_subset(&join_order_canonical, &component_set);
+            let Some(hypergraph) = build_trie_hypergraph(&ordered_component, &equi_predicates)
+            else {
+                continue;
+            };
+            let hash_cost = estimate_pairwise_hash_join_cost(&ordered_component, &rows_by_table);
+            let Some(agm_bound) =
+                estimate_agm_upper_bound(&ordered_component, &rows_by_table, &hypergraph)
+            else {
+                continue;
+            };
+            let leapfrog_cost = agm_bound
+                * LEAPFROG_SEEK_OVERHEAD_FACTOR.mul_add(ordered_component.len() as f64, 1.0);
+            if leapfrog_cost < hash_cost {
+                for table in &ordered_component {
+                    selected_tables.insert(table.clone());
+                }
+                selected_components.push((
+                    ordered_component,
+                    leapfrog_cost,
+                    hash_cost,
+                    hypergraph.arity,
+                ));
+            }
+        }
+    }
+
+    let mut segments = selected_components
+        .into_iter()
+        .map(
+            |(relations, leapfrog_cost, hash_cost, arity)| JoinPlanSegment {
+                relations: relations
+                    .into_iter()
+                    .filter_map(|table| canonical_to_original.get(&table).cloned())
+                    .collect(),
+                operator: JoinOperator::LeapfrogTriejoin,
+                estimated_cost: leapfrog_cost,
+                reason: format!(
+                    "AGM estimate {:.1} beats hash cost {:.1}; trie arity {}",
+                    leapfrog_cost, hash_cost, arity
+                ),
+            },
+        )
+        .collect::<Vec<_>>();
+
+    if segments.is_empty() {
+        let hash_cost = estimate_pairwise_hash_join_cost(&join_order_canonical, &rows_by_table);
+        let reason = if !feature_flags.leapfrog_join {
+            "leapfrog_join feature flag disabled".to_owned()
+        } else if !leapfrog_shape_supported {
+            "outer/natural/theta join shape is not Leapfrog-compatible".to_owned()
+        } else if join_order.len() < 3 {
+            "2-way joins stay on pairwise hash join".to_owned()
+        } else if !theta_join_tables.is_empty() {
+            "theta/non-equi join predicates require hash fallback".to_owned()
+        } else {
+            "no compatible 3+ equi-join component with lower AGM estimate".to_owned()
+        };
+        return vec![JoinPlanSegment {
+            relations: join_order.to_vec(),
+            operator: JoinOperator::HashJoin,
+            estimated_cost: hash_cost,
+            reason,
+        }];
+    }
+
+    let remaining_tables = join_order_canonical
+        .iter()
+        .filter(|table| !selected_tables.contains(*table))
+        .cloned()
+        .collect::<Vec<_>>();
+    if remaining_tables.len() >= 2 {
+        let hash_cost = estimate_pairwise_hash_join_cost(&remaining_tables, &rows_by_table);
+        segments.push(JoinPlanSegment {
+            relations: remaining_tables
+                .iter()
+                .filter_map(|table| canonical_to_original.get(table).cloned())
+                .collect(),
+            operator: JoinOperator::HashJoin,
+            estimated_cost: hash_cost,
+            reason: "remaining joins use pairwise hash join".to_owned(),
+        });
+    }
+
+    let join_order_position = join_order_canonical
+        .iter()
+        .enumerate()
+        .map(|(idx, table)| (table.clone(), idx))
+        .collect::<HashMap<_, _>>();
+    segments.sort_by_key(|segment| {
+        segment
+            .relations
+            .first()
+            .and_then(|table| {
+                join_order_position
+                    .get(&canonical_table_key(table))
+                    .copied()
+            })
+            .unwrap_or(usize::MAX)
+    });
+    segments
+}
+
+fn build_table_row_map(
+    tables: &[TableStats],
+    join_order_canonical: &[String],
+) -> HashMap<String, f64> {
+    let mut rows_by_table = tables
+        .iter()
+        .map(|table| (canonical_table_key(&table.name), table.n_rows.max(1) as f64))
+        .collect::<HashMap<_, _>>();
+    for table in join_order_canonical {
+        rows_by_table.entry(table.clone()).or_insert(1.0);
+    }
+    rows_by_table
+}
+
+fn collect_join_predicates(
+    where_terms: &[WhereTerm<'_>],
+    join_table_set: &HashSet<String>,
+) -> (Vec<EquiJoinPredicate>, HashSet<String>) {
+    let mut equi_predicates = Vec::new();
+    let mut theta_join_tables = HashSet::new();
+
+    for term in where_terms {
+        let Expr::BinaryOp {
+            left, op, right, ..
+        } = term.expr
+        else {
+            continue;
+        };
+        let Some(left_col) = extract_qualified_column(left) else {
+            continue;
+        };
+        let Some(right_col) = extract_qualified_column(right) else {
+            continue;
+        };
+        if left_col.table == right_col.table {
+            continue;
+        }
+        if !join_table_set.contains(&left_col.table) || !join_table_set.contains(&right_col.table) {
+            continue;
+        }
+
+        if *op == AstBinaryOp::Eq {
+            equi_predicates.push(EquiJoinPredicate {
+                left: left_col,
+                right: right_col,
+            });
+        } else {
+            theta_join_tables.insert(left_col.table);
+            theta_join_tables.insert(right_col.table);
+        }
+    }
+
+    (equi_predicates, theta_join_tables)
+}
+
+fn extract_qualified_column(expr: &Expr) -> Option<ColumnKey> {
+    let Expr::Column(column_ref, _) = expr else {
+        return None;
+    };
+    let table = column_ref.table.as_ref()?;
+    Some(ColumnKey {
+        table: canonical_table_key(table),
+        column: column_ref.column.to_ascii_lowercase(),
+    })
+}
+
+fn connected_components(tables: &[String], predicates: &[EquiJoinPredicate]) -> Vec<Vec<String>> {
+    if tables.is_empty() {
+        return vec![];
+    }
+
+    let table_set = tables.iter().cloned().collect::<HashSet<_>>();
+    let mut adjacency = tables
+        .iter()
+        .map(|table| (table.clone(), HashSet::<String>::new()))
+        .collect::<HashMap<_, _>>();
+
+    for predicate in predicates {
+        if table_set.contains(&predicate.left.table) && table_set.contains(&predicate.right.table) {
+            adjacency
+                .entry(predicate.left.table.clone())
+                .or_default()
+                .insert(predicate.right.table.clone());
+            adjacency
+                .entry(predicate.right.table.clone())
+                .or_default()
+                .insert(predicate.left.table.clone());
+        }
+    }
+
+    let mut visited = HashSet::<String>::new();
+    let mut components = Vec::new();
+    for table in tables {
+        if visited.contains(table) {
+            continue;
+        }
+        let mut stack = vec![table.clone()];
+        let mut component = Vec::new();
+        while let Some(current) = stack.pop() {
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            component.push(current.clone());
+            if let Some(neighbors) = adjacency.get(&current) {
+                for neighbor in neighbors {
+                    if !visited.contains(neighbor) {
+                        stack.push(neighbor.clone());
+                    }
+                }
+            }
+        }
+        components.push(component);
+    }
+
+    components
+}
+
+fn ordered_subset(join_order: &[String], selected_tables: &HashSet<String>) -> Vec<String> {
+    join_order
+        .iter()
+        .filter(|table| selected_tables.contains(*table))
+        .cloned()
+        .collect()
+}
+
+fn estimate_pairwise_hash_join_cost(
+    component: &[String],
+    rows_by_table: &HashMap<String, f64>,
+) -> f64 {
+    if component.len() < 2 {
+        return 0.0;
+    }
+
+    let mut iter = component.iter();
+    let first_rows = iter
+        .next()
+        .and_then(|table| rows_by_table.get(table))
+        .copied()
+        .unwrap_or(1.0)
+        .max(1.0);
+    let mut intermediate_rows = first_rows;
+    let mut total_cost = 0.0;
+
+    for table in iter {
+        let relation_rows = rows_by_table.get(table).copied().unwrap_or(1.0).max(1.0);
+        total_cost += intermediate_rows.min(relation_rows) + intermediate_rows.max(relation_rows);
+        intermediate_rows =
+            (intermediate_rows * relation_rows * HASH_JOIN_SELECTIVITY_HEURISTIC).max(1.0);
+    }
+
+    total_cost
+}
+
+#[allow(clippy::too_many_lines)]
+fn build_trie_hypergraph(
+    component: &[String],
+    predicates: &[EquiJoinPredicate],
+) -> Option<TrieHypergraph> {
+    if component.len() < 2 {
+        return None;
+    }
+
+    let component_set = component.iter().cloned().collect::<HashSet<_>>();
+    let table_to_index = component
+        .iter()
+        .enumerate()
+        .map(|(idx, table)| (table.clone(), idx))
+        .collect::<HashMap<_, _>>();
+
+    let mut endpoint_ids = HashMap::<ColumnKey, usize>::new();
+    let mut edge_endpoint_pairs = Vec::<(usize, usize, String, String)>::new();
+    for predicate in predicates {
+        if !component_set.contains(&predicate.left.table)
+            || !component_set.contains(&predicate.right.table)
+        {
+            continue;
+        }
+        let left_entry = if let Some(existing) = endpoint_ids.get(&predicate.left).copied() {
+            existing
+        } else {
+            let next = endpoint_ids.len();
+            endpoint_ids.insert(predicate.left.clone(), next);
+            next
+        };
+        let right_entry = if let Some(existing) = endpoint_ids.get(&predicate.right).copied() {
+            existing
+        } else {
+            let next = endpoint_ids.len();
+            endpoint_ids.insert(predicate.right.clone(), next);
+            next
+        };
+        edge_endpoint_pairs.push((
+            left_entry,
+            right_entry,
+            predicate.left.table.clone(),
+            predicate.right.table.clone(),
+        ));
+    }
+
+    if edge_endpoint_pairs.is_empty() {
+        return None;
+    }
+
+    let mut union_find = UnionFind::new(endpoint_ids.len());
+    for (left_id, right_id, _, _) in &edge_endpoint_pairs {
+        union_find.union(*left_id, *right_id);
+    }
+
+    let mut root_to_variable = HashMap::<usize, usize>::new();
+    let mut relation_variable_sets = vec![HashSet::<usize>::new(); component.len()];
+    for (left_id, right_id, left_table, right_table) in edge_endpoint_pairs {
+        let left_root = union_find.find(left_id);
+        let right_root = union_find.find(right_id);
+        let left_variable = if let Some(existing) = root_to_variable.get(&left_root).copied() {
+            existing
+        } else {
+            let next = root_to_variable.len();
+            root_to_variable.insert(left_root, next);
+            next
+        };
+        let right_variable = if let Some(existing) = root_to_variable.get(&right_root).copied() {
+            existing
+        } else {
+            let next = root_to_variable.len();
+            root_to_variable.insert(right_root, next);
+            next
+        };
+        let left_index = *table_to_index.get(&left_table)?;
+        let right_index = *table_to_index.get(&right_table)?;
+        relation_variable_sets[left_index].insert(left_variable);
+        relation_variable_sets[right_index].insert(right_variable);
+    }
+
+    if relation_variable_sets.iter().any(HashSet::is_empty) {
+        return None;
+    }
+    let expected_arity = relation_variable_sets.first()?.len();
+    if expected_arity == 0
+        || relation_variable_sets
+            .iter()
+            .any(|variables| variables.len() != expected_arity)
+    {
+        return None;
+    }
+
+    let variable_count = root_to_variable.len();
+    let mut variable_degree = vec![0usize; variable_count];
+    for variables in &relation_variable_sets {
+        for variable in variables {
+            variable_degree[*variable] += 1;
+        }
+    }
+    if variable_degree.iter().any(|degree| *degree < 2) {
+        return None;
+    }
+
+    let relation_variables = relation_variable_sets
+        .into_iter()
+        .map(|variables| {
+            let mut ordered = variables.into_iter().collect::<Vec<_>>();
+            ordered.sort_unstable();
+            ordered
+        })
+        .collect::<Vec<_>>();
+
+    Some(TrieHypergraph {
+        relation_variables,
+        variable_count,
+        arity: expected_arity,
+    })
+}
+
+fn estimate_agm_upper_bound(
+    component: &[String],
+    rows_by_table: &HashMap<String, f64>,
+    hypergraph: &TrieHypergraph,
+) -> Option<f64> {
+    if component.len() != hypergraph.relation_variables.len() || hypergraph.variable_count == 0 {
+        return None;
+    }
+
+    let mut variable_degree = vec![0usize; hypergraph.variable_count];
+    for variables in &hypergraph.relation_variables {
+        for variable in variables {
+            variable_degree[*variable] += 1;
+        }
+    }
+
+    let mut bound = 1.0;
+    for (relation_idx, table) in component.iter().enumerate() {
+        let row_count = rows_by_table.get(table).copied().unwrap_or(1.0).max(1.0);
+        let exponent = hypergraph.relation_variables[relation_idx]
+            .iter()
+            .map(|variable| 1.0 / variable_degree[*variable] as f64)
+            .fold(0.0, f64::max);
+        bound *= row_count.powf(exponent);
+    }
+    Some(bound.max(1.0))
+}
+
+fn from_clause_supports_leapfrog(from_clause: Option<&FromClause>) -> bool {
+    let Some(from_clause) = from_clause else {
+        return true;
+    };
+
+    for join in &from_clause.joins {
+        if join.join_type.natural {
+            return false;
+        }
+        if !matches!(join.join_type.kind, JoinKind::Inner | JoinKind::Cross) {
+            return false;
+        }
+        if let Some(constraint) = &join.constraint {
+            match constraint {
+                JoinConstraint::Using(columns) => {
+                    if columns.is_empty() {
+                        return false;
+                    }
+                }
+                JoinConstraint::On(expr) => {
+                    let conjuncts = decompose_where(expr);
+                    if conjuncts.is_empty() {
+                        return false;
+                    }
+                    if conjuncts
+                        .iter()
+                        .any(|conjunct| !expression_is_equi_column_predicate(conjunct))
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    true
+}
+
+fn expression_is_equi_column_predicate(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::BinaryOp {
+            left,
+            op: AstBinaryOp::Eq,
+            right,
+            ..
+        } if extract_where_column(left).is_some() && extract_where_column(right).is_some()
+    )
+}
+
 /// A partial join path during beam search.
 #[derive(Debug, Clone)]
 struct PartialPath {
@@ -1537,12 +2161,39 @@ pub fn order_joins_with_hints(
     table_index_hints: Option<&BTreeMap<String, IndexHint>>,
     cracking_hints: Option<&mut CrackingHintStore>,
 ) -> QueryPlan {
+    order_joins_with_hints_and_features(
+        tables,
+        indexes,
+        where_terms,
+        needed_columns,
+        cross_join_pairs,
+        table_index_hints,
+        cracking_hints,
+        PlannerFeatureFlags::default(),
+    )
+}
+
+/// Order tables using bounded beam search and select join operators (hash vs
+/// Leapfrog Triejoin) based on feature flags and cost model.
+#[must_use]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub fn order_joins_with_hints_and_features(
+    tables: &[TableStats],
+    indexes: &[IndexInfo],
+    where_terms: &[WhereTerm<'_>],
+    needed_columns: Option<&[String]>,
+    cross_join_pairs: &[(String, String)],
+    table_index_hints: Option<&BTreeMap<String, IndexHint>>,
+    cracking_hints: Option<&mut CrackingHintStore>,
+    feature_flags: PlannerFeatureFlags,
+) -> QueryPlan {
     let n = tables.len();
 
     if n == 0 {
         return QueryPlan {
             join_order: vec![],
             access_paths: vec![],
+            join_segments: vec![],
             total_cost: 0.0,
         };
     }
@@ -1559,6 +2210,7 @@ pub fn order_joins_with_hints(
         let plan = QueryPlan {
             join_order: vec![tables[0].name.clone()],
             access_paths: vec![ap.clone()],
+            join_segments: vec![],
             total_cost: ap.estimated_cost,
         };
         if let Some(store) = cracking_hints {
@@ -1694,9 +2346,13 @@ pub fn order_joins_with_hints(
         })
         .expect("tables must be non-empty (checked n == 0 above)");
 
+    let join_segments =
+        choose_join_segments(&best.tables, tables, where_terms, None, feature_flags);
+
     let plan = QueryPlan {
         join_order: best.tables,
         access_paths: best.access_paths,
+        join_segments,
         total_cost: best.cost,
     };
 
@@ -2704,6 +3360,207 @@ mod tests {
     }
 
     #[test]
+    fn test_two_way_join_stays_hash_even_with_leapfrog_enabled() {
+        let tables = [table_stats("t1", 10, 100), table_stats("t2", 12, 120)];
+        let terms = [join_term("t1", "k", "t2", "k")];
+        let plan = order_joins_with_hints_and_features(
+            &tables,
+            &[],
+            &terms,
+            None,
+            &[],
+            None,
+            None,
+            PlannerFeatureFlags {
+                leapfrog_join: true,
+            },
+        );
+
+        assert_eq!(plan.join_segments.len(), 1);
+        assert_eq!(plan.join_segments[0].operator, JoinOperator::HashJoin);
+    }
+
+    #[test]
+    fn test_three_way_equi_join_uses_leapfrog_when_feature_enabled() {
+        let tables = [
+            table_stats("a", 1024, 1_000_000),
+            table_stats("b", 1024, 1_000_000),
+            table_stats("c", 1024, 1_000_000),
+        ];
+        let terms = [join_term("a", "k", "b", "k"), join_term("b", "k", "c", "k")];
+        let plan = order_joins_with_hints_and_features(
+            &tables,
+            &[],
+            &terms,
+            None,
+            &[],
+            None,
+            None,
+            PlannerFeatureFlags {
+                leapfrog_join: true,
+            },
+        );
+
+        assert!(
+            plan.join_segments
+                .iter()
+                .any(|segment| segment.operator == JoinOperator::LeapfrogTriejoin
+                    && segment.relations.len() == 3),
+            "expected Leapfrog segment, got {:?}",
+            plan.join_segments
+        );
+    }
+
+    #[test]
+    fn test_leapfrog_feature_flag_gates_routing() {
+        let tables = [
+            table_stats("a", 1024, 1_000_000),
+            table_stats("b", 1024, 1_000_000),
+            table_stats("c", 1024, 1_000_000),
+        ];
+        let terms = [join_term("a", "k", "b", "k"), join_term("b", "k", "c", "k")];
+        let plan = order_joins_with_hints_and_features(
+            &tables,
+            &[],
+            &terms,
+            None,
+            &[],
+            None,
+            None,
+            PlannerFeatureFlags {
+                leapfrog_join: false,
+            },
+        );
+
+        assert_eq!(plan.join_segments.len(), 1);
+        assert_eq!(plan.join_segments[0].operator, JoinOperator::HashJoin);
+    }
+
+    #[test]
+    fn test_mixed_join_segments_support_leapfrog_and_hash() {
+        let tables = [
+            table_stats("a", 512, 900_000),
+            table_stats("b", 512, 900_000),
+            table_stats("c", 512, 900_000),
+            table_stats("d", 64, 10_000),
+            table_stats("e", 64, 10_000),
+        ];
+        let terms = [
+            join_term("a", "k", "b", "k"),
+            join_term("b", "k", "c", "k"),
+            join_term("d", "k", "e", "k"),
+        ];
+        let plan = order_joins_with_hints_and_features(
+            &tables,
+            &[],
+            &terms,
+            None,
+            &[],
+            None,
+            None,
+            PlannerFeatureFlags {
+                leapfrog_join: true,
+            },
+        );
+
+        assert!(
+            plan.join_segments
+                .iter()
+                .any(|segment| segment.operator == JoinOperator::LeapfrogTriejoin
+                    && segment.relations.len() == 3),
+            "expected 3-way Leapfrog segment, got {:?}",
+            plan.join_segments
+        );
+        assert!(
+            plan.join_segments
+                .iter()
+                .any(|segment| segment.operator == JoinOperator::HashJoin
+                    && segment.relations.len() == 2),
+            "expected 2-way hash segment, got {:?}",
+            plan.join_segments
+        );
+    }
+
+    #[test]
+    fn test_incompatible_trie_ordering_falls_back_to_hash_join() {
+        let tables = [
+            table_stats("a", 256, 100_000),
+            table_stats("b", 256, 100_000),
+            table_stats("c", 256, 100_000),
+        ];
+        let terms = [join_term("a", "x", "b", "x"), join_term("b", "y", "c", "y")];
+        let plan = order_joins_with_hints_and_features(
+            &tables,
+            &[],
+            &terms,
+            None,
+            &[],
+            None,
+            None,
+            PlannerFeatureFlags {
+                leapfrog_join: true,
+            },
+        );
+
+        assert!(
+            plan.join_segments
+                .iter()
+                .all(|segment| segment.operator == JoinOperator::HashJoin),
+            "incompatible trie ordering should stay hash-only: {:?}",
+            plan.join_segments
+        );
+    }
+
+    #[test]
+    fn test_outer_join_shape_forces_hash_fallback() {
+        use fsqlite_ast::{JoinClause, JoinConstraint, JoinKind, JoinType};
+
+        let from = FromClause {
+            source: TableOrSubquery::Table {
+                name: QualifiedName::bare("a"),
+                alias: None,
+                index_hint: None,
+            },
+            joins: vec![JoinClause {
+                join_type: JoinType {
+                    natural: false,
+                    kind: JoinKind::Left,
+                },
+                table: TableOrSubquery::Table {
+                    name: QualifiedName::bare("b"),
+                    alias: None,
+                    index_hint: None,
+                },
+                constraint: Some(JoinConstraint::On(Expr::BinaryOp {
+                    left: Box::new(Expr::Column(ColumnRef::qualified("a", "k"), Span::ZERO)),
+                    op: AstBinaryOp::Eq,
+                    right: Box::new(Expr::Column(ColumnRef::qualified("b", "k"), Span::ZERO)),
+                    span: Span::ZERO,
+                })),
+            }],
+        };
+        let tables = [
+            table_stats("a", 128, 100_000),
+            table_stats("b", 128, 100_000),
+            table_stats("c", 128, 100_000),
+        ];
+        let join_order = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        let terms = [join_term("a", "k", "b", "k"), join_term("b", "k", "c", "k")];
+        let segments = choose_join_segments(
+            &join_order,
+            &tables,
+            &terms,
+            Some(&from),
+            PlannerFeatureFlags {
+                leapfrog_join: true,
+            },
+        );
+
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].operator, JoinOperator::HashJoin);
+    }
+
+    #[test]
     fn test_collect_table_index_hints_from_clause_includes_aliases() {
         use fsqlite_ast::{JoinClause, JoinKind, JoinType};
 
@@ -2851,12 +3708,39 @@ mod tests {
                     estimated_rows: 10.0,
                 },
             ],
+            join_segments: vec![JoinPlanSegment {
+                relations: vec!["t1".to_owned(), "t2".to_owned()],
+                operator: JoinOperator::HashJoin,
+                estimated_cost: 115.0,
+                reason: "2-way joins stay on pairwise hash join".to_owned(),
+            }],
             total_cost: 115.0,
         };
         let display = plan.to_string();
         assert!(display.contains("QUERY PLAN"));
         assert!(display.contains("SCAN t1"));
+        assert!(display.contains("JOIN OPERATORS"));
+        assert!(display.contains("HASH JOIN"));
         assert!(display.contains("USING INDEX idx_t2"));
+    }
+
+    #[test]
+    fn test_query_plan_display_mentions_leapfrog_operator() {
+        let plan = QueryPlan {
+            join_order: vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
+            access_paths: vec![],
+            join_segments: vec![JoinPlanSegment {
+                relations: vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
+                operator: JoinOperator::LeapfrogTriejoin,
+                estimated_cost: 42.0,
+                reason: "AGM estimate 42.0 beats hash cost 100.0; trie arity 1".to_owned(),
+            }],
+            total_cost: 42.0,
+        };
+
+        let display = plan.to_string();
+        assert!(display.contains("LEAPFROG TRIEJOIN"));
+        assert!(display.contains("JOIN OPERATORS"));
     }
 
     #[test]

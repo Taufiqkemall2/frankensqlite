@@ -702,6 +702,12 @@ mod tests {
                     estimated_rows: 10.0,
                 },
             ],
+            join_segments: vec![crate::JoinPlanSegment {
+                relations: vec!["users".to_owned(), "orders".to_owned()],
+                operator: crate::JoinOperator::HashJoin,
+                estimated_cost: 115.0,
+                reason: "2-way joins stay on pairwise hash join".to_owned(),
+            }],
             total_cost: 115.0,
         }
     }
