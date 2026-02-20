@@ -9,8 +9,6 @@
 
 use std::collections::{BTreeSet, VecDeque};
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Instant;
 
@@ -22,6 +20,7 @@ use fsqlite_types::value::SqliteValue;
 
 const CI_WRITERS: usize = 10;
 const CI_TXNS_PER_WRITER: usize = 1_000;
+const SINGLE_WRITER_TXNS: usize = 1_000;
 const STRESS_WRITERS: usize = 100;
 const STRESS_TXNS_PER_WRITER: usize = 10_000;
 const ACCOUNT_COUNT: i64 = 128;
@@ -89,6 +88,17 @@ fn ssi_serialization_correctness_ci_scale() {
 }
 
 #[test]
+fn ssi_serialization_correctness_single_writer_smoke() {
+    let summary = run_ssi_workload(1, SINGLE_WRITER_TXNS, TEST_SEED, "single-writer");
+    let attempted = summary.committed + summary.aborted;
+    assert!(attempted > 0, "expected at least one attempted single-writer transaction");
+    assert_eq!(
+        summary.aborted, 0,
+        "single-writer run should not abort under page-level FCW"
+    );
+}
+
+#[test]
 #[ignore = "long-running stress profile for bd-3plop.5 acceptance envelope"]
 fn ssi_serialization_correctness_stress_profile() {
     let summary = run_ssi_workload(STRESS_WRITERS, STRESS_TXNS_PER_WRITER, TEST_SEED, "stress");
@@ -122,25 +132,13 @@ fn run_ssi_workload(
     let db_path = db_dir.path().join("ssi_serialization.db");
     initialize_db(&db_path);
 
-    let start_counter = Arc::new(AtomicU64::new(1));
-    let commit_counter = Arc::new(AtomicU64::new(1));
-
     let started = Instant::now();
     let mut handles = Vec::with_capacity(writers);
     for worker_id in 0..writers {
         let path = db_path.clone();
         let worker_seed = derive_worker_seed(seed, worker_id);
-        let start_ref = Arc::clone(&start_counter);
-        let commit_ref = Arc::clone(&commit_counter);
         handles.push(thread::spawn(move || {
-            run_worker(
-                &path,
-                worker_id,
-                txns_per_writer,
-                worker_seed,
-                &start_ref,
-                &commit_ref,
-            )
+            run_worker(&path, worker_id, txns_per_writer, worker_seed)
         }));
     }
 
@@ -180,12 +178,13 @@ fn run_ssi_workload(
         "negative balance observed in {label}: min_balance={min_balance}"
     );
 
-    let cycle = detect_cycle(&committed_txns);
-    assert!(
-        !cycle,
-        "serialization graph contains a cycle in {label}; committed_txns={}",
-        committed_txns.len()
-    );
+    if let Some(cycle) = detect_cycle(&committed_txns) {
+        let witness = render_cycle_witness(&committed_txns, &cycle);
+        panic!(
+            "serialization graph contains a cycle in {label}; committed_txns={}; witness={witness}",
+            committed_txns.len()
+        );
+    }
 
     WorkloadSummary {
         committed,
@@ -224,8 +223,6 @@ fn run_worker(
     worker_id: usize,
     txns_per_worker: usize,
     seed: u64,
-    start_counter: &AtomicU64,
-    commit_counter: &AtomicU64,
 ) -> WorkerResult {
     let mut result = WorkerResult::default();
     let mut rng = StdRng::seed_from_u64(seed);
@@ -239,13 +236,11 @@ fn run_worker(
     for txn_index in 0..txns_per_worker {
         let mut retries = 0_usize;
         loop {
-            let start_order = start_counter.fetch_add(1, Ordering::SeqCst);
             let kind = choose_txn_kind(&mut rng);
 
             let execute_result: Result<_, FrankenError> = execute_single_txn(&conn, &mut rng, kind);
             match execute_result {
-                Ok((read_set, write_set, delta_sum)) => {
-                    let commit_order = commit_counter.fetch_add(1, Ordering::SeqCst);
+                Ok((start_order, commit_order, read_set, write_set, delta_sum)) => {
                     result.committed += 1;
                     result.sum_delta += delta_sum;
                     result.txns.push(CommittedTxn {
@@ -286,8 +281,13 @@ fn execute_single_txn(
     conn: &fsqlite::Connection,
     rng: &mut StdRng,
     kind: TxnKind,
-) -> Result<(BTreeSet<i64>, BTreeSet<i64>, i64), FrankenError> {
+) -> Result<(u64, u64, BTreeSet<i64>, BTreeSet<i64>, i64), FrankenError> {
     conn.execute("BEGIN CONCURRENT;")?;
+    let start_order = conn.current_concurrent_snapshot_seq().ok_or_else(|| {
+        FrankenError::Internal(
+            "missing concurrent snapshot sequence after BEGIN CONCURRENT".to_owned(),
+        )
+    })?;
 
     let mut read_set = BTreeSet::new();
     let mut write_set = BTreeSet::new();
@@ -337,7 +337,10 @@ fn execute_single_txn(
     }
 
     conn.execute("COMMIT;")?;
-    Ok((read_set, write_set, delta_sum))
+    let commit_order = conn.last_local_commit_seq().ok_or_else(|| {
+        FrankenError::Internal("missing commit sequence after successful COMMIT".to_owned())
+    })?;
+    Ok((start_order, commit_order, read_set, write_set, delta_sum))
 }
 
 fn choose_txn_kind(rng: &mut StdRng) -> TxnKind {
@@ -404,10 +407,10 @@ fn read_account_invariants(path: &Path) -> (i64, i64) {
     (final_sum, min_balance)
 }
 
-fn detect_cycle(txns: &[CommittedTxn]) -> bool {
+fn detect_cycle(txns: &[CommittedTxn]) -> Option<Vec<usize>> {
     let node_count = txns.len();
     if node_count <= 1 {
-        return false;
+        return None;
     }
 
     let mut edges: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); node_count];
@@ -459,7 +462,72 @@ fn detect_cycle(txns: &[CommittedTxn]) -> bool {
         }
     }
 
-    visited != node_count
+    if visited == node_count {
+        return None;
+    }
+
+    // Extract one concrete cycle from the residual subgraph (nodes with
+    // positive indegree after Kahn elimination).
+    let mut state = vec![0_u8; node_count]; // 0=unseen, 1=visiting, 2=done
+    let mut stack = Vec::new();
+    for node in 0..node_count {
+        if indegree[node] == 0 || state[node] != 0 {
+            continue;
+        }
+        if let Some(cycle) = dfs_cycle(node, &edges, &indegree, &mut state, &mut stack) {
+            return Some(cycle);
+        }
+    }
+    Some(Vec::new())
+}
+
+fn dfs_cycle(
+    node: usize,
+    edges: &[BTreeSet<usize>],
+    indegree: &[usize],
+    state: &mut [u8],
+    stack: &mut Vec<usize>,
+) -> Option<Vec<usize>> {
+    state[node] = 1;
+    stack.push(node);
+    for &next in &edges[node] {
+        if indegree[next] == 0 {
+            continue;
+        }
+        if state[next] == 0 {
+            if let Some(cycle) = dfs_cycle(next, edges, indegree, state, stack) {
+                return Some(cycle);
+            }
+        } else if state[next] == 1 {
+            let start = stack
+                .iter()
+                .position(|&value| value == next)
+                .expect("cycle back-edge target should be in DFS stack");
+            let mut cycle = stack[start..].to_vec();
+            cycle.push(next);
+            return Some(cycle);
+        }
+    }
+    stack.pop();
+    state[node] = 2;
+    None
+}
+
+fn render_cycle_witness(txns: &[CommittedTxn], cycle: &[usize]) -> String {
+    if cycle.is_empty() {
+        return "unresolved-cycle-no-path".to_owned();
+    }
+    cycle
+        .iter()
+        .map(|&idx| {
+            let txn = &txns[idx];
+            format!(
+                "#{idx}(start={},commit={},r={:?},w={:?})",
+                txn.start_order, txn.commit_order, txn.read_set, txn.write_set
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" -> ")
 }
 
 fn orient_read_write_conflict(

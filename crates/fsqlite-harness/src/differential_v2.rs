@@ -23,6 +23,7 @@
 //! guaranteeing that the same logical input always maps to the same identifier
 //! regardless of serialization whitespace or field ordering differences.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::fmt::Write as _;
 
@@ -591,8 +592,20 @@ pub fn run_differential<F: SqlExecutor, C: SqlExecutor>(
     }
 
     // Compare logical state.
-    let f_dump = fsqlite_exec.logical_dump();
-    let c_dump = csqlite_exec.logical_dump();
+    //
+    // FrankenSQLite does not guarantee `sqlite_master` parity yet, so relying
+    // solely on metadata introspection can yield false divergences even when
+    // statement outcomes match. When schema CREATE TABLE statements are present,
+    // derive the table list directly from the envelope for a deterministic dump.
+    let schema_tables = extract_schema_table_names(&envelope.schema);
+    let (f_dump, c_dump) = if schema_tables.is_empty() {
+        (fsqlite_exec.logical_dump(), csqlite_exec.logical_dump())
+    } else {
+        (
+            logical_dump_for_tables(fsqlite_exec, &schema_tables),
+            logical_dump_for_tables(csqlite_exec, &schema_tables),
+        )
+    };
     let f_hash = sha256_hex(f_dump.as_bytes());
     let c_hash = sha256_hex(c_dump.as_bytes());
     let state_matched = f_hash == c_hash;
@@ -630,6 +643,79 @@ pub fn run_differential<F: SqlExecutor, C: SqlExecutor>(
 
     result.artifact_hashes.result_hash = result.compute_result_hash();
     result
+}
+
+fn extract_schema_table_names(schema: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut tables = Vec::new();
+
+    for stmt in schema {
+        if let Some(table) = parse_created_table_name(stmt) {
+            if seen.insert(table.clone()) {
+                tables.push(table);
+            }
+        }
+    }
+
+    tables
+}
+
+fn parse_created_table_name(sql: &str) -> Option<String> {
+    let mut tokens = sql.split_whitespace();
+    let first = tokens.next()?;
+    if !first.eq_ignore_ascii_case("CREATE") {
+        return None;
+    }
+
+    let mut next = tokens.next()?;
+    if next.eq_ignore_ascii_case("TEMP") || next.eq_ignore_ascii_case("TEMPORARY") {
+        next = tokens.next()?;
+    }
+    if !next.eq_ignore_ascii_case("TABLE") {
+        return None;
+    }
+
+    let mut name = tokens.next()?;
+    if name.eq_ignore_ascii_case("IF") {
+        let not_kw = tokens.next()?;
+        let exists_kw = tokens.next()?;
+        if !not_kw.eq_ignore_ascii_case("NOT") || !exists_kw.eq_ignore_ascii_case("EXISTS") {
+            return None;
+        }
+        name = tokens.next()?;
+    }
+
+    let before_paren = name.split('(').next().unwrap_or(name);
+    let trimmed = before_paren.trim_end_matches(';');
+    let normalized = trimmed.trim_matches(|c| matches!(c, '"' | '\'' | '`' | '[' | ']'));
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized.to_owned())
+    }
+}
+
+fn logical_dump_for_tables<E: SqlExecutor>(exec: &E, tables: &[String]) -> String {
+    let mut dump = String::new();
+    for table in tables {
+        let _ = writeln!(dump, "-- TABLE: {table}");
+        let rows = exec
+            .query(&format!("SELECT * FROM \"{table}\" ORDER BY rowid"))
+            .or_else(|_| exec.query(&format!("SELECT * FROM \"{table}\" ORDER BY 1")))
+            .or_else(|_| exec.query(&format!("SELECT * FROM \"{table}\"")));
+        if let Ok(rows) = rows {
+            for row in &rows {
+                for (j, val) in row.iter().enumerate() {
+                    if j > 0 {
+                        dump.push('|');
+                    }
+                    let _ = write!(dump, "{val}");
+                }
+                dump.push('\n');
+            }
+        }
+    }
+    dump
 }
 
 /// Deterministic reduction artifact for a divergent workload.

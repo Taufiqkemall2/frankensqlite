@@ -16,15 +16,22 @@ on:
       - "crates/fsqlite-planner/**"
       - "crates/fsqlite-harness/src/backlog_quality_gate.rs"
       - "crates/fsqlite-harness/src/bin/backlog_quality_gate_runner.rs"
+      - "crates/fsqlite-harness/src/bin/differential_manifest_runner.rs"
+      - "crates/fsqlite-harness/src/bin/durability_matrix_manifest.rs"
       - "crates/fsqlite-harness/src/bin/perf_baseline_pack_runner.rs"
       - "crates/fsqlite-harness/src/bin/validation_manifest_runner.rs"
+      - "crates/fsqlite-harness/src/durability_matrix.rs"
+      - "crates/fsqlite-harness/src/differential_runner.rs"
       - "crates/fsqlite-harness/src/perf_loop.rs"
       - "crates/fsqlite-harness/src/performance_regression_detector.rs"
       - "crates/fsqlite-harness/src/validation_manifest.rs"
+      - "crates/fsqlite-harness/tests/bd_mblr_7_4_durability_matrix.rs"
       - "crates/fsqlite-mvcc/**"
       - "crates/fsqlite-vdbe/**"
       - "scripts/verify_backlog_quality_gate.sh"
       - "scripts/verify_ci_artifact_gates.sh"
+      - "scripts/verify_differential_ci_lane.sh"
+      - "scripts/verify_durability_matrix.sh"
       - "scripts/verify_perf_baseline_pack.sh"
       - "scripts/verify_validation_manifest.sh"
       - "scripts/bd_1as_4_index_selection_e2e.sh"
@@ -60,6 +67,188 @@ jobs:
         with:
           name: backlog-quality-gate-artifacts
           path: artifacts/backlog-quality-gate-e2e/
+          retention-days: 21
+
+  differential-ci-smoke:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUST_BACKTRACE: "1"
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly
+
+      - name: Run deterministic differential smoke lane (warning mode)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/differential-ci/smoke
+          bash ./scripts/verify_differential_ci_lane.sh --lane smoke --json \
+            > artifacts/differential-ci/smoke/report.json
+
+      - name: Publish differential smoke summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          report_path="artifacts/differential-ci/smoke/report.json"
+          if [[ -f "${report_path}" ]]; then
+            echo "### Differential CI Lane (smoke, warning mode)" >> "${GITHUB_STEP_SUMMARY}"
+            jq -r '
+              "- lane_outcome: \(.lane.outcome)",
+              "- deterministic_match: \(.run.deterministic_match)",
+              "- run_id: `\(.run.run_id)`",
+              "- trace_id: `\(.run.trace_id)`",
+              "- seed: \(.run.root_seed)",
+              "- total_cases: \(.results.total_cases)",
+              "- diverged_cases: \(.results.diverged_cases)",
+              "- mismatch_class_counts: `\(.results.mismatch_class_counts)`",
+              "- manifest_a: `\(.artifacts.manifest_a)`",
+              "- runner_log_a: `\(.artifacts.runner_log_a)`",
+              "- replay_command: `\(.replay_command)`"
+            ' "${report_path}" >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo "Differential smoke report missing at ${report_path}" >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Upload differential smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: differential-ci-smoke-artifacts
+          path: artifacts/differential-ci/smoke/
+          retention-days: 21
+
+  differential-ci-expanded:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      RUST_BACKTRACE: "1"
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly
+
+      - name: Run deterministic differential expanded lane (warning mode)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/differential-ci/expanded
+          bash ./scripts/verify_differential_ci_lane.sh --lane expanded --json \
+            > artifacts/differential-ci/expanded/report.json
+
+      - name: Publish differential expanded summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          report_path="artifacts/differential-ci/expanded/report.json"
+          if [[ -f "${report_path}" ]]; then
+            echo "### Differential CI Lane (expanded, warning mode)" >> "${GITHUB_STEP_SUMMARY}"
+            jq -r '
+              "- lane_outcome: \(.lane.outcome)",
+              "- deterministic_match: \(.run.deterministic_match)",
+              "- run_id: `\(.run.run_id)`",
+              "- trace_id: `\(.run.trace_id)`",
+              "- seed: \(.run.root_seed)",
+              "- total_cases: \(.results.total_cases)",
+              "- diverged_cases: \(.results.diverged_cases)",
+              "- mismatch_class_counts: `\(.results.mismatch_class_counts)`",
+              "- manifest_a: `\(.artifacts.manifest_a)`",
+              "- runner_log_a: `\(.artifacts.runner_log_a)`",
+              "- replay_command: `\(.replay_command)`"
+            ' "${report_path}" >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo "Differential expanded report missing at ${report_path}" >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Upload differential expanded artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: differential-ci-expanded-artifacts
+          path: artifacts/differential-ci/expanded/
+          retention-days: 21
+
+  durability-matrix-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      RUST_BACKTRACE: "1"
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly
+
+      - name: Run deterministic durability matrix gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/durability-matrix
+          bash ./scripts/verify_durability_matrix.sh --json > artifacts/durability-matrix/report.json
+
+      - name: Publish durability matrix summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          report_path="artifacts/durability-matrix/report.json"
+          if [[ -f "${report_path}" ]]; then
+            echo "### Durability Matrix Gate" >> "${GITHUB_STEP_SUMMARY}"
+            jq -r '
+              "- lane_outcome: \(.lane.outcome)",
+              "- highest_severity: \(.lane.highest_severity)",
+              "- violation_count: \(.lane.violation_count)",
+              "- block_release: \(.release_gate.block_release)",
+              "- blocking_threshold: \(.release_gate.blocking_threshold)",
+              "- run_id: `\(.run.run_id)`",
+              "- trace_id: `\(.run.trace_id)`",
+              "- root_seed: \(.run.root_seed)",
+              "- environment_count: \(.matrix.environment_count)",
+              "- scenario_count: \(.matrix.scenario_count)",
+              "- probe_count: \(.matrix.probe_count)",
+              "- dry_run_total: \(.dry_run.total_probes)",
+              "- checks.matrix_determinism.pass: \(.checks.matrix_determinism.pass)",
+              "- checks.workflow_determinism.pass: \(.checks.workflow_determinism.pass)",
+              "- checks.matrix_contract.pass: \(.checks.matrix_contract.pass)",
+              "- checks.dry_run_contract.pass: \(.checks.dry_run_contract.pass)",
+              "- checks.matrix_dry_run_counts.pass: \(.checks.matrix_dry_run_counts.pass)",
+              "- report: `\($report_path)`",
+              "- replay_matrix_command: `\(.replay.matrix_command)`",
+              "- replay_dry_run_command: `\(.replay.dry_run_command)`"
+            ' --arg report_path "${report_path}" "${report_path}" >> "${GITHUB_STEP_SUMMARY}"
+            if jq -e '.drift.violations | length > 0' "${report_path}" >/dev/null; then
+              echo "- drift_violations:" >> "${GITHUB_STEP_SUMMARY}"
+              jq -r '.drift.violations[] | "  - [\(.severity)] \(.phase): \(.detail)"' "${report_path}" >> "${GITHUB_STEP_SUMMARY}"
+            fi
+          else
+            echo "Durability matrix report missing at ${report_path}" >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Upload durability matrix artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: durability-matrix-artifacts
+          path: artifacts/durability-matrix/
           retention-days: 21
 
   param-binding-regression-guard:

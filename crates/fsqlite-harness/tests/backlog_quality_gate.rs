@@ -109,7 +109,10 @@ fn baseline_mode_flags_only_new_critical_regressions() {
         schema_version: BACKLOG_QUALITY_GATE_SCHEMA_VERSION.to_owned(),
         entries: vec![BacklogQualityBaselineEntry {
             issue_id: "bd-known".to_owned(),
-            missing_requirements: vec![RequirementKind::DeterministicE2e],
+            missing_requirements: vec![
+                RequirementKind::DeterministicE2e,
+                RequirementKind::StructuredLogging,
+            ],
         }],
     };
     fs::write(

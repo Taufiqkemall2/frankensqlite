@@ -451,3 +451,104 @@ fn main() -> ExitCode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fsqlite_harness::differential_runner::CoverageSummary;
+    use fsqlite_harness::mismatch_minimizer::DeduplicatedFailures;
+
+    fn test_config() -> Config {
+        Config {
+            workspace_root: PathBuf::from("/tmp/workspace"),
+            output_json: PathBuf::from(
+                "artifacts/differential-manifest/differential_manifest.json",
+            ),
+            output_human: PathBuf::from("artifacts/differential-manifest/differential_manifest.md"),
+            fixtures_dir: PathBuf::from("conformance"),
+            run_id: "bd-mblr.7.1.2-test-run".to_owned(),
+            trace_id: "trace-test".to_owned(),
+            scenario_id: "DIFF-712".to_owned(),
+            root_seed: 424_242,
+            max_cases_per_entry: 8,
+            max_entries: Some(64),
+            generated_unix_ms: 1_700_000_000_000,
+            skip_fixtures: true,
+        }
+    }
+
+    #[test]
+    fn build_trace_id_is_deterministic() {
+        let left = build_trace_id("example-run");
+        let right = build_trace_id("example-run");
+        assert_eq!(left, right);
+        assert!(left.starts_with("trace-"));
+        assert_ne!(
+            build_trace_id("example-run-a"),
+            build_trace_id("example-run-b")
+        );
+    }
+
+    #[test]
+    fn replay_command_includes_deterministic_controls() {
+        let config = test_config();
+        let replay = build_replay_command(&config);
+
+        assert!(replay.contains("--root-seed 424242"));
+        assert!(replay.contains("--max-cases-per-entry 8"));
+        assert!(replay.contains("--max-entries 64"));
+        assert!(replay.contains("--generated-unix-ms 1700000000000"));
+        assert!(replay.contains("--skip-fixtures"));
+        assert!(
+            replay.contains(
+                "--output-json artifacts/differential-manifest/differential_manifest.json"
+            )
+        );
+        assert!(
+            replay.contains(
+                "--output-human artifacts/differential-manifest/differential_manifest.md"
+            )
+        );
+    }
+
+    #[test]
+    fn human_summary_contains_replay_and_counts() {
+        let config = test_config();
+        let replay = build_replay_command(&config);
+        let run_report = DifferentialRunReport {
+            bead_id: BEAD_ID.to_owned(),
+            data_hash: "abc123".to_owned(),
+            base_seed: config.root_seed,
+            total_cases: 12,
+            passed: 11,
+            diverged: 1,
+            skipped: 0,
+            divergent_cases: Vec::new(),
+            deduplicated: DeduplicatedFailures::default(),
+            coverage_summary: CoverageSummary::default(),
+        };
+        let manifest = DifferentialManifest {
+            schema_version: 1,
+            bead_id: BEAD_ID.to_owned(),
+            run_id: config.run_id.clone(),
+            trace_id: config.trace_id.clone(),
+            scenario_id: config.scenario_id.clone(),
+            generated_unix_ms: config.generated_unix_ms,
+            commit_sha: "deadbeef".to_owned(),
+            root_seed: config.root_seed,
+            fixture_entries_ingested: 4,
+            corpus_entries: 16,
+            overall_pass: false,
+            run_report,
+            replay: ReplayCommand {
+                command: replay.clone(),
+            },
+        };
+
+        let human = build_human_summary(&manifest);
+        assert!(human.contains("run_id: `bd-mblr.7.1.2-test-run`"));
+        assert!(human.contains("diverged: `1`"));
+        assert!(human.contains("overall_pass: `false`"));
+        assert!(human.contains(&replay));
+    }
+}

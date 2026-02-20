@@ -5,6 +5,10 @@
 # 1. Synthetic backlog with known baseline issue produces deterministic pass output.
 # 2. Introducing a new critical-path acceptance gap causes regression failure.
 # 3. Optional repository-mode run validates current .beads backlog against baseline.
+#
+# Env overrides:
+# - BACKLOG_QUALITY_GATE_RUNNER_BIN=target/debug/backlog_quality_gate_runner
+# - BACKLOG_QUALITY_GATE_USE_RCH=1
 
 set -euo pipefail
 
@@ -32,7 +36,14 @@ done
 
 mkdir -p "$RUN_ROOT"
 
-if command -v rch >/dev/null 2>&1; then
+RUNNER_BIN="${BACKLOG_QUALITY_GATE_RUNNER_BIN:-}"
+if [[ -n "${RUNNER_BIN}" ]]; then
+  if [[ ! -x "${RUNNER_BIN}" ]]; then
+    echo "ERROR: BACKLOG_QUALITY_GATE_RUNNER_BIN is not executable: ${RUNNER_BIN}" >&2
+    exit 2
+  fi
+  RUNNER=("${RUNNER_BIN}")
+elif [[ "${BACKLOG_QUALITY_GATE_USE_RCH:-1}" == "1" ]] && command -v rch >/dev/null 2>&1; then
   RUNNER=(rch exec -- cargo run -p fsqlite-harness --bin backlog_quality_gate_runner --)
 else
   RUNNER=(cargo run -p fsqlite-harness --bin backlog_quality_gate_runner --)
@@ -68,7 +79,10 @@ cat > "$FIXTURE_BASELINE" <<'EOF'
   "entries": [
     {
       "issue_id": "bd-fixture-known",
-      "missing_requirements": ["deterministic_e2e"]
+      "missing_requirements": [
+        "deterministic_e2e",
+        "structured_logging"
+      ]
     }
   ]
 }
@@ -80,7 +94,8 @@ EOF
   --output-json "$REPORT_A" \
   --output-human "$SUMMARY_A" \
   --critical-priority-max 1 \
-  --generated-unix-ms "$FIXED_TS"
+  --generated-unix-ms "$FIXED_TS" \
+  1>&2
 
 "${RUNNER[@]}" \
   --beads "$FIXTURE_BEADS_PASS" \
@@ -88,7 +103,8 @@ EOF
   --output-json "$REPORT_B" \
   --output-human "$SUMMARY_B" \
   --critical-priority-max 1 \
-  --generated-unix-ms "$FIXED_TS"
+  --generated-unix-ms "$FIXED_TS" \
+  1>&2
 
 if ! diff -u "$REPORT_A" "$REPORT_B" >/dev/null; then
   echo "ERROR: deterministic replay failed for pass fixture reports" >&2
@@ -103,7 +119,8 @@ set +e
   --output-json "$REPORT_FAIL" \
   --output-human "$SUMMARY_FAIL" \
   --critical-priority-max 1 \
-  --generated-unix-ms "$FIXED_TS"
+  --generated-unix-ms "$FIXED_TS" \
+  1>&2
 FAIL_EXIT=$?
 set -e
 
@@ -128,7 +145,8 @@ if $REPO_GATE; then
     --baseline "$WORKSPACE_ROOT/conformance/backlog_quality_gate_baseline.json" \
     --output-json "$REPO_REPORT" \
     --output-human "$REPO_SUMMARY" \
-    --critical-priority-max 1
+    --critical-priority-max 1 \
+    1>&2
   REPO_STATUS=$?
   set -e
 fi
