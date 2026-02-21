@@ -55,6 +55,27 @@ pub fn record_func_call(duration_us: u64) {
     FSQLITE_FUNC_EVAL_DURATION_US_TOTAL.fetch_add(duration_us, Ordering::Relaxed);
 }
 
+// ── UDF registration metrics (bd-2wt.3) ────────────────────────────────
+
+/// Total number of UDF registrations.
+static FSQLITE_UDF_REGISTERED: AtomicU64 = AtomicU64::new(0);
+
+/// Record a UDF registration event.
+pub fn record_udf_registered() {
+    FSQLITE_UDF_REGISTERED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Current count of UDF registrations.
+#[must_use]
+pub fn udf_registered_count() -> u64 {
+    FSQLITE_UDF_REGISTERED.load(Ordering::Relaxed)
+}
+
+/// Reset UDF registration counter (tests/diagnostics).
+pub fn reset_udf_metrics() {
+    FSQLITE_UDF_REGISTERED.store(0, Ordering::Relaxed);
+}
+
 pub mod agg_builtins;
 pub mod aggregate;
 pub mod authorizer;
@@ -136,6 +157,19 @@ impl FunctionRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create a mutable clone of a registry from an `Arc` reference.
+    ///
+    /// This is used by the UDF registration API to produce a new registry
+    /// containing the existing functions plus the newly registered UDF.
+    #[must_use]
+    pub fn clone_from_arc(arc: &Arc<FunctionRegistry>) -> Self {
+        Self {
+            scalars: arc.scalars.clone(),
+            aggregates: arc.aggregates.clone(),
+            windows: arc.windows.clone(),
+        }
     }
 
     /// Register a scalar function, keyed by `(name, num_args)`.
@@ -291,6 +325,21 @@ impl FunctionRegistry {
     pub fn contains_window(&self, name: &str) -> bool {
         let canon = canonical_name(name);
         self.windows.keys().any(|k| k.name == canon)
+    }
+
+    /// Return deduplicated lowercase names of all registered aggregate functions.
+    ///
+    /// Used by the codegen thread-local to recognize custom aggregate UDFs.
+    #[must_use]
+    pub fn aggregate_names_lowercase(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .aggregates
+            .keys()
+            .map(|k| k.name.to_ascii_lowercase())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
     }
 }
 

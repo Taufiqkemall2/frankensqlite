@@ -752,30 +752,13 @@ fn trigger_when_matches(when_clause: Option<&Expr>, frame: Option<&TriggerFrame>
 /// For `UPDATE OF col1, col2` triggers, ensure at least one listed column
 /// actually changed between OLD and NEW snapshots.
 fn trigger_update_of_columns_changed(
-    trigger_event: &fsqlite_ast::TriggerEvent,
-    frame: &TriggerFrame,
+    _trigger_event: &fsqlite_ast::TriggerEvent,
+    _frame: &TriggerFrame,
 ) -> bool {
-    use fsqlite_ast::TriggerEvent;
-    let TriggerEvent::Update(trigger_cols) = trigger_event else {
-        return true;
-    };
-    if trigger_cols.is_empty() {
-        return true;
-    }
-    let (Some(old_row), Some(new_row)) = (frame.old_row.as_deref(), frame.new_row.as_deref())
-    else {
-        // Conservatively allow firing when snapshots are incomplete.
-        return true;
-    };
-
-    trigger_cols.iter().any(|column| {
-        let Some(column_index) = frame.column_index(column) else {
-            return false;
-        };
-        let old_value = old_row.get(column_index).unwrap_or(&SqliteValue::Null);
-        let new_value = new_row.get(column_index).unwrap_or(&SqliteValue::Null);
-        cmp_values(old_value, new_value) != std::cmp::Ordering::Equal
-    })
+    // In SQLite, UPDATE OF triggers fire if the column is in the SET clause,
+    // regardless of whether the value actually changed.
+    // The SET clause inclusion is already checked by trigger_event_matches.
+    true
 }
 
 #[derive(Debug, Clone)]
@@ -988,7 +971,8 @@ pub struct Connection {
     /// Stack of active trigger OLD/NEW bindings for nested trigger execution.
     trigger_frame_stack: RefCell<Vec<TriggerFrame>>,
     /// Scalar/aggregate/window function registry shared with the VDBE engine.
-    func_registry: Arc<FunctionRegistry>,
+    /// Wrapped in `RefCell` to allow UDF registration after connection creation.
+    func_registry: RefCell<Arc<FunctionRegistry>>,
     /// Whether an explicit transaction is active (BEGIN without matching COMMIT/ROLLBACK).
     in_transaction: RefCell<bool>,
     /// Snapshot taken at BEGIN time, restored on ROLLBACK.
@@ -1131,7 +1115,7 @@ impl Connection {
             views: RefCell::new(Vec::new()),
             triggers: RefCell::new(Vec::new()),
             trigger_frame_stack: RefCell::new(Vec::new()),
-            func_registry: default_function_registry(),
+            func_registry: RefCell::new(default_function_registry()),
             in_transaction: RefCell::new(false),
             txn_snapshot: RefCell::new(None),
             savepoints: RefCell::new(Vec::new()),
@@ -1327,6 +1311,95 @@ impl Connection {
         *self.closed.get_mut() = true;
         emit_compat_trace_event(trace_registration.as_ref(), TraceEvent::Close);
         Ok(())
+    }
+
+    // ── User-Defined Function (UDF) Registration (bd-2wt.3) ────────────
+
+    /// Register a custom scalar function.
+    ///
+    /// The function becomes available immediately for subsequent queries.
+    /// Previously prepared statements are NOT affected — only new
+    /// `prepare()` / `query()` / `execute()` calls see the new function.
+    ///
+    /// Overwrites any existing function with the same `(name, num_args)` key.
+    pub fn register_scalar_function<F>(&self, function: F)
+    where
+        F: fsqlite_func::ScalarFunction + 'static,
+    {
+        let func_name = function.name().to_owned();
+        let func_args = function.num_args();
+        let deterministic = function.is_deterministic();
+        tracing::info!(
+            target: "fsqlite.udf",
+            func_name = %func_name,
+            func_type = "scalar",
+            num_args = func_args,
+            deterministic = deterministic,
+            "udf_register"
+        );
+        fsqlite_func::record_udf_registered();
+        let mut registry =
+            FunctionRegistry::clone_from_arc(&self.func_registry.borrow());
+        registry.register_scalar(function);
+        *self.func_registry.borrow_mut() = Arc::new(registry);
+    }
+
+    /// Register a custom aggregate function.
+    ///
+    /// The function becomes available immediately for subsequent queries.
+    /// Overwrites any existing function with the same `(name, num_args)` key.
+    pub fn register_aggregate_function<F>(&self, function: F)
+    where
+        F: fsqlite_func::AggregateFunction + 'static,
+        F::State: 'static,
+    {
+        let func_name = function.name().to_owned();
+        let func_args = function.num_args();
+        tracing::info!(
+            target: "fsqlite.udf",
+            func_name = %func_name,
+            func_type = "aggregate",
+            num_args = func_args,
+            "udf_register"
+        );
+        fsqlite_func::record_udf_registered();
+        let mut registry =
+            FunctionRegistry::clone_from_arc(&self.func_registry.borrow());
+        registry.register_aggregate(function);
+        *self.func_registry.borrow_mut() = Arc::new(registry);
+    }
+
+    /// Register a custom window function.
+    ///
+    /// The function becomes available immediately for subsequent queries.
+    /// Overwrites any existing function with the same `(name, num_args)` key.
+    pub fn register_window_function<F>(&self, function: F)
+    where
+        F: fsqlite_func::WindowFunction + 'static,
+        F::State: 'static,
+    {
+        let func_name = function.name().to_owned();
+        let func_args = function.num_args();
+        tracing::info!(
+            target: "fsqlite.udf",
+            func_name = %func_name,
+            func_type = "window",
+            num_args = func_args,
+            "udf_register"
+        );
+        fsqlite_func::record_udf_registered();
+        let mut registry =
+            FunctionRegistry::clone_from_arc(&self.func_registry.borrow());
+        registry.register_window(function);
+        *self.func_registry.borrow_mut() = Arc::new(registry);
+    }
+
+    /// Return lowercase names of all custom aggregate UDFs in the registry.
+    ///
+    /// Used to populate the codegen thread-local so custom aggregates emit
+    /// AggStep/AggFinal opcodes instead of PureFunc.
+    fn extra_aggregate_names(&self) -> Vec<String> {
+        self.func_registry.borrow().aggregate_names_lowercase()
     }
 
     /// Prepare SQL into a statement.
@@ -1651,10 +1724,11 @@ impl Connection {
                     record_trace_span_created();
                     let _plan_guard = plan_span.enter();
                     let program = compile_expression_select(&rewritten)?;
+                    let registry = self.func_registry.borrow().clone();
                     let mut rows = execute_program_with_postprocess(
                         &program,
                         params,
-                        Some(&self.func_registry),
+                        Some(&registry),
                         Some(&build_expression_postprocess(&rewritten)),
                     )?;
                     if distinct {
@@ -2485,7 +2559,7 @@ impl Connection {
 
     /// Compile and wrap a statement into a `PreparedStatement`.
     fn compile_and_wrap(&self, statement: &Statement) -> Result<PreparedStatement> {
-        let registry = Some(Arc::clone(&self.func_registry));
+        let registry = Some(Arc::clone(&*self.func_registry.borrow()));
         match statement {
             Statement::Select(select) if is_expression_only_select(select) => {
                 let program = compile_expression_select(select)?;
@@ -5904,7 +5978,14 @@ impl Connection {
             concurrent_mode: self.is_concurrent_transaction(),
             rowid_alias_col_idx: None,
         };
-        codegen_select(&mut builder, select, &schema, &ctx).map_err(codegen_error_to_franken)?;
+        // Expose custom aggregate UDF names to the codegen so it emits
+        // AggStep/AggFinal instead of PureFunc for registered aggregates.
+        let extra_agg = self.extra_aggregate_names();
+        fsqlite_vdbe::codegen::set_extra_aggregate_names(extra_agg);
+        let result =
+            codegen_select(&mut builder, select, &schema, &ctx).map_err(codegen_error_to_franken);
+        fsqlite_vdbe::codegen::clear_extra_aggregate_names();
+        result?;
         builder.finish()
     }
 
@@ -7262,10 +7343,11 @@ impl Connection {
             None
         };
 
+        let func_reg = self.func_registry.borrow().clone();
         let (result, txn_back) = execute_table_program_with_db(
             program,
             params,
-            &self.func_registry,
+            &func_reg,
             &self.db,
             txn,
             cookie,
@@ -12496,6 +12578,52 @@ mod tests {
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
             .lock()
             .expect("raptorq telemetry test mutex should not be poisoned")
+    }
+
+    // ── Data visibility diagnostic test ─────────────────────────────────
+
+    #[test]
+    fn test_data_visibility_after_explicit_txn() {
+        let conn = Connection::open(":memory:".to_string()).unwrap();
+        // Create a table (like beads_rust schema)
+        conn.execute("CREATE TABLE IF NOT EXISTS issues (id TEXT PRIMARY KEY, title TEXT NOT NULL)").unwrap();
+        // Check schema
+        let schema = conn.schema.borrow();
+        let table = schema.iter().find(|t| t.name == "issues").unwrap();
+        let root_page = table.root_page;
+        eprintln!("[DIAG] issues table root_page={root_page}");
+        drop(schema);
+
+        // Check pager db_size after schema
+        {
+            let cx = conn.op_cx();
+            let txn = conn.pager.begin(&cx, super::TransactionMode::Deferred).unwrap();
+            eprintln!("[DIAG] After schema: can read root page {root_page}");
+            let page = txn.get_page(&cx, PageNumber::new(root_page as u32).unwrap()).unwrap();
+            let data = page.as_ref();
+            eprintln!("[DIAG] root page first_byte=0x{:02x} is_zero={}", data[0], data.iter().all(|&b| b == 0));
+            let _= txn.rollback(&cx);
+        }
+
+        // Explicit transaction: INSERT
+        conn.execute("BEGIN IMMEDIATE").unwrap();
+        conn.execute_with_params(
+            "INSERT INTO issues (id, title) VALUES (?, ?)",
+            &[SqliteValue::from("bd-1"), SqliteValue::from("Test")],
+        ).unwrap();
+        conn.execute("COMMIT").unwrap();
+
+        // Now read it back (autocommit)
+        let rows = conn.query_with_params(
+            "SELECT count(*) FROM issues WHERE id = ?",
+            &[SqliteValue::from("bd-1")],
+        ).unwrap();
+        let count = rows.first()
+            .and_then(|r| r.values().first())
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or(-1);
+        eprintln!("[DIAG] count after explicit txn: {count}");
+        assert_eq!(count, 1, "data inserted in explicit txn should be visible");
     }
 
     // ── Cx trace context propagation tests (bd-2g5.6) ─────────────────
