@@ -25,6 +25,7 @@ pub mod observability;
 pub mod physical_merge;
 pub mod retry_policy;
 pub mod rowid_alloc;
+pub mod seqlock;
 pub mod shared_lock_table;
 pub mod sheaf_conformal;
 pub mod shm;
@@ -128,6 +129,9 @@ pub use physical_merge::{
     CellOp, CellOpKind, FreeSpaceOp, HeaderOp, MergeError, MergeLadderResult, ParsedCell,
     ParsedPage, RangeXorPatch, StructuredPagePatch, apply_patch, diff_parsed_pages,
     evaluate_merge_ladder, merge_structured_patches, parse_btree_page, repack_btree_page,
+};
+pub use seqlock::{
+    SeqLock, SeqLockPair, SeqLockTriple, SeqlockMetrics, reset_seqlock_metrics, seqlock_metrics,
 };
 pub use retry_policy::{
     BetaPosterior, ContentionBucketKey, DEFAULT_CANDIDATE_WAITS_MS, DEFAULT_STARVATION_THRESHOLD,

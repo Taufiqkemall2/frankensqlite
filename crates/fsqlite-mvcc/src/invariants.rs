@@ -100,8 +100,9 @@ impl TxnManager {
     pub fn alloc_commit_seq(&self) -> CommitSeq {
         // We hold a lock to update active_commits atomically with the allocation
         // to ensure no race allows stable_commit_seq to jump past us.
+        let mut active = self.active_commits.lock();
         let seq = self.next_commit_seq.fetch_add(1, Ordering::Release);
-        self.active_commits.lock().insert(seq);
+        active.insert(seq);
         CommitSeq::new(seq)
     }
 
@@ -130,7 +131,7 @@ impl TxnManager {
         // We use MAX here because multiple threads might call finish concurrently
         // (if we had fine-grained locking, though currently serialized by caller).
         // But active_commits lock ensures we see a consistent view.
-        self.stable_commit_seq.store(new_stable, Ordering::Release);
+        self.stable_commit_seq.fetch_max(new_stable, Ordering::Release);
     }
 
     /// The current (not-yet-allocated) `TxnId` counter value.
@@ -293,10 +294,10 @@ impl VersionStore {
                 end_ts: None,
             },
         );
-        if let Some(old_head) = previous_head
-            && let Some(old_range) = ranges.get_mut(&old_head)
-        {
-            old_range.end_ts = Some(begin_ts);
+        if let Some(old_head) = previous_head {
+            if let Some(old_range) = ranges.get_mut(&old_head) {
+                old_range.end_ts = Some(begin_ts);
+            }
         }
         drop(ranges);
 

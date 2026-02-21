@@ -878,14 +878,14 @@ impl ConformalCalibrator {
     #[must_use]
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn upper_bound(&self) -> Option<f64> {
-        if !self.is_calibrated() {
+        if !self.is_calibrated() || self.residuals.is_empty() {
             return None;
         }
         let mut sorted = self.residuals.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         #[allow(clippy::cast_precision_loss)]
         let q_idx = ((1.0 - self.config.alpha) * (sorted.len() + 1) as f64).ceil() as usize;
-        let idx = q_idx.min(sorted.len()) - 1;
+        let idx = q_idx.min(sorted.len()).saturating_sub(1);
         Some(sorted[idx])
     }
 

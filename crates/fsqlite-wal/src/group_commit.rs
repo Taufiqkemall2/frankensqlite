@@ -1002,7 +1002,7 @@ mod tests {
         wal.append_frame(&cx, 2, &sample_page(0x02), 2)
             .expect("append commit");
         assert_eq!(wal.frame_count(), 2);
-        let checksum_after_2 = wal.running_checksum();
+        let _checksum_after_2 = wal.running_checksum();
 
         // Now write a consolidated batch.
         let batches = vec![TransactionFrameBatch::new(vec![

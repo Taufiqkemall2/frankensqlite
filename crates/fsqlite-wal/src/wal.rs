@@ -329,7 +329,8 @@ impl<F: VfsFile> WalFile<F> {
         let file_size = file.file_size(cx)?;
         let data_bytes =
             file_size.saturating_sub(u64::try_from(WAL_HEADER_SIZE).expect("header size fits u64"));
-        let max_frames = usize::try_from(data_bytes).unwrap_or(usize::MAX) / frame_size;
+        let max_frames = usize::try_from(data_bytes / u64::try_from(frame_size).unwrap_or(1))
+            .unwrap_or(usize::MAX);
 
         let mut running_checksum = header_checksum;
         let mut valid_frames = 0_usize;

@@ -240,7 +240,7 @@ impl GlobalCommitMarker {
         let timestamp_ns = u64::from_le_bytes(data[24..32].try_into().ok()?);
 
         let count = usize::try_from(participant_count).ok()?;
-        let needed = COMMIT_MARKER_MIN_SIZE + count * 12;
+        let needed = count.checked_mul(12)?.checked_add(COMMIT_MARKER_MIN_SIZE)?;
         if data.len() < needed {
             return None;
         }
