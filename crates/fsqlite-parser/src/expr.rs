@@ -602,7 +602,7 @@ impl Parser {
         if !self.eat_kind(&TokenKind::KwAnd) {
             return Err(self.err_here("expected AND in BETWEEN expression"));
         }
-        let high = self.parse_expr_bp(bp::NOT_PREFIX)?;
+        let high = self.parse_expr_bp(bp::EQUALITY.1)?;
         let span = lhs.span().merge(high.span());
         Ok(Expr::Between {
             expr: Box::new(lhs),
@@ -792,18 +792,21 @@ impl Parser {
 
     fn parse_type_name(&mut self) -> Result<TypeName, ParseError> {
         let mut parts = Vec::new();
-        while matches!(
-            self.peek_kind(),
-            TokenKind::Id(_) | TokenKind::QuotedId(_, _)
-        ) {
-            let tok = self.advance_token();
-            if let TokenKind::Id(s) | TokenKind::QuotedId(s, _) = &tok.kind {
-                parts.push(s.clone());
-            } else {
-                return Err(ParseError::at(
-                    "expected identifier in type name",
-                    Some(&tok),
-                ));
+        loop {
+            match self.peek_kind() {
+                TokenKind::Id(_) | TokenKind::QuotedId(_, _) => {
+                    let tok = self.advance_token();
+                    if let TokenKind::Id(s) | TokenKind::QuotedId(s, _) = &tok.kind {
+                        parts.push(s.clone());
+                    } else {
+                        unreachable!();
+                    }
+                }
+                k if is_nonreserved_kw(k) => {
+                    let tok = self.advance_token();
+                    parts.push(kw_to_str(&tok.kind));
+                }
+                _ => break,
             }
         }
         if parts.is_empty() {

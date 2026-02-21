@@ -1188,7 +1188,6 @@ pub(crate) fn apply_child_replacement<W: PageWriter>(
     if !touches_rightmost
         && header.page_type.is_interior()
         && !new_pgnos.is_empty()
-        && !new_dividers.is_empty()
     {
         let patch_idx = first_child + new_dividers.len();
         if patch_idx >= final_cells.len() {

@@ -1970,7 +1970,6 @@ pub(crate) fn is_nonreserved_kw(k: &TokenKind) -> bool {
             | TokenKind::KwVirtual
             | TokenKind::KwWindow
             | TokenKind::KwWithout
-            | TokenKind::KwAdd
     )
 }
 

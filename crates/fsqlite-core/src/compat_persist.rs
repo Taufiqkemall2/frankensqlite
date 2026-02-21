@@ -23,7 +23,11 @@ use fsqlite_types::value::SqliteValue;
 use fsqlite_types::{PageNumber, PageSize};
 use fsqlite_vdbe::codegen::{ColumnInfo, TableSchema};
 use fsqlite_vdbe::engine::MemDatabase;
-use fsqlite_vfs::{UnixVfs, host_fs};
+use fsqlite_vfs::host_fs;
+#[cfg(unix)]
+use fsqlite_vfs::UnixVfs as PlatformVfs;
+#[cfg(target_os = "windows")]
+use fsqlite_vfs::WindowsVfs as PlatformVfs;
 
 /// SQLite file header magic bytes (first 16 bytes).
 const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
@@ -82,7 +86,7 @@ pub fn persist_to_sqlite(
     }
 
     let cx = Cx::new();
-    let vfs = UnixVfs::new();
+    let vfs = PlatformVfs::new();
     let pager = SimplePager::open(vfs, path, DEFAULT_PAGE_SIZE)?;
     let mut txn = pager.begin(&cx, TransactionMode::Immediate)?;
 
@@ -196,7 +200,7 @@ pub fn persist_to_sqlite(
 #[allow(clippy::too_many_lines, clippy::similar_names)]
 pub fn load_from_sqlite(path: &Path) -> Result<LoadedState> {
     let cx = Cx::new();
-    let vfs = UnixVfs::new();
+    let vfs = PlatformVfs::new();
     let pager = SimplePager::open(vfs, path, DEFAULT_PAGE_SIZE)?;
     let mut txn = pager.begin(&cx, TransactionMode::ReadOnly)?;
 

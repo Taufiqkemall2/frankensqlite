@@ -77,12 +77,13 @@ impl SqliteValue {
             TypeAffinity::Integer => match &self {
                 Self::Text(s) => try_coerce_text_to_numeric(s).unwrap_or(self),
                 Self::Float(f) => {
-                    let i = *f as i64;
-                    if !f.is_nan() && (i as f64) == *f {
-                        Self::Integer(i)
-                    } else {
-                        self
+                    if *f >= -9_223_372_036_854_775_808.0 && *f < 9_223_372_036_854_775_808.0 {
+                        let i = *f as i64;
+                        if (i as f64) == *f {
+                            return Self::Integer(i);
+                        }
                     }
+                    self
                 }
                 _ => self,
             },
@@ -194,9 +195,9 @@ impl SqliteValue {
             Self::Null | Self::Blob(_) => 0,
             Self::Integer(i) => *i,
             Self::Float(f) => *f as i64,
-            Self::Text(s) => s.parse::<i64>().unwrap_or_else(|_| {
+            Self::Text(s) => s.trim().parse::<i64>().unwrap_or_else(|_| {
                 // Try parsing as float first, then truncate
-                s.parse::<f64>().map_or(0, |f| f as i64)
+                s.trim().parse::<f64>().map_or(0, |f| f as i64)
             }),
         }
     }
@@ -214,7 +215,7 @@ impl SqliteValue {
             Self::Null | Self::Blob(_) => 0.0,
             Self::Integer(i) => *i as f64,
             Self::Float(f) => *f,
-            Self::Text(s) => s.parse::<f64>().unwrap_or(0.0),
+            Self::Text(s) => s.trim().parse::<f64>().unwrap_or(0.0),
         }
     }
 
@@ -677,12 +678,15 @@ fn try_coerce_text_to_numeric(s: &str) -> Option<SqliteValue> {
         if !f.is_finite() {
             return None;
         }
-        // If the float is an exact integer value, store as integer.
-        #[allow(clippy::cast_possible_truncation)]
-        let i = f as i64;
-        #[allow(clippy::cast_precision_loss)]
-        if (i as f64) == f {
-            return Some(SqliteValue::Integer(i));
+        // If the float is an exact integer value within bounds, store as integer.
+        // Checking bounds prevents incorrect saturation for values >= 2^63.
+        if f >= -9_223_372_036_854_775_808.0 && f < 9_223_372_036_854_775_808.0 {
+            #[allow(clippy::cast_possible_truncation)]
+            let i = f as i64;
+            #[allow(clippy::cast_precision_loss)]
+            if (i as f64) == f {
+                return Some(SqliteValue::Integer(i));
+            }
         }
         return Some(SqliteValue::Float(f));
     }

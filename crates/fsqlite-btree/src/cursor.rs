@@ -661,9 +661,14 @@ impl<P: PageReader> BtCursor<P> {
                     BinarySearchResult::NotFound(idx) => {
                         let mut entry = entry;
                         if idx >= entry.header.cell_count {
-                            entry.cell_idx = entry.header.cell_count;
+                            if entry.header.cell_count > 0 {
+                                entry.cell_idx = entry.header.cell_count - 1;
+                            } else {
+                                entry.cell_idx = 0;
+                            }
                             self.stack.push(entry);
-                            self.at_eof = true;
+                            self.at_eof = false;
+                            self.advance_next(cx)?;
                         } else {
                             entry.cell_idx = idx;
                             self.stack.push(entry);
@@ -783,9 +788,14 @@ impl<P: PageReader> BtCursor<P> {
                     BinarySearchResult::NotFound(idx) => {
                         let mut entry = entry;
                         if idx >= entry.header.cell_count {
-                            entry.cell_idx = entry.header.cell_count;
+                            if entry.header.cell_count > 0 {
+                                entry.cell_idx = entry.header.cell_count - 1;
+                            } else {
+                                entry.cell_idx = 0;
+                            }
                             self.stack.push(entry);
-                            self.at_eof = true;
+                            self.at_eof = false;
+                            self.advance_next(cx)?;
                         } else {
                             entry.cell_idx = idx;
                             self.stack.push(entry);
@@ -875,7 +885,7 @@ impl<P: PageReader> BtCursor<P> {
             let cell = self.parse_cell_at(entry, mid)?;
             let key = self.read_cell_payload(cx, entry, &cell)?;
 
-            if target <= key.as_slice() {
+            if target < key.as_slice() {
                 hi = mid;
             } else {
                 lo = mid + 1;
@@ -1435,17 +1445,20 @@ impl<P: PageWriter> BtCursor<P> {
         if new_count == 0 {
             refreshed.cell_idx = 0;
             self.at_eof = true;
+            self.stack[depth - 1] = refreshed;
         } else if delete_idx >= usize::from(new_count) {
-            refreshed.cell_idx = new_count;
-            self.at_eof = true;
+            refreshed.cell_idx = new_count - 1;
+            self.stack[depth - 1] = refreshed;
+            self.at_eof = false;
+            self.advance_next(cx)?;
         } else {
             #[allow(clippy::cast_possible_truncation)]
             {
                 refreshed.cell_idx = delete_idx as u16;
             }
             self.at_eof = false;
+            self.stack[depth - 1] = refreshed;
         }
-        self.stack[depth - 1] = refreshed;
 
         // Now it is safe to free the overflow chain.
         if let Some(first) = overflow_head {
