@@ -287,12 +287,8 @@ fn enforce_constraints(
     constraints: &TableConstraints,
 ) -> Result<(), RebaseError> {
     // NOT NULL checks.
-    for (i, (&is_not_null, val)) in constraints
-        .not_null
-        .iter()
-        .zip(updated_row.iter())
-        .enumerate()
-    {
+    for (i, &is_not_null) in constraints.not_null.iter().enumerate() {
+        let val = updated_row.get(i).unwrap_or(&SqliteValue::Null);
         if is_not_null && matches!(val, SqliteValue::Null) {
             return Err(RebaseError::NotNullViolation {
                 table: constraints.table_id,

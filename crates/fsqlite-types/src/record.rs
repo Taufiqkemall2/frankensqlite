@@ -35,7 +35,7 @@ pub fn parse_record(data: &[u8]) -> Option<Vec<SqliteValue>> {
     let mut serial_types = Vec::new();
     let mut offset = hdr_varint_len;
     while offset < header_size {
-        let (serial_type, consumed) = read_varint(&data[offset..])?;
+        let (serial_type, consumed) = read_varint(&data[offset..header_size])?;
         serial_types.push(serial_type);
         offset += consumed;
     }

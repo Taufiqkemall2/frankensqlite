@@ -360,9 +360,9 @@ fn eval_binary_op(op: RebaseBinaryOp, left: SqliteValue, right: SqliteValue) -> 
     let right = right.apply_affinity(TypeAffinity::Numeric);
 
     match op {
-        RebaseBinaryOp::Add => numeric_add(&left, &right),
-        RebaseBinaryOp::Subtract => numeric_sub(&left, &right),
-        RebaseBinaryOp::Multiply => numeric_mul(&left, &right),
+        RebaseBinaryOp::Add => left.sql_add(&right),
+        RebaseBinaryOp::Subtract => left.sql_sub(&right),
+        RebaseBinaryOp::Multiply => left.sql_mul(&right),
         RebaseBinaryOp::Divide => numeric_div(&left, &right),
         RebaseBinaryOp::Remainder => numeric_rem(&left, &right),
         RebaseBinaryOp::BitwiseAnd => integer_bitop(&left, &right, |a, b| a & b),
@@ -392,57 +392,6 @@ fn eval_binary_op(op: RebaseBinaryOp, left: SqliteValue, right: SqliteValue) -> 
     }
 }
 
-fn to_integer(v: &SqliteValue) -> i64 {
-    match v {
-        SqliteValue::Integer(i) => *i,
-        #[allow(clippy::cast_possible_truncation)]
-        SqliteValue::Float(f) => *f as i64,
-        _ => 0,
-    }
-}
-
-fn to_float(v: &SqliteValue) -> f64 {
-    match v {
-        #[allow(clippy::cast_precision_loss)]
-        SqliteValue::Integer(i) => *i as f64,
-        SqliteValue::Float(f) => *f,
-        _ => 0.0,
-    }
-}
-
-fn numeric_add(l: &SqliteValue, r: &SqliteValue) -> SqliteValue {
-    if let (SqliteValue::Integer(a), SqliteValue::Integer(b)) = (l, r) {
-        match a.checked_add(*b) {
-            Some(v) => SqliteValue::Integer(v),
-            None => SqliteValue::Float((*a as f64) + (*b as f64)),
-        }
-    } else {
-        SqliteValue::Float(to_float(l) + to_float(r))
-    }
-}
-
-fn numeric_sub(l: &SqliteValue, r: &SqliteValue) -> SqliteValue {
-    if let (SqliteValue::Integer(a), SqliteValue::Integer(b)) = (l, r) {
-        match a.checked_sub(*b) {
-            Some(v) => SqliteValue::Integer(v),
-            None => SqliteValue::Float((*a as f64) - (*b as f64)),
-        }
-    } else {
-        SqliteValue::Float(to_float(l) - to_float(r))
-    }
-}
-
-fn numeric_mul(l: &SqliteValue, r: &SqliteValue) -> SqliteValue {
-    if let (SqliteValue::Integer(a), SqliteValue::Integer(b)) = (l, r) {
-        match a.checked_mul(*b) {
-            Some(v) => SqliteValue::Integer(v),
-            None => SqliteValue::Float((*a as f64) * (*b as f64)),
-        }
-    } else {
-        SqliteValue::Float(to_float(l) * to_float(r))
-    }
-}
-
 fn numeric_div(l: &SqliteValue, r: &SqliteValue) -> SqliteValue {
     if let (SqliteValue::Integer(a), SqliteValue::Integer(b)) = (l, r) {
         if *b == 0 {
@@ -450,11 +399,11 @@ fn numeric_div(l: &SqliteValue, r: &SqliteValue) -> SqliteValue {
         }
         SqliteValue::Integer(a.wrapping_div(*b))
     } else {
-        let fb = to_float(r);
+        let fb = r.to_float();
         if fb == 0.0 {
             return SqliteValue::Null;
         }
-        SqliteValue::Float(to_float(l) / fb)
+        SqliteValue::from(l.to_float() / fb)
     }
 }
 
@@ -465,16 +414,16 @@ fn numeric_rem(l: &SqliteValue, r: &SqliteValue) -> SqliteValue {
         }
         SqliteValue::Integer(a.wrapping_rem(*b))
     } else {
-        let fb = to_float(r);
+        let fb = r.to_float();
         if fb == 0.0 {
             return SqliteValue::Null;
         }
-        SqliteValue::Float(to_float(l) % fb)
+        SqliteValue::from(l.to_float() % fb)
     }
 }
 
 fn integer_bitop(l: &SqliteValue, r: &SqliteValue, f: impl FnOnce(i64, i64) -> i64) -> SqliteValue {
-    SqliteValue::Integer(f(to_integer(l), to_integer(r)))
+    SqliteValue::Integer(f(l.to_integer(), r.to_integer()))
 }
 
 /// Evaluate a built-in function. Only a limited set is supported for rebase.
