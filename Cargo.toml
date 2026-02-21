@@ -35,6 +35,9 @@ edition = "2024"
 license-file = "LICENSE"
 repository = "https://github.com/Dicklesworthstone/frankensqlite"
 rust-version = "1.85"
+readme = "README.md"
+keywords = ["sqlite", "database", "embedded", "sql", "pure-rust"]
+categories = ["database-implementations", "parser-implementations"]
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -42,47 +45,98 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }
+cast_lossless = { level = "allow", priority = 1 }
+cast_possible_truncation = { level = "allow", priority = 1 }
+cast_possible_wrap = { level = "allow", priority = 1 }
 cast_precision_loss = { level = "allow", priority = 1 }
+cast_sign_loss = { level = "allow", priority = 1 }
 doc_markdown = { level = "allow", priority = 1 }
 missing_const_for_fn = { level = "allow", priority = 1 }
-uninlined_format_args = { level = "allow", priority = 1 }
 missing_errors_doc = { level = "allow", priority = 1 }
 missing_panics_doc = { level = "allow", priority = 1 }
 module_name_repetitions = { level = "allow", priority = 1 }
 must_use_candidate = { level = "allow", priority = 1 }
 option_if_let_else = { level = "allow", priority = 1 }
+significant_drop_tightening = { level = "allow", priority = 1 }
+similar_names = { level = "allow", priority = 1 }
+too_many_lines = { level = "allow", priority = 1 }
+unreadable_literal = { level = "allow", priority = 1 }
+uninlined_format_args = { level = "allow", priority = 1 }
+# Test-heavy patterns: these pedantic/nursery lints fire pervasively in the
+# 200+ harness test files and add noise without catching real bugs.
+assertions_on_constants = { level = "allow", priority = 1 }
+bool_to_int_with_if = { level = "allow", priority = 1 }
+case_sensitive_file_extension_comparisons = { level = "allow", priority = 1 }
+collection_is_never_read = { level = "allow", priority = 1 }
+explicit_iter_loop = { level = "allow", priority = 1 }
+float_cmp = { level = "allow", priority = 1 }
+format_push_string = { level = "allow", priority = 1 }
+if_then_some_else_none = { level = "allow", priority = 1 }
+let_and_return = { level = "allow", priority = 1 }
+many_single_char_names = { level = "allow", priority = 1 }
+manual_range_contains = { level = "allow", priority = 1 }
+needless_collect = { level = "allow", priority = 1 }
+needless_pass_by_value = { level = "allow", priority = 1 }
+no_effect_underscore_binding = { level = "allow", priority = 1 }
+redundant_clone = { level = "allow", priority = 1 }
+redundant_closure_for_method_calls = { level = "allow", priority = 1 }
+return_self_not_must_use = { level = "allow", priority = 1 }
+single_char_pattern = { level = "allow", priority = 1 }
+single_match = { level = "allow", priority = 1 }
+stable_sort_primitive = { level = "allow", priority = 1 }
+used_underscore_binding = { level = "allow", priority = 1 }
+useless_format = { level = "allow", priority = 1 }
+useless_vec = { level = "allow", priority = 1 }
+wildcard_enum_match_arm = { level = "allow", priority = 1 }
+# Additional pedantic lints that generate noise in test code
+approx_constant = { level = "allow", priority = 1 }
+cloned_ref_to_slice_refs = { level = "allow", priority = 1 }
+default_trait_access = { level = "allow", priority = 1 }
+expect_fun_call = { level = "allow", priority = 1 }
+format_collect = { level = "allow", priority = 1 }
+if_not_else = { level = "allow", priority = 1 }
+items_after_statements = { level = "allow", priority = 1 }
+manual_assert = { level = "allow", priority = 1 }
+manual_checked_ops = { level = "allow", priority = 1 }
+manual_let_else = { level = "allow", priority = 1 }
+manual_string_new = { level = "allow", priority = 1 }
+map_unwrap_or = { level = "allow", priority = 1 }
+match_wildcard_for_single_variants = { level = "allow", priority = 1 }
+single_match_else = { level = "allow", priority = 1 }
+unnecessary_cast = { level = "allow", priority = 1 }
+unnecessary_literal_bound = { level = "allow", priority = 1 }
 
 [workspace.dependencies]
 # Internal crates
-fsqlite-types = { path = "crates/fsqlite-types" }
-fsqlite-error = { path = "crates/fsqlite-error" }
-fsqlite-vfs = { path = "crates/fsqlite-vfs" }
-fsqlite-pager = { path = "crates/fsqlite-pager" }
-fsqlite-wal = { path = "crates/fsqlite-wal" }
-fsqlite-mvcc = { path = "crates/fsqlite-mvcc" }
-fsqlite-btree = { path = "crates/fsqlite-btree" }
-fsqlite-ast = { path = "crates/fsqlite-ast" }
-fsqlite-parser = { path = "crates/fsqlite-parser" }
-fsqlite-planner = { path = "crates/fsqlite-planner" }
-fsqlite-vdbe = { path = "crates/fsqlite-vdbe" }
-fsqlite-func = { path = "crates/fsqlite-func" }
-fsqlite-ext-fts3 = { path = "crates/fsqlite-ext-fts3" }
-fsqlite-ext-fts5 = { path = "crates/fsqlite-ext-fts5" }
-fsqlite-ext-rtree = { path = "crates/fsqlite-ext-rtree" }
-fsqlite-ext-json = { path = "crates/fsqlite-ext-json" }
-fsqlite-ext-session = { path = "crates/fsqlite-ext-session" }
-fsqlite-ext-icu = { path = "crates/fsqlite-ext-icu" }
-fsqlite-ext-misc = { path = "crates/fsqlite-ext-misc" }
-fsqlite-core = { path = "crates/fsqlite-core" }
-fsqlite = { path = "crates/fsqlite" }
-fsqlite-cli = { path = "crates/fsqlite-cli" }
-fsqlite-harness = { path = "crates/fsqlite-harness" }
-fsqlite-e2e = { path = "crates/fsqlite-e2e" }
-fsqlite-observability = { path = "crates/fsqlite-observability" }
-fsqlite-c-api = { path = "crates/fsqlite-c-api" }
+fsqlite-types = { version = "0.1.0", path = "crates/fsqlite-types" }
+fsqlite-error = { version = "0.1.0", path = "crates/fsqlite-error" }
+fsqlite-vfs = { version = "0.1.0", path = "crates/fsqlite-vfs" }
+fsqlite-pager = { version = "0.1.0", path = "crates/fsqlite-pager" }
+fsqlite-wal = { version = "0.1.0", path = "crates/fsqlite-wal" }
+fsqlite-mvcc = { version = "0.1.0", path = "crates/fsqlite-mvcc" }
+fsqlite-btree = { version = "0.1.0", path = "crates/fsqlite-btree" }
+fsqlite-ast = { version = "0.1.0", path = "crates/fsqlite-ast" }
+fsqlite-parser = { version = "0.1.0", path = "crates/fsqlite-parser" }
+fsqlite-planner = { version = "0.1.0", path = "crates/fsqlite-planner" }
+fsqlite-vdbe = { version = "0.1.0", path = "crates/fsqlite-vdbe" }
+fsqlite-func = { version = "0.1.0", path = "crates/fsqlite-func" }
+fsqlite-ext-fts3 = { version = "0.1.0", path = "crates/fsqlite-ext-fts3" }
+fsqlite-ext-fts5 = { version = "0.1.0", path = "crates/fsqlite-ext-fts5" }
+fsqlite-ext-rtree = { version = "0.1.0", path = "crates/fsqlite-ext-rtree" }
+fsqlite-ext-json = { version = "0.1.0", path = "crates/fsqlite-ext-json" }
+fsqlite-ext-session = { version = "0.1.0", path = "crates/fsqlite-ext-session" }
+fsqlite-ext-icu = { version = "0.1.0", path = "crates/fsqlite-ext-icu" }
+fsqlite-ext-misc = { version = "0.1.0", path = "crates/fsqlite-ext-misc" }
+fsqlite-core = { version = "0.1.0", path = "crates/fsqlite-core" }
+fsqlite = { version = "0.1.0", path = "crates/fsqlite" }
+fsqlite-cli = { version = "0.1.0", path = "crates/fsqlite-cli" }
+fsqlite-harness = { version = "0.1.0", path = "crates/fsqlite-harness" }
+fsqlite-e2e = { version = "0.1.0", path = "crates/fsqlite-e2e" }
+fsqlite-observability = { version = "0.1.0", path = "crates/fsqlite-observability" }
+fsqlite-c-api = { version = "0.1.0", path = "crates/fsqlite-c-api" }
 
 # External dependencies
-ftui = { version = "0.2.0", path = "../frankentui/crates/ftui" }
+ftui = { version = "0.2.1" }
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
@@ -105,7 +159,7 @@ argon2 = "0.5"
 rand = "0.8"
 hashbrown = { version = "0.14", features = ["serde"] }
 rusqlite = { version = "0.32", features = ["bundled", "backup"] }
-asupersync = { version = "0.2.0", path = "../asupersync" }
+asupersync = { version = "0.2.5" }
 
 # Dev dependencies
 criterion = { version = "0.5", features = ["html_reports"] }
