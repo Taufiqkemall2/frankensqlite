@@ -647,7 +647,7 @@ fn split_oversized_leaves<K: Ord + Clone, V: Clone>(
 ) {
     let mut i = 0;
     while i < children.len() {
-        if let BeNode::Leaf { entries } = &mut children[i] {
+        let split_data = if let BeNode::Leaf { entries } = &mut children[i] {
             if entries.len() > leaf_cap {
                 let mid = entries.len() / 2;
                 let right_entries = entries.split_off(mid);
@@ -655,11 +655,19 @@ fn split_oversized_leaves<K: Ord + Clone, V: Clone>(
                 let right_leaf = BeNode::Leaf {
                     entries: right_entries,
                 };
-                pivots.insert(i, new_pivot);
-                children.insert(i + 1, right_leaf);
-                // Don't increment i — re-check the left half.
-                continue;
+                Some((new_pivot, right_leaf))
+            } else {
+                None
             }
+        } else {
+            None
+        };
+
+        if let Some((new_pivot, right_leaf)) = split_data {
+            pivots.insert(i, new_pivot);
+            children.insert(i + 1, right_leaf);
+            // Don't increment i — re-check the left half.
+            continue;
         }
         i += 1;
     }
@@ -673,22 +681,13 @@ fn split_oversized_interiors<K: Ord + Clone, V: Clone>(
 ) {
     let mut i = 0;
     while i < children.len() {
-        let should_split = if let BeNode::Interior {
-            pivots: cpivots, ..
-        } = &children[i]
+        let split_data = if let BeNode::Interior {
+            pivots: cpivots,
+            children: cchildren,
+            buffer: cbuffer,
+        } = &mut children[i]
         {
-            cpivots.len() > max_pivots
-        } else {
-            false
-        };
-
-        if should_split {
-            if let BeNode::Interior {
-                pivots: cpivots,
-                children: cchildren,
-                buffer: cbuffer,
-            } = &mut children[i]
-            {
+            if cpivots.len() > max_pivots {
                 let mid = cpivots.len() / 2;
                 let promote = cpivots[mid].clone();
 
@@ -714,11 +713,18 @@ fn split_oversized_interiors<K: Ord + Clone, V: Clone>(
                     children: right_children,
                     buffer: right_buf,
                 };
-
-                pivots.insert(i, promote);
-                children.insert(i + 1, right_node);
-                continue;
+                Some((promote, right_node))
+            } else {
+                None
             }
+        } else {
+            None
+        };
+
+        if let Some((promote, right_node)) = split_data {
+            pivots.insert(i, promote);
+            children.insert(i + 1, right_node);
+            continue;
         }
         i += 1;
     }

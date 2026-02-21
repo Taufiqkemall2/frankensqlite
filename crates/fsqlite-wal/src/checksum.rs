@@ -658,7 +658,7 @@ pub fn integrity_check_sqlite_file_level1(db_bytes: &[u8]) -> Result<IntegrityCh
 pub fn integrity_check_level2_btree(
     page_number: u32,
     page_size: usize,
-    cell_spans: &[(u16, u16)],
+    cell_spans: &[(u16, u32)],
     keys: &[i64],
 ) -> IntegrityCheckReport {
     let mut report = IntegrityCheckReport::ok(1);
@@ -676,8 +676,8 @@ pub fn integrity_check_level2_btree(
     sorted_spans.sort_unstable_by_key(|&(start, _)| start);
 
     for (start, end) in &sorted_spans {
-        let start_usize = usize::from(*start);
-        let end_usize = usize::from(*end);
+        let start_usize = *start as usize;
+        let end_usize = *end as usize;
         if start_usize >= end_usize || end_usize > page_size {
             report.push(
                 IntegrityCheckLevel::BtreeStructural,
@@ -690,7 +690,7 @@ pub fn integrity_check_level2_btree(
     for window in sorted_spans.windows(2) {
         let (_, prev_end) = window[0];
         let (next_start, _) = window[1];
-        if prev_end > next_start {
+        if prev_end > u32::from(next_start) {
             report.push(
                 IntegrityCheckLevel::BtreeStructural,
                 Some(page_number),

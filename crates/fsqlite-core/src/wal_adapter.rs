@@ -173,7 +173,9 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         for i in (0..=last_commit_frame).rev() {
             let header = self.wal.read_frame_header(cx, i)?;
             if header.page_number == page_number {
-                let (_, data) = self.wal.read_frame(cx, i)?;
+                let mut frame_buf = vec![0u8; self.wal.frame_size()];
+                self.wal.read_frame_into(cx, i, &mut frame_buf)?;
+                let data = frame_buf[fsqlite_wal::checksum::WAL_FRAME_HEADER_SIZE..].to_vec();
                 debug!(
                     page_number,
                     frame_index = i,
@@ -259,41 +261,6 @@ struct CheckpointTargetAdapterRef<'a> {
 }
 
 impl CheckpointTarget for CheckpointTargetAdapterRef<'_> {
-    fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
-        self.writer.write_page(cx, page_no, data)
-    }
-
-    fn truncate_db(&mut self, cx: &Cx, n_pages: u32) -> Result<()> {
-        self.writer.truncate(cx, n_pages)
-    }
-
-    fn sync_db(&mut self, cx: &Cx) -> Result<()> {
-        self.writer.sync(cx)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// CheckpointTargetAdapter: CheckpointPageWriter → CheckpointTarget
-// ---------------------------------------------------------------------------
-
-/// Adapter wrapping [`CheckpointPageWriter`] to implement the WAL executor's
-/// [`CheckpointTarget`] trait.
-///
-/// During checkpoint, the WAL executor calls `CheckpointTarget` methods to
-/// write pages back to the database file. This adapter delegates those calls
-/// to the pager's sealed `CheckpointPageWriter`.
-pub struct CheckpointTargetAdapter {
-    writer: Box<dyn CheckpointPageWriter>,
-}
-
-impl CheckpointTargetAdapter {
-    /// Wrap a boxed [`CheckpointPageWriter`] in the adapter.
-    pub fn new(writer: Box<dyn CheckpointPageWriter>) -> Self {
-        Self { writer }
-    }
-}
-
-impl CheckpointTarget for CheckpointTargetAdapter {
     fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
         self.writer.write_page(cx, page_no, data)
     }

@@ -288,10 +288,8 @@ impl VfsFile for IoUringFile {
 
     fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
         checkpoint_or_abort(cx)?;
-        if self.runtime.is_available() {
-            if self.write_via_uring(buf, offset).is_ok() {
-                return Ok(());
-            }
+        if self.runtime.is_available() && self.write_via_uring(buf, offset).is_ok() {
+            return Ok(());
         }
         self.inner.write(cx, buf, offset)
     }

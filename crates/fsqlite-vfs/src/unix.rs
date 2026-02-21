@@ -1519,8 +1519,42 @@ impl VfsFile for UnixFile {
 
         let shm_info = self.ensure_shm_info()?;
         let mut info = shm_info.lock().expect("shm info lock poisoned");
-        if let Some(existing) = info.regions.get(&region) {
-            return Ok(existing.clone());
+        if let Some(existing) = info.regions.get(&region).cloned() {
+            let requested_size = usize::try_from(size).map_err(|_| FrankenError::LockFailed {
+                detail: format!("shm_map size too large: {size}"),
+            })?;
+            if existing.len() >= requested_size {
+                drop(info);
+                return Ok(existing);
+            }
+            if !extend {
+                drop(info);
+                return Err(FrankenError::LockFailed {
+                    detail: format!(
+                        "shm region {region} is {} bytes, requested {requested_size} bytes without extend",
+                        existing.len()
+                    ),
+                });
+            }
+
+            let replacement = ShmRegion::new(requested_size);
+            {
+                let existing_guard = existing.lock();
+                let mut replacement_guard = replacement.lock();
+                let copy_len = existing_guard.len().min(replacement_guard.len());
+                replacement_guard[..copy_len].copy_from_slice(&existing_guard[..copy_len]);
+            }
+            let region_count = u64::from(region) + 1;
+            let target_len =
+                region_count
+                    .checked_mul(u64::from(size))
+                    .ok_or_else(|| FrankenError::LockFailed {
+                        detail: "shm_map file length overflow".to_string(),
+                    })?;
+            info.file.set_len(target_len).map_err(FrankenError::Io)?;
+            info.regions.insert(region, replacement.clone());
+            drop(info);
+            return Ok(replacement);
         }
         if !extend {
             return Err(FrankenError::CannotOpen {

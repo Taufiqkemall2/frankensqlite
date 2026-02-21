@@ -520,7 +520,13 @@ impl S3Fifo {
             Some(EntryState::Ghost) => {
                 self.remove_ghost(page_id);
                 self.ghost_hits_since_adapt = self.ghost_hits_since_adapt.saturating_add(1);
+                
+                self.main.push_back(page_id);
+                self.index.insert(page_id, EntryState::Resident(ResidentState::main()));
                 events.push(S3FifoEvent::GhostReadmission(page_id));
+                
+                self.rebalance(&mut events);
+                return events;
             }
             None => {}
         }

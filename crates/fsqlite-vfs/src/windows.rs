@@ -768,6 +768,14 @@ impl VfsFile for WindowsFile {
             let region_ref = match entry {
                 std::collections::hash_map::Entry::Occupied(mut occupied) => {
                     if occupied.get().len() < size_usize {
+                        if !extend {
+                            return Err(FrankenError::LockFailed {
+                                detail: format!(
+                                    "shm region {region} is {} bytes, requested {size_usize} bytes without extend",
+                                    occupied.get().len()
+                                ),
+                            });
+                        }
                         let replacement = ShmRegion::new(size_usize);
                         {
                             let current = occupied.get();

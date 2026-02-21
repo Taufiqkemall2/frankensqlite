@@ -1622,6 +1622,8 @@ impl Connection {
                 | Statement::Delete(_)
                 | Statement::CreateTable(_)
                 | Statement::CreateVirtualTable(_)
+                | Statement::CreateView(_)
+                | Statement::CreateTrigger(_)
                 | Statement::Drop(_)
                 | Statement::AlterTable(_)
                 | Statement::CreateIndex(_)
@@ -3804,7 +3806,8 @@ impl Connection {
     /// Execute an ALTER TABLE statement.
     fn execute_alter_table(&self, alter: &fsqlite_ast::AlterTableStatement) -> Result<()> {
         let table_name = &alter.table.name;
-        match &alter.action {
+        let old_name = table_name.clone();
+        let new_schema = match &alter.action {
             AlterTableAction::RenameTo(new_name) => {
                 let mut schema = self.schema.borrow_mut();
                 let table = schema
@@ -3814,6 +3817,7 @@ impl Connection {
                         name: table_name.clone(),
                     })?;
                 table.name.clone_from(new_name);
+                table.clone()
             }
             AlterTableAction::RenameColumn { old, new } => {
                 let mut schema = self.schema.borrow_mut();
@@ -3829,6 +3833,7 @@ impl Connection {
                     .find(|c| c.name.eq_ignore_ascii_case(old))
                     .ok_or_else(|| FrankenError::Internal(format!("no such column: {old}")))?;
                 col.name.clone_from(new);
+                table.clone()
             }
             AlterTableAction::AddColumn(col_def) => {
                 let affinity = col_def
@@ -3858,6 +3863,7 @@ impl Connection {
                     notnull,
                     default_value,
                 });
+                table.clone()
             }
             AlterTableAction::DropColumn(col_name) => {
                 let mut schema = self.schema.borrow_mut();
@@ -3873,8 +3879,20 @@ impl Connection {
                     .position(|c| c.name.eq_ignore_ascii_case(col_name))
                     .ok_or_else(|| FrankenError::Internal(format!("no such column: {col_name}")))?;
                 table.columns.remove(col_idx);
+                table.clone()
             }
-        }
+        };
+
+        self.delete_sqlite_master_row(&old_name)?;
+        let create_sql = crate::compat_persist::build_create_table_sql(&new_schema);
+        self.insert_sqlite_master_row(
+            "table",
+            &new_schema.name,
+            &new_schema.name,
+            new_schema.root_page,
+            &create_sql,
+        )?;
+
         self.increment_schema_cookie();
         Ok(())
     }
