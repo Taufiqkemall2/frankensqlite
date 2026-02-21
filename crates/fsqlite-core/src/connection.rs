@@ -1883,6 +1883,7 @@ impl Connection {
                         }
                         // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                         *self.last_changes.borrow_mut() = affected;
+                        #[allow(clippy::cast_possible_wrap)]
                         set_last_changes(affected as i64);
                         return Ok(Vec::new());
                     }
@@ -1930,6 +1931,7 @@ impl Connection {
 
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 *self.last_changes.borrow_mut() = affected;
+                #[allow(clippy::cast_possible_wrap)]
                 set_last_changes(affected as i64);
                 if insert.returning.is_empty() {
                     Ok(Vec::new())
@@ -2020,6 +2022,7 @@ impl Connection {
 
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 *self.last_changes.borrow_mut() = affected;
+                #[allow(clippy::cast_possible_wrap)]
                 set_last_changes(affected as i64);
                 if update.returning.is_empty() {
                     Ok(Vec::new())
@@ -2096,6 +2099,7 @@ impl Connection {
 
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 *self.last_changes.borrow_mut() = affected;
+                #[allow(clippy::cast_possible_wrap)]
                 set_last_changes(affected as i64);
                 if delete.returning.is_empty() {
                     Ok(Vec::new())
@@ -2203,6 +2207,7 @@ impl Connection {
         }
     }
 
+    #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
     fn execute_insert_select_fallback(
         &self,
         insert: &fsqlite_ast::InsertStatement,
@@ -3669,6 +3674,7 @@ impl Connection {
     }
 
     /// Execute a DROP statement (TABLE, INDEX, VIEW, TRIGGER).
+    #[allow(clippy::too_many_lines)]
     fn execute_drop(&self, drop_stmt: &fsqlite_ast::DropStatement) -> Result<()> {
         let swallow_missing_master =
             |err: FrankenError| -> Result<()> {
@@ -4876,6 +4882,7 @@ impl Connection {
         }
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn finalize_concurrent_commit_with_registry(
         &self,
         registry: &mut ConcurrentRegistry,
@@ -5527,16 +5534,12 @@ impl Connection {
                 let to_i64_usize = |value: usize| i64::try_from(value).unwrap_or(i64::MAX);
                 let snapshot = self.pager.cache_metrics_snapshot()?;
                 let total_accesses = snapshot.total_accesses();
-                let hit_rate_pct = if total_accesses == 0 {
-                    0
-                } else {
-                    let rounded_pct = snapshot
-                        .hits
-                        .saturating_mul(100)
-                        .saturating_add(total_accesses / 2)
-                        / total_accesses;
-                    to_i64_u64(rounded_pct)
-                };
+                let hit_rate_pct = snapshot
+                    .hits
+                    .saturating_mul(100)
+                    .saturating_add(total_accesses / 2)
+                    .checked_div(total_accesses)
+                    .map_or(0, to_i64_u64);
                 Ok(vec![
                     Row {
                         values: vec![
@@ -5881,7 +5884,7 @@ impl Connection {
             // PRAGMA table_info(table_name) — return column metadata.
             "table_info" | "table_xinfo" => {
                 let table_name = match pragma.value.as_ref() {
-                    Some(PragmaValue::Call(expr)) | Some(PragmaValue::Assign(expr)) => {
+                    Some(PragmaValue::Call(expr) | PragmaValue::Assign(expr)) => {
                         match expr {
                             Expr::Column(col_ref, _) if col_ref.table.is_none() => {
                                 col_ref.column.clone()
@@ -7435,6 +7438,7 @@ impl Connection {
                     session_id,
                     registry: Arc::clone(&self.concurrent_registry),
                     lock_table: Arc::clone(&self.concurrent_lock_table),
+                    #[allow(clippy::cast_sign_loss)]
                     busy_timeout_ms: self.pragma_state.borrow().busy_timeout_ms.max(0) as u64,
                 })
         } else {
@@ -9375,6 +9379,7 @@ fn format_expr_as_default(expr: &Expr) -> String {
             Literal::Float(f) => f.to_string(),
             Literal::String(s) => format!("'{s}'"),
             Literal::Blob(b) => {
+                #[allow(clippy::format_collect)]
                 let hex: String = b.iter().map(|byte| format!("{byte:02X}")).collect();
                 format!("X'{hex}'")
             }
@@ -12771,8 +12776,9 @@ mod tests {
         // Check pager db_size after schema
         {
             let cx = conn.op_cx();
-            let txn = conn.pager.begin(&cx, super::TransactionMode::Deferred).unwrap();
+            let mut txn = conn.pager.begin(&cx, super::TransactionMode::Deferred).unwrap();
             eprintln!("[DIAG] After schema: can read root page {root_page}");
+            #[allow(clippy::cast_sign_loss)]
             let page = txn.get_page(&cx, PageNumber::new(root_page as u32).unwrap()).unwrap();
             let data = page.as_ref();
             eprintln!("[DIAG] root page first_byte=0x{:02x} is_zero={}", data[0], data.iter().all(|&b| b == 0));
@@ -18051,6 +18057,8 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::significant_drop_tightening)]
     fn test_sql_concurrent_updates_populate_write_sets() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("write_set_probe.db");

@@ -174,6 +174,7 @@ impl CountMinSketch {
     }
 
     /// Observe an item with a given count increment.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn observe_n(&mut self, item: u64, count: u64) {
         for (row, seed) in self.seeds.iter().enumerate() {
             let hash = mix64(item ^ *seed);
@@ -197,6 +198,7 @@ impl CountMinSketch {
     /// Returns the minimum count across all hash rows. This is an upper bound
     /// on the true count (never undercounts).
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn estimate(&self, item: u64) -> u64 {
         record_estimate();
         let mut min_count = u64::MAX;
@@ -326,8 +328,7 @@ impl StreamingHistogram {
     /// Record a single observation.
     pub fn observe(&mut self, value: u64) {
         let bucket = match self.boundaries.binary_search(&value) {
-            Ok(idx) => idx,
-            Err(idx) => idx,
+            Ok(idx) | Err(idx) => idx,
         };
         // `bucket` is the index of the first boundary >= value, or boundaries.len()
         // for overflow.
@@ -386,7 +387,7 @@ impl StreamingHistogram {
     /// Uses linear interpolation within buckets. Returns the upper boundary of
     /// the bucket containing the target rank.
     #[must_use]
-    #[allow(clippy::cast_precision_loss)]
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn percentile(&self, p: f64) -> u64 {
         record_estimate();
         if self.count == 0 {
@@ -525,6 +526,7 @@ pub struct SlidingWindowHistogram {
     last_ts: u64,
 }
 
+#[allow(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for SlidingWindowHistogram {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SlidingWindowHistogram")
@@ -532,7 +534,7 @@ impl std::fmt::Debug for SlidingWindowHistogram {
             .field("slot_duration_us", &self.config.slot_duration_us)
             .field("num_boundaries", &self.boundaries.len())
             .field("head", &self.head)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -580,6 +582,7 @@ impl SlidingWindowHistogram {
     }
 
     /// Advance the window to the given timestamp, clearing stale slots.
+    #[allow(clippy::cast_possible_truncation)]
     fn advance_to(&mut self, now_us: u64) {
         if now_us <= self.last_ts {
             return;
@@ -605,8 +608,7 @@ impl SlidingWindowHistogram {
         self.advance_to(now_us);
 
         let bucket = match self.boundaries.binary_search(&value) {
-            Ok(idx) => idx,
-            Err(idx) => idx,
+            Ok(idx) | Err(idx) => idx,
         };
         self.slot_counts[self.head][bucket] = self.slot_counts[self.head][bucket].saturating_add(1);
         self.slot_obs[self.head] = self.slot_obs[self.head].saturating_add(1);
@@ -643,7 +645,7 @@ impl SlidingWindowHistogram {
 
     /// Estimate the p-th percentile across the entire window.
     #[must_use]
-    #[allow(clippy::cast_precision_loss)]
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn percentile(&self, p: f64) -> u64 {
         record_estimate();
         let total = self.count();
@@ -745,13 +747,14 @@ pub struct SlidingWindowCms {
     seeds: Vec<u64>,
 }
 
+#[allow(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for SlidingWindowCms {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SlidingWindowCms")
             .field("width", &self.width)
             .field("depth", &self.depth)
             .field("num_slots", &self.config.num_slots)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -803,6 +806,7 @@ impl SlidingWindowCms {
         }
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn advance_to(&mut self, now_us: u64) {
         if now_us <= self.last_ts {
             return;
@@ -822,6 +826,7 @@ impl SlidingWindowCms {
         self.last_ts = now_us;
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn hash_to_col(&self, row: usize, item: u64) -> usize {
         (mix64(item ^ self.seeds[row]) as usize) % self.width
     }
@@ -910,9 +915,10 @@ pub struct MemoryAllocationTracker {
 
 /// Default allocation size histogram boundaries (bytes).
 pub const DEFAULT_ALLOC_SIZE_BUCKETS: &[u64] = &[
-    16, 32, 64, 128, 256, 512, 1024, 4096, 16384, 65536, 262144, 1048576,
+    16, 32, 64, 128, 256, 512, 1024, 4096, 16384, 65536, 262_144, 1_048_576,
 ];
 
+#[allow(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for MemoryAllocationTracker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MemoryAllocationTracker")
@@ -920,7 +926,7 @@ impl std::fmt::Debug for MemoryAllocationTracker {
             .field("total_freed", &self.total_freed)
             .field("alloc_count", &self.alloc_count)
             .field("free_count", &self.free_count)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

@@ -606,17 +606,17 @@ impl PageReader for SharedTxnPageIo {
         // must be tracked so commit-time SSI edge detection can identify
         // dangerous structures and abort pivots when required.
         if let Some(ctx) = &self.concurrent {
-            let mut registry = ctx
-                .registry
+            ctx.registry
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let handle = registry.get_mut(ctx.session_id).ok_or_else(|| {
-                FrankenError::Internal(format!(
-                    "MVCC session {} not found in registry during read",
-                    ctx.session_id
-                ))
-            })?;
-            handle.record_read(page_no);
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_mut(ctx.session_id)
+                .ok_or_else(|| {
+                    FrankenError::Internal(format!(
+                        "MVCC session {} not found in registry during read",
+                        ctx.session_id
+                    ))
+                })?
+                .record_read(page_no);
         }
 
         Ok(page)
@@ -632,26 +632,23 @@ impl PageWriter for SharedTxnPageIo {
             let mut backoff = Duration::from_micros(50);
 
             loop {
-                let write_result = {
-                    let mut registry = ctx
-                        .registry
+                let page_data = PageData::from_vec(data.to_vec());
+                let write_result = concurrent_write_page(
+                    ctx.registry
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let handle = registry.get_mut(ctx.session_id).ok_or_else(|| {
-                        FrankenError::Internal(format!(
-                            "MVCC session {} not found in registry during write",
-                            ctx.session_id
-                        ))
-                    })?;
-                    let page_data = PageData::from_vec(data.to_vec());
-                    concurrent_write_page(
-                        handle,
-                        &ctx.lock_table,
-                        ctx.session_id,
-                        page_no,
-                        page_data,
-                    )
-                };
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get_mut(ctx.session_id)
+                        .ok_or_else(|| {
+                            FrankenError::Internal(format!(
+                                "MVCC session {} not found in registry during write",
+                                ctx.session_id
+                            ))
+                        })?,
+                    &ctx.lock_table,
+                    ctx.session_id,
+                    page_no,
+                    page_data,
+                );
 
                 match write_result {
                     Ok(()) => break,
@@ -3595,7 +3592,7 @@ impl VdbeEngine {
             let has_mem_table = self
                 .db
                 .as_ref()
-                .map_or(false, |db| db.get_table(root_page).is_some());
+                .is_some_and(|db| db.get_table(root_page).is_some());
             if !has_mem_table {
                 // No MemDatabase fallback available — refuse to open.
                 tracing::warn!(

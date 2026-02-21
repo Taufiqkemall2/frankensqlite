@@ -159,7 +159,7 @@ pub struct Scope {
     /// CTE names visible in this scope.
     ctes: HashSet<String>,
     /// Parent scope (for subquery nesting).
-    parent: Option<Box<Scope>>,
+    parent: Option<Box<Self>>,
 }
 
 impl Scope {
@@ -176,7 +176,7 @@ impl Scope {
 
     /// Create a child scope (for subqueries).
     #[must_use]
-    pub fn child(parent: Scope) -> Self {
+    pub fn child(parent: Self) -> Self {
         Self {
             aliases: HashMap::new(),
             columns: HashMap::new(),
@@ -223,7 +223,7 @@ impl Scope {
         if let Some(qualifier) = table_qualifier {
             let key = qualifier.to_ascii_lowercase();
             if let Some(cols) = self.columns.get(&key) {
-                if cols.as_ref().map_or(true, |c| c.contains(&col_lower)) {
+                if cols.as_ref().is_none_or(|c| c.contains(&col_lower)) {
                     return ResolveResult::Resolved(key);
                 }
                 return ResolveResult::ColumnNotFound;
@@ -238,7 +238,7 @@ impl Scope {
         // Unqualified: search all aliases in this scope.
         let mut matches = Vec::new();
         for (alias, cols) in &self.columns {
-            if cols.as_ref().map_or(true, |c| c.contains(&col_lower)) {
+            if cols.as_ref().is_none_or(|c| c.contains(&col_lower)) {
                 matches.push(alias.clone());
             }
         }
@@ -574,6 +574,7 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn resolve_expr(&mut self, expr: &Expr, scope: &Scope) {
         match expr {
             Expr::Column(col_ref, _span) => {
@@ -583,7 +584,10 @@ impl<'a> Resolver<'a> {
                 self.resolve_expr(left, scope);
                 self.resolve_expr(right, scope);
             }
-            Expr::UnaryOp { expr: inner, .. } => {
+            Expr::UnaryOp { expr: inner, .. }
+            | Expr::Cast { expr: inner, .. }
+            | Expr::Collate { expr: inner, .. }
+            | Expr::IsNull { expr: inner, .. } => {
                 self.resolve_expr(inner, scope);
             }
             Expr::Between {
@@ -627,7 +631,10 @@ impl<'a> Resolver<'a> {
                     self.resolve_expr(esc, scope);
                 }
             }
-            Expr::Subquery(select, _) => {
+            Expr::Subquery(select, _)
+            | Expr::Exists {
+                subquery: select, ..
+            } => {
                 let mut child = Scope::child(scope.clone());
                 self.resolve_select(select, &mut child);
             }
@@ -642,9 +649,6 @@ impl<'a> Resolver<'a> {
                 if let Some(filter) = filter {
                     self.resolve_expr(filter, scope);
                 }
-            }
-            Expr::Cast { expr: inner, .. } => {
-                self.resolve_expr(inner, scope);
             }
             Expr::Case {
                 operand,
@@ -662,18 +666,6 @@ impl<'a> Resolver<'a> {
                 if let Some(else_e) = else_expr {
                     self.resolve_expr(else_e, scope);
                 }
-            }
-            Expr::Collate { expr: inner, .. } => {
-                self.resolve_expr(inner, scope);
-            }
-            Expr::IsNull { expr: inner, .. } => {
-                self.resolve_expr(inner, scope);
-            }
-            Expr::Exists {
-                subquery: select, ..
-            } => {
-                let mut child = Scope::child(scope.clone());
-                self.resolve_select(select, &mut child);
             }
             Expr::JsonAccess { expr: inner, path, .. } => {
                 self.resolve_expr(inner, scope);
@@ -758,9 +750,8 @@ impl<'a> Resolver<'a> {
     }
 
     fn resolve_table_name(&mut self, name: &str, scope: &Scope) {
-        if scope.ctes.contains(&name.to_ascii_lowercase()) {
-            self.tables_resolved += 1;
-        } else if self.schema.find_table(name).is_some() {
+        if scope.ctes.contains(&name.to_ascii_lowercase()) || self.schema.find_table(name).is_some()
+        {
             self.tables_resolved += 1;
         } else {
             self.push_error(SemanticErrorKind::UnresolvedTable {
@@ -844,39 +835,24 @@ impl<'a> Resolver<'a> {
 #[must_use]
 fn known_function_arity(name: &str) -> Option<FunctionArity> {
     match name.to_ascii_lowercase().as_str() {
-        // Aggregate functions
-        "count" => Some(FunctionArity::Range(0, 1)),
-        "sum" | "total" | "avg" => Some(FunctionArity::Exact(1)),
-        "min" | "max" => Some(FunctionArity::Variadic),
-        "group_concat" => Some(FunctionArity::Range(1, 2)),
-
-        // Scalar functions
-        "abs" | "hex" | "length" | "lower" | "upper" | "typeof" | "unicode" | "quote"
-        | "zeroblob" | "soundex" | "likelihood" => {
-            Some(FunctionArity::Exact(1))
-        }
-        "trim" | "ltrim" | "rtrim" => Some(FunctionArity::Range(1, 2)),
-        "ifnull" | "nullif" | "instr" | "glob" => Some(FunctionArity::Exact(2)),
-        "iif" | "replace" => Some(FunctionArity::Exact(3)),
-        "substr" | "substring" | "like" => Some(FunctionArity::Range(2, 3)),
-        "coalesce" | "printf" | "format" | "char" => Some(FunctionArity::Variadic),
         "random" | "changes" | "last_insert_rowid" | "total_changes" => {
             Some(FunctionArity::Exact(0))
         }
-        "randomblob" => Some(FunctionArity::Exact(1)),
-
-        // Date/time functions
-        "date" | "time" | "datetime" | "julianday" | "strftime" | "unixepoch" => {
-            Some(FunctionArity::Variadic)
+        // Aggregate (1-arg) and scalar (1-arg) functions
+        "sum" | "total" | "avg" | "abs" | "hex" | "length" | "lower" | "upper" | "typeof"
+        | "unicode" | "quote" | "zeroblob" | "soundex" | "likelihood" | "randomblob" => {
+            Some(FunctionArity::Exact(1))
         }
-
-        // JSON functions
-        "json" | "json_array" | "json_object" | "json_type" | "json_valid" => {
-            Some(FunctionArity::Variadic)
-        }
-        "json_extract" | "json_insert" | "json_replace" | "json_set" | "json_remove" => {
-            Some(FunctionArity::Variadic)
-        }
+        "ifnull" | "nullif" | "instr" | "glob" => Some(FunctionArity::Exact(2)),
+        "iif" | "replace" => Some(FunctionArity::Exact(3)),
+        "count" => Some(FunctionArity::Range(0, 1)),
+        "group_concat" | "trim" | "ltrim" | "rtrim" => Some(FunctionArity::Range(1, 2)),
+        "substr" | "substring" | "like" => Some(FunctionArity::Range(2, 3)),
+        // Variadic: aggregates, scalars, date/time, and JSON functions
+        "min" | "max" | "coalesce" | "printf" | "format" | "char" | "date" | "time"
+        | "datetime" | "julianday" | "strftime" | "unixepoch" | "json" | "json_array"
+        | "json_object" | "json_type" | "json_valid" | "json_extract" | "json_insert"
+        | "json_replace" | "json_set" | "json_remove" => Some(FunctionArity::Variadic),
 
         _ => None, // Unknown function — skip arity check.
     }
@@ -992,7 +968,7 @@ mod tests {
         let mut scope = Scope::root();
         let cols: HashSet<String> = ["id", "name", "email"]
             .iter()
-            .map(|s| s.to_string())
+            .map(ToString::to_string)
             .collect();
         scope.add_alias("u", "users", Some(cols));
 
@@ -1016,12 +992,12 @@ mod tests {
         scope.add_alias(
             "u",
             "users",
-            Some(["id", "name"].iter().map(|s| s.to_string()).collect()),
+            Some(["id", "name"].iter().map(ToString::to_string).collect()),
         );
         scope.add_alias(
             "o",
             "orders",
-            Some(["id", "user_id"].iter().map(|s| s.to_string()).collect()),
+            Some(["id", "user_id"].iter().map(ToString::to_string).collect()),
         );
 
         // "name" is unique → resolved to "u"
@@ -1057,7 +1033,7 @@ mod tests {
         parent.add_alias(
             "u",
             "users",
-            Some(["id", "name"].iter().map(|s| s.to_string()).collect()),
+            Some(["id", "name"].iter().map(ToString::to_string).collect()),
         );
         let child = Scope::child(parent);
 

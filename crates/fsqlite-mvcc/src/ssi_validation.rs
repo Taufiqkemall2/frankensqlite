@@ -412,7 +412,7 @@ pub fn discover_incoming_edges(
 
             let candidate_begin = candidate.begin_seq.get();
             let candidate_end = candidate.commit_seq.map_or(u64::MAX, CommitSeq::get);
-            let overlaps = committing_begin <= candidate_end && candidate_begin <= committing_end;
+            let overlaps = committing_begin < candidate_end && candidate_begin < committing_end;
             if !overlaps || !seen_sources.insert(candidate.token) {
                 continue;
             }
@@ -494,7 +494,7 @@ pub fn discover_outgoing_edges(
 
             let candidate_begin = candidate.begin_seq.get();
             let candidate_end = candidate.commit_seq.map_or(u64::MAX, CommitSeq::get);
-            let overlaps = committing_begin <= candidate_end && candidate_begin <= committing_end;
+            let overlaps = committing_begin < candidate_end && candidate_begin < committing_end;
             if !overlaps || !seen_targets.insert(candidate.token) {
                 continue;
             }
@@ -2342,6 +2342,7 @@ mod tests {
     // -- §5.7.3 stress test 28: 3-way adversarial cycle breaks --
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_adversarial_three_way_cycle_breaks_with_single_abort() {
         let begin_seq = CommitSeq::new(1);
         let t1 = TxnToken::new(TxnId::new(401).unwrap(), TxnEpoch::new(0));

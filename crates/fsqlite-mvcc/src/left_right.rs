@@ -200,6 +200,7 @@ impl LeftRight {
     }
 }
 
+#[allow(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for LeftRight {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let active = self.active.load(Ordering::Relaxed);
@@ -209,7 +210,7 @@ impl std::fmt::Debug for LeftRight {
             .field("active", &if active == 0 { "left" } else { "right" })
             .field("left_readers", &lr)
             .field("right_readers", &rr)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -318,12 +319,13 @@ impl LeftRightPair {
     }
 }
 
+#[allow(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for LeftRightPair {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let active = self.active.load(Ordering::Relaxed);
         f.debug_struct("LeftRightPair")
             .field("active", &if active == 0 { "left" } else { "right" })
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -451,12 +453,13 @@ impl LeftRightTriple {
     }
 }
 
+#[allow(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for LeftRightTriple {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let active = self.active.load(Ordering::Relaxed);
         f.debug_struct("LeftRightTriple")
             .field("active", &if active == 0 { "left" } else { "right" })
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

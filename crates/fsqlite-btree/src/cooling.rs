@@ -161,6 +161,7 @@ impl CoolingStateMachine {
     ///
     /// Returns `true` if the transition was performed, `false` if the page
     /// was already Hot or Cooling (in which case it's re-heated if Cooling).
+    #[allow(clippy::significant_drop_tightening)]
     pub fn load_page(&self, page_id: u64, frame_addr: u64) -> bool {
         let mut pages = self.pages.lock().expect("cooling lock");
         let entry = pages.entry(page_id).or_insert(PageState {
@@ -263,6 +264,7 @@ impl CoolingStateMachine {
             // Reset access counter for the next scan interval.
             entry.access_count = 0;
         }
+        drop(pages);
 
         CoolingScanResult {
             pages_scanned: scanned,
@@ -288,10 +290,10 @@ impl CoolingStateMachine {
             .expect("cooling lock")
             .get(&page_id)
             .and_then(|e| {
-                if e.temperature != PageTemperature::Cold {
-                    Some(e.frame_addr)
-                } else {
+                if e.temperature == PageTemperature::Cold {
                     None
+                } else {
+                    Some(e.frame_addr)
                 }
             })
     }
@@ -308,6 +310,7 @@ impl CoolingStateMachine {
                 PageTemperature::Cold => counts.cold += 1,
             }
         }
+        drop(pages);
         counts
     }
 
@@ -324,6 +327,7 @@ impl CoolingStateMachine {
     }
 }
 
+#[allow(clippy::missing_fields_in_debug)]
 impl fmt::Debug for CoolingStateMachine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let counts = self.temperature_counts();

@@ -117,7 +117,7 @@ impl<K: Ord + Clone, V: Clone> BeMessage<K, V> {
     /// Return the key this message targets.
     pub fn key(&self) -> &K {
         match self {
-            BeMessage::Insert { key, .. } | BeMessage::Delete { key } => key,
+            Self::Insert { key, .. } | Self::Delete { key } => key,
         }
     }
 }
@@ -138,7 +138,7 @@ enum BeNode<K: Ord + Clone, V: Clone> {
         /// `children[pivots.len()]` covers keys >= last pivot.
         pivots: Vec<K>,
         /// Child nodes. len() == pivots.len() + 1.
-        children: Vec<BeNode<K, V>>,
+        children: Vec<Self>,
         /// Pending messages waiting to be flushed down.
         buffer: Vec<BeMessage<K, V>>,
     },
@@ -146,7 +146,7 @@ enum BeNode<K: Ord + Clone, V: Clone> {
 
 impl<K: Ord + Clone, V: Clone> BeNode<K, V> {
     fn new_leaf() -> Self {
-        BeNode::Leaf {
+        Self::Leaf {
             entries: Vec::new(),
         }
     }
@@ -404,6 +404,7 @@ impl<K: Ord + Clone, V: Clone> BeTree<K, V> {
     }
 
     /// Recursive lookup: check buffer messages, then descend.
+    #[allow(clippy::self_only_used_in_recursion)]
     fn get_in_node<'a>(&'a self, node: &'a BeNode<K, V>, key: &K) -> Option<&'a V> {
         match node {
             BeNode::Leaf { entries } => {
@@ -444,6 +445,7 @@ impl<K: Ord + Clone, V: Clone> BeTree<K, V> {
     /// Messages are processed top-down: higher-level buffer messages take
     /// priority over lower-level buffer messages and leaf entries. Within
     /// the same buffer, later messages win (iterate in reverse + `or_insert`).
+    #[allow(clippy::self_only_used_in_recursion)]
     fn collect_range(
         &self,
         node: &BeNode<K, V>,
@@ -512,6 +514,7 @@ impl<K: Ord + Clone, V: Clone> BeTree<K, V> {
     /// Collect all entries and pending messages (for full scan / entries()).
     ///
     /// Same top-down priority as collect_range.
+    #[allow(clippy::self_only_used_in_recursion)]
     fn collect_all(&self, node: &BeNode<K, V>, pending: &mut BTreeMap<K, Option<V>>) {
         match node {
             BeNode::Leaf { entries } => {
@@ -540,6 +543,7 @@ impl<K: Ord + Clone, V: Clone> BeTree<K, V> {
     }
 }
 
+#[allow(clippy::missing_fields_in_debug)]
 impl<K: Ord + Clone + fmt::Debug, V: Clone + fmt::Debug> fmt::Debug for BeTree<K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BeTree")

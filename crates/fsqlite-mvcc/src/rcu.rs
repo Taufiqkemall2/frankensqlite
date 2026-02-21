@@ -180,6 +180,7 @@ impl QsbrRegistry {
         self.synchronize_core(Some(caller_slot));
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn synchronize_core(&self, caller_slot: Option<usize>) {
         let _guard = self.writer_lock.lock();
         let start = Instant::now();
@@ -216,6 +217,7 @@ impl QsbrRegistry {
         }
 
         let elapsed = start.elapsed();
+        #[allow(clippy::cast_possible_truncation)]
         let ns = elapsed.as_nanos() as u64;
 
         // Update metrics.
@@ -260,12 +262,13 @@ impl Default for QsbrRegistry {
     }
 }
 
+#[allow(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for QsbrRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QsbrRegistry")
             .field("global_epoch", &self.global_epoch.load(Ordering::Relaxed))
             .field("active_threads", &self.active_threads())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -331,6 +334,7 @@ impl RcuCell {
     }
 
     /// Zero-overhead read.
+    #[allow(clippy::inline_always)]
     #[inline(always)]
     pub fn read(&self) -> u64 {
         self.value.load(Ordering::Acquire)
@@ -434,11 +438,12 @@ impl RcuPair {
     }
 }
 
+#[allow(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for RcuPair {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RcuPair")
             .field("active", &self.active.load(Ordering::Relaxed))
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -521,11 +526,12 @@ impl RcuTriple {
     }
 }
 
+#[allow(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for RcuTriple {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RcuTriple")
             .field("active", &self.active.load(Ordering::Relaxed))
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -657,6 +663,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::similar_names)]
     fn rcu_pair_no_torn_reads() {
         let reg = Arc::new(QsbrRegistry::new());
         let pair = Arc::new(RcuPair::new(0, 0));
@@ -753,6 +760,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::similar_names)]
     fn stress_concurrent_rw() {
         let reg = Arc::new(QsbrRegistry::new());
         let pair = Arc::new(RcuPair::new(0, 0));

@@ -165,13 +165,14 @@ impl LrcCodec {
     /// `source_data` is split into `symbol_size`-byte symbols.
     /// Each locality group of `r` symbols gets a local parity (XOR).
     /// A global parity (XOR of all source symbols) is also computed.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn encode(&self, source_data: &[u8], symbol_size: usize) -> LrcEncodeResult {
         assert!(symbol_size > 0, "symbol_size must be > 0");
 
         LRC_ENCODE_TOTAL.fetch_add(1, Ordering::Relaxed);
 
         // Split source into symbols, padding the last one if needed.
-        let k = (source_data.len() + symbol_size - 1) / symbol_size;
+        let k = source_data.len().div_ceil(symbol_size);
         let mut source_symbols: Vec<(u32, Vec<u8>)> = Vec::with_capacity(k);
 
         for i in 0..k {
@@ -184,7 +185,7 @@ impl LrcCodec {
 
         // Compute locality groups and local parities.
         let r = self.config.locality;
-        let num_groups = (k + r - 1) / r;
+        let num_groups = k.div_ceil(r);
         let mut local_parities: Vec<(u32, Vec<u8>)> = Vec::with_capacity(num_groups);
 
         for g in 0..num_groups {
@@ -192,8 +193,8 @@ impl LrcCodec {
             let group_end = ((g + 1) * r).min(k);
 
             let mut parity = vec![0u8; symbol_size];
-            for i in group_start..group_end {
-                xor_into(&mut parity, &source_symbols[i].1);
+            for (_, sym) in source_symbols.iter().take(group_end).skip(group_start) {
+                xor_into(&mut parity, sym);
             }
             local_parities.push((g as u32, parity));
         }
@@ -219,6 +220,7 @@ impl LrcCodec {
     /// `available` maps symbol index -> data for symbols that are present.
     /// `missing` lists the indices of symbols that need repair.
     /// Returns the repair outcome.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn repair(
         &self,
         encode_result: &LrcEncodeResult,

@@ -130,9 +130,9 @@ pub enum ProvenanceToken {
     /// Base tuple generator.
     Base(TupleId),
     /// Alternative derivation (union/OR).
-    Plus(Box<ProvenanceToken>, Box<ProvenanceToken>),
+    Plus(Box<Self>, Box<Self>),
     /// Combined contribution (join/AND).
-    Times(Box<ProvenanceToken>, Box<ProvenanceToken>),
+    Times(Box<Self>, Box<Self>),
 }
 
 impl fmt::Debug for ProvenanceToken {
@@ -276,7 +276,7 @@ impl ProvenanceAnnotation {
             tree_size = token.tree_size(),
             "provenance_annotation_created"
         );
-        Self { output_row, token }
+        Self { token, output_row }
     }
 
     /// Get the why-provenance (contributing base tuples).
@@ -547,7 +547,7 @@ pub fn why_not(
             missing.len(),
             missing
                 .iter()
-                .map(|id| id.to_string())
+                .map(std::string::ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(", ")
         )
@@ -641,7 +641,7 @@ mod tests {
         let how = join.how_provenance();
         assert!(how.contains("t1:10"));
         assert!(how.contains("t2:20"));
-        assert!(how.contains("*"));
+        assert!(how.contains('*'));
 
         println!("[PASS] how provenance: derivation expression contains join");
     }

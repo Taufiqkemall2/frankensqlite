@@ -327,7 +327,7 @@ impl ColumnStats {
             if !sample.is_empty() {
                 let matching = sample
                     .iter()
-                    .filter(|sv| cmp_matches(sv, op, value))
+                    .filter(|sv| cmp_matches(sv, *op, value))
                     .count();
                 let sel = (matching as f64 / sample.len() as f64).clamp(0.0, 1.0);
                 let span = tracing::debug_span!(
@@ -365,7 +365,7 @@ impl ColumnStats {
         }
 
         // Default heuristic.
-        let sel = default_selectivity(op);
+        let sel = default_selectivity(*op);
         let span = tracing::debug_span!(
             target: "fsqlite.planner",
             "cost_estimate",
@@ -383,7 +383,7 @@ impl ColumnStats {
 }
 
 /// Default selectivity heuristic when no statistics are available.
-fn default_selectivity(op: &Operator) -> f64 {
+fn default_selectivity(op: Operator) -> f64 {
     match op {
         Operator::Eq | Operator::Is => 0.01,    // ~1/100 rows match
         Operator::Ne | Operator::IsNot => 0.99,
@@ -393,7 +393,7 @@ fn default_selectivity(op: &Operator) -> f64 {
 }
 
 /// Check if a sample value satisfies the comparison operator against the probe.
-fn cmp_matches(sample_val: &SqliteValue, op: &Operator, probe: &SqliteValue) -> bool {
+fn cmp_matches(sample_val: &SqliteValue, op: Operator, probe: &SqliteValue) -> bool {
     let ord = sample_val.partial_cmp(probe);
     match op {
         Operator::Eq | Operator::Is => ord == Some(Ordering::Equal),
@@ -549,10 +549,10 @@ mod tests {
 
     #[test]
     fn test_default_selectivity_values() {
-        assert!((default_selectivity(&Operator::Eq) - 0.01).abs() < 0.001);
-        assert!((default_selectivity(&Operator::Ne) - 0.99).abs() < 0.001);
-        assert!((default_selectivity(&Operator::Lt) - 0.333).abs() < 0.001);
-        assert!((default_selectivity(&Operator::Like) - 0.1).abs() < 0.001);
+        assert!((default_selectivity(Operator::Eq) - 0.01).abs() < 0.001);
+        assert!((default_selectivity(Operator::Ne) - 0.99).abs() < 0.001);
+        assert!((default_selectivity(Operator::Lt) - 0.333).abs() < 0.001);
+        assert!((default_selectivity(Operator::Like) - 0.1).abs() < 0.001);
     }
 
     #[test]
@@ -560,14 +560,14 @@ mod tests {
         let v50 = SqliteValue::Integer(50);
         let v100 = SqliteValue::Integer(100);
 
-        assert!(cmp_matches(&v50, &Operator::Eq, &v50));
-        assert!(!cmp_matches(&v50, &Operator::Eq, &v100));
-        assert!(cmp_matches(&v50, &Operator::Lt, &v100));
-        assert!(!cmp_matches(&v100, &Operator::Lt, &v50));
-        assert!(cmp_matches(&v50, &Operator::Le, &v50));
-        assert!(cmp_matches(&v100, &Operator::Gt, &v50));
-        assert!(cmp_matches(&v100, &Operator::Ge, &v100));
-        assert!(cmp_matches(&v50, &Operator::Ne, &v100));
+        assert!(cmp_matches(&v50, Operator::Eq, &v50));
+        assert!(!cmp_matches(&v50, Operator::Eq, &v100));
+        assert!(cmp_matches(&v50, Operator::Lt, &v100));
+        assert!(!cmp_matches(&v100, Operator::Lt, &v50));
+        assert!(cmp_matches(&v50, Operator::Le, &v50));
+        assert!(cmp_matches(&v100, Operator::Gt, &v50));
+        assert!(cmp_matches(&v100, Operator::Ge, &v100));
+        assert!(cmp_matches(&v50, Operator::Ne, &v100));
     }
 
     #[test]

@@ -481,13 +481,13 @@ fn codegen_insert_values(
             let reg = val_regs + i as i32;
             match val_expr {
                 Expr::Placeholder(pt, _) => {
-                    let idx = match pt {
-                        fsqlite_ast::PlaceholderType::Numbered(n) => *n as i32,
-                        _ => {
-                            let p = param_idx;
-                            param_idx += 1;
-                            p
-                        }
+                    #[allow(clippy::cast_possible_wrap)]
+                    let idx = if let fsqlite_ast::PlaceholderType::Numbered(n) = pt {
+                        *n as i32
+                    } else {
+                        let p = param_idx;
+                        param_idx += 1;
+                        p
                     };
                     b.emit_op(Opcode::Variable, idx, reg, 0, P4::None, 0);
                 }
@@ -710,13 +710,13 @@ pub fn codegen_update(
         let (_col_idx, reg) = new_val_regs[i];
         match &assign.value {
             Expr::Placeholder(pt, _) => {
-                let idx = match pt {
-                    fsqlite_ast::PlaceholderType::Numbered(n) => *n as i32,
-                    _ => {
-                        let p = param_idx;
-                        param_idx += 1;
-                        p
-                    }
+                #[allow(clippy::cast_possible_wrap)]
+                let idx = if let fsqlite_ast::PlaceholderType::Numbered(n) = pt {
+                    *n as i32
+                } else {
+                    let p = param_idx;
+                    param_idx += 1;
+                    p
                 };
                 b.emit_op(Opcode::Variable, idx, reg, 0, P4::None, 0);
             }

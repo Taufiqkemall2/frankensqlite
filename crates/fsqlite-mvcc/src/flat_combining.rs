@@ -185,7 +185,7 @@ impl FlatCombiner {
             let s = format!("{t:?}");
             let mut h = 1u64;
             for b in s.bytes() {
-                h = h.wrapping_mul(31).wrapping_add(b as u64);
+                h = h.wrapping_mul(31).wrapping_add(u64::from(b));
             }
             if h == 0 { 1 } else { h }
         };
@@ -271,12 +271,13 @@ impl FlatCombiner {
     }
 }
 
+#[allow(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for FlatCombiner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FlatCombiner")
             .field("value", &self.value.load(Ordering::Relaxed))
             .field("active_threads", &self.active_threads())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -336,6 +337,7 @@ impl FcHandle<'_> {
                     .state
                     .store(SLOT_EMPTY, Ordering::Release);
 
+                #[allow(clippy::cast_possible_truncation)]
                 let elapsed_ns = start.elapsed().as_nanos() as u64;
                 FC_WAIT_NS_TOTAL.fetch_add(elapsed_ns, Ordering::Relaxed);
                 update_max(&FC_WAIT_NS_MAX, elapsed_ns);
@@ -470,6 +472,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::many_single_char_names)]
     fn concurrent_stress_no_lost_updates() {
         let fc = Arc::new(FlatCombiner::new(0));
         let stop = Arc::new(AtomicBool::new(false));

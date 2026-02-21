@@ -1615,36 +1615,22 @@ pub fn try_cleanup_sentinel_slot(
         "reclaiming stale sentinel slot"
     );
 
-    // Clear all fields. The txn_id store(0) MUST be LAST (Release ordering)
-    // so other scanners see a consistent free slot.
-    slot.state.store(0, Ordering::Release);
-    slot.mode.store(0, Ordering::Release);
-    slot.commit_seq.store(0, Ordering::Release);
-    slot.begin_seq.store(0, Ordering::Release);
-    slot.snapshot_high.store(0, Ordering::Release);
-    slot.witness_epoch.store(0, Ordering::Release);
-    slot.has_in_rw.store(false, Ordering::Release);
-    slot.has_out_rw.store(false, Ordering::Release);
-    slot.marked_for_abort.store(false, Ordering::Release);
-    slot.write_set_pages.store(0, Ordering::Release);
-    slot.pid.store(0, Ordering::Release);
-    slot.pid_birth.store(0, Ordering::Release);
-    slot.lease_expiry.store(0, Ordering::Release);
-    slot.cleanup_txn_id.store(0, Ordering::Release);
-    slot.claiming_timestamp.store(0, Ordering::Release);
-    // Free the slot — Release ordering ensures all field clears are visible.
-    slot.txn_id.store(0, Ordering::Release);
+    // Safely free the slot by CASing from cleaning_word to 0.
+    // We avoid blindly clearing fields here because multiple cleaners might race
+    // and corrupt the slot if it is quickly re-allocated by a new transaction.
+    let cleaning_word = encode_cleaning(orphan_txn_id);
+    if slot.txn_id.compare_exchange(cleaning_word, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+        if !was_claiming && prior_cleanup_marker != 0 {
+            GLOBAL_TXN_SLOT_METRICS.record_slot_released(None, reclaim_pid);
+        }
 
-    // If a stuck CLEANING slot carried a prewritten cleanup marker, it may have
-    // originated from a previously published real transaction slot.
-    if !was_claiming && prior_cleanup_marker != 0 {
-        GLOBAL_TXN_SLOT_METRICS.record_slot_released(None, reclaim_pid);
+        return SlotCleanupResult::Reclaimed {
+            orphan_txn_id,
+            was_claiming,
+        };
     }
 
-    SlotCleanupResult::Reclaimed {
-        orphan_txn_id,
-        was_claiming,
-    }
+    SlotCleanupResult::CasRaceSkipped
 }
 
 /// Scan all slots, clean up stale sentinels, then compute the new GC horizon.
@@ -1689,31 +1675,7 @@ pub struct OrphanedSlotCleanupStats {
     pub locks_released: usize,
 }
 
-/// Clear all mutable fields of a [`SharedTxnSlot`], with `txn_id = 0` stored
-/// last using `Release` ordering (§5.6.2.2 field-clearing discipline).
-///
-/// The `txn_id = 0` store is the sentinel that marks the slot as free. Any
-/// reader that observes `txn_id == 0` must see all other fields already cleared
-/// (Release/Acquire pairing).
-fn clear_slot_fields(slot: &SharedTxnSlot) {
-    slot.state.store(0, Ordering::Release);
-    slot.mode.store(0, Ordering::Release);
-    slot.commit_seq.store(0, Ordering::Release);
-    slot.begin_seq.store(0, Ordering::Release);
-    slot.snapshot_high.store(0, Ordering::Release);
-    slot.witness_epoch.store(0, Ordering::Release);
-    slot.has_in_rw.store(false, Ordering::Release);
-    slot.has_out_rw.store(false, Ordering::Release);
-    slot.marked_for_abort.store(false, Ordering::Release);
-    slot.write_set_pages.store(0, Ordering::Release);
-    slot.pid.store(0, Ordering::Release);
-    slot.pid_birth.store(0, Ordering::Release);
-    slot.lease_expiry.store(0, Ordering::Release);
-    slot.cleanup_txn_id.store(0, Ordering::Release);
-    slot.claiming_timestamp.store(0, Ordering::Release);
-    // Free the slot — Release ordering ensures all field clears are visible.
-    slot.txn_id.store(0, Ordering::Release);
-}
+
 
 /// Attempt to clean up a single orphaned slot (§5.6.2.2).
 ///
@@ -1825,16 +1787,19 @@ pub fn try_cleanup_orphaned_slot(
             "reclaiming stale sentinel slot"
         );
 
-        clear_slot_fields(slot);
+        let cleaning_word = encode_cleaning(orphan_txn_id);
+        if slot.txn_id.compare_exchange(cleaning_word, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            if !was_claiming && prior_cleanup_marker != 0 {
+                GLOBAL_TXN_SLOT_METRICS.record_slot_released(None, reclaim_pid);
+            }
 
-        if !was_claiming && prior_cleanup_marker != 0 {
-            GLOBAL_TXN_SLOT_METRICS.record_slot_released(None, reclaim_pid);
+            return SlotCleanupResult::Reclaimed {
+                orphan_txn_id,
+                was_claiming,
+            };
         }
-
-        return SlotCleanupResult::Reclaimed {
-            orphan_txn_id,
-            was_claiming,
-        };
+        
+        return SlotCleanupResult::CasRaceSkipped;
     }
 
     // ===== Real TxnId (no sentinel tag) =====
@@ -1873,13 +1838,15 @@ pub fn try_cleanup_orphaned_slot(
 
     tracing::info!(orphan_txn_id, "reclaiming orphaned real TxnId slot");
 
-    clear_slot_fields(slot);
-    GLOBAL_TXN_SLOT_METRICS.record_slot_released(None, pid);
-
-    SlotCleanupResult::Reclaimed {
-        orphan_txn_id,
-        was_claiming: false,
+    if slot.txn_id.compare_exchange(cleaning_word, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+        GLOBAL_TXN_SLOT_METRICS.record_slot_released(None, pid);
+        return SlotCleanupResult::Reclaimed {
+            orphan_txn_id,
+            was_claiming: false,
+        };
     }
+    
+    SlotCleanupResult::CasRaceSkipped
 }
 
 /// Scan all slots and clean up orphaned entries (§5.6.2.2).

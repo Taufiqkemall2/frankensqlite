@@ -78,6 +78,7 @@ struct Segment {
     /// Last key in the segment (inclusive).
     key_hi: u64,
     /// Position of key_lo in the sorted array.
+    #[allow(dead_code)]
     pos_lo: usize,
     /// Slope: (delta_pos) / (delta_key). Stored as f64 for precision.
     slope: f64,
@@ -87,9 +88,10 @@ struct Segment {
 
 impl Segment {
     /// Predict the position of a key using the linear model.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn predict(&self, key: u64) -> usize {
         let delta = key as f64 - self.key_lo as f64;
-        let predicted = self.intercept + self.slope * delta;
+        let predicted = self.slope.mul_add(delta, self.intercept);
         predicted.round().max(0.0) as usize
     }
 }
@@ -153,12 +155,9 @@ impl LearnedIndex {
         }
 
         // Find the segment containing this key.
-        let seg_idx = match self.find_segment(key) {
-            Some(idx) => idx,
-            None => {
-                record_lookup(0);
-                return None;
-            }
+        let Some(seg_idx) = self.find_segment(key) else {
+            record_lookup(0);
+            return None;
         };
         let seg = &self.segments[seg_idx];
 
@@ -173,16 +172,12 @@ impl LearnedIndex {
         for i in lo..hi {
             match self.keys[i].cmp(&key) {
                 std::cmp::Ordering::Equal => {
-                    let error = if predicted > i {
-                        predicted - i
-                    } else {
-                        i - predicted
-                    };
+                    let error = predicted.abs_diff(i);
                     record_lookup(error);
                     return Some(i);
                 }
                 std::cmp::Ordering::Greater => break,
-                std::cmp::Ordering::Less => continue,
+                std::cmp::Ordering::Less => {}
             }
         }
 
@@ -231,11 +226,7 @@ impl LearnedIndex {
         for (actual_pos, &key) in self.keys.iter().enumerate() {
             if let Some(seg_idx) = self.find_segment(key) {
                 let predicted = self.segments[seg_idx].predict(key);
-                let err = if predicted > actual_pos {
-                    predicted - actual_pos
-                } else {
-                    actual_pos - predicted
-                };
+                let err = predicted.abs_diff(actual_pos);
                 max_err = max_err.max(err);
             }
         }
@@ -328,12 +319,9 @@ fn train_piecewise_linear(keys: &[u64], max_error: usize) -> Vec<Segment> {
             let mut max_err = 0usize;
             for i in seg_start..=next_end {
                 let predicted = intercept + slope * (keys[i] as f64 - keys[seg_start] as f64);
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 let predicted_pos = predicted.round().max(0.0) as usize;
-                let err = if predicted_pos > i {
-                    predicted_pos - i
-                } else {
-                    i - predicted_pos
-                };
+                let err = predicted_pos.abs_diff(i);
                 max_err = max_err.max(err);
             }
 
@@ -380,7 +368,9 @@ mod tests {
         assert!(!idx.is_empty());
 
         for &k in &keys {
-            assert_eq!(idx.lookup(k), Some(k as usize));
+            #[allow(clippy::cast_possible_truncation)]
+            let expected = k as usize;
+            assert_eq!(idx.lookup(k), Some(expected));
         }
 
         assert_eq!(idx.lookup(100), None);

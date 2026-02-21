@@ -338,6 +338,7 @@ impl<T: Ord + Copy + fmt::Debug> CrackedColumn<T> {
     }
 }
 
+#[allow(clippy::missing_fields_in_debug)]
 impl<T: Ord + Copy + fmt::Debug> fmt::Debug for CrackedColumn<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CrackedColumn")
@@ -392,7 +393,7 @@ mod tests {
 
         let result = col.range_query(3, 6);
         let mut sorted_result: Vec<i32> = result.to_vec();
-        sorted_result.sort();
+        sorted_result.sort_unstable();
         assert_eq!(sorted_result, vec![3, 4, 5, 6]);
 
         assert!(col.num_cracks() > 0);
@@ -409,7 +410,7 @@ mod tests {
 
         let result = col.range_query(20, 40);
         let mut sorted: Vec<u32> = result.to_vec();
-        sorted.sort();
+        sorted.sort_unstable();
         let expected: Vec<u32> = (20..=40).collect();
         assert_eq!(sorted, expected);
     }
@@ -429,7 +430,10 @@ mod tests {
         assert!(col.is_empty());
         assert_eq!(col.len(), 0);
         assert!(col.is_fully_sorted());
-        assert_eq!(col.avg_segment_size(), 0.0);
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(col.avg_segment_size(), 0.0);
+        }
     }
 
     #[test]

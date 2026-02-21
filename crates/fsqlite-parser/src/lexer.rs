@@ -388,9 +388,8 @@ impl<'a> Lexer<'a> {
                         self.advance();
                         self.advance();
                         break;
-                    } else {
-                        self.advance();
                     }
+                    self.advance();
                 }
                 continue;
             }

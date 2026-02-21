@@ -164,7 +164,7 @@ impl FunctionRegistry {
     /// This is used by the UDF registration API to produce a new registry
     /// containing the existing functions plus the newly registered UDF.
     #[must_use]
-    pub fn clone_from_arc(arc: &Arc<FunctionRegistry>) -> Self {
+    pub fn clone_from_arc(arc: &Arc<Self>) -> Self {
         Self {
             scalars: arc.scalars.clone(),
             aggregates: arc.aggregates.clone(),

@@ -680,7 +680,7 @@ fn try_coerce_text_to_numeric(s: &str) -> Option<SqliteValue> {
         }
         // If the float is an exact integer value within bounds, store as integer.
         // Checking bounds prevents incorrect saturation for values >= 2^63.
-        if f >= -9_223_372_036_854_775_808.0 && f < 9_223_372_036_854_775_808.0 {
+        if (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&f) {
             #[allow(clippy::cast_possible_truncation)]
             let i = f as i64;
             #[allow(clippy::cast_precision_loss)]

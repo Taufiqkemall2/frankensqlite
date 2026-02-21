@@ -502,6 +502,7 @@ pub struct PlannerFeatureFlags {
 
 /// Maximum table count for DPccp exhaustive search.
 /// Above this threshold we use bounded beam search.
+#[allow(dead_code)]
 const DPCCP_MAX_TABLES: usize = 6;
 
 /// Monotonic counter: total join plans enumerated.
@@ -701,16 +702,18 @@ pub fn record_estimation_error(actual: f64, estimated: f64) {
         return;
     }
     let ratio = actual / estimated;
-    let mut obs = ESTIMATION_ERROR_OBSERVATIONS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    obs.push(ratio);
+    {
+        let mut obs = ESTIMATION_ERROR_OBSERVATIONS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        obs.push(ratio);
+    }
 
     tracing::debug!(
         actual,
         estimated,
         ratio,
-        miscalibrated = ratio > 5.0 || ratio < 0.2,
+        miscalibrated = !(0.2..=5.0).contains(&ratio),
         "planner.estimation_error"
     );
 }
@@ -2585,6 +2588,7 @@ fn cross_join_allowed(
 /// bitmask-based dynamic programming. Returns the minimum-cost permutation.
 ///
 /// Only used when `n <= DPCCP_MAX_TABLES` and `feature_flags.dpccp_join`.
+#[allow(dead_code, clippy::cast_possible_truncation)]
 fn dpccp_order_joins(
     tables: &[TableStats],
     indexes: &[IndexInfo],
@@ -2602,10 +2606,10 @@ fn dpccp_order_joins(
     let mut plans_counted: u64 = 0;
 
     // Base: single-table subsets.
-    for i in 0..n {
+    for (i, table) in tables.iter().enumerate() {
         let mask = 1u64 << i;
         let ap = join_access_path(
-            &tables[i],
+            table,
             indexes,
             where_terms,
             needed_columns,
@@ -2627,13 +2631,13 @@ fn dpccp_order_joins(
         }
 
         // Try adding each table not in the current set.
-        for i in 0..n {
+        for (i, table) in tables.iter().enumerate() {
             if mask & (1u64 << i) != 0 {
                 continue; // Already in set.
             }
             let new_mask = mask | (1u64 << i);
             let ap = join_access_path(
-                &tables[i],
+                table,
                 indexes,
                 where_terms,
                 needed_columns,
@@ -2826,7 +2830,7 @@ pub fn try_constant_fold(expr: &Expr) -> FoldResult {
                             FoldResult::Literal(if a == b { Literal::True } else { Literal::False })
                         }
                         fsqlite_ast::BinaryOp::Ne => {
-                            FoldResult::Literal(if a != b { Literal::True } else { Literal::False })
+                            FoldResult::Literal(if a == b { Literal::False } else { Literal::True })
                         }
                         fsqlite_ast::BinaryOp::Lt => {
                             FoldResult::Literal(if a < b { Literal::True } else { Literal::False })

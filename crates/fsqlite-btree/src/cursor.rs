@@ -811,13 +811,28 @@ impl<P: PageReader> BtCursor<P> {
             }
 
             // Interior index page: binary search to find which child to descend.
-            let child_idx = self.binary_search_index_interior(cx, &entry, target_key)?;
-            let child = self.child_page_at(&entry, child_idx)?;
-            let mut entry = entry;
-            entry.cell_idx = child_idx;
-            self.stack.push(entry);
-            self.issue_prefetch_hint(cx, child);
-            current_page = child;
+            let search_result = self.binary_search_index_interior(cx, &entry, target_key)?;
+            match search_result {
+                BinarySearchResult::Found(idx) => {
+                    let mut entry = entry;
+                    entry.cell_idx = idx;
+                    self.stack.push(entry);
+                    self.at_eof = false;
+                    self.record_point_witness(WitnessKey::Cell {
+                        btree_root: self.root_page,
+                        tag: Self::cell_tag_from_index_key(target_key),
+                    });
+                    return Ok(SeekResult::Found);
+                }
+                BinarySearchResult::NotFound(child_idx) => {
+                    let child = self.child_page_at(&entry, child_idx)?;
+                    let mut entry = entry;
+                    entry.cell_idx = child_idx;
+                    self.stack.push(entry);
+                    self.issue_prefetch_hint(cx, child);
+                    current_page = child;
+                }
+            }
         }
     }
 
@@ -872,10 +887,10 @@ impl<P: PageReader> BtCursor<P> {
         cx: &Cx,
         entry: &StackEntry,
         target: &[u8],
-    ) -> Result<u16> {
+    ) -> Result<BinarySearchResult> {
         let count = entry.header.cell_count;
         if count == 0 {
-            return Ok(0);
+            return Ok(BinarySearchResult::NotFound(0));
         }
 
         let mut lo = 0u16;
@@ -885,13 +900,13 @@ impl<P: PageReader> BtCursor<P> {
             let cell = self.parse_cell_at(entry, mid)?;
             let key = self.read_cell_payload(cx, entry, &cell)?;
 
-            if target < key.as_slice() {
-                hi = mid;
-            } else {
-                lo = mid + 1;
+            match key.as_slice().cmp(target) {
+                std::cmp::Ordering::Equal => return Ok(BinarySearchResult::Found(mid)),
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
             }
         }
-        Ok(lo)
+        Ok(BinarySearchResult::NotFound(lo))
     }
 
     /// Advance to the next entry. Returns false if at EOF.
@@ -918,12 +933,18 @@ impl<P: PageReader> BtCursor<P> {
             while let Some(parent) = self.stack.last() {
                 if parent.cell_idx < parent.header.cell_count {
                     // We came from the left child of cell[cell_idx].
-                    // Move to the next child (right subtree of this separator).
-                    let next_child_idx = parent.cell_idx + 1;
-                    let child = self.child_page_at(parent, next_child_idx)?;
-                    self.stack.last_mut().unwrap().cell_idx = next_child_idx;
-                    self.issue_prefetch_hint(cx, child);
-                    return self.move_to_leftmost_leaf(cx, child, true);
+                    if self.is_table {
+                        // Table B-trees are B+trees. Skip the separator cell.
+                        let next_child_idx = parent.cell_idx + 1;
+                        let child = self.child_page_at(parent, next_child_idx)?;
+                        self.stack.last_mut().unwrap().cell_idx = next_child_idx;
+                        self.issue_prefetch_hint(cx, child);
+                        return self.move_to_leftmost_leaf(cx, child, true);
+                    } else {
+                        // Index B-trees: the separator cell is the next record.
+                        self.at_eof = false;
+                        return Ok(true);
+                    }
                 }
                 // cell_idx == cell_count means we already visited right_child.
                 self.stack.pop();
@@ -934,10 +955,14 @@ impl<P: PageReader> BtCursor<P> {
             return Ok(false);
         }
 
-        // Should never be called on an interior page (cursor always at leaf).
-        Err(FrankenError::internal(
-            "cursor on interior page during next",
-        ))
+        // On an interior page (only happens for index B-trees).
+        // The current position is the separator cell itself.
+        // The next logical entry is the leftmost descendant of the right subtree.
+        let next_child_idx = top.cell_idx + 1;
+        let child = self.child_page_at(top, next_child_idx)?;
+        self.stack.last_mut().unwrap().cell_idx = next_child_idx;
+        self.issue_prefetch_hint(cx, child);
+        self.move_to_leftmost_leaf(cx, child, true)
     }
 
     /// Move to the previous entry. Returns false if at the beginning.
@@ -961,10 +986,18 @@ impl<P: PageReader> BtCursor<P> {
             while let Some(parent) = self.stack.last() {
                 if parent.cell_idx > 0 {
                     let prev_child_idx = parent.cell_idx - 1;
-                    let child = self.child_page_at(parent, prev_child_idx)?;
-                    self.stack.last_mut().unwrap().cell_idx = prev_child_idx;
-                    self.issue_prefetch_hint(cx, child);
-                    return self.move_to_rightmost_leaf(cx, child, true);
+                    if self.is_table {
+                        // Table B-trees are B+trees. Skip separator.
+                        let child = self.child_page_at(parent, prev_child_idx)?;
+                        self.stack.last_mut().unwrap().cell_idx = prev_child_idx;
+                        self.issue_prefetch_hint(cx, child);
+                        return self.move_to_rightmost_leaf(cx, child, true);
+                    } else {
+                        // Index B-trees: stop at the separator cell.
+                        self.stack.last_mut().unwrap().cell_idx = prev_child_idx;
+                        self.at_eof = false;
+                        return Ok(true);
+                    }
                 }
                 // cell_idx == 0 means we came from the leftmost child.
                 self.stack.pop();
@@ -974,9 +1007,12 @@ impl<P: PageReader> BtCursor<P> {
             return Ok(false);
         }
 
-        Err(FrankenError::internal(
-            "cursor on interior page during prev",
-        ))
+        // On an interior page (only happens for index B-trees).
+        // The current position is the separator cell itself.
+        // The previous logical entry is the rightmost descendant of the left subtree.
+        let child = self.child_page_at(top, top.cell_idx)?;
+        self.issue_prefetch_hint(cx, child);
+        self.move_to_rightmost_leaf(cx, child, true)
     }
 }
 

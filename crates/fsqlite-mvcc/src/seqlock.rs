@@ -154,13 +154,14 @@ impl SeqLock {
     }
 }
 
+#[allow(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for SeqLock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let seq = self.seq.load(Ordering::Relaxed);
         f.debug_struct("SeqLock")
             .field("seq", &seq)
             .field("writing", &(seq & 1 == 1))
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -248,13 +249,14 @@ impl SeqLockPair {
     }
 }
 
+#[allow(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for SeqLockPair {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let seq = self.seq.load(Ordering::Relaxed);
         f.debug_struct("SeqLockPair")
             .field("seq", &seq)
             .field("writing", &(seq & 1 == 1))
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -346,13 +348,14 @@ impl SeqLockTriple {
     }
 }
 
+#[allow(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for SeqLockTriple {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let seq = self.seq.load(Ordering::Relaxed);
         f.debug_struct("SeqLockTriple")
             .field("seq", &seq)
             .field("writing", &(seq & 1 == 1))
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

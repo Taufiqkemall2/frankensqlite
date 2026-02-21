@@ -97,6 +97,7 @@ impl TxnManager {
     /// This must be called only under the commit mutex to maintain
     /// strict ordering. Uses `Release` ordering so that readers using
     /// `Acquire` will see all prior version chain updates.
+    #[allow(clippy::significant_drop_tightening)]
     pub fn alloc_commit_seq(&self) -> CommitSeq {
         // We hold a lock to update active_commits atomically with the allocation
         // to ensure no race allows stable_commit_seq to jump past us.
@@ -506,6 +507,7 @@ impl VersionStore {
     /// # Returns
     ///
     /// A [`GcTickResult`] summarizing what was pruned and whether budgets were exhausted.
+    #[allow(clippy::significant_drop_tightening)]
     pub fn gc_tick(&self, todo: &mut GcTodo, horizon: CommitSeq) -> GcTickResult {
         let mut arena = self.arena.write();
         let mut chain_heads = self.chain_heads.write();
@@ -516,6 +518,7 @@ impl VersionStore {
             &mut chain_heads,
             self.guard_registry(),
         );
+        drop(arena);
         let mut ranges = self.visibility_ranges.write();
         for idx in &result.pruned_indices {
             ranges.remove(idx);

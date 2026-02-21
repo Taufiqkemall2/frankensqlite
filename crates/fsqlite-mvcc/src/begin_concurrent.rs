@@ -827,6 +827,7 @@ pub fn prepare_concurrent_commit_with_ssi(
 ///
 /// Applies SSI side effects (T3 propagation), records committed conflict
 /// history, updates the commit index, and releases page locks.
+#[allow(clippy::too_many_lines)]
 pub fn finalize_prepared_concurrent_commit_with_ssi(
     registry: &mut ConcurrentRegistry,
     commit_index: &CommitIndex,

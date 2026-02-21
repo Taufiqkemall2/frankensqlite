@@ -310,6 +310,7 @@ pub fn parse_btree_page(
 }
 
 /// Extract a single cell's raw bytes, rowid (if table B-tree), and key digest.
+#[allow(clippy::cast_possible_truncation)]
 fn extract_cell_with_digest(
     page: &[u8],
     cell_offset: usize,

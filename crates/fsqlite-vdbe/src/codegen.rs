@@ -1508,7 +1508,7 @@ fn is_aggregate_function(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     AGGREGATE_FUNCTIONS.iter().any(|&n| n == lower)
         || EXTRA_AGG_NAMES
-            .with(|extra| extra.borrow().iter().any(|n| *n == lower))
+            .with(|extra| extra.borrow().contains(&lower))
 }
 
 /// Check whether any result column contains an aggregate function call.
@@ -2982,6 +2982,7 @@ pub fn codegen_update(
             // rowid.
             b.emit_op(Opcode::Rowid, table_cursor, target_reg, 0, P4::None, 0);
         } else {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             b.emit_op(
                 Opcode::Column,
                 table_cursor,
@@ -3989,6 +3990,7 @@ fn extract_rowid_bind_param(where_clause: Option<&Expr>) -> Option<i32> {
 }
 
 /// Check if a WHERE clause is `col = ?` for an indexed column.
+#[allow(dead_code)]
 fn extract_column_eq_bind(where_clause: Option<&Expr>) -> Option<(String, i32)> {
     let expr = where_clause?;
     if let Expr::BinaryOp {
@@ -4009,6 +4011,7 @@ fn extract_column_eq_bind(where_clause: Option<&Expr>) -> Option<(String, i32)> 
 }
 
 /// Extract a column name from an expression if it's a simple column reference.
+#[allow(dead_code)]
 fn column_name(expr: &Expr) -> Option<String> {
     if let Expr::Column(col_ref, _) = expr {
         if !is_rowid_ref(col_ref) {
@@ -4643,7 +4646,8 @@ fn emit_in_probe_expr(
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
-    clippy::too_many_lines
+    clippy::too_many_lines,
+    clippy::many_single_char_names
 )]
 fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx<'_>>) {
     match expr {
@@ -4706,7 +4710,7 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 };
                 b.emit_op(Opcode::String8, 0, reg, 0, P4::Str(ts), 0);
             }
-            _ => {
+            Literal::Null => {
                 b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
             }
         },
@@ -5739,6 +5743,7 @@ mod tests {
 
     // === Test: INSERT ... SELECT with specific columns ===
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_codegen_insert_select_with_columns() {
         // Schema with source "s" having 3 columns, target "t" with 2.
         let schema = vec![

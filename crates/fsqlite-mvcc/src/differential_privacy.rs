@@ -69,6 +69,7 @@ pub fn reset_dp_metrics() {
     FSQLITE_DP_BUDGET_EXHAUSTED_TOTAL.store(0, Ordering::Relaxed);
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn record_dp_query(epsilon: f64) {
     FSQLITE_DP_QUERIES_TOTAL.fetch_add(1, Ordering::Relaxed);
     let micros = (epsilon * 1_000_000.0) as u64;
@@ -98,10 +99,10 @@ impl SplitMix64 {
     }
 
     fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9E3779B97F4A7C15);
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^ (z >> 31)
     }
 
@@ -118,7 +119,7 @@ impl SplitMix64 {
     /// Sample from Laplace(0, b) using inverse CDF.
     fn sample_laplace(&mut self, b: f64) -> f64 {
         let u = self.next_f64() - 0.5;
-        -b * u.signum() * (1.0 - 2.0 * u.abs()).ln()
+        -b * u.signum() * 2.0f64.mul_add(-u.abs(), 1.0).ln()
     }
 
     /// Sample from N(0, 1) using Box-Muller transform.
@@ -302,11 +303,12 @@ pub struct DpEngine {
     rng: SplitMix64,
 }
 
+#[allow(clippy::missing_fields_in_debug)]
 impl fmt::Debug for DpEngine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DpEngine")
             .field("budget", &self.budget)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -434,6 +436,7 @@ impl DpEngine {
         })
     }
 
+    #[allow(clippy::unused_self)]
     fn validate_params(&self, sensitivity: f64, epsilon: f64) -> Result<(), DpError> {
         if sensitivity <= 0.0 || !sensitivity.is_finite() {
             return Err(DpError::InvalidParameter(format!(
@@ -479,6 +482,7 @@ pub mod sensitivity {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
 
@@ -610,8 +614,8 @@ mod tests {
             sum_sq += x * x;
         }
 
-        let mean = sum / n as f64;
-        let variance = sum_sq / n as f64 - mean * mean;
+        let mean = sum / f64::from(n);
+        let variance = sum_sq / f64::from(n) - mean * mean;
 
         // Laplace(0, 1): E[X] = 0, Var[X] = 2b² = 2.
         assert!(
@@ -639,8 +643,8 @@ mod tests {
             sum_sq += x * x;
         }
 
-        let mean = sum / n as f64;
-        let variance = sum_sq / n as f64 - mean * mean;
+        let mean = sum / f64::from(n);
+        let variance = sum_sq / f64::from(n) - mean * mean;
 
         // N(0, 1): E[X] = 0, Var[X] = 1.
         assert!(

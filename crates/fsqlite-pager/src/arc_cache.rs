@@ -1215,9 +1215,9 @@ impl ArcCacheInner {
                 for (_, key, idx, is_t1) in versions.into_iter().skip(1) {
                     // Skip pinned pages.
                     let is_pinned = if is_t1 {
-                        self.t1.get(idx).map_or(false, |p| p.is_pinned())
+                        self.t1.get(idx).is_some_and(CachedPage::is_pinned)
                     } else {
-                        self.t2.get(idx).map_or(false, |p| p.is_pinned())
+                        self.t2.get(idx).is_some_and(CachedPage::is_pinned)
                     };
 
                     if is_pinned {
@@ -1242,6 +1242,7 @@ impl ArcCacheInner {
         self.version_coalesce_count = self.version_coalesce_count.saturating_add(removed_u64);
     }
 
+    #[allow(dead_code)]
     fn coalesce_versions_for_pgno(&mut self, pgno: PageNumber) -> usize {
         #[derive(Clone, Copy)]
         enum ResidentList {
