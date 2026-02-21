@@ -138,6 +138,8 @@ struct MemCursor {
     position: Option<usize>,
     /// Pseudo-table data (for OpenPseudo: a single row set by RowData/MakeRecord).
     pseudo_row: Option<Vec<SqliteValue>>,
+    /// Register containing the pseudo-row data blob.
+    pseudo_reg: Option<i32>,
     /// Whether this is a pseudo cursor (OpenPseudo).
     is_pseudo: bool,
 }
@@ -149,16 +151,18 @@ impl MemCursor {
             writable,
             position: None,
             pseudo_row: None,
+            pseudo_reg: None,
             is_pseudo: false,
         }
     }
 
-    fn new_pseudo() -> Self {
+    fn new_pseudo(reg: i32) -> Self {
         Self {
             root_page: -1,
             writable: false,
             position: None,
             pseudo_row: None,
+            pseudo_reg: Some(reg),
             is_pseudo: true,
         }
     }
@@ -1971,7 +1975,7 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     self.pending_next_after_delete.remove(&cursor_id);
                     self.storage_cursors.remove(&cursor_id);
-                    self.cursors.insert(cursor_id, MemCursor::new_pseudo());
+                    self.cursors.insert(cursor_id, MemCursor::new_pseudo(op.p2));
                     pc += 1;
                 }
 
@@ -2201,6 +2205,9 @@ impl VdbeEngine {
                 Opcode::Prev => {
                     // Move cursor backward. Jump to p2 if more rows.
                     let cursor_id = op.p1;
+                    // Prev repositions the cursor, so clear any pending
+                    // delete/next state before evaluating movement.
+                    self.pending_next_after_delete.remove(&cursor_id);
                     let has_prev = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
                         cursor.cursor.prev(&cursor.cx)?
                     } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
@@ -2246,13 +2253,16 @@ impl VdbeEngine {
 
                 Opcode::RowData => {
                     // Store raw row data as a blob in register p2.
-                    // For pseudo-cursors, retrieve the blob from p2.
                     let cursor_id = op.p1;
                     let target = op.p2;
                     if let Some(cursor) = self.cursors.get(&cursor_id) {
                         if cursor.is_pseudo {
-                            // Pseudo cursor: the "row data" was already set via
-                            // a prior MakeRecord → set_reg. Leave register as-is.
+                            if let Some(reg) = cursor.pseudo_reg {
+                                let blob = self.get_reg(reg).clone();
+                                self.set_reg(target, blob);
+                            } else {
+                                self.set_reg(target, SqliteValue::Null);
+                            }
                         } else {
                             self.set_reg(target, SqliteValue::Null);
                         }
@@ -3443,12 +3453,13 @@ impl VdbeEngine {
 
         if let Some(cursor) = self.cursors.get(&cursor_id) {
             if cursor.is_pseudo {
-                return Ok(cursor
-                    .pseudo_row
-                    .as_ref()
-                    .and_then(|row| row.get(col_idx))
-                    .cloned()
-                    .unwrap_or(SqliteValue::Null));
+                if let Some(reg) = cursor.pseudo_reg {
+                    let blob = self.get_reg(reg);
+                    if let Ok(values) = decode_record(blob) {
+                        return Ok(values.get(col_idx).cloned().unwrap_or(SqliteValue::Null));
+                    }
+                }
+                return Ok(SqliteValue::Null);
             }
             if let Some(pos) = cursor.position
                 && let Some(db) = self.db.as_ref()
@@ -6902,6 +6913,55 @@ mod tests {
         assert!(rowids.contains(&1));
         assert!(rowids.contains(&2));
         assert!(rowids.contains(&3));
+    }
+
+    #[test]
+    fn test_delete_then_prev_then_next_advances_correctly() {
+        // Regression: after Delete marks pending_next_after_delete, a
+        // subsequent Prev must clear that pending state. Otherwise the next
+        // Next call can incorrectly "stay put" and repeat the same row.
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).unwrap();
+        table.insert(1, vec![SqliteValue::Integer(10)]);
+        table.insert(2, vec![SqliteValue::Integer(20)]);
+        table.insert(3, vec![SqliteValue::Integer(30)]);
+
+        let (rows, _) = run_write_with_storage_cursors(db, |b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+
+            // Seek rowid=2 and delete it. Cursor should land on successor.
+            b.emit_op(Opcode::Integer, 2, 1, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SeekRowid, 0, 1, end, P4::None, 0);
+            b.emit_op(Opcode::Delete, 0, 0, 0, P4::None, 0);
+
+            // Step backward once (to rowid=1) and emit it.
+            let prev_ok = b.emit_label();
+            b.emit_jump_to_label(Opcode::Prev, 0, 0, prev_ok, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, end, P4::None, 0);
+            b.resolve_label(prev_ok);
+            b.emit_op(Opcode::Rowid, 0, 2, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 2, 1, 0, P4::None, 0);
+
+            // Now step forward once. Correct behavior is rowid=3 (not 1).
+            let next_ok = b.emit_label();
+            b.emit_jump_to_label(Opcode::Next, 0, 0, next_ok, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, end, P4::None, 0);
+            b.resolve_label(next_ok);
+            b.emit_op(Opcode::Rowid, 0, 3, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 3, 1, 0, P4::None, 0);
+
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(
+            rows,
+            vec![vec![SqliteValue::Integer(1)], vec![SqliteValue::Integer(3)]],
+            "Delete->Prev->Next should land on rowids 1 then 3 without repeating row 1"
+        );
     }
 
     #[test]

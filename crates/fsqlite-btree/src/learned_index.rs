@@ -246,11 +246,7 @@ impl LearnedIndex {
 
         if idx == 0 {
             // Key is before the first segment.
-            if key <= self.segments[0].key_hi {
-                Some(0)
-            } else {
-                None
-            }
+            None
         } else {
             let seg_idx = idx - 1;
             if key <= self.segments[seg_idx].key_hi {
