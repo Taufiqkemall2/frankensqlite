@@ -751,6 +751,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fsqlite-c-api"
+version = "0.1.0"
+dependencies = [
+ "fsqlite",
+ "fsqlite-error",
+ "fsqlite-types",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "fsqlite-cli"
 version = "0.1.0"
 dependencies = [
@@ -923,6 +934,7 @@ dependencies = [
  "fsqlite-mvcc",
  "fsqlite-pager",
  "fsqlite-parser",
+ "fsqlite-planner",
  "fsqlite-types",
  "fsqlite-vdbe",
  "fsqlite-vfs",

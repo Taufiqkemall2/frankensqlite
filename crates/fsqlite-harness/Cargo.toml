@@ -42,6 +42,7 @@ fsqlite-func = { workspace = true }
 fsqlite-mvcc = { workspace = true }
 fsqlite-pager = { workspace = true }
 fsqlite-parser = { workspace = true }
+fsqlite-planner = { workspace = true }
 fsqlite-types = { workspace = true }
 fsqlite-vdbe = { workspace = true }
 fsqlite-wal = { workspace = true }

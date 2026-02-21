@@ -27,6 +27,7 @@ members = [
     "crates/fsqlite-harness",
     "crates/fsqlite-e2e",
     "crates/fsqlite-observability",
+    "crates/fsqlite-c-api",
 ]
 
 [workspace.package]
@@ -78,6 +79,7 @@ fsqlite-cli = { path = "crates/fsqlite-cli" }
 fsqlite-harness = { path = "crates/fsqlite-harness" }
 fsqlite-e2e = { path = "crates/fsqlite-e2e" }
 fsqlite-observability = { path = "crates/fsqlite-observability" }
+fsqlite-c-api = { path = "crates/fsqlite-c-api" }
 
 # External dependencies
 ftui = { version = "0.2.0", path = "../frankentui/crates/ftui" }
