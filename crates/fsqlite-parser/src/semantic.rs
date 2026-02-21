@@ -154,7 +154,8 @@ pub struct Scope {
     /// Table aliases visible in this scope: alias → table name.
     aliases: HashMap<String, String>,
     /// Columns visible from each alias: alias → set of column names.
-    columns: HashMap<String, HashSet<String>>,
+    /// None means the columns are unknown (CTE or subquery), so any column reference is optimistically accepted.
+    columns: HashMap<String, Option<HashSet<String>>>,
     /// CTE names visible in this scope.
     ctes: HashSet<String>,
     /// Parent scope (for subquery nesting).
@@ -185,7 +186,7 @@ impl Scope {
     }
 
     /// Register a table alias with its columns.
-    pub fn add_alias(&mut self, alias: &str, table_name: &str, columns: HashSet<String>) {
+    pub fn add_alias(&mut self, alias: &str, table_name: &str, columns: Option<HashSet<String>>) {
         let key = alias.to_ascii_lowercase();
         self.aliases.insert(key.clone(), table_name.to_owned());
         self.columns.insert(key, columns);
@@ -222,7 +223,7 @@ impl Scope {
         if let Some(qualifier) = table_qualifier {
             let key = qualifier.to_ascii_lowercase();
             if let Some(cols) = self.columns.get(&key) {
-                if cols.contains(&col_lower) {
+                if cols.as_ref().map_or(true, |c| c.contains(&col_lower)) {
                     return ResolveResult::Resolved(key);
                 }
                 return ResolveResult::ColumnNotFound;
@@ -237,7 +238,7 @@ impl Scope {
         // Unqualified: search all aliases in this scope.
         let mut matches = Vec::new();
         for (alias, cols) in &self.columns {
-            if cols.contains(&col_lower) {
+            if cols.as_ref().map_or(true, |c| c.contains(&col_lower)) {
                 matches.push(alias.clone());
             }
         }
@@ -495,7 +496,7 @@ impl<'a> Resolver<'a> {
                 // Resolve table name against schema or CTEs.
                 if scope.ctes.contains(&table_name.to_ascii_lowercase()) {
                     // CTE reference — columns are unknown at this stage.
-                    scope.add_alias(alias_name, table_name, HashSet::new());
+                    scope.add_alias(alias_name, table_name, None);
                     self.tables_resolved += 1;
                 } else if let Some(table_def) = self.schema.find_table(table_name) {
                     let col_set: HashSet<String> = table_def
@@ -503,7 +504,7 @@ impl<'a> Resolver<'a> {
                         .iter()
                         .map(|c| c.name.to_ascii_lowercase())
                         .collect();
-                    scope.add_alias(alias_name, table_name, col_set);
+                    scope.add_alias(alias_name, table_name, Some(col_set));
                     self.tables_resolved += 1;
                 } else {
                     self.push_error(SemanticErrorKind::UnresolvedTable {
@@ -519,14 +520,14 @@ impl<'a> Resolver<'a> {
                 // Register the subquery alias with empty columns (we don't
                 // track subquery output columns at this stage).
                 if let Some(alias) = alias {
-                    scope.add_alias(alias, "<subquery>", HashSet::new());
+                    scope.add_alias(alias, "<subquery>", None);
                 }
             }
             TableOrSubquery::TableFunction {
                 name, alias, ..
             } => {
                 let alias_name = alias.as_deref().unwrap_or(name);
-                scope.add_alias(alias_name, name, HashSet::new());
+                scope.add_alias(alias_name, name, None);
                 self.tables_resolved += 1;
             }
             TableOrSubquery::ParenJoin(inner_from) => {
@@ -845,7 +846,8 @@ fn known_function_arity(name: &str) -> Option<FunctionArity> {
     match name.to_ascii_lowercase().as_str() {
         // Aggregate functions
         "count" => Some(FunctionArity::Range(0, 1)),
-        "sum" | "total" | "avg" | "min" | "max" => Some(FunctionArity::Exact(1)),
+        "sum" | "total" | "avg" => Some(FunctionArity::Exact(1)),
+        "min" | "max" => Some(FunctionArity::Variadic),
         "group_concat" => Some(FunctionArity::Range(1, 2)),
 
         // Scalar functions
@@ -853,10 +855,10 @@ fn known_function_arity(name: &str) -> Option<FunctionArity> {
         | "zeroblob" | "trim" | "ltrim" | "rtrim" | "soundex" | "char" | "likelihood" => {
             Some(FunctionArity::Exact(1))
         }
-        "coalesce" | "ifnull" | "nullif" | "iif" => Some(FunctionArity::Range(2, 3)),
-        "instr" | "like" | "glob" => Some(FunctionArity::Exact(2)),
-        "substr" | "substring" | "replace" => Some(FunctionArity::Range(2, 3)),
-        "printf" | "format" => Some(FunctionArity::Variadic),
+        "ifnull" | "nullif" | "instr" | "like" | "glob" => Some(FunctionArity::Exact(2)),
+        "iif" | "replace" => Some(FunctionArity::Exact(3)),
+        "substr" | "substring" => Some(FunctionArity::Range(2, 3)),
+        "coalesce" | "printf" | "format" => Some(FunctionArity::Variadic),
         "random" | "changes" | "last_insert_rowid" | "total_changes" => {
             Some(FunctionArity::Exact(0))
         }
@@ -991,7 +993,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        scope.add_alias("u", "users", cols);
+        scope.add_alias("u", "users", Some(cols));
 
         assert_eq!(
             scope.resolve_column(Some("u"), "id"),
@@ -1013,12 +1015,12 @@ mod tests {
         scope.add_alias(
             "u",
             "users",
-            ["id", "name"].iter().map(|s| s.to_string()).collect(),
+            Some(["id", "name"].iter().map(|s| s.to_string()).collect()),
         );
         scope.add_alias(
             "o",
             "orders",
-            ["id", "user_id"].iter().map(|s| s.to_string()).collect(),
+            Some(["id", "user_id"].iter().map(|s| s.to_string()).collect()),
         );
 
         // "name" is unique → resolved to "u"
@@ -1054,7 +1056,7 @@ mod tests {
         parent.add_alias(
             "u",
             "users",
-            ["id", "name"].iter().map(|s| s.to_string()).collect(),
+            Some(["id", "name"].iter().map(|s| s.to_string()).collect()),
         );
         let child = Scope::child(parent);
 
