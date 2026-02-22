@@ -1619,7 +1619,11 @@ pub fn try_cleanup_sentinel_slot(
     // We avoid blindly clearing fields here because multiple cleaners might race
     // and corrupt the slot if it is quickly re-allocated by a new transaction.
     let cleaning_word = encode_cleaning(orphan_txn_id);
-    if slot.txn_id.compare_exchange(cleaning_word, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+    if slot
+        .txn_id
+        .compare_exchange(cleaning_word, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
         if !was_claiming && prior_cleanup_marker != 0 {
             GLOBAL_TXN_SLOT_METRICS.record_slot_released(None, reclaim_pid);
         }
@@ -1674,8 +1678,6 @@ pub struct OrphanedSlotCleanupStats {
     /// Number of page lock releases performed.
     pub locks_released: usize,
 }
-
-
 
 /// Attempt to clean up a single orphaned slot (§5.6.2.2).
 ///
@@ -1788,7 +1790,11 @@ pub fn try_cleanup_orphaned_slot(
         );
 
         let cleaning_word = encode_cleaning(orphan_txn_id);
-        if slot.txn_id.compare_exchange(cleaning_word, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+        if slot
+            .txn_id
+            .compare_exchange(cleaning_word, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
             if !was_claiming && prior_cleanup_marker != 0 {
                 GLOBAL_TXN_SLOT_METRICS.record_slot_released(None, reclaim_pid);
             }
@@ -1798,7 +1804,7 @@ pub fn try_cleanup_orphaned_slot(
                 was_claiming,
             };
         }
-        
+
         return SlotCleanupResult::CasRaceSkipped;
     }
 
@@ -1838,14 +1844,18 @@ pub fn try_cleanup_orphaned_slot(
 
     tracing::info!(orphan_txn_id, "reclaiming orphaned real TxnId slot");
 
-    if slot.txn_id.compare_exchange(cleaning_word, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+    if slot
+        .txn_id
+        .compare_exchange(cleaning_word, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
         GLOBAL_TXN_SLOT_METRICS.record_slot_released(None, pid);
         return SlotCleanupResult::Reclaimed {
             orphan_txn_id,
             was_claiming: false,
         };
     }
-    
+
     SlotCleanupResult::CasRaceSkipped
 }
 

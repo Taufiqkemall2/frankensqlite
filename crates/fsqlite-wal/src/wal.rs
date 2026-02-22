@@ -929,9 +929,10 @@ mod tests {
 
         let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create WAL");
 
-        // Write 3 frames.
+        // Write 3 frames (last is a commit so recovery sees them).
         for i in 0..3u8 {
-            wal.append_frame(&cx, u32::from(i) + 1, &sample_page(i), 0)
+            let db_size = if i == 2 { 3 } else { 0 };
+            wal.append_frame(&cx, u32::from(i) + 1, &sample_page(i), db_size)
                 .expect("append");
         }
         let checksum_after_3 = wal.running_checksum();
@@ -992,14 +993,21 @@ mod tests {
     #[test]
     fn test_truncated_wal_recovers_committed_prefix() {
         // Simulate a crash mid-write by truncating the WAL file after the 3rd
-        // frame (of 5). On reopen, only the first 3 valid frames should load.
+        // frame (of 5). On reopen, only the committed prefix should load.
+        // Frame 3 (i==2) is a commit; frame 5 (i==4) is also a commit but gets truncated.
         let cx = test_cx();
         let vfs = MemoryVfs::new();
         let file = open_wal_file(&vfs, &cx);
 
         let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create WAL");
         for i in 0..5u8 {
-            let db_size = if i == 4 { 5 } else { 0 };
+            let db_size = if i == 2 {
+                3
+            } else if i == 4 {
+                5
+            } else {
+                0
+            };
             wal.append_frame(&cx, u32::from(i) + 1, &sample_page(i), db_size)
                 .expect("append");
         }
@@ -1036,14 +1044,21 @@ mod tests {
     #[test]
     fn test_corrupt_frame_payload_detected_on_reopen() {
         // Corrupt a byte in frame 3's payload. On reopen, the checksum chain
-        // breaks at frame 3, so only frames 0-2 should load.
+        // breaks at frame 3, so only the committed prefix (frames 0-2) should load.
+        // Frame 3 (i==2) is a commit marker so the committed prefix is 3 frames.
         let cx = test_cx();
         let vfs = MemoryVfs::new();
         let file = open_wal_file(&vfs, &cx);
 
         let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create WAL");
         for i in 0..5u8 {
-            let db_size = if i == 4 { 5 } else { 0 };
+            let db_size = if i == 2 {
+                3
+            } else if i == 4 {
+                5
+            } else {
+                0
+            };
             wal.append_frame(&cx, u32::from(i) + 1, &sample_page(i), db_size)
                 .expect("append");
         }
@@ -1121,22 +1136,19 @@ mod tests {
         f.write(&cx, &buf, corrupt_offset_u64).expect("corrupt");
         drop(f);
 
-        // Reopen: chain breaks at frame 5 (index 4), so 4 valid frames remain.
+        // Reopen: chain breaks at frame 5 (index 4). The last commit
+        // boundary is frame 3 (db_size=3), so only 3 committed frames remain.
         let file2 = open_wal_file(&vfs, &cx);
         let mut wal2 = WalFile::open(&cx, file2).expect("open WAL after corruption");
         assert_eq!(
             wal2.frame_count(),
-            4,
-            "chain should break at corrupted frame 5, keeping frames 1-4"
+            3,
+            "chain should break at corrupted frame 5, keeping committed prefix (frames 1-3)"
         );
 
-        // The last commit frame is frame 3 (db_size=3). Frames 4 is
-        // uncommitted (part of truncated txn 2).
+        // The last commit frame is frame 3 (db_size=3).
         let header3 = wal2.read_frame_header(&cx, 2).expect("read frame 3 header");
         assert!(header3.is_commit(), "frame 3 should be a commit frame");
-
-        let header4 = wal2.read_frame_header(&cx, 3).expect("read frame 4 header");
-        assert!(!header4.is_commit(), "frame 4 is not a commit frame");
 
         wal2.close(&cx).expect("close WAL");
     }
@@ -1248,9 +1260,9 @@ mod tests {
     #[test]
     fn test_crash_after_single_uncommitted_frame() {
         // Write a single non-commit frame (db_size=0), close/reopen.
-        // The frame should still load (it has a valid checksum), but
-        // it's not a commit frame, so a recovery protocol would not
-        // replay it. We verify the frame_count and commit status here.
+        // Since this frame is not a commit, recovery correctly excludes it
+        // from the committed frame count. Only committed transactions are
+        // visible after WAL recovery.
         let cx = test_cx();
         let vfs = MemoryVfs::new();
         let file = open_wal_file(&vfs, &cx);
@@ -1261,13 +1273,11 @@ mod tests {
         wal.close(&cx).expect("close WAL");
 
         let file2 = open_wal_file(&vfs, &cx);
-        let mut wal2 = WalFile::open(&cx, file2).expect("reopen WAL");
-        assert_eq!(wal2.frame_count(), 1, "valid frame should load");
-
-        let header = wal2.read_frame_header(&cx, 0).expect("read header");
-        assert!(
-            !header.is_commit(),
-            "non-commit frame should not be marked as commit"
+        let wal2 = WalFile::open(&cx, file2).expect("reopen WAL");
+        assert_eq!(
+            wal2.frame_count(),
+            0,
+            "uncommitted frame excluded from recovery"
         );
         wal2.close(&cx).expect("close WAL");
     }

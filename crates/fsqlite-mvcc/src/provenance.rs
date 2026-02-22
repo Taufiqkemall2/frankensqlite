@@ -52,10 +52,8 @@ pub fn provenance_metrics() -> ProvenanceMetrics {
     ProvenanceMetrics {
         fsqlite_provenance_annotations_total: FSQLITE_PROVENANCE_ANNOTATIONS_TOTAL
             .load(Ordering::Relaxed),
-        fsqlite_provenance_queries_total: FSQLITE_PROVENANCE_QUERIES_TOTAL
-            .load(Ordering::Relaxed),
-        fsqlite_provenance_rows_emitted: FSQLITE_PROVENANCE_ROWS_EMITTED
-            .load(Ordering::Relaxed),
+        fsqlite_provenance_queries_total: FSQLITE_PROVENANCE_QUERIES_TOTAL.load(Ordering::Relaxed),
+        fsqlite_provenance_rows_emitted: FSQLITE_PROVENANCE_ROWS_EMITTED.load(Ordering::Relaxed),
     }
 }
 

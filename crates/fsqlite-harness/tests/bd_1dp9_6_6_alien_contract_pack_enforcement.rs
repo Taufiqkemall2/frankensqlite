@@ -14,29 +14,23 @@
 //! - Gate outcome classification
 //! - Conformance summary
 
-use fsqlite_harness::confidence_gates::{
-    GateConfig, GateDecision, GATE_SCHEMA_VERSION,
-};
+use fsqlite_harness::confidence_gates::{GATE_SCHEMA_VERSION, GateConfig, GateDecision};
 use fsqlite_harness::impact_graph::{
-    ImpactGraph, ScenarioCategory, ValidationLane,
-    compute_impact_coverage,
+    ImpactGraph, ScenarioCategory, ValidationLane, compute_impact_coverage,
 };
 use fsqlite_harness::ratchet_policy::{
-    RatchetDecision, RatchetPolicy, RatchetState, RatchetVerdict,
-    RATCHET_SCHEMA_VERSION, check_rollback_signal, enter_quarantine, exit_quarantine,
-    grant_waiver, revoke_waiver,
+    RATCHET_SCHEMA_VERSION, RatchetDecision, RatchetPolicy, RatchetState, RatchetVerdict,
+    check_rollback_signal, enter_quarantine, exit_quarantine, grant_waiver, revoke_waiver,
 };
-use fsqlite_harness::score_engine::{
-    BetaParams, PriorConfig, ScoreEngineConfig,
-};
+use fsqlite_harness::score_engine::{BetaParams, PriorConfig, ScoreEngineConfig};
 use fsqlite_harness::validation_manifest::{
     GateOutcome, GateRecord, InvariantGapReason, InvariantGapSeverity, ReplayContract,
     ScenarioGapReason, ScenarioGapSeverity, VALIDATION_MANIFEST_SCHEMA_VERSION,
 };
 use fsqlite_harness::verification_contract_enforcement::{
-    BeadContractVerdict, ContractBeadStatus, ContractEnforcementOutcome, EnforcementDisposition,
-    VerificationContractReport, CONTRACT_ENFORCEMENT_SCHEMA_VERSION, enforce_gate_decision,
-    render_contract_enforcement_logs,
+    BeadContractVerdict, CONTRACT_ENFORCEMENT_SCHEMA_VERSION, ContractBeadStatus,
+    ContractEnforcementOutcome, EnforcementDisposition, VerificationContractReport,
+    enforce_gate_decision, render_contract_enforcement_logs,
 };
 
 // ── 1. Verification contract enforcement types ──────────────────────────────
@@ -108,7 +102,10 @@ fn enforce_gate_decision_all_passing() {
     assert!(outcome.final_gate_passed);
     assert!(outcome.base_gate_passed);
     assert!(outcome.contract_passed);
-    assert!(matches!(outcome.disposition, EnforcementDisposition::Allowed));
+    assert!(matches!(
+        outcome.disposition,
+        EnforcementDisposition::Allowed
+    ));
 }
 
 #[test]
@@ -186,10 +183,7 @@ fn render_contract_enforcement_logs_not_empty() {
     };
 
     let logs = render_contract_enforcement_logs(&outcome);
-    assert!(
-        !logs.is_empty(),
-        "enforcement logs should not be empty"
-    );
+    assert!(!logs.is_empty(), "enforcement logs should not be empty");
 }
 
 // ── 5. BetaParams posterior computation ─────────────────────────────────────
@@ -202,11 +196,16 @@ fn beta_params_posterior_computation() {
 
     // After 8 successes, 2 failures: Beta(9, 3).
     let posterior = BetaParams::new(9.0, 3.0);
-    assert!((posterior.mean() - 0.75).abs() < 1e-10, "Beta(9,3) mean = 0.75");
+    assert!(
+        (posterior.mean() - 0.75).abs() < 1e-10,
+        "Beta(9,3) mean = 0.75"
+    );
     assert!(posterior.variance() > 0.0);
 
     // Mode of Beta(9,3) = (9-1)/(9+3-2) = 8/10 = 0.8.
-    let mode = posterior.mode().expect("mode should exist for alpha,beta > 1");
+    let mode = posterior
+        .mode()
+        .expect("mode should exist for alpha,beta > 1");
     assert!((mode - 0.8).abs() < 1e-10, "Beta(9,3) mode = 0.8");
 
     // Credible interval should be within [0, 1].
@@ -243,7 +242,10 @@ fn prior_config_named_constructors() {
 #[test]
 fn gate_decision_variants() {
     assert!(GateDecision::Pass.is_pass());
-    assert!(!GateDecision::Conditional.is_pass(), "Conditional is NOT a pass");
+    assert!(
+        !GateDecision::Conditional.is_pass(),
+        "Conditional is NOT a pass"
+    );
     assert!(!GateDecision::Fail.is_pass());
     assert!(GateDecision::Waived.is_pass());
 }
@@ -573,9 +575,6 @@ fn conformance_summary() {
     ];
     let passed = checks.iter().filter(|(_, ok)| *ok).count();
     let total = checks.len();
-    assert_eq!(
-        passed, total,
-        "conformance: {passed}/{total} gates passed"
-    );
+    assert_eq!(passed, total, "conformance: {passed}/{total} gates passed");
     eprintln!("[bd-1dp9.6.6] conformance: {passed}/{total} gates passed");
 }

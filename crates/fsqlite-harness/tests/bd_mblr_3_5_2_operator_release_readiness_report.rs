@@ -8,10 +8,9 @@
 //! bd-mblr.3.5.1 (validation manifest), bd-mblr.3.3 (flake budget/retry).
 
 use fsqlite_harness::validation_manifest::{
-    GateOutcome, ValidationManifest, ValidationManifestConfig,
-    COVERAGE_GATE_ID, INVARIANT_DRIFT_GATE_ID, LOGGING_GATE_ID, NO_MOCK_GATE_ID,
-    SCENARIO_DRIFT_GATE_ID, VALIDATION_MANIFEST_SCENARIO_ID,
-    build_validation_manifest_bundle, validate_manifest_contract,
+    COVERAGE_GATE_ID, GateOutcome, INVARIANT_DRIFT_GATE_ID, LOGGING_GATE_ID, NO_MOCK_GATE_ID,
+    SCENARIO_DRIFT_GATE_ID, VALIDATION_MANIFEST_SCENARIO_ID, ValidationManifest,
+    ValidationManifestConfig, build_validation_manifest_bundle, validate_manifest_contract,
 };
 
 const BEAD_ID: &str = "bd-mblr.3.5.2";
@@ -90,7 +89,8 @@ fn readiness_report_lists_all_gates() {
     for gate in &bundle.manifest.gates {
         assert!(
             summary.contains(&gate.gate_id),
-            "report must list gate {}", gate.gate_id
+            "report must list gate {}",
+            gate.gate_id
         );
     }
 }
@@ -103,7 +103,8 @@ fn readiness_report_shows_gate_outcomes() {
     for gate in &bundle.manifest.gates {
         assert!(
             summary.contains(&format!("{}", gate.outcome)),
-            "report must show outcome for gate {}", gate.gate_id
+            "report must show outcome for gate {}",
+            gate.gate_id
         );
     }
 }
@@ -116,7 +117,8 @@ fn readiness_report_shows_gate_families() {
     for gate in &bundle.manifest.gates {
         assert!(
             summary.contains(&gate.gate_family),
-            "report must show family for gate {}", gate.gate_id
+            "report must show family for gate {}",
+            gate.gate_id
         );
     }
 }
@@ -135,7 +137,10 @@ fn blocked_criteria_identified_from_failing_gates() {
         .collect();
 
     if !failing_gates.is_empty() {
-        assert!(!bundle.manifest.overall_pass, "failing gates mean overall_pass=false");
+        assert!(
+            !bundle.manifest.overall_pass,
+            "failing gates mean overall_pass=false"
+        );
     }
 
     // If there are failing gates, each one represents a blocked criterion
@@ -179,7 +184,10 @@ fn invariant_drift_statistics_for_operator() {
     let drift = &bundle.manifest.invariant_drift;
 
     assert!(drift.total_matrix_tests > 0, "matrix must have tests");
-    assert!(drift.total_matrix_invariants > 0, "matrix must have invariants");
+    assert!(
+        drift.total_matrix_invariants > 0,
+        "matrix must have invariants"
+    );
     // unit_matrix_overall_fill_pct should be a valid percentage
     assert!(
         (0.0..=100.0).contains(&drift.unit_matrix_overall_fill_pct),
@@ -218,7 +226,10 @@ fn logging_conformance_has_profile_info() {
     let bundle = build_bundle();
     let log = &bundle.manifest.logging_conformance;
 
-    assert!(!log.profile_doc_path.is_empty(), "must have profile doc path");
+    assert!(
+        !log.profile_doc_path.is_empty(),
+        "must have profile doc path"
+    );
     assert!(!log.profile_version.is_empty(), "must have profile version");
 }
 
@@ -255,14 +266,20 @@ fn artifact_links_resolve_to_content() {
 fn artifact_content_is_parseable_for_drilldown() {
     let bundle = build_bundle();
     for (uri, content) in &bundle.gate_artifacts {
-        if std::path::Path::new(uri.as_str()).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("json")) {
+        if std::path::Path::new(uri.as_str())
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        {
             let parsed: Result<serde_json::Value, _> = serde_json::from_str(content);
             assert!(
                 parsed.is_ok(),
                 "artifact {uri} must be parseable JSON for drill-down: {}",
                 parsed.unwrap_err()
             );
-        } else if std::path::Path::new(uri.as_str()).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl")) {
+        } else if std::path::Path::new(uri.as_str())
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+        {
             for line in content.lines() {
                 if line.trim().is_empty() {
                     continue;
@@ -281,7 +298,10 @@ fn replay_command_enables_operator_reproduction() {
     let bundle = build_bundle();
     let cmd = &bundle.manifest.replay.command;
 
-    assert!(!cmd.is_empty(), "replay command must exist for operator reproduction");
+    assert!(
+        !cmd.is_empty(),
+        "replay command must exist for operator reproduction"
+    );
     assert!(
         cmd.contains("validation_manifest_runner"),
         "replay command must reference the runner binary"
@@ -325,7 +345,10 @@ fn report_is_complete_for_offline_triage() {
         NO_MOCK_GATE_ID,
         LOGGING_GATE_ID,
     ] {
-        assert!(summary.contains(gate_id), "summary must include gate {gate_id}");
+        assert!(
+            summary.contains(gate_id),
+            "summary must include gate {gate_id}"
+        );
     }
 }
 
@@ -365,7 +388,10 @@ fn readiness_report_is_deterministic() {
     let a = build_validation_manifest_bundle(&config).unwrap();
     let b = build_validation_manifest_bundle(&config).unwrap();
 
-    assert_eq!(a.human_summary, b.human_summary, "human summary must be deterministic");
+    assert_eq!(
+        a.human_summary, b.human_summary,
+        "human summary must be deterministic"
+    );
 
     let json_a = a.manifest.to_json().unwrap();
     let json_b = b.manifest.to_json().unwrap();
@@ -381,7 +407,10 @@ fn readiness_report_survives_json_roundtrip() {
     let restored = ValidationManifest::from_json(&json).unwrap();
 
     // All drill-down information must survive
-    assert_eq!(restored.invariant_drift.gaps.len(), bundle.manifest.invariant_drift.gaps.len());
+    assert_eq!(
+        restored.invariant_drift.gaps.len(),
+        bundle.manifest.invariant_drift.gaps.len()
+    );
     assert_eq!(
         restored.scenario_coverage_drift.gaps.len(),
         bundle.manifest.scenario_coverage_drift.gaps.len()
@@ -406,7 +435,10 @@ fn readiness_report_survives_json_roundtrip() {
 fn readiness_manifest_passes_contract() {
     let bundle = build_bundle();
     let errors = validate_manifest_contract(&bundle.manifest);
-    assert!(errors.is_empty(), "readiness manifest must pass contract: {errors:?}");
+    assert!(
+        errors.is_empty(),
+        "readiness manifest must pass contract: {errors:?}"
+    );
 }
 
 // ─── Evidence-Link Integrity ──────────────────────────────────────────
@@ -414,8 +446,12 @@ fn readiness_manifest_passes_contract() {
 #[test]
 fn all_artifact_uris_are_in_top_level_index() {
     let bundle = build_bundle();
-    let top_level: std::collections::BTreeSet<&str> =
-        bundle.manifest.artifact_uris.iter().map(String::as_str).collect();
+    let top_level: std::collections::BTreeSet<&str> = bundle
+        .manifest
+        .artifact_uris
+        .iter()
+        .map(String::as_str)
+        .collect();
 
     for gate in &bundle.manifest.gates {
         for uri in &gate.artifact_uris {
@@ -460,10 +496,19 @@ fn conformance_summary() {
     let checks = vec![
         ("C-1: Report includes overall verdict and pass status", true),
         ("C-2: Report lists all 5 gates with outcomes", true),
-        ("C-3: Failing gates identifiable for priority ordering", true),
-        ("C-4: Invariant drift gaps have details and remediation", true),
+        (
+            "C-3: Failing gates identifiable for priority ordering",
+            true,
+        ),
+        (
+            "C-4: Invariant drift gaps have details and remediation",
+            true,
+        ),
         ("C-5: Artifact links resolve to parseable content", true),
-        ("C-6: Report compact for CI but complete for offline triage", true),
+        (
+            "C-6: Report compact for CI but complete for offline triage",
+            true,
+        ),
         ("C-7: Report deterministic for same inputs", true),
         ("C-8: Drill-down data survives JSON round-trip", true),
         ("C-9: Evidence-link integrity validated", true),

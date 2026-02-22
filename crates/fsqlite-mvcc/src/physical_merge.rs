@@ -324,12 +324,18 @@ fn extract_cell_with_digest(
         BTreePageType::LeafTable => parse_leaf_table_cell(remaining, table_id, usable as u32),
         BTreePageType::LeafIndex => parse_leaf_index_cell(remaining, table_id, usable as u32),
         BTreePageType::InteriorTable => parse_interior_table_cell(remaining, table_id),
-        BTreePageType::InteriorIndex => parse_interior_index_cell(remaining, table_id, usable as u32),
+        BTreePageType::InteriorIndex => {
+            parse_interior_index_cell(remaining, table_id, usable as u32)
+        }
     }
 }
 
 /// Parse a leaf table cell: `[varint payload_size][varint rowid][payload...][overflow?]`
-fn parse_leaf_table_cell(data: &[u8], table_id: TableId, usable: u32) -> Result<CellExtract, MergeError> {
+fn parse_leaf_table_cell(
+    data: &[u8],
+    table_id: TableId,
+    usable: u32,
+) -> Result<CellExtract, MergeError> {
     let (payload_size, n1) =
         fsqlite_types::serial_type::read_varint(data).ok_or(MergeError::InvalidPageBuffer)?;
     let (rowid_u64, n2) = fsqlite_types::serial_type::read_varint(&data[n1..])
@@ -339,11 +345,7 @@ fn parse_leaf_table_cell(data: &[u8], table_id: TableId, usable: u32) -> Result<
     let rowid = rowid_u64 as i64;
 
     let header_len = n1 + n2;
-    let local_payload = compute_local_payload_size(
-        payload_size,
-        usable,
-        true,
-    );
+    let local_payload = compute_local_payload_size(payload_size, usable, true);
     let has_overflow = payload_size > u64::from(local_payload);
 
     let total_cell_size = header_len + local_payload as usize + if has_overflow { 4 } else { 0 };
@@ -362,7 +364,11 @@ fn parse_leaf_table_cell(data: &[u8], table_id: TableId, usable: u32) -> Result<
 }
 
 /// Parse a leaf index cell: `[varint payload_size][payload...][overflow?]`
-fn parse_leaf_index_cell(data: &[u8], table_id: TableId, usable: u32) -> Result<CellExtract, MergeError> {
+fn parse_leaf_index_cell(
+    data: &[u8],
+    table_id: TableId,
+    usable: u32,
+) -> Result<CellExtract, MergeError> {
     let (payload_size, n1) =
         fsqlite_types::serial_type::read_varint(data).ok_or(MergeError::InvalidPageBuffer)?;
 
@@ -411,7 +417,11 @@ fn parse_interior_table_cell(data: &[u8], table_id: TableId) -> Result<CellExtra
 }
 
 /// Parse an interior index cell: `[4-byte left_child][varint payload_size][payload...][overflow?]`
-fn parse_interior_index_cell(data: &[u8], table_id: TableId, usable: u32) -> Result<CellExtract, MergeError> {
+fn parse_interior_index_cell(
+    data: &[u8],
+    table_id: TableId,
+    usable: u32,
+) -> Result<CellExtract, MergeError> {
     if data.len() < 4 {
         return Err(MergeError::InvalidPageBuffer);
     }

@@ -14,9 +14,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
-use fsqlite_mvcc::{
-    SeqLock, SeqLockPair, SeqLockTriple, reset_seqlock_metrics, seqlock_metrics,
-};
+use fsqlite_mvcc::{SeqLock, SeqLockPair, SeqLockTriple, reset_seqlock_metrics, seqlock_metrics};
 
 // ---------------------------------------------------------------------------
 // Test 1: Single-value read/write
@@ -226,7 +224,10 @@ fn test_metrics_integration() {
     assert!(json.contains("fsqlite_seqlock_reads_total"));
     assert!(json.contains("fsqlite_seqlock_retries_total"));
 
-    println!("[PASS] metrics: reads={} retries={}", m.fsqlite_seqlock_reads_total, m.fsqlite_seqlock_retries_total);
+    println!(
+        "[PASS] metrics: reads={} retries={}",
+        m.fsqlite_seqlock_reads_total, m.fsqlite_seqlock_retries_total
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -292,7 +293,12 @@ fn test_stress_concurrent_rw() {
     assert!(writes > 0);
     assert!(reads > 0);
     assert_eq!(seq % 2, 0, "sequence must be even: {seq}");
-    assert_eq!(seq, writes * 2, "seq={seq} but expected writes*2={}", writes * 2);
+    assert_eq!(
+        seq,
+        writes * 2,
+        "seq={seq} but expected writes*2={}",
+        writes * 2
+    );
 
     println!("[PASS] stress: writes={writes} reads={reads} seq={seq}");
 }
@@ -439,7 +445,10 @@ fn test_conformance_summary() {
     println!("  \"total\": {total},");
     println!("  \"passed\": {passed},");
     println!("  \"failed\": {failed},");
-    println!("  \"pass_rate\": \"{:.1}%\",", passed as f64 / total as f64 * 100.0);
+    println!(
+        "  \"pass_rate\": \"{:.1}%\",",
+        passed as f64 / total as f64 * 100.0
+    );
     println!("  \"cases\": [");
     for (i, r) in results.iter().enumerate() {
         let comma = if i + 1 < total { "," } else { "" };

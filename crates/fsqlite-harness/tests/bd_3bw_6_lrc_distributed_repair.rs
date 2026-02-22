@@ -44,7 +44,9 @@ fn test_basic_encode_structure() {
 
     println!(
         "[PASS] Basic encode: {} source, {} groups, {} local parities",
-        result.k_source, result.num_groups, result.local_parities.len()
+        result.k_source,
+        result.num_groups,
+        result.local_parities.len()
     );
 }
 
@@ -81,8 +83,14 @@ fn test_local_repair() {
             assert_eq!(*symbol_index, 1);
             assert_eq!(*group_index, 0);
             // Local repair reads r-1 group members + 1 local parity.
-            assert!(*symbols_read <= 3, "local repair should read at most r symbols");
-            assert_eq!(repaired, &result.source_symbols[1].1, "repaired data should match original");
+            assert!(
+                *symbols_read <= 3,
+                "local repair should read at most r symbols"
+            );
+            assert_eq!(
+                repaired, &result.source_symbols[1].1,
+                "repaired data should match original"
+            );
         }
         other => panic!("expected LocalRepair, got {other:?}"),
     }
@@ -166,7 +174,10 @@ fn test_multi_group_encode() {
             expected_global[j] ^= b;
         }
     }
-    assert_eq!(result.global_parity, expected_global, "global parity incorrect");
+    assert_eq!(
+        result.global_parity, expected_global,
+        "global parity incorrect"
+    );
 
     println!("[PASS] Multi-group encode: 10 symbols, 5 groups, parities verified");
 }
@@ -193,10 +204,7 @@ fn test_repair_io_reduction() {
     assert_eq!(outcomes.len(), 1);
 
     match &outcomes[0] {
-        LrcRepairOutcome::LocalRepair {
-            symbols_read,
-            ..
-        } => {
+        LrcRepairOutcome::LocalRepair { symbols_read, .. } => {
             // Local repair should read at most r symbols (group members + parity).
             let r = result.locality;
             assert!(
@@ -257,7 +265,9 @@ fn test_multiple_missing_unrecoverable() {
         "at least one should be unrecoverable"
     );
 
-    println!("[PASS] Multiple missing: {unrecoverable_count}/2 correctly identified as unrecoverable");
+    println!(
+        "[PASS] Multiple missing: {unrecoverable_count}/2 correctly identified as unrecoverable"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -288,8 +298,7 @@ fn test_full_round_trip() {
             LrcRepairOutcome::LocalRepair { data: repaired, .. }
             | LrcRepairOutcome::GlobalRepair { data: repaired, .. } => {
                 assert_eq!(
-                    repaired,
-                    &result.source_symbols[erase_idx as usize].1,
+                    repaired, &result.source_symbols[erase_idx as usize].1,
                     "round-trip failed for symbol {erase_idx}"
                 );
             }
@@ -345,12 +354,16 @@ fn test_metrics_fidelity() {
 
     // Display format.
     let text = format!("{}", m_after);
-    assert!(text.contains("lrc_local_repairs="), "Display should include local repairs");
-    assert!(text.contains("lrc_encodes="), "Display should include encodes");
-
-    println!(
-        "[PASS] Metrics fidelity: delta_encodes={delta_encodes}, delta_local={delta_local}"
+    assert!(
+        text.contains("lrc_local_repairs="),
+        "Display should include local repairs"
     );
+    assert!(
+        text.contains("lrc_encodes="),
+        "Display should include encodes"
+    );
+
+    println!("[PASS] Metrics fidelity: delta_encodes={delta_encodes}, delta_local={delta_local}");
 }
 
 // ---------------------------------------------------------------------------
@@ -455,7 +468,9 @@ fn test_conformance_summary() {
         }
     }
     let out2 = codec.repair(&result, &avail2, &[0, 1]);
-    let multi_ok = out2.iter().any(|o| matches!(o, LrcRepairOutcome::Unrecoverable { .. }));
+    let multi_ok = out2
+        .iter()
+        .any(|o| matches!(o, LrcRepairOutcome::Unrecoverable { .. }));
 
     println!();
     println!("=== Conformance Summary ===");

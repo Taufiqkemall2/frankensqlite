@@ -16,8 +16,9 @@
 use std::time::Duration;
 
 use fsqlite_harness::benchmark_corpus::{
-    BenchmarkFamily, BenchmarkTier, build_benchmark_corpus, build_validated_benchmark_corpus,
-    render_operator_workflow, validate_benchmark_corpus, CORPUS_SCHEMA_VERSION, DEFAULT_ROOT_SEED,
+    BenchmarkFamily, BenchmarkTier, CORPUS_SCHEMA_VERSION, DEFAULT_ROOT_SEED,
+    build_benchmark_corpus, build_validated_benchmark_corpus, render_operator_workflow,
+    validate_benchmark_corpus,
 };
 use fsqlite_wal::group_commit::{
     ConsolidationMetrics, ConsolidationPhase, FrameSubmission, GroupCommitConfig,
@@ -134,7 +135,10 @@ fn consolidator_should_flush_when_full() {
     assert!(!consolidator.should_flush_now());
 
     consolidator.submit_batch(make_batch(1)).unwrap();
-    assert!(consolidator.should_flush_now(), "3/3 frames should trigger flush");
+    assert!(
+        consolidator.should_flush_now(),
+        "3/3 frames should trigger flush"
+    );
 
     // time_until_flush should be zero when full.
     assert_eq!(consolidator.time_until_flush(), Duration::ZERO);
@@ -318,8 +322,14 @@ fn corpus_covers_all_tiers_and_families() {
     let corpus = build_benchmark_corpus(DEFAULT_ROOT_SEED);
 
     let tiers: std::collections::HashSet<_> = corpus.entries.iter().map(|e| e.tier).collect();
-    assert!(tiers.contains(&BenchmarkTier::Micro), "should have micro benchmarks");
-    assert!(tiers.contains(&BenchmarkTier::Macro), "should have macro benchmarks");
+    assert!(
+        tiers.contains(&BenchmarkTier::Micro),
+        "should have micro benchmarks"
+    );
+    assert!(
+        tiers.contains(&BenchmarkTier::Macro),
+        "should have macro benchmarks"
+    );
 
     let families: std::collections::HashSet<_> = corpus.entries.iter().map(|e| e.family).collect();
     assert!(families.contains(&BenchmarkFamily::WriteContention));
@@ -447,10 +457,7 @@ fn conformance_summary() {
     ];
     let passed = checks.iter().filter(|(_, ok)| *ok).count();
     let total = checks.len();
-    assert_eq!(
-        passed, total,
-        "conformance: {passed}/{total} gates passed"
-    );
+    assert_eq!(passed, total, "conformance: {passed}/{total} gates passed");
     eprintln!("[bd-ncivz.4] conformance: {passed}/{total} gates passed");
 }
 

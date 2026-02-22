@@ -508,10 +508,7 @@ mod tests {
                 let mut reads = 0u64;
                 while !rs.load(std::sync::atomic::Ordering::Relaxed) {
                     if let Some((a, b, c)) = rsl.read("triple") {
-                        assert!(
-                            a == b && b == c,
-                            "torn read: a={a}, b={b}, c={c}"
-                        );
+                        assert!(a == b && b == c, "torn read: a={a}, b={b}, c={c}");
                         reads += 1;
                     }
                 }

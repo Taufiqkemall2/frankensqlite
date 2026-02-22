@@ -13,10 +13,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fsqlite_harness::fslab::FsLab;
-use fsqlite_mvcc::{
-    FlatCombiner, LeftRight, LeftRightPair, QsbrRegistry, RcuCell,
-    SeqLock,
-};
+use fsqlite_mvcc::{FlatCombiner, LeftRight, LeftRightPair, QsbrRegistry, RcuCell, SeqLock};
 
 /// Track how many distinct schedule seeds we've explored.
 static SCHEDULES_EXPLORED: AtomicU64 = AtomicU64::new(0);
@@ -348,7 +345,10 @@ fn test_trace_certificates() {
         report.trace_certificate.schedule_hash != 0,
         "schedule_hash should be non-zero"
     );
-    assert!(report.trace_fingerprint != 0, "fingerprint should be non-zero");
+    assert!(
+        report.trace_fingerprint != 0,
+        "fingerprint should be non-zero"
+    );
 
     // Replay same seed — should produce identical certificate.
     let report2 = lab.run_with_setup(|runtime, root| {
@@ -365,8 +365,7 @@ fn test_trace_certificates() {
     });
 
     assert_eq!(
-        report.trace_certificate.schedule_hash,
-        report2.trace_certificate.schedule_hash,
+        report.trace_certificate.schedule_hash, report2.trace_certificate.schedule_hash,
         "trace certificates differ on replay"
     );
 
@@ -400,7 +399,10 @@ fn test_conformance_summary() {
         results.push(TestResult {
             name: "fslab_smoke",
             pass,
-            detail: format!("quiescent={} steps={}", report.quiescent, report.steps_total),
+            detail: format!(
+                "quiescent={} steps={}",
+                report.quiescent, report.steps_total
+            ),
         });
     }
 
@@ -467,10 +469,7 @@ fn test_conformance_summary() {
         results.push(TestResult {
             name: "chaos_tolerance",
             pass,
-            detail: format!(
-                "violations={}",
-                report.invariant_violations.len()
-            ),
+            detail: format!("violations={}", report.invariant_violations.len()),
         });
     }
 
@@ -501,8 +500,7 @@ fn test_conformance_summary() {
     {
         let lab = FsLab::new(0xAA).worker_count(1).max_steps(5_000);
         let report = lab.run_single_task(async { 1_u64 });
-        let pass =
-            report.trace_certificate.schedule_hash != 0 && report.trace_fingerprint != 0;
+        let pass = report.trace_certificate.schedule_hash != 0 && report.trace_fingerprint != 0;
         results.push(TestResult {
             name: "trace_certificate",
             pass,

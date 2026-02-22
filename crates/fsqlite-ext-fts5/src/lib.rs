@@ -826,28 +826,14 @@ fn parse_or(
 fn parse_and(
     tokens: &[Fts5QueryToken],
 ) -> std::result::Result<(Fts5Expr, &[Fts5QueryToken]), Fts5QueryError> {
-    let (mut left, mut rest) = parse_not(tokens)?;
-
-    while let Some(token) = rest.first() {
-        if token.kind == Fts5QueryTokenKind::And {
-            let (right, r) = parse_not(&rest[1..])?;
-            left = Fts5Expr::And(Box::new(left), Box::new(right));
-            rest = r;
-        } else {
-            break;
-        }
-    }
-
-    Ok((left, rest))
-}
-
-fn parse_not(
-    tokens: &[Fts5QueryToken],
-) -> std::result::Result<(Fts5Expr, &[Fts5QueryToken]), Fts5QueryError> {
     let (mut left, mut rest) = parse_primary(tokens)?;
 
     while let Some(token) = rest.first() {
-        if token.kind == Fts5QueryTokenKind::Not {
+        if token.kind == Fts5QueryTokenKind::And {
+            let (right, r) = parse_primary(&rest[1..])?;
+            left = Fts5Expr::And(Box::new(left), Box::new(right));
+            rest = r;
+        } else if token.kind == Fts5QueryTokenKind::Not {
             let (right, r) = parse_primary(&rest[1..])?;
             left = Fts5Expr::Not(Box::new(left), Box::new(right));
             rest = r;

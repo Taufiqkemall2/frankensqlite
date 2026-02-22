@@ -233,10 +233,7 @@ fn test_metrics_lifecycle() {
     let _ = ProvenanceAnnotation::new(0, ProvenanceToken::One);
 
     let m2 = provenance_metrics();
-    assert!(
-        m2.fsqlite_provenance_rows_emitted >= 1,
-        "1 row emitted"
-    );
+    assert!(m2.fsqlite_provenance_rows_emitted >= 1, "1 row emitted");
 
     // Query provenance (why/how).
     let t3 = ProvenanceToken::base(1, 30);

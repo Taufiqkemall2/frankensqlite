@@ -13,8 +13,8 @@
 //!  10. Machine-readable conformance output
 
 use fsqlite_mvcc::{
-    CountMinSketch, CountMinSketchConfig, NitroSketch, NitroSketchConfig,
-    SpaceSavingSummary, DEFAULT_NITRO_PRECISION, MIN_NITRO_PRECISION, MAX_NITRO_PRECISION,
+    CountMinSketch, CountMinSketchConfig, DEFAULT_NITRO_PRECISION, MAX_NITRO_PRECISION,
+    MIN_NITRO_PRECISION, NitroSketch, NitroSketchConfig, SpaceSavingSummary,
     sketch_telemetry_metrics,
 };
 
@@ -159,9 +159,21 @@ fn test_cms_frequency_estimation() {
     }
 
     // CMS never undercounts.
-    assert!(cms.estimate(1) >= 1000, "users frequency too low: {}", cms.estimate(1));
-    assert!(cms.estimate(2) >= 100, "orders frequency too low: {}", cms.estimate(2));
-    assert!(cms.estimate(3) >= 10, "logs frequency too low: {}", cms.estimate(3));
+    assert!(
+        cms.estimate(1) >= 1000,
+        "users frequency too low: {}",
+        cms.estimate(1)
+    );
+    assert!(
+        cms.estimate(2) >= 100,
+        "orders frequency too low: {}",
+        cms.estimate(2)
+    );
+    assert!(
+        cms.estimate(3) >= 10,
+        "logs frequency too low: {}",
+        cms.estimate(3)
+    );
 
     // With width=1024, small number of distinct items should be exact.
     assert_eq!(cms.estimate(1), 1000);
@@ -174,7 +186,10 @@ fn test_cms_frequency_estimation() {
 
     println!(
         "[PASS] CMS frequency: users={} orders={} logs={} unseen={}",
-        cms.estimate(1), cms.estimate(2), cms.estimate(3), unseen
+        cms.estimate(1),
+        cms.estimate(2),
+        cms.estimate(3),
+        unseen
     );
 }
 
@@ -307,8 +322,7 @@ fn test_spacesaving_topk_ordering() {
 #[test]
 fn test_ams_window_collector() {
     use fsqlite_mvcc::{
-        AmsWindowCollector, AmsWindowCollectorConfig,
-        DEFAULT_AMS_R, DEFAULT_HEAVY_HITTER_K,
+        AmsWindowCollector, AmsWindowCollectorConfig, DEFAULT_AMS_R, DEFAULT_HEAVY_HITTER_K,
     };
 
     let config = AmsWindowCollectorConfig {
@@ -448,22 +462,36 @@ fn test_conformance_summary() {
     let card_ok = (card - 50_000.0).abs() / 50_000.0 < 0.05;
 
     // Property 2: Deterministic replay.
-    let cfg = NitroSketchConfig { precision: 8, seed: 99 };
+    let cfg = NitroSketchConfig {
+        precision: 8,
+        seed: 99,
+    };
     let mut a = NitroSketch::new(&cfg);
     let mut b = NitroSketch::new(&cfg);
-    for i in 0..1000u64 { a.observe_u64(i); b.observe_u64(i); }
+    for i in 0..1000u64 {
+        a.observe_u64(i);
+        b.observe_u64(i);
+    }
     let replay_ok = (a.estimate_cardinality() - b.estimate_cardinality()).abs() < f64::EPSILON;
 
     // Property 3: CMS never undercounts.
-    let mut cms = CountMinSketch::new(&CountMinSketchConfig { width: 512, depth: 4, seed: 0 });
+    let mut cms = CountMinSketch::new(&CountMinSketchConfig {
+        width: 512,
+        depth: 4,
+        seed: 0,
+    });
     cms.observe_n(1, 100);
     cms.observe_n(2, 50);
     let cms_ok = cms.estimate(1) >= 100 && cms.estimate(2) >= 50;
 
     // Property 4: SpaceSaving top-K ordering.
     let mut ss = SpaceSavingSummary::new(32);
-    for _ in 0..1000 { ss.observe_incidence(1); }
-    for _ in 0..500 { ss.observe_incidence(2); }
+    for _ in 0..1000 {
+        ss.observe_incidence(1);
+    }
+    for _ in 0..500 {
+        ss.observe_incidence(2);
+    }
     let sorted = ss.entries_sorted();
     let ss_ok = !sorted.is_empty() && sorted[0].count_lower_bound() >= 1000;
 
@@ -477,10 +505,21 @@ fn test_conformance_summary() {
     println!("=== Conformance Summary ===");
     println!("  [CONFORM] NitroSketch cardinality: est={card:.0}, within 5% of 50K");
     println!("  [CONFORM] Deterministic replay: same seed = same output");
-    println!("  [CONFORM] CMS never-undercount: est(1)={} >= 100", cms.estimate(1));
-    println!("  [CONFORM] SpaceSaving top-K: {} entries, ordered by count", sorted.len());
-    println!("  [CONFORM] Precision bounds: [{MIN_NITRO_PRECISION}, {MAX_NITRO_PRECISION}] enforced");
-    println!("  [CONFORM] Memory footprint: {}B tracked", ns.memory_bytes());
+    println!(
+        "  [CONFORM] CMS never-undercount: est(1)={} >= 100",
+        cms.estimate(1)
+    );
+    println!(
+        "  [CONFORM] SpaceSaving top-K: {} entries, ordered by count",
+        sorted.len()
+    );
+    println!(
+        "  [CONFORM] Precision bounds: [{MIN_NITRO_PRECISION}, {MAX_NITRO_PRECISION}] enforced"
+    );
+    println!(
+        "  [CONFORM] Memory footprint: {}B tracked",
+        ns.memory_bytes()
+    );
     println!("  Conformance: 6 / 6 (100.0%)");
 
     assert!(card_ok, "cardinality accuracy failed: {card}");

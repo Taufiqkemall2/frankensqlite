@@ -63,9 +63,7 @@ fn test_laplace_noise_calibration() {
     assert!((b.spent() - 1.5).abs() < 1e-10);
     assert_eq!(b.queries_charged(), 2);
 
-    println!(
-        "[PASS] Laplace calibration: b=2 for ε=0.5, b=100 for Δf=100/ε=1"
-    );
+    println!("[PASS] Laplace calibration: b=2 for ε=0.5, b=100 for Δf=100/ε=1");
 }
 
 // ---------------------------------------------------------------------------
@@ -199,10 +197,7 @@ fn test_laplace_statistical_properties() {
     let variance = sum_noise_sq / n as f64 - mean * mean;
     let expected_variance = 2.0 * b * b; // Var[Lap(0, b)] = 2b²
 
-    assert!(
-        mean.abs() < 0.1,
-        "Laplace mean should be ~0, got {mean:.4}"
-    );
+    assert!(mean.abs() < 0.1, "Laplace mean should be ~0, got {mean:.4}");
     assert!(
         (variance - expected_variance).abs() < 1.0,
         "Laplace variance should be ~{expected_variance:.1}, got {variance:.4}"
@@ -277,7 +272,11 @@ fn test_sensitivity_helpers() {
     // Edge case: n=0.
     assert_eq!(sensitivity::avg(100.0, 0), 0.0);
 
-    println!("[PASS] sensitivity helpers: count={}, sum(500)={}, avg(100,1000)={s}", sensitivity::COUNT, sensitivity::sum(500.0));
+    println!(
+        "[PASS] sensitivity helpers: count={}, sum(500)={}, avg(100,1000)={s}",
+        sensitivity::COUNT,
+        sensitivity::sum(500.0)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -309,7 +308,10 @@ fn test_metrics_lifecycle() {
     let _ = engine2.laplace(100.0, 1.0, 0.5); // should fail
 
     let m2 = dp_metrics();
-    assert!(m2.fsqlite_dp_budget_exhausted_total >= 1, "exhaustion should be counted");
+    assert!(
+        m2.fsqlite_dp_budget_exhausted_total >= 1,
+        "exhaustion should be counted"
+    );
 
     // Serialization.
     let json = serde_json::to_string(&m2).unwrap();
@@ -407,11 +409,15 @@ fn test_conformance_summary() {
         let mut e = DpEngine::new(10.0, 42).unwrap();
         e.laplace(100.0, 1.0, 1.0).unwrap();
         let m = dp_metrics();
-        let pass = m.fsqlite_dp_queries_total >= 1 && m.fsqlite_dp_epsilon_spent_micros >= 1_000_000;
+        let pass =
+            m.fsqlite_dp_queries_total >= 1 && m.fsqlite_dp_epsilon_spent_micros >= 1_000_000;
         results.push(TestResult {
             name: "metrics",
             pass,
-            detail: format!("queries={} ε_micros={}", m.fsqlite_dp_queries_total, m.fsqlite_dp_epsilon_spent_micros),
+            detail: format!(
+                "queries={} ε_micros={}",
+                m.fsqlite_dp_queries_total, m.fsqlite_dp_epsilon_spent_micros
+            ),
         });
     }
 

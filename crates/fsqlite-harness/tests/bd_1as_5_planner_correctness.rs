@@ -23,8 +23,7 @@
 use fsqlite_ast::{Expr, Literal, Span};
 use fsqlite_planner::{
     AccessPathKind, IndexInfo, IndexUsability, PushedPredicate, StatsSource, TableStats,
-    WhereTerm, WhereTermKind, WhereColumn,
-    analyze_index_usability, best_access_path,
+    WhereColumn, WhereTerm, WhereTermKind, analyze_index_usability, best_access_path,
     estimate_cost, order_joins, pushdown_predicates,
 };
 
@@ -72,12 +71,42 @@ fn join_term(expr: &Expr) -> WhereTerm<'_> {
 
 fn tpch_tables() -> Vec<TableStats> {
     vec![
-        TableStats { name: "nation".to_owned(), n_pages: 1, n_rows: 25, source: StatsSource::Analyze },
-        TableStats { name: "region".to_owned(), n_pages: 1, n_rows: 5, source: StatsSource::Analyze },
-        TableStats { name: "supplier".to_owned(), n_pages: 100, n_rows: 10_000, source: StatsSource::Analyze },
-        TableStats { name: "customer".to_owned(), n_pages: 500, n_rows: 150_000, source: StatsSource::Analyze },
-        TableStats { name: "orders".to_owned(), n_pages: 2000, n_rows: 1_500_000, source: StatsSource::Analyze },
-        TableStats { name: "lineitem".to_owned(), n_pages: 8000, n_rows: 6_000_000, source: StatsSource::Analyze },
+        TableStats {
+            name: "nation".to_owned(),
+            n_pages: 1,
+            n_rows: 25,
+            source: StatsSource::Analyze,
+        },
+        TableStats {
+            name: "region".to_owned(),
+            n_pages: 1,
+            n_rows: 5,
+            source: StatsSource::Analyze,
+        },
+        TableStats {
+            name: "supplier".to_owned(),
+            n_pages: 100,
+            n_rows: 10_000,
+            source: StatsSource::Analyze,
+        },
+        TableStats {
+            name: "customer".to_owned(),
+            n_pages: 500,
+            n_rows: 150_000,
+            source: StatsSource::Analyze,
+        },
+        TableStats {
+            name: "orders".to_owned(),
+            n_pages: 2000,
+            n_rows: 1_500_000,
+            source: StatsSource::Analyze,
+        },
+        TableStats {
+            name: "lineitem".to_owned(),
+            n_pages: 8000,
+            n_rows: 6_000_000,
+            source: StatsSource::Analyze,
+        },
     ]
 }
 
@@ -129,10 +158,30 @@ fn tpch_indexes() -> Vec<IndexInfo> {
 
 fn oltp_tables() -> Vec<TableStats> {
     vec![
-        TableStats { name: "users".to_owned(), n_pages: 200, n_rows: 50_000, source: StatsSource::Analyze },
-        TableStats { name: "orders".to_owned(), n_pages: 1000, n_rows: 500_000, source: StatsSource::Analyze },
-        TableStats { name: "items".to_owned(), n_pages: 50, n_rows: 10_000, source: StatsSource::Analyze },
-        TableStats { name: "order_items".to_owned(), n_pages: 2000, n_rows: 2_000_000, source: StatsSource::Analyze },
+        TableStats {
+            name: "users".to_owned(),
+            n_pages: 200,
+            n_rows: 50_000,
+            source: StatsSource::Analyze,
+        },
+        TableStats {
+            name: "orders".to_owned(),
+            n_pages: 1000,
+            n_rows: 500_000,
+            source: StatsSource::Analyze,
+        },
+        TableStats {
+            name: "items".to_owned(),
+            n_pages: 50,
+            n_rows: 10_000,
+            source: StatsSource::Analyze,
+        },
+        TableStats {
+            name: "order_items".to_owned(),
+            n_pages: 2000,
+            n_rows: 2_000_000,
+            source: StatsSource::Analyze,
+        },
     ]
 }
 
@@ -207,8 +256,18 @@ fn test_join_ordering_smallest_first() {
 #[test]
 fn test_join_ordering_two_table() {
     let tables = vec![
-        TableStats { name: "users".to_owned(), n_pages: 200, n_rows: 50_000, source: StatsSource::Analyze },
-        TableStats { name: "orders".to_owned(), n_pages: 1000, n_rows: 500_000, source: StatsSource::Analyze },
+        TableStats {
+            name: "users".to_owned(),
+            n_pages: 200,
+            n_rows: 50_000,
+            source: StatsSource::Analyze,
+        },
+        TableStats {
+            name: "orders".to_owned(),
+            n_pages: 1000,
+            n_rows: 500_000,
+            source: StatsSource::Analyze,
+        },
     ];
 
     let expr = dummy_expr();
@@ -315,7 +374,11 @@ fn test_predicate_pushdown() {
     let (pushed, remaining): (Vec<PushedPredicate<'_>>, Vec<&WhereTerm<'_>>) =
         pushdown_predicates(&terms, &table_names);
 
-    assert_eq!(pushed.len(), 1, "one single-table predicate should be pushed");
+    assert_eq!(
+        pushed.len(),
+        1,
+        "one single-table predicate should be pushed"
+    );
     assert_eq!(pushed[0].table, "users", "pushed predicate targets 'users'");
     assert_eq!(remaining.len(), 1, "join predicate remains");
 
@@ -348,11 +411,7 @@ fn test_cost_model_sanity() {
     );
 
     // Index range with high selectivity
-    let range_high = estimate_cost(
-        &AccessPathKind::IndexScanRange { selectivity: 0.5 },
-        tp,
-        ip,
-    );
+    let range_high = estimate_cost(&AccessPathKind::IndexScanRange { selectivity: 0.5 }, tp, ip);
 
     // Cost ordering: rowid < eq < range_low < range_high < full
     assert!(
@@ -378,11 +437,7 @@ fn test_cost_model_sanity() {
         tp,
         ip,
     );
-    let non_covering = estimate_cost(
-        &AccessPathKind::IndexScanRange { selectivity: 0.1 },
-        tp,
-        ip,
-    );
+    let non_covering = estimate_cost(&AccessPathKind::IndexScanRange { selectivity: 0.1 }, tp, ip);
     assert!(
         covering < non_covering,
         "covering scan ({covering}) should be cheaper than non-covering ({non_covering})"
@@ -498,22 +553,43 @@ fn test_conformance_summary() {
         let tables = tpch_tables();
         let plan = order_joins(&tables, &[], &[], None, &[]);
         let pass = plan.join_order[0] == "region" && plan.join_order[1] == "nation";
-        results.push(TestResult { name: "join_order_smallest_first", pass });
+        results.push(TestResult {
+            name: "join_order_smallest_first",
+            pass,
+        });
     }
 
     // 2. Join ordering: two-table
     {
         let tables = vec![
-            TableStats { name: "small".to_owned(), n_pages: 10, n_rows: 100, source: StatsSource::Analyze },
-            TableStats { name: "large".to_owned(), n_pages: 1000, n_rows: 1_000_000, source: StatsSource::Analyze },
+            TableStats {
+                name: "small".to_owned(),
+                n_pages: 10,
+                n_rows: 100,
+                source: StatsSource::Analyze,
+            },
+            TableStats {
+                name: "large".to_owned(),
+                n_pages: 1000,
+                n_rows: 1_000_000,
+                source: StatsSource::Analyze,
+            },
         ];
         let plan = order_joins(&tables, &[], &[], None, &[]);
-        results.push(TestResult { name: "join_order_two_table", pass: plan.join_order[0] == "small" });
+        results.push(TestResult {
+            name: "join_order_two_table",
+            pass: plan.join_order[0] == "small",
+        });
     }
 
     // 3. Access path: full scan without WHERE
     {
-        let table = TableStats { name: "t".to_owned(), n_pages: 100, n_rows: 10_000, source: StatsSource::Analyze };
+        let table = TableStats {
+            name: "t".to_owned(),
+            n_pages: 100,
+            n_rows: 10_000,
+            source: StatsSource::Analyze,
+        };
         let path = best_access_path(&table, &[], &[], None);
         results.push(TestResult {
             name: "access_path_full_scan",
@@ -523,11 +599,21 @@ fn test_conformance_summary() {
 
     // 4. Access path: index equality
     {
-        let table = TableStats { name: "t".to_owned(), n_pages: 100, n_rows: 10_000, source: StatsSource::Analyze };
+        let table = TableStats {
+            name: "t".to_owned(),
+            n_pages: 100,
+            n_rows: 10_000,
+            source: StatsSource::Analyze,
+        };
         let idx = IndexInfo {
-            name: "idx_t_a".to_owned(), table: "t".to_owned(),
-            columns: vec!["a".to_owned()], unique: false, n_pages: 20,
-            source: StatsSource::Analyze, partial_where: None, expression_columns: vec![],
+            name: "idx_t_a".to_owned(),
+            table: "t".to_owned(),
+            columns: vec!["a".to_owned()],
+            unique: false,
+            n_pages: 20,
+            source: StatsSource::Analyze,
+            partial_where: None,
+            expression_columns: vec![],
         };
         let expr = dummy_expr();
         let eq = eq_term("t", "a", &expr);
@@ -615,20 +701,31 @@ fn test_conformance_summary() {
     println!("  \"total\": {total},");
     println!("  \"passed\": {passed},");
     println!("  \"failed\": {failed},");
-    println!("  \"pass_rate\": \"{:.1}%\",", passed as f64 / total as f64 * 100.0);
+    println!(
+        "  \"pass_rate\": \"{:.1}%\",",
+        passed as f64 / total as f64 * 100.0
+    );
     println!("  \"cases\": [");
     for (i, r) in results.iter().enumerate() {
         let comma = if i + 1 < total { "," } else { "" };
         let status = if r.pass { "PASS" } else { "FAIL" };
-        println!("    {{ \"name\": \"{}\", \"status\": \"{status}\" }}{comma}", r.name);
+        println!(
+            "    {{ \"name\": \"{}\", \"status\": \"{status}\" }}{comma}",
+            r.name
+        );
     }
     println!("  ]");
     println!("}}");
 
     assert_eq!(
-        failed, 0,
+        failed,
+        0,
         "{failed}/{total} planner conformance tests failed: {:?}",
-        results.iter().filter(|r| !r.pass).map(|r| r.name).collect::<Vec<_>>()
+        results
+            .iter()
+            .filter(|r| !r.pass)
+            .map(|r| r.name)
+            .collect::<Vec<_>>()
     );
 
     println!("[PASS] all {total} planner conformance tests passed");

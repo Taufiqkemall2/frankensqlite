@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 
 use fsqlite_harness::performance_regression_detector::{
-    BenchmarkSample, GovernanceReport, GOVERNANCE_BEAD_ID, HostContext, PerformanceSlo,
+    BenchmarkSample, GOVERNANCE_BEAD_ID, GovernanceReport, HostContext, PerformanceSlo,
     RegressionSeverity, RegressionTolerance, SCHEMA_VERSION, SloPolicy, SloVerdict, SloWaiver,
     WaiverRegistry, evaluate_governance, load_governance_report, validate_slo_policy,
     validate_waiver_registry, write_governance_report,
@@ -190,8 +190,7 @@ fn ci_gate_warning_on_relative_regression() {
     let report = eval(&candidates, &default_policy(), &empty_waivers());
 
     assert!(
-        report.overall_verdict == SloVerdict::Warning
-            || report.overall_verdict == SloVerdict::Pass,
+        report.overall_verdict == SloVerdict::Warning || report.overall_verdict == SloVerdict::Pass,
         "expected warning or pass, got: {:?}",
         report.overall_verdict
     );
@@ -243,8 +242,15 @@ fn expired_waiver_does_not_downgrade() {
     };
     let report = eval(&candidates, &default_policy(), &waivers);
 
-    assert_eq!(report.overall_verdict, SloVerdict::Fail, "expired waiver must not save");
-    assert!(!report.expired_waivers.is_empty(), "must track expired waivers");
+    assert_eq!(
+        report.overall_verdict,
+        SloVerdict::Fail,
+        "expired waiver must not save"
+    );
+    assert!(
+        !report.expired_waivers.is_empty(),
+        "must track expired waivers"
+    );
     assert!(
         report.expired_waivers[0].contains("expired"),
         "expiry notice must contain 'expired': {:?}",
@@ -331,14 +337,27 @@ fn multi_scenario_all_waived_verdicts() {
     let waivers = WaiverRegistry {
         bead_id: GOVERNANCE_BEAD_ID.to_owned(),
         waivers: vec![
-            make_waiver(SCENARIO_A, "2026-02-01", "2026-03-01", RegressionSeverity::Critical),
-            make_waiver(SCENARIO_B, "2026-02-01", "2026-03-01", RegressionSeverity::Critical),
+            make_waiver(
+                SCENARIO_A,
+                "2026-02-01",
+                "2026-03-01",
+                RegressionSeverity::Critical,
+            ),
+            make_waiver(
+                SCENARIO_B,
+                "2026-02-01",
+                "2026-03-01",
+                RegressionSeverity::Critical,
+            ),
         ],
     };
     let report = eval(&candidates, &default_policy(), &waivers);
 
     assert_eq!(report.scenarios_waived, 2);
-    assert!(report.scenarios_failed == 0, "all should be waived not failed");
+    assert!(
+        report.scenarios_failed == 0,
+        "all should be waived not failed"
+    );
 }
 
 // ─── Report Persistence and Ingestion ─────────────────────────────────
@@ -493,7 +512,10 @@ fn report_counts_are_consistent() {
 
     assert_eq!(
         report.scenarios_evaluated,
-        report.scenarios_passed + report.scenarios_failed + report.scenarios_waived + report.scenarios_warned,
+        report.scenarios_passed
+            + report.scenarios_failed
+            + report.scenarios_waived
+            + report.scenarios_warned,
         "counts must sum to evaluated"
     );
 }
@@ -517,7 +539,10 @@ fn ungoverned_scenario_not_counted() {
     ];
     let report = eval(&candidates, &default_policy(), &empty_waivers());
 
-    assert_eq!(report.scenarios_evaluated, 0, "ungoverned scenario must be skipped");
+    assert_eq!(
+        report.scenarios_evaluated, 0,
+        "ungoverned scenario must be skipped"
+    );
     assert_eq!(report.overall_verdict, SloVerdict::Pass);
 }
 
@@ -535,20 +560,24 @@ fn expired_waivers_tracked_in_report() {
     let candidates = vec![sample(SCENARIO_A, "cand-1", 1_010.0, 5_000.0)]; // passes
     let waivers = WaiverRegistry {
         bead_id: GOVERNANCE_BEAD_ID.to_owned(),
-        waivers: vec![
-            make_waiver(
-                SCENARIO_B,
-                "2026-01-01",
-                "2026-01-31", // expired
-                RegressionSeverity::Warning,
-            ),
-        ],
+        waivers: vec![make_waiver(
+            SCENARIO_B,
+            "2026-01-01",
+            "2026-01-31", // expired
+            RegressionSeverity::Warning,
+        )],
     };
     let report = eval(&candidates, &default_policy(), &waivers);
 
-    assert!(!report.expired_waivers.is_empty(), "must track expired waivers");
     assert!(
-        report.expired_waivers.iter().any(|e| e.contains(SCENARIO_B)),
+        !report.expired_waivers.is_empty(),
+        "must track expired waivers"
+    );
+    assert!(
+        report
+            .expired_waivers
+            .iter()
+            .any(|e| e.contains(SCENARIO_B)),
         "expired notice must reference scenario"
     );
 }

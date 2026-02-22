@@ -20,9 +20,9 @@
 use std::ffi::{CStr, CString};
 use std::fmt::Write as _;
 use std::os::raw::{c_char, c_double, c_int, c_void};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use fsqlite::Connection;
 use fsqlite_error::{ErrorCode, FrankenError};
@@ -85,7 +85,13 @@ pub struct CompatMetricsSnapshot {
 
 impl CompatMetricsSnapshot {
     pub fn total(&self) -> u64 {
-        self.open + self.close + self.exec + self.prepare + self.step + self.finalize + self.column
+        self.open
+            + self.close
+            + self.exec
+            + self.prepare
+            + self.step
+            + self.finalize
+            + self.column
             + self.errmsg
     }
 }
@@ -180,10 +186,7 @@ fn error_to_code(err: &FrankenError) -> c_int {
 /// `filename` must be a valid null-terminated C string (or null for `:memory:`).
 /// `pp_db` must point to a valid `*mut Sqlite3` location.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sqlite3_open(
-    filename: *const c_char,
-    pp_db: *mut *mut Sqlite3,
-) -> c_int {
+pub unsafe extern "C" fn sqlite3_open(filename: *const c_char, pp_db: *mut *mut Sqlite3) -> c_int {
     COMPAT_OPEN.fetch_add(1, Ordering::Relaxed);
     let _span = tracing::info_span!("compat_api", api_func = "open").entered();
 
@@ -338,8 +341,7 @@ pub unsafe extern "C" fn sqlite3_exec(
                         owned_names.push(cname);
                     }
 
-                    let rc =
-                        cb(parg, ncols, c_values.as_mut_ptr(), c_names.as_mut_ptr());
+                    let rc = cb(parg, ncols, c_values.as_mut_ptr(), c_names.as_mut_ptr());
                     // Keep owned CStrings alive until the callback returns.
                     drop(owned_vals);
                     drop(owned_names);
@@ -648,10 +650,7 @@ pub unsafe extern "C" fn sqlite3_column_type(stmt: *mut Sqlite3Stmt, i_col: c_in
 /// # Safety
 /// `stmt` must be a valid handle with an active row.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sqlite3_column_int64(
-    stmt: *mut Sqlite3Stmt,
-    i_col: c_int,
-) -> i64 {
+pub unsafe extern "C" fn sqlite3_column_int64(stmt: *mut Sqlite3Stmt, i_col: c_int) -> i64 {
     COMPAT_COLUMN.fetch_add(1, Ordering::Relaxed);
 
     match current_value(stmt, i_col) {
@@ -667,10 +666,7 @@ pub unsafe extern "C" fn sqlite3_column_int64(
 /// # Safety
 /// `stmt` must be a valid handle with an active row.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sqlite3_column_int(
-    stmt: *mut Sqlite3Stmt,
-    i_col: c_int,
-) -> c_int {
+pub unsafe extern "C" fn sqlite3_column_int(stmt: *mut Sqlite3Stmt, i_col: c_int) -> c_int {
     COMPAT_COLUMN.fetch_add(1, Ordering::Relaxed);
 
     sqlite3_column_int64(stmt, i_col) as c_int
@@ -681,10 +677,7 @@ pub unsafe extern "C" fn sqlite3_column_int(
 /// # Safety
 /// `stmt` must be a valid handle with an active row.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sqlite3_column_double(
-    stmt: *mut Sqlite3Stmt,
-    i_col: c_int,
-) -> c_double {
+pub unsafe extern "C" fn sqlite3_column_double(stmt: *mut Sqlite3Stmt, i_col: c_int) -> c_double {
     COMPAT_COLUMN.fetch_add(1, Ordering::Relaxed);
 
     match current_value(stmt, i_col) {
@@ -803,10 +796,7 @@ pub unsafe extern "C" fn sqlite3_column_blob(
 /// # Safety
 /// `stmt` must be a valid handle with an active row.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sqlite3_column_bytes(
-    stmt: *mut Sqlite3Stmt,
-    i_col: c_int,
-) -> c_int {
+pub unsafe extern "C" fn sqlite3_column_bytes(stmt: *mut Sqlite3Stmt, i_col: c_int) -> c_int {
     COMPAT_COLUMN.fetch_add(1, Ordering::Relaxed);
 
     match current_value(stmt, i_col) {
@@ -942,10 +932,7 @@ mod tests {
 
             let db = open_memory();
 
-            let sql = CString::new(
-                "CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT);",
-            )
-            .unwrap();
+            let sql = CString::new("CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT);").unwrap();
             let rc = sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), ptr::null_mut());
             assert_eq!(rc, SQLITE_OK);
 
@@ -964,7 +951,9 @@ mod tests {
                 db,
                 sql.as_ptr(),
                 Some(count_cb),
-                std::ptr::from_ref::<AtomicU64>(&row_count).cast_mut().cast(),
+                std::ptr::from_ref::<AtomicU64>(&row_count)
+                    .cast_mut()
+                    .cast(),
                 ptr::null_mut(),
             );
             assert_eq!(rc, SQLITE_OK);
@@ -1349,10 +1338,7 @@ mod tests {
     fn test_misuse_null_args() {
         unsafe {
             // Null pp_db → MISUSE.
-            assert_eq!(
-                sqlite3_open(ptr::null(), ptr::null_mut()),
-                SQLITE_MISUSE
-            );
+            assert_eq!(sqlite3_open(ptr::null(), ptr::null_mut()), SQLITE_MISUSE);
 
             // Null filename with valid pp_db → :memory: (OK).
             let mut db: *mut Sqlite3 = ptr::null_mut();
@@ -1371,10 +1357,7 @@ mod tests {
             let db = open_memory();
 
             // Full DDL + DML cycle via exec.
-            let sql = CString::new(
-                "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);",
-            )
-            .unwrap();
+            let sql = CString::new("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);").unwrap();
             assert_eq!(
                 sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
                 SQLITE_OK

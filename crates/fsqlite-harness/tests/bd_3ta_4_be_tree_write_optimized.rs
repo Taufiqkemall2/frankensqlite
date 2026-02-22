@@ -4,9 +4,7 @@
 //! buffers, delete correctness, write amplification characteristics, and
 //! metrics fidelity.
 
-use fsqlite_btree::be_tree::{
-    BeTree, BeTreeConfig, betree_metrics_snapshot, reset_betree_metrics,
-};
+use fsqlite_btree::be_tree::{BeTree, BeTreeConfig, betree_metrics_snapshot, reset_betree_metrics};
 
 const BEAD_ID: &str = "bd-3ta.4";
 
@@ -35,11 +33,7 @@ fn test_basic_insert_and_lookup() {
         Some(&"five"),
         "bead_id={BEAD_ID} case=point_lookup_5"
     );
-    assert_eq!(
-        tree.get(&99),
-        None,
-        "bead_id={BEAD_ID} case=absent_key"
-    );
+    assert_eq!(tree.get(&99), None, "bead_id={BEAD_ID} case=absent_key");
     assert_eq!(tree.len(), 3, "bead_id={BEAD_ID} case=len_after_3_inserts");
 }
 
@@ -192,14 +186,20 @@ fn test_range_query_with_deletes() {
     );
 
     // Expected: 8,9,11,12,13,14,16,17,18,19,21,22
-    let expected: Vec<i32> = (8..=22).filter(|&k| k != 10 && k != 15 && k != 20).collect();
+    let expected: Vec<i32> = (8..=22)
+        .filter(|&k| k != 10 && k != 15 && k != 20)
+        .collect();
     assert_eq!(keys, expected, "bead_id={BEAD_ID} case=range_with_holes");
 }
 
 // ── 6. Large-scale correctness ───────────────────────────────────────────
 
 #[test]
-#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+#[allow(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
 fn test_large_scale_correctness() {
     let config = BeTreeConfig {
         buffer_capacity: 8,
@@ -381,7 +381,9 @@ fn test_conformance_summary() {
     // Range query
     let range_result = tree.range(&10, &20);
     let pass_range = range_result.len() == 11
-        && range_result.iter().all(|(k, v)| *k >= 10 && *k <= 20 && k == v);
+        && range_result
+            .iter()
+            .all(|(k, v)| *k >= 10 && *k <= 20 && k == v);
 
     // Delete
     for i in 0..50 {
@@ -408,12 +410,30 @@ fn test_conformance_summary() {
     let total_count = total.len();
 
     println!("\n=== {BEAD_ID} Bε-tree Conformance ===");
-    println!("  insert:      {}", if pass_insert { "PASS" } else { "FAIL" });
-    println!("  lookup:      {}", if pass_lookup { "PASS" } else { "FAIL" });
-    println!("  range:       {}", if pass_range { "PASS" } else { "FAIL" });
-    println!("  delete:      {}", if pass_delete { "PASS" } else { "FAIL" });
-    println!("  sorted:      {}", if pass_sorted { "PASS" } else { "FAIL" });
-    println!("  depth:       {}", if pass_depth { "PASS" } else { "FAIL" });
+    println!(
+        "  insert:      {}",
+        if pass_insert { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  lookup:      {}",
+        if pass_lookup { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  range:       {}",
+        if pass_range { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  delete:      {}",
+        if pass_delete { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  sorted:      {}",
+        if pass_sorted { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  depth:       {}",
+        if pass_depth { "PASS" } else { "FAIL" }
+    );
     println!("  [{passed}/{total_count}] conformance checks passed");
 
     assert_eq!(

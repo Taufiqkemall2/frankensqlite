@@ -77,7 +77,9 @@ fn corrupt_bit_flip(data: &mut [u8], seed: u64) {
     let mut state = seed;
     let flips = 4;
     for _ in 0..flips {
-        state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         let byte_idx = (state >> 16) as usize % data.len();
         let bit_idx = (state >> 8) as u8 % 8;
         data[byte_idx] ^= 1 << bit_idx;
@@ -99,13 +101,15 @@ fn test_encode_repair_symbols() {
     let mut total_repair_symbols = 0;
     for (meta, symbols) in &groups {
         assert_eq!(
-            symbols.len(), GROUP_R as usize,
+            symbols.len(),
+            GROUP_R as usize,
             "bead_id={BEAD_ID} case=repair_count group_start={}",
             meta.start_pgno,
         );
         for (esi, data) in symbols {
             assert_eq!(
-                data.len(), PAGE_SIZE,
+                data.len(),
+                PAGE_SIZE,
                 "bead_id={BEAD_ID} case=symbol_size esi={esi}",
             );
             assert!(
@@ -124,7 +128,8 @@ fn test_encode_repair_symbols() {
     );
 
     assert_eq!(
-        total_repair_symbols, (num_groups * GROUP_R) as usize,
+        total_repair_symbols,
+        (num_groups * GROUP_R) as usize,
         "bead_id={BEAD_ID} case=total_repair_symbols",
     );
 }
@@ -188,7 +193,11 @@ fn test_single_page_repair_with_witness() {
     );
 
     match outcome {
-        RepairOutcome::Repaired { pgno, repaired_data, witness } => {
+        RepairOutcome::Repaired {
+            pgno,
+            repaired_data,
+            witness,
+        } => {
             assert_eq!(pgno, target_pgno, "bead_id={BEAD_ID} case=repaired_pgno");
             assert!(
                 verify_page_blake3(&repaired_data, &expected_blake3),
@@ -223,7 +232,10 @@ fn test_multi_page_batch_repair() {
     let corrupt_targets = [2_u32, 7, 14];
     let mut corrupted_pages = pages.clone();
     for &pgno in &corrupt_targets {
-        corrupt_bit_flip(&mut corrupted_pages[(pgno - 1) as usize], u64::from(pgno) * 12345);
+        corrupt_bit_flip(
+            &mut corrupted_pages[(pgno - 1) as usize],
+            u64::from(pgno) * 12345,
+        );
     }
 
     let (ref meta, ref repair_syms) = groups[0];
@@ -242,7 +254,10 @@ fn test_multi_page_batch_repair() {
     for outcome in &outcomes {
         match outcome {
             RepairOutcome::Repaired { pgno, witness, .. } => {
-                assert!(witness.verified, "bead_id={BEAD_ID} case=batch_witness pgno={pgno}");
+                assert!(
+                    witness.verified,
+                    "bead_id={BEAD_ID} case=batch_witness pgno={pgno}"
+                );
                 repaired_count += 1;
             }
             RepairOutcome::Intact { .. } => {}
@@ -257,7 +272,8 @@ fn test_multi_page_batch_repair() {
         corrupt_targets.len(),
     );
     assert_eq!(
-        repaired_count, corrupt_targets.len(),
+        repaired_count,
+        corrupt_targets.len(),
         "bead_id={BEAD_ID} case=all_corrupted_repaired",
     );
 }
@@ -288,7 +304,10 @@ fn test_intact_page_detection() {
     match outcome {
         RepairOutcome::Intact { pgno, blake3_hash } => {
             assert_eq!(pgno, target_pgno, "bead_id={BEAD_ID} case=intact_pgno");
-            assert_eq!(blake3_hash, expected_blake3, "bead_id={BEAD_ID} case=intact_hash");
+            assert_eq!(
+                blake3_hash, expected_blake3,
+                "bead_id={BEAD_ID} case=intact_hash"
+            );
             println!("[{BEAD_ID}] intact detection: page {pgno} correctly identified as intact");
         }
         other => panic!("bead_id={BEAD_ID} case=expected_intact got={other:?}"),
@@ -329,7 +348,11 @@ fn test_zero_fill_corruption_repair() {
     );
 
     match outcome {
-        RepairOutcome::Repaired { pgno, repaired_data, witness } => {
+        RepairOutcome::Repaired {
+            pgno,
+            repaired_data,
+            witness,
+        } => {
             assert!(witness.verified, "bead_id={BEAD_ID} case=zerofill_witness");
             assert_eq!(
                 repaired_data, *original,
@@ -413,8 +436,11 @@ fn test_witness_proof_completeness() {
         &expected_blake3,
         meta,
         &|pgno| {
-            if pgno == target_pgno { corrupted.clone() }
-            else { all_pages[(pgno - 1) as usize].clone() }
+            if pgno == target_pgno {
+                corrupted.clone()
+            } else {
+                all_pages[(pgno - 1) as usize].clone()
+            }
         },
         repair_syms,
     );
@@ -441,9 +467,18 @@ fn test_witness_proof_completeness() {
 
         // Witness is serializable (evidence ledger format).
         let json = serde_json::to_string_pretty(&witness).expect("witness serializes");
-        assert!(json.contains("corrupted_hash"), "bead_id={BEAD_ID} case=json_has_corrupted");
-        assert!(json.contains("repaired_hash"), "bead_id={BEAD_ID} case=json_has_repaired");
-        assert!(json.contains("expected_hash"), "bead_id={BEAD_ID} case=json_has_expected");
+        assert!(
+            json.contains("corrupted_hash"),
+            "bead_id={BEAD_ID} case=json_has_corrupted"
+        );
+        assert!(
+            json.contains("repaired_hash"),
+            "bead_id={BEAD_ID} case=json_has_repaired"
+        );
+        assert!(
+            json.contains("expected_hash"),
+            "bead_id={BEAD_ID} case=json_has_expected"
+        );
 
         println!("[{BEAD_ID}] witness proof:");
         println!("{json}");
@@ -481,12 +516,20 @@ fn test_repair_determinism() {
             &expected_blake3,
             meta,
             &|pgno| {
-                if pgno == target_pgno { corrupted_copy.clone() }
-                else { all_pages_copy[(pgno - 1) as usize].clone() }
+                if pgno == target_pgno {
+                    corrupted_copy.clone()
+                } else {
+                    all_pages_copy[(pgno - 1) as usize].clone()
+                }
             },
             repair_syms,
         );
-        if let RepairOutcome::Repaired { repaired_data, witness, .. } = outcome {
+        if let RepairOutcome::Repaired {
+            repaired_data,
+            witness,
+            ..
+        } = outcome
+        {
             results.push((repaired_data, witness));
         } else {
             panic!("bead_id={BEAD_ID} case=expected_repaired_for_determinism");
@@ -513,7 +556,9 @@ fn test_conformance_summary() {
     let groups = build_all_groups(&pages);
 
     // 1. Repair symbol generation.
-    let pass_encode = groups.iter().all(|(_, syms)| syms.len() == GROUP_R as usize);
+    let pass_encode = groups
+        .iter()
+        .all(|(_, syms)| syms.len() == GROUP_R as usize);
 
     // 2. BLAKE3 detection.
     let page = make_page(1);
@@ -529,15 +574,28 @@ fn test_conformance_summary() {
     let (ref meta, ref syms) = groups[0];
     let all_p = pages.clone();
     let outcome = detect_and_repair_page(
-        target, &corrupted, &expected, meta,
-        &|pgno| if pgno == target { corrupted.clone() } else { all_p[(pgno - 1) as usize].clone() },
+        target,
+        &corrupted,
+        &expected,
+        meta,
+        &|pgno| {
+            if pgno == target {
+                corrupted.clone()
+            } else {
+                all_p[(pgno - 1) as usize].clone()
+            }
+        },
         syms,
     );
-    let pass_repair = matches!(outcome, RepairOutcome::Repaired { ref witness, .. } if witness.verified);
+    let pass_repair =
+        matches!(outcome, RepairOutcome::Repaired { ref witness, .. } if witness.verified);
 
     // 4. Intact detection.
     let intact_outcome = detect_and_repair_page(
-        10, original, &blake3_page_checksum(original), meta,
+        10,
+        original,
+        &blake3_page_checksum(original),
+        meta,
         &|pgno| all_p[(pgno - 1) as usize].clone(),
         syms,
     );
@@ -554,11 +612,28 @@ fn test_conformance_summary() {
     let mut c2 = original.clone();
     corrupt_bit_flip(&mut c2, 0xAABB);
     let o2 = detect_and_repair_page(
-        target, &c2, &expected, meta,
-        &|pgno| if pgno == target { c2.clone() } else { all_p[(pgno - 1) as usize].clone() },
+        target,
+        &c2,
+        &expected,
+        meta,
+        &|pgno| {
+            if pgno == target {
+                c2.clone()
+            } else {
+                all_p[(pgno - 1) as usize].clone()
+            }
+        },
         syms,
     );
-    let pass_determinism = if let (RepairOutcome::Repaired { repaired_data: d1, .. }, RepairOutcome::Repaired { repaired_data: d2, .. }) = (&outcome, &o2) {
+    let pass_determinism = if let (
+        RepairOutcome::Repaired {
+            repaired_data: d1, ..
+        },
+        RepairOutcome::Repaired {
+            repaired_data: d2, ..
+        },
+    ) = (&outcome, &o2)
+    {
         d1 == d2
     } else {
         false

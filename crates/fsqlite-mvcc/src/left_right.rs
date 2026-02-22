@@ -133,8 +133,7 @@ impl LeftRight {
         };
         FSQLITE_LEFTRIGHT_READS_TOTAL.fetch_add(1, Ordering::Relaxed);
         if retries > 0 {
-            FSQLITE_LEFTRIGHT_READER_RETRIES_TOTAL
-                .fetch_add(u64::from(retries), Ordering::Relaxed);
+            FSQLITE_LEFTRIGHT_READER_RETRIES_TOTAL.fetch_add(u64::from(retries), Ordering::Relaxed);
         }
         emit_read_trace(data_key, retries);
         value
@@ -271,8 +270,7 @@ impl LeftRightPair {
         };
         FSQLITE_LEFTRIGHT_READS_TOTAL.fetch_add(1, Ordering::Relaxed);
         if retries > 0 {
-            FSQLITE_LEFTRIGHT_READER_RETRIES_TOTAL
-                .fetch_add(u64::from(retries), Ordering::Relaxed);
+            FSQLITE_LEFTRIGHT_READER_RETRIES_TOTAL.fetch_add(u64::from(retries), Ordering::Relaxed);
         }
         emit_read_trace(data_key, retries);
         value
@@ -374,12 +372,7 @@ impl LeftRightTriple {
         let value = loop {
             let side = self.active.load(Ordering::Acquire);
             let (readers, da, db, dc) = if side == 0 {
-                (
-                    &self.left_readers,
-                    &self.left_a,
-                    &self.left_b,
-                    &self.left_c,
-                )
+                (&self.left_readers, &self.left_a, &self.left_b, &self.left_c)
             } else {
                 (
                     &self.right_readers,
@@ -401,8 +394,7 @@ impl LeftRightTriple {
         };
         FSQLITE_LEFTRIGHT_READS_TOTAL.fetch_add(1, Ordering::Relaxed);
         if retries > 0 {
-            FSQLITE_LEFTRIGHT_READER_RETRIES_TOTAL
-                .fetch_add(u64::from(retries), Ordering::Relaxed);
+            FSQLITE_LEFTRIGHT_READER_RETRIES_TOTAL.fetch_add(u64::from(retries), Ordering::Relaxed);
         }
         emit_read_trace(data_key, retries);
         value

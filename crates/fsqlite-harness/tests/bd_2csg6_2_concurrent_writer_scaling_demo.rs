@@ -5,8 +5,8 @@
 //! first-committer-wins conflict detection, and demonstrates that concurrent
 //! writers achieve linear-ish scaling while single-writer remains flat.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use fsqlite_mvcc::{
@@ -105,7 +105,13 @@ fn concurrent_writer_throughput(n_threads: u32, ops_per_writer: u32) -> (f64, u6
                     let write_ok = {
                         let mut r = reg.lock().unwrap();
                         let handle = r.get_mut(session_id).unwrap();
-                        concurrent_write_page(handle, &lt, session_id, pgno, page_data((i & 0xFF) as u8))
+                        concurrent_write_page(
+                            handle,
+                            &lt,
+                            session_id,
+                            pgno,
+                            page_data((i & 0xFF) as u8),
+                        )
                     };
 
                     if write_ok.is_err() {
@@ -180,8 +186,16 @@ fn test_basic_concurrent_writer_correctness() {
         concurrent_commit(h, &commit_index, &lock_table, s2, CommitSeq::new(102)).unwrap()
     };
 
-    assert_eq!(seq1, CommitSeq::new(101), "bead_id={BEAD_ID} case=s1_committed");
-    assert_eq!(seq2, CommitSeq::new(102), "bead_id={BEAD_ID} case=s2_committed");
+    assert_eq!(
+        seq1,
+        CommitSeq::new(101),
+        "bead_id={BEAD_ID} case=s1_committed"
+    );
+    assert_eq!(
+        seq2,
+        CommitSeq::new(102),
+        "bead_id={BEAD_ID} case=s2_committed"
+    );
 
     println!("[{BEAD_ID}] basic correctness: both writers committed on disjoint pages");
 }
@@ -207,10 +221,7 @@ fn test_first_committer_wins_conflict() {
     {
         let h = registry.get_mut(s2).unwrap();
         let result = concurrent_write_page(h, &lock_table, s2, page(5), page_data(0xB2));
-        assert!(
-            result.is_err(),
-            "bead_id={BEAD_ID} case=page_lock_conflict",
-        );
+        assert!(result.is_err(), "bead_id={BEAD_ID} case=page_lock_conflict",);
     }
 
     // s1 commits successfully.
@@ -218,7 +229,11 @@ fn test_first_committer_wins_conflict() {
         let h = registry.get_mut(s1).unwrap();
         concurrent_commit(h, &commit_index, &lock_table, s1, CommitSeq::new(101)).unwrap()
     };
-    assert_eq!(seq1, CommitSeq::new(101), "bead_id={BEAD_ID} case=first_committer_wins");
+    assert_eq!(
+        seq1,
+        CommitSeq::new(101),
+        "bead_id={BEAD_ID} case=first_committer_wins"
+    );
 
     println!("[{BEAD_ID}] FCW: first writer wins, second gets lock conflict");
 }
@@ -259,7 +274,9 @@ fn test_fcw_stale_snapshot_conflict() {
             println!("[{BEAD_ID}] FCW stale snapshot: s2 correctly aborted with BusySnapshot");
         }
         other => {
-            panic!("bead_id={BEAD_ID} case=fcw_stale_snapshot expected BusySnapshot+Conflict got={other:?}");
+            panic!(
+                "bead_id={BEAD_ID} case=fcw_stale_snapshot expected BusySnapshot+Conflict got={other:?}"
+            );
         }
     }
 }
@@ -272,8 +289,10 @@ fn test_throughput_scaling_comparison() {
     let thread_counts = [1, 2, 4, 8];
 
     println!("[{BEAD_ID}] Concurrent Writer Scaling Demo");
-    println!("{:>8} {:>14} {:>14} {:>10} {:>10} {:>8}",
-        "threads", "single(ops/s)", "mvcc(ops/s)", "committed", "aborted", "speedup");
+    println!(
+        "{:>8} {:>14} {:>14} {:>10} {:>10} {:>8}",
+        "threads", "single(ops/s)", "mvcc(ops/s)", "committed", "aborted", "speedup"
+    );
     println!("{}", "-".repeat(72));
 
     let mut results = Vec::new();
@@ -293,14 +312,13 @@ fn test_throughput_scaling_comparison() {
     // At 4+ threads, MVCC should show some scaling advantage.
     // (The registry mutex may limit scaling, but should still beat single-writer.)
     if let Some((_, _, _, committed, _, _)) = results.iter().find(|(n, _, _, _, _, _)| *n == 4) {
-        assert!(
-            *committed > 0,
-            "bead_id={BEAD_ID} case=4_thread_committed",
-        );
+        assert!(*committed > 0, "bead_id={BEAD_ID} case=4_thread_committed",);
     }
 
     // All single-thread runs should commit all ops.
-    if let Some((_, _, _, committed, aborted, _)) = results.iter().find(|(n, _, _, _, _, _)| *n == 1) {
+    if let Some((_, _, _, committed, aborted, _)) =
+        results.iter().find(|(n, _, _, _, _, _)| *n == 1)
+    {
         assert_eq!(
             *committed, ops_per_writer as u64,
             "bead_id={BEAD_ID} case=single_thread_all_committed",
@@ -357,7 +375,13 @@ fn test_ssi_abort_rate_transparency() {
                     let write_ok = {
                         let mut r = reg.lock().unwrap();
                         let handle = r.get_mut(session_id).unwrap();
-                        concurrent_write_page(handle, &lt, session_id, pgno, page_data((i & 0xFF) as u8))
+                        concurrent_write_page(
+                            handle,
+                            &lt,
+                            session_id,
+                            pgno,
+                            page_data((i & 0xFF) as u8),
+                        )
                     };
 
                     if write_ok.is_err() {
@@ -379,8 +403,12 @@ fn test_ssi_abort_rate_transparency() {
                     }
 
                     match result {
-                        Ok(_) => { comm.fetch_add(1, Ordering::Relaxed); }
-                        Err(_) => { abrt.fetch_add(1, Ordering::Relaxed); }
+                        Ok(_) => {
+                            comm.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(_) => {
+                            abrt.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             })
@@ -394,19 +422,21 @@ fn test_ssi_abort_rate_transparency() {
     let total = total_attempted.load(Ordering::Relaxed);
     let comm = committed.load(Ordering::Relaxed);
     let abrt = aborted.load(Ordering::Relaxed);
-    let abort_rate = if total > 0 { abrt as f64 / total as f64 * 100.0 } else { 0.0 };
+    let abort_rate = if total > 0 {
+        abrt as f64 / total as f64 * 100.0
+    } else {
+        0.0
+    };
 
     println!("[{BEAD_ID}] SSI abort transparency ({n_threads} threads, overlapping pages):");
     println!("  attempted={total} committed={comm} aborted={abrt} abort_rate={abort_rate:.1}%");
 
     // With overlapping pages, some aborts are expected.
-    assert!(
-        comm > 0,
-        "bead_id={BEAD_ID} case=some_commits_succeeded",
-    );
+    assert!(comm > 0, "bead_id={BEAD_ID} case=some_commits_succeeded",);
     // Total should equal committed + aborted.
     assert_eq!(
-        total, comm + abrt,
+        total,
+        comm + abrt,
         "bead_id={BEAD_ID} case=total_consistency",
     );
 }
@@ -469,9 +499,7 @@ fn test_throughput_zero_contention() {
 #[test]
 fn test_single_thread_baseline() {
     let (tp, elapsed) = single_writer_throughput(1, 1000);
-    println!(
-        "[{BEAD_ID}] single-writer baseline: throughput={tp:.0} ops/s elapsed={elapsed:?}"
-    );
+    println!("[{BEAD_ID}] single-writer baseline: throughput={tp:.0} ops/s elapsed={elapsed:?}");
     assert!(
         tp > 0.0,
         "bead_id={BEAD_ID} case=baseline_positive_throughput",
@@ -496,10 +524,7 @@ fn test_scaling_ratio() {
 
     // With no contention and separate page ranges, we expect some scaling.
     // The registry mutex limits throughput, but 4 threads should be faster than 1.
-    assert!(
-        committed_4 > 0,
-        "bead_id={BEAD_ID} case=4_thread_commits",
-    );
+    assert!(committed_4 > 0, "bead_id={BEAD_ID} case=4_thread_commits",);
 }
 
 // ── 10. Conformance summary ─────────────────────────────────────────────────
@@ -536,8 +561,8 @@ fn test_conformance_summary() {
         concurrent_write_page(h, &lock_table, s3, page(1), page_data(3)).unwrap();
     }
     let c3 = registry.get_mut(s3).unwrap();
-    let pass_fcw = concurrent_commit(c3, &commit_index, &lock_table, s3, CommitSeq::new(103))
-        .is_err(); // Should fail: page 1 already committed at seq 101.
+    let pass_fcw =
+        concurrent_commit(c3, &commit_index, &lock_table, s3, CommitSeq::new(103)).is_err(); // Should fail: page 1 already committed at seq 101.
     registry.remove(s3);
 
     // 3. Zero contention throughput.

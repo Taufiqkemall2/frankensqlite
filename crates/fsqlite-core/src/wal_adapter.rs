@@ -559,7 +559,9 @@ mod tests {
     fn test_checkpoint_adapter_write_page() {
         let cx = test_cx();
         let mut writer = MockCheckpointPageWriter;
-        let mut adapter = CheckpointTargetAdapterRef { writer: &mut writer };
+        let mut adapter = CheckpointTargetAdapterRef {
+            writer: &mut writer,
+        };
 
         let page_no = PageNumber::new(1).expect("valid page number");
         adapter
@@ -571,7 +573,9 @@ mod tests {
     fn test_checkpoint_adapter_truncate_db() {
         let cx = test_cx();
         let mut writer = MockCheckpointPageWriter;
-        let mut adapter = CheckpointTargetAdapterRef { writer: &mut writer };
+        let mut adapter = CheckpointTargetAdapterRef {
+            writer: &mut writer,
+        };
 
         adapter.truncate_db(&cx, 10).expect("truncate_db");
     }
@@ -580,7 +584,9 @@ mod tests {
     fn test_checkpoint_adapter_sync_db() {
         let cx = test_cx();
         let mut writer = MockCheckpointPageWriter;
-        let mut adapter = CheckpointTargetAdapterRef { writer: &mut writer };
+        let mut adapter = CheckpointTargetAdapterRef {
+            writer: &mut writer,
+        };
 
         adapter.sync_db(&cx).expect("sync_db");
     }
@@ -589,7 +595,9 @@ mod tests {
     fn test_checkpoint_adapter_as_dyn_target() {
         let cx = test_cx();
         let mut writer = MockCheckpointPageWriter;
-        let mut adapter = CheckpointTargetAdapterRef { writer: &mut writer };
+        let mut adapter = CheckpointTargetAdapterRef {
+            writer: &mut writer,
+        };
 
         // Verify it can be used as a trait object.
         let target: &mut dyn CheckpointTarget = &mut adapter;

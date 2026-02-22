@@ -158,7 +158,7 @@ impl ColumnStats {
         if self.table_row_count == 0 {
             return 0.0;
         }
-        
+
         // Base probability space is non-NULL rows (SQL tristate logic)
         let non_null_count = self.table_row_count.saturating_sub(self.null_count) as f64;
         if non_null_count <= 0.0 {
@@ -385,7 +385,7 @@ impl ColumnStats {
 /// Default selectivity heuristic when no statistics are available.
 fn default_selectivity(op: Operator) -> f64 {
     match op {
-        Operator::Eq | Operator::Is => 0.01,    // ~1/100 rows match
+        Operator::Eq | Operator::Is => 0.01, // ~1/100 rows match
         Operator::Ne | Operator::IsNot => 0.99,
         Operator::Lt | Operator::Le | Operator::Gt | Operator::Ge => 1.0 / 3.0,
         Operator::Like | Operator::Glob => 0.1,
@@ -418,7 +418,9 @@ mod tests {
             count: 100,
             ndv: 100,
         };
-        let hist = Histogram { buckets: vec![bucket] };
+        let hist = Histogram {
+            buckets: vec![bucket],
+        };
 
         // Value 50 should be ~50% through the bucket
         let est = hist.estimate_less_than_rows(&SqliteValue::Integer(50));
@@ -494,11 +496,8 @@ mod tests {
             .map(|i| SqliteValue::Integer(if i < 3 { 42 } else { i + 100 }))
             .collect();
 
-        let est = stats.estimate_cardinality(
-            &Operator::Eq,
-            &SqliteValue::Integer(42),
-            Some(&sample),
-        );
+        let est =
+            stats.estimate_cardinality(&Operator::Eq, &SqliteValue::Integer(42), Some(&sample));
         assert_eq!(est.method, EstimationMethod::Sampling);
         assert!((est.selectivity - 0.3).abs() < 0.01);
         assert!((est.estimated_rows - 300.0).abs() < 1.0);
@@ -516,11 +515,7 @@ mod tests {
             histogram: None,
         };
 
-        let est = stats.estimate_cardinality(
-            &Operator::Eq,
-            &SqliteValue::Integer(42),
-            None,
-        );
+        let est = stats.estimate_cardinality(&Operator::Eq, &SqliteValue::Integer(42), None);
         assert_eq!(est.method, EstimationMethod::Ndv);
         assert!((est.selectivity - 0.02).abs() < 0.001);
         assert!((est.estimated_rows - 20.0).abs() < 0.1);
@@ -538,11 +533,7 @@ mod tests {
             histogram: None,
         };
 
-        let est = stats.estimate_cardinality(
-            &Operator::Gt,
-            &SqliteValue::Integer(42),
-            None,
-        );
+        let est = stats.estimate_cardinality(&Operator::Gt, &SqliteValue::Integer(42), None);
         assert_eq!(est.method, EstimationMethod::Heuristic);
         assert!((est.selectivity - 1.0 / 3.0).abs() < 0.01);
     }
@@ -584,11 +575,8 @@ mod tests {
         };
 
         let sample = vec![SqliteValue::Integer(42); 10];
-        let est = stats.estimate_cardinality(
-            &Operator::Eq,
-            &SqliteValue::Integer(42),
-            Some(&sample),
-        );
+        let est =
+            stats.estimate_cardinality(&Operator::Eq, &SqliteValue::Integer(42), Some(&sample));
         // With sample, should prefer sampling over NDV
         assert_eq!(est.method, EstimationMethod::Sampling);
         assert!((est.selectivity - 1.0).abs() < 0.01);

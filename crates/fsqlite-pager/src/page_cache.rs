@@ -1083,10 +1083,7 @@ mod tests {
         assert_eq!(reset.hits, 0, "bead_id={BEAD_ID} case=reset_hits");
         assert_eq!(reset.misses, 0, "bead_id={BEAD_ID} case=reset_misses");
         assert_eq!(reset.admits, 0, "bead_id={BEAD_ID} case=reset_admits");
-        assert_eq!(
-            reset.evictions, 0,
-            "bead_id={BEAD_ID} case=reset_evictions"
-        );
+        assert_eq!(reset.evictions, 0, "bead_id={BEAD_ID} case=reset_evictions");
     }
 
     // -----------------------------------------------------------------------

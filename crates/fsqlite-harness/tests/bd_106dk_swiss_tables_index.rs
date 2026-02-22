@@ -12,8 +12,8 @@
 //!   9. Index operator and edge cases
 //!  10. Machine-readable conformance output
 
-use fsqlite_btree::swiss_index::SwissIndex;
 use fsqlite_btree::btree_metrics_snapshot;
+use fsqlite_btree::swiss_index::SwissIndex;
 
 // ---------------------------------------------------------------------------
 // Test 1: Basic CRUD operations
@@ -87,8 +87,8 @@ fn test_load_factor_tracking() {
     );
 
     // Probe count should have increased.
-    let delta_probes = m_after.fsqlite_swiss_table_probes_total
-        - m_before.fsqlite_swiss_table_probes_total;
+    let delta_probes =
+        m_after.fsqlite_swiss_table_probes_total - m_before.fsqlite_swiss_table_probes_total;
     assert!(
         delta_probes >= 64,
         "should have at least 64 probes from inserts, got {delta_probes}"
@@ -129,16 +129,17 @@ fn test_large_scale_lookup() {
         }
     }
 
-    assert_eq!(mismatches, 0, "found {mismatches} mismatches in 10K lookups");
+    assert_eq!(
+        mismatches, 0,
+        "found {mismatches} mismatches in 10K lookups"
+    );
 
     // Non-existent keys should return None.
     for i in 10_000..10_100u64 {
         assert!(map.get(&i).is_none(), "key {i} should not exist");
     }
 
-    println!(
-        "[PASS] Large-scale lookup: 10K entries, 0 mismatches, 100 negative lookups verified"
-    );
+    println!("[PASS] Large-scale lookup: 10K entries, 0 mismatches, 100 negative lookups verified");
 }
 
 // ---------------------------------------------------------------------------
@@ -174,9 +175,15 @@ fn test_collision_handling() {
     // Odd-indexed keys should still be present.
     for (i, key) in keys.iter().enumerate() {
         if i % 2 == 1 {
-            assert!(map.contains_key(key.as_str()), "key {key} should still exist");
+            assert!(
+                map.contains_key(key.as_str()),
+                "key {key} should still exist"
+            );
         } else {
-            assert!(!map.contains_key(key.as_str()), "key {key} should be removed");
+            assert!(
+                !map.contains_key(key.as_str()),
+                "key {key} should be removed"
+            );
         }
     }
 
@@ -212,7 +219,11 @@ fn test_iterator_consistency() {
         *v += 1;
     }
     value_sum = map.values().sum();
-    assert_eq!(value_sum, expected_sum + 100, "iter_mut() modification failed");
+    assert_eq!(
+        value_sum,
+        expected_sum + 100,
+        "iter_mut() modification failed"
+    );
 
     // into_iter() should consume the map.
     let collected: Vec<(u64, u64)> = map.into_iter().collect();
@@ -276,8 +287,8 @@ fn test_probe_metrics_fidelity() {
     }
 
     let m_after = btree_metrics_snapshot();
-    let delta = m_after.fsqlite_swiss_table_probes_total
-        - m_before.fsqlite_swiss_table_probes_total;
+    let delta =
+        m_after.fsqlite_swiss_table_probes_total - m_before.fsqlite_swiss_table_probes_total;
 
     // At least 10 + 10 + 5 + 3 + 2 = 30 probes (parallel tests may add more).
     assert!(delta >= 30, "expected >= 30 probes, got {delta}");
@@ -328,7 +339,10 @@ fn test_index_operator_and_edges() {
 
     // Debug format
     let dbg = format!("{map:?}");
-    assert!(dbg.contains("SwissIndex"), "Debug should include type name: {dbg}");
+    assert!(
+        dbg.contains("SwissIndex"),
+        "Debug should include type name: {dbg}"
+    );
 
     // Clone
     let map2 = map.clone();
@@ -371,7 +385,9 @@ fn test_conformance_summary() {
 
     // Property 6: No torn data (clear + verify).
     let mut m3: SwissIndex<u64, u64> = SwissIndex::new();
-    for i in 0..100 { m3.insert(i, i); }
+    for i in 0..100 {
+        m3.insert(i, i);
+    }
     m3.clear();
     let clear_ok = m3.is_empty();
 

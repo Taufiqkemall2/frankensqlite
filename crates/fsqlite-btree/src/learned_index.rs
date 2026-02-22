@@ -131,10 +131,7 @@ impl LearnedIndex {
     ///
     /// Panics if `keys` is not sorted.
     pub fn build(keys: &[u64], config: LearnedIndexConfig) -> Self {
-        assert!(
-            keys.windows(2).all(|w| w[0] <= w[1]),
-            "keys must be sorted"
-        );
+        assert!(keys.windows(2).all(|w| w[0] <= w[1]), "keys must be sorted");
 
         let segments = train_piecewise_linear(keys, config.max_error);
 
@@ -240,9 +237,7 @@ impl LearnedIndex {
         }
 
         // Binary search by key_lo.
-        let idx = self
-            .segments
-            .partition_point(|seg| seg.key_lo <= key);
+        let idx = self.segments.partition_point(|seg| seg.key_lo <= key);
 
         if idx == 0 {
             // Key is before the first segment.

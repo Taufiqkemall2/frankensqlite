@@ -13,9 +13,9 @@
 //!            histogram `bloodstream_propagation_duration_us`,
 //!            gauge `bloodstream_active_bindings`.
 
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use serde::{Deserialize, Serialize};
 
 /// Bead identifier for log correlation.
 #[allow(dead_code)]
@@ -108,7 +108,10 @@ impl DeltaBatch {
 
     /// Distinct source tables referenced in this batch.
     pub fn source_tables(&self) -> BTreeSet<&str> {
-        self.deltas.iter().map(|d| d.source_table.as_str()).collect()
+        self.deltas
+            .iter()
+            .map(|d| d.source_table.as_str())
+            .collect()
     }
 
     /// Count deltas by kind.
@@ -236,9 +239,7 @@ impl ViewBinding {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PropagationResult {
     /// All bindings received the batch successfully.
-    Success {
-        widgets_invalidated: usize,
-    },
+    Success { widgets_invalidated: usize },
     /// Some bindings received deltas; others were suspended or detached.
     Partial {
         widgets_invalidated: usize,
@@ -255,8 +256,13 @@ impl PropagationResult {
     /// Number of widgets invalidated.
     pub fn widgets_invalidated(&self) -> usize {
         match self {
-            Self::Success { widgets_invalidated }
-            | Self::Partial { widgets_invalidated, .. } => *widgets_invalidated,
+            Self::Success {
+                widgets_invalidated,
+            }
+            | Self::Partial {
+                widgets_invalidated,
+                ..
+            } => *widgets_invalidated,
             Self::NoMatch | Self::Shutdown => 0,
         }
     }
@@ -490,7 +496,9 @@ impl PropagationEngine {
         }
 
         if skipped_suspended == 0 && skipped_detached == 0 {
-            PropagationResult::Success { widgets_invalidated }
+            PropagationResult::Success {
+                widgets_invalidated,
+            }
         } else {
             PropagationResult::Partial {
                 widgets_invalidated,

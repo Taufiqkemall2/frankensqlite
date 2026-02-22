@@ -411,7 +411,7 @@ where
             db_path: path.to_owned(),
             inner: Arc::new(Mutex::new(PagerInner {
                 db_file,
-                cache: PageCache::new(page_size, 256),
+                cache: PageCache::new(page_size, 1024),
                 page_size,
                 db_size,
                 next_page,

@@ -82,7 +82,10 @@ fn drift_classification_acceptable_variants() {
 fn drift_classification_display() {
     let cases = [
         (DriftClassification::Identical, "identical"),
-        (DriftClassification::SemanticEquivalent, "semantic-equivalent"),
+        (
+            DriftClassification::SemanticEquivalent,
+            "semantic-equivalent",
+        ),
         (DriftClassification::WithinEpsilon, "within-epsilon"),
         (DriftClassification::Divergent, "DIVERGENT"),
         (DriftClassification::Unsupported, "unsupported"),
@@ -234,7 +237,10 @@ fn drift_failure_has_repro_command() {
         repro_command: "cargo test -p fsqlite-harness --lib toolchain_determinism -- test-probe-1 --exact --nocapture".to_owned(),
     };
 
-    assert!(!failure.repro_command.is_empty(), "repro command must exist");
+    assert!(
+        !failure.repro_command.is_empty(),
+        "repro command must exist"
+    );
     assert!(
         failure.repro_command.contains(&failure.probe_id),
         "repro command must reference the failing probe"
@@ -391,8 +397,7 @@ fn default_config_watchdog_passes() {
 
     // Default config with max_failures=0 — local run should pass
     assert!(
-        report.verdict == WatchdogVerdict::Pass
-            || report.verdict == WatchdogVerdict::Warning,
+        report.verdict == WatchdogVerdict::Pass || report.verdict == WatchdogVerdict::Warning,
         "default watchdog should pass or warn, got: {}",
         report.verdict
     );
@@ -450,8 +455,7 @@ fn session_entry_results_cover_corpus() {
     );
     // Entry results span all corpus entries across all toolchains
     assert!(
-        report.session.entry_results.len()
-            >= report.session.corpus_entry_count,
+        report.session.entry_results.len() >= report.session.corpus_entry_count,
         "entry results must cover at least one per corpus entry"
     );
 }
@@ -472,8 +476,7 @@ fn session_probe_results_cover_probes() {
 fn session_json_roundtrip() {
     let report = watchdog_report();
     let json = report.session.to_json().unwrap();
-    let restored =
-        fsqlite_harness::toolchain_determinism::RunSession::from_json(&json).unwrap();
+    let restored = fsqlite_harness::toolchain_determinism::RunSession::from_json(&json).unwrap();
 
     assert_eq!(restored.bead_id, report.session.bead_id);
     assert_eq!(restored.root_seed, report.session.root_seed);
@@ -487,12 +490,21 @@ fn session_json_roundtrip() {
 fn conformance_summary() {
     let checks = vec![
         ("C-1: DivergenceClass severity ordering and display", true),
-        ("C-2: DriftClassification acceptable/unacceptable boundary", true),
-        ("C-3: DriftFailure includes repro command and subsystem", true),
+        (
+            "C-2: DriftClassification acceptable/unacceptable boundary",
+            true,
+        ),
+        (
+            "C-3: DriftFailure includes repro command and subsystem",
+            true,
+        ),
         ("C-4: TimingAnomaly tracks observed vs. allowed ratio", true),
         ("C-5: WatchdogReport has triage line and summary", true),
         ("C-6: DriftReport from session preserves all metrics", true),
-        ("C-7: Reports survive JSON round-trip (watchdog + drift + session)", true),
+        (
+            "C-7: Reports survive JSON round-trip (watchdog + drift + session)",
+            true,
+        ),
         ("C-8: Reports are deterministic for same config", true),
         ("C-9: Runner and matrix validate without errors", true),
     ];

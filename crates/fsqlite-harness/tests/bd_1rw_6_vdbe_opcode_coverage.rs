@@ -108,9 +108,7 @@ fn build_opcode_tests() -> Vec<OpcodeTest> {
             setup: vec![],
             sql: "SELECT 3.14;",
             expected_opcodes: vec!["Real", "ResultRow"],
-            validate: |_, rows| {
-                matches!(rows[0][0], SqliteValue::Float(v) if (v - 3.14).abs() < 1e-10)
-            },
+            validate: |_, rows| matches!(rows[0][0], SqliteValue::Float(v) if (v - 3.14).abs() < 1e-10),
         },
         OpcodeTest {
             name: "string_constant",
@@ -134,9 +132,7 @@ fn build_opcode_tests() -> Vec<OpcodeTest> {
             setup: vec![],
             sql: "SELECT x'DEADBEEF';",
             expected_opcodes: vec!["Blob"],
-            validate: |_, rows| {
-                matches!(&rows[0][0], SqliteValue::Blob(b) if b == &[0xDE, 0xAD, 0xBE, 0xEF])
-            },
+            validate: |_, rows| matches!(&rows[0][0], SqliteValue::Blob(b) if b == &[0xDE, 0xAD, 0xBE, 0xEF]),
         },
         // ── Arithmetic ───────────────────────────────────────────
         OpcodeTest {
@@ -145,9 +141,7 @@ fn build_opcode_tests() -> Vec<OpcodeTest> {
             setup: vec![],
             sql: "SELECT 10 + 5, 10 - 5;",
             expected_opcodes: vec!["Add", "Subtract"],
-            validate: |_, rows| {
-                rows[0] == [SqliteValue::Integer(15), SqliteValue::Integer(5)]
-            },
+            validate: |_, rows| rows[0] == [SqliteValue::Integer(15), SqliteValue::Integer(5)],
         },
         OpcodeTest {
             name: "multiply_divide",
@@ -155,9 +149,7 @@ fn build_opcode_tests() -> Vec<OpcodeTest> {
             setup: vec![],
             sql: "SELECT 6 * 7, 42 / 6;",
             expected_opcodes: vec!["Multiply", "Divide"],
-            validate: |_, rows| {
-                rows[0] == [SqliteValue::Integer(42), SqliteValue::Integer(7)]
-            },
+            validate: |_, rows| rows[0] == [SqliteValue::Integer(42), SqliteValue::Integer(7)],
         },
         OpcodeTest {
             name: "remainder",
@@ -190,9 +182,7 @@ fn build_opcode_tests() -> Vec<OpcodeTest> {
             setup: vec![],
             sql: "SELECT 1 = 1, 1 = 2;",
             expected_opcodes: vec!["Eq"],
-            validate: |_, rows| {
-                rows[0] == [SqliteValue::Integer(1), SqliteValue::Integer(0)]
-            },
+            validate: |_, rows| rows[0] == [SqliteValue::Integer(1), SqliteValue::Integer(0)],
         },
         OpcodeTest {
             name: "lt_le_gt_ge",
@@ -216,9 +206,7 @@ fn build_opcode_tests() -> Vec<OpcodeTest> {
             setup: vec![],
             sql: "SELECT NULL IS NULL, 42 IS NOT NULL;",
             expected_opcodes: vec![],
-            validate: |_, rows| {
-                rows[0] == [SqliteValue::Integer(1), SqliteValue::Integer(1)]
-            },
+            validate: |_, rows| rows[0] == [SqliteValue::Integer(1), SqliteValue::Integer(1)],
         },
         OpcodeTest {
             name: "and_or_not",
@@ -297,9 +285,7 @@ fn build_opcode_tests() -> Vec<OpcodeTest> {
             ],
             sql: "UPDATE upd_t SET v = 99 WHERE id = 2;",
             expected_opcodes: vec![],
-            validate: |conn, _| {
-                query_first_int(conn, "SELECT v FROM upd_t WHERE id = 2;") == 99
-            },
+            validate: |conn, _| query_first_int(conn, "SELECT v FROM upd_t WHERE id = 2;") == 99,
         },
         // ── Aggregates ───────────────────────────────────────────
         OpcodeTest {
@@ -596,14 +582,10 @@ fn build_opcode_tests() -> Vec<OpcodeTest> {
         OpcodeTest {
             name: "transaction_commit",
             category: "transaction",
-            setup: vec![
-                "CREATE TABLE txn(id INTEGER PRIMARY KEY, v INTEGER);",
-            ],
+            setup: vec!["CREATE TABLE txn(id INTEGER PRIMARY KEY, v INTEGER);"],
             sql: "BEGIN; INSERT INTO txn VALUES(1, 100); COMMIT;",
             expected_opcodes: vec![],
-            validate: |conn, _| {
-                query_first_int(conn, "SELECT v FROM txn WHERE id = 1;") == 100
-            },
+            validate: |conn, _| query_first_int(conn, "SELECT v FROM txn WHERE id = 1;") == 100,
         },
         OpcodeTest {
             name: "transaction_rollback",
@@ -614,9 +596,7 @@ fn build_opcode_tests() -> Vec<OpcodeTest> {
             ],
             sql: "BEGIN; UPDATE txr SET v = 999 WHERE id = 1; ROLLBACK;",
             expected_opcodes: vec![],
-            validate: |conn, _| {
-                query_first_int(conn, "SELECT v FROM txr WHERE id = 1;") == 100
-            },
+            validate: |conn, _| query_first_int(conn, "SELECT v FROM txr WHERE id = 1;") == 100,
         },
         // ── DDL / Schema ─────────────────────────────────────────
         OpcodeTest {
@@ -639,9 +619,7 @@ fn build_opcode_tests() -> Vec<OpcodeTest> {
             ],
             sql: "DROP TABLE to_drop;",
             expected_opcodes: vec![],
-            validate: |conn, _| {
-                conn.query("SELECT * FROM to_drop;").is_err()
-            },
+            validate: |conn, _| conn.query("SELECT * FROM to_drop;").is_err(),
         },
         // ── Parameterized queries ────────────────────────────────
         OpcodeTest {
@@ -762,8 +740,7 @@ fn build_opcode_tests() -> Vec<OpcodeTest> {
             sql: "SELECT IFNULL(NULL, 42), NULLIF(1, 1);",
             expected_opcodes: vec![],
             validate: |_, rows| {
-                rows[0][0] == SqliteValue::Integer(42)
-                    && rows[0][1] == SqliteValue::Null
+                rows[0][0] == SqliteValue::Integer(42) && rows[0][1] == SqliteValue::Null
             },
         },
         // ── Coroutine-triggering queries ─────────────────────────
@@ -802,25 +779,26 @@ fn test_vdbe_opcode_coverage_matrix() {
             }
 
             // Execute the main SQL
-            let rows: Vec<Vec<SqliteValue>> = if t.sql.contains(';') && t.sql.matches(';').count() > 1 {
-                // Multi-statement: execute each statement
-                for stmt in t.sql.split(';').filter(|s| !s.trim().is_empty()) {
-                    let trimmed = format!("{};", stmt.trim());
-                    let _ = conn.execute(&trimmed).or_else(|_| {
-                        conn.query(&trimmed).map(|r| r.len())
-                    });
-                }
-                Vec::new()
-            } else if t.sql.trim_start().to_uppercase().starts_with("SELECT") {
-                conn.query(t.sql)
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|r| r.values().to_vec())
-                    .collect()
-            } else {
-                let _ = conn.execute(t.sql);
-                Vec::new()
-            };
+            let rows: Vec<Vec<SqliteValue>> =
+                if t.sql.contains(';') && t.sql.matches(';').count() > 1 {
+                    // Multi-statement: execute each statement
+                    for stmt in t.sql.split(';').filter(|s| !s.trim().is_empty()) {
+                        let trimmed = format!("{};", stmt.trim());
+                        let _ = conn
+                            .execute(&trimmed)
+                            .or_else(|_| conn.query(&trimmed).map(|r| r.len()));
+                    }
+                    Vec::new()
+                } else if t.sql.trim_start().to_uppercase().starts_with("SELECT") {
+                    conn.query(t.sql)
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|r| r.values().to_vec())
+                        .collect()
+                } else {
+                    let _ = conn.execute(t.sql);
+                    Vec::new()
+                };
 
             // Check expected opcodes in explain output if this is a single SELECT
             if !t.expected_opcodes.is_empty() {
@@ -830,7 +808,9 @@ fn test_vdbe_opcode_coverage_matrix() {
                         assert!(
                             explain.contains(opcode),
                             "test '{}': expected opcode '{}' not found in explain:\n{}",
-                            t.name, opcode, explain
+                            t.name,
+                            opcode,
+                            explain
                         );
                     }
                 }
@@ -926,11 +906,7 @@ fn build_sqllogic_tests() -> Vec<SqlLogicTest> {
             setup: vec![],
             query: "SELECT 'a' || 'b', LENGTH('hello'), UPPER('world');",
 
-            expected: vec![vec![
-                T("ab".into()),
-                I(5),
-                T("WORLD".into()),
-            ]],
+            expected: vec![vec![T("ab".into()), I(5), T("WORLD".into())]],
         },
         SqlLogicTest {
             label: "null_arithmetic",
@@ -990,10 +966,7 @@ fn build_sqllogic_tests() -> Vec<SqlLogicTest> {
             ],
             query: "SELECT cat, SUM(amt) FROM slt4 GROUP BY cat ORDER BY cat;",
 
-            expected: vec![
-                vec![T("A".into()), I(4)],
-                vec![T("B".into()), I(6)],
-            ],
+            expected: vec![vec![T("A".into()), I(4)], vec![T("B".into()), I(6)]],
         },
         SqlLogicTest {
             label: "union_all_correctness",
@@ -1033,10 +1006,7 @@ fn build_sqllogic_tests() -> Vec<SqlLogicTest> {
             ],
             query: "SELECT slt_l.name, slt_r.score FROM slt_l INNER JOIN slt_r ON slt_l.id = slt_r.lid ORDER BY slt_r.score;",
 
-            expected: vec![
-                vec![T("bob".into()), I(80)],
-                vec![T("alice".into()), I(90)],
-            ],
+            expected: vec![vec![T("bob".into()), I(80)], vec![T("alice".into()), I(90)]],
         },
         SqlLogicTest {
             label: "delete_and_recount",
@@ -1128,13 +1098,16 @@ fn test_sqllogictest_result_correctness() {
 
             // Handle multi-statement queries (DML ; SELECT)
             let rows = if t.query.matches(';').count() > 1 {
-                let stmts: Vec<&str> = t.query.split(';').filter(|s| !s.trim().is_empty()).collect();
+                let stmts: Vec<&str> = t
+                    .query
+                    .split(';')
+                    .filter(|s| !s.trim().is_empty())
+                    .collect();
                 // Execute all but last, query the last
                 for stmt in &stmts[..stmts.len() - 1] {
                     let trimmed = format!("{};", stmt.trim());
-                    conn.execute(&trimmed).unwrap_or_else(|_| {
-                        conn.query(&trimmed).map(|r| r.len()).unwrap_or(0)
-                    });
+                    conn.execute(&trimmed)
+                        .unwrap_or_else(|_| conn.query(&trimmed).map(|r| r.len()).unwrap_or(0));
                 }
                 let last = format!("{};", stmts.last().unwrap().trim());
                 conn.query(&last).unwrap_or_default()
@@ -1276,12 +1249,7 @@ fn test_sort_large_dataset() {
         .collect();
 
     for w in vals.windows(2) {
-        assert!(
-            w[0] <= w[1],
-            "sort order violated: {} > {}",
-            w[0],
-            w[1]
-        );
+        assert!(w[0] <= w[1], "sort order violated: {} > {}", w[0], w[1]);
     }
 
     // Multi-column sort
@@ -1293,9 +1261,7 @@ fn test_sort_large_dataset() {
     let pairs: Vec<(i64, i64)> = rows2
         .iter()
         .filter_map(|r| match (r.values().first(), r.values().get(1)) {
-            (Some(SqliteValue::Integer(id)), Some(SqliteValue::Integer(val))) => {
-                Some((*id, *val))
-            }
+            (Some(SqliteValue::Integer(id)), Some(SqliteValue::Integer(val))) => Some((*id, *val)),
             _ => None,
         })
         .collect();
@@ -1323,8 +1289,10 @@ fn test_complex_query_opcode_chains() {
     // Setup: orders + items tables
     conn.execute("CREATE TABLE orders(id INTEGER PRIMARY KEY, customer TEXT, total REAL);")
         .unwrap();
-    conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, order_id INTEGER, name TEXT, price REAL);")
-        .unwrap();
+    conn.execute(
+        "CREATE TABLE items(id INTEGER PRIMARY KEY, order_id INTEGER, name TEXT, price REAL);",
+    )
+    .unwrap();
 
     // Insert data
     conn.execute("INSERT INTO orders VALUES(1, 'Alice', 100.0);")
@@ -1452,9 +1420,7 @@ fn test_edge_cases() {
 
     // Empty result set
     conn.execute("CREATE TABLE empty_t(v INTEGER);").unwrap();
-    let rows = conn
-        .query("SELECT v FROM empty_t;")
-        .expect("empty result");
+    let rows = conn.query("SELECT v FROM empty_t;").expect("empty result");
     assert_eq!(rows.len(), 0);
     println!("[PASS] edge :: empty result set");
 
@@ -1467,7 +1433,10 @@ fn test_edge_cases() {
     println!("[PASS] edge :: multi-type single row");
 
     // Large number of columns
-    let many_cols: String = (1..=20).map(|i| format!("{i}")).collect::<Vec<_>>().join(", ");
+    let many_cols: String = (1..=20)
+        .map(|i| format!("{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     let rows = conn
         .query(&format!("SELECT {many_cols};"))
         .expect("20 columns");
@@ -1502,10 +1471,7 @@ fn test_edge_cases() {
     let rows = conn
         .query("SELECT 2147483647;") // i32::MAX, well within i64 range
         .expect("large int");
-    assert_eq!(
-        rows[0].values()[0],
-        SqliteValue::Integer(2_147_483_647)
-    );
+    assert_eq!(rows[0].values()[0], SqliteValue::Integer(2_147_483_647));
     println!("[PASS] edge :: large integer value");
 
     // Empty string vs NULL
@@ -1550,9 +1516,7 @@ fn test_conformance_summary_json() {
             }
         }));
 
-        let entry = categories
-            .entry(t.category.to_owned())
-            .or_insert((0, 0));
+        let entry = categories.entry(t.category.to_owned()).or_insert((0, 0));
         entry.0 += 1;
         if result.is_ok() {
             entry.1 += 1;

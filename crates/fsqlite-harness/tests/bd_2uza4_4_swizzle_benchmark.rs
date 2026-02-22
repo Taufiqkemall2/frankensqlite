@@ -182,7 +182,9 @@ fn run_benchmark(
     let num_leaves = count_leaves(depth, fanout);
 
     // Build page table (unswizzled path).
-    let page_table: HashMap<u64, usize> = (0..num_pages as u64).map(|pid| (pid, pid as usize)).collect();
+    let page_table: HashMap<u64, usize> = (0..num_pages as u64)
+        .map(|pid| (pid, pid as usize))
+        .collect();
 
     // Build swizzle pointers (swizzled path).
     let mut swizzle_ptrs: Vec<Vec<SwizzlePtr>> = Vec::with_capacity(num_pages);
@@ -210,7 +212,9 @@ fn run_benchmark(
             (0..max_depth)
                 .map(|lvl| {
                     // Simple hash-like mixing for deterministic pseudo-random child selection.
-                    let mix = i.wrapping_mul(2654435761).wrapping_add(lvl.wrapping_mul(0x9E3779B9));
+                    let mix = i
+                        .wrapping_mul(2654435761)
+                        .wrapping_add(lvl.wrapping_mul(0x9E3779B9));
                     mix % fanout
                 })
                 .collect()
@@ -237,12 +241,8 @@ fn run_benchmark(
     let start = Instant::now();
     let mut checksum2 = 0u64;
     for t in &targets {
-        checksum2 = checksum2.wrapping_add(swizzled_lookup(
-            &swizzle_ptrs,
-            &pages,
-            root as usize,
-            t,
-        ));
+        checksum2 =
+            checksum2.wrapping_add(swizzled_lookup(&swizzle_ptrs, &pages, root as usize, t));
     }
     std::hint::black_box(checksum2);
     let swizzled_elapsed = start.elapsed().as_nanos();
@@ -251,7 +251,8 @@ fn run_benchmark(
     let start = Instant::now();
     let mut checksum3 = 0u64;
     for t in &targets {
-        checksum3 = checksum3.wrapping_add(direct_lookup(&direct_children, &pages, root as usize, t));
+        checksum3 =
+            checksum3.wrapping_add(direct_lookup(&direct_children, &pages, root as usize, t));
     }
     std::hint::black_box(checksum3);
     let direct_elapsed = start.elapsed().as_nanos();
@@ -355,8 +356,9 @@ fn bench_skewed_access_pattern() {
     let (pages, root) = build_sim_btree(depth, fanout);
     let num_pages = pages.len();
 
-    let page_table: HashMap<u64, usize> =
-        (0..num_pages as u64).map(|pid| (pid, pid as usize)).collect();
+    let page_table: HashMap<u64, usize> = (0..num_pages as u64)
+        .map(|pid| (pid, pid as usize))
+        .collect();
 
     let direct_children: Vec<Vec<usize>> = pages
         .iter()
@@ -369,7 +371,9 @@ fn bench_skewed_access_pattern() {
         .map(|i: usize| {
             (0..max_depth)
                 .map(|lvl: usize| {
-                    let mix = i.wrapping_mul(2654435761).wrapping_add(lvl.wrapping_mul(0x9E3779B9));
+                    let mix = i
+                        .wrapping_mul(2654435761)
+                        .wrapping_add(lvl.wrapping_mul(0x9E3779B9));
                     // Skew: 80% go to child 0-2, 20% go anywhere.
                     if mix % 5 < 4 {
                         mix % 3 // hot children
@@ -486,8 +490,9 @@ fn bench_page_table_overhead() {
     let num_lookups = 2_000_000usize;
 
     // Build HashMap page table.
-    let page_table: HashMap<u64, usize> =
-        (0..num_pages as u64).map(|pid| (pid, pid as usize)).collect();
+    let page_table: HashMap<u64, usize> = (0..num_pages as u64)
+        .map(|pid| (pid, pid as usize))
+        .collect();
 
     // Build direct array.
     let direct: Vec<usize> = (0..num_pages).collect();
@@ -548,7 +553,10 @@ fn bench_page_table_overhead() {
 #[test]
 fn bench_scaling_by_depth() {
     println!("\n=== {BEAD_ID} Scaling by Tree Depth ===");
-    println!("{:<8} {:<12} {:<12} {:<12} {:<10}", "Depth", "Unsw ns/op", "Sw ns/op", "Direct ns", "Speedup");
+    println!(
+        "{:<8} {:<12} {:<12} {:<12} {:<10}",
+        "Depth", "Unsw ns/op", "Sw ns/op", "Direct ns", "Speedup"
+    );
 
     let mut all_speedups = Vec::new();
 
@@ -620,13 +628,17 @@ fn test_conformance_summary() {
 
         let t1 = Instant::now();
         let mut s1 = 0usize;
-        for &k in &keys { s1 = s1.wrapping_add(pt[&k]); }
+        for &k in &keys {
+            s1 = s1.wrapping_add(pt[&k]);
+        }
         std::hint::black_box(s1);
         let hash_t = t1.elapsed().as_nanos();
 
         let t2 = Instant::now();
         let mut s2 = 0usize;
-        for &k in &keys { s2 = s2.wrapping_add(arr[k as usize]); }
+        for &k in &keys {
+            s2 = s2.wrapping_add(arr[k as usize]);
+        }
         std::hint::black_box(s2);
         let direct_t = t2.elapsed().as_nanos();
 
@@ -652,12 +664,42 @@ fn test_conformance_summary() {
     let total = checks.len();
 
     println!("\n=== {BEAD_ID} Swizzle Benchmark Conformance ===");
-    println!("  swizzled ≤ unswizzled: {}", if pass_swizzled_not_slower { "PASS" } else { "FAIL" });
-    println!("  direct ≤ swizzled:     {}", if pass_direct_fastest { "PASS" } else { "FAIL" });
-    println!("  correctness:           {}", if pass_correctness { "PASS" } else { "FAIL" });
-    println!("  depth scaling:         {}", if pass_depth_scaling { "PASS" } else { "FAIL" });
-    println!("  page table overhead:   {}", if pass_page_table_overhead { "PASS" } else { "FAIL" });
-    println!("  swizzle ptr decode:    {}", if pass_swizzle_ptr_decode { "PASS" } else { "FAIL" });
+    println!(
+        "  swizzled ≤ unswizzled: {}",
+        if pass_swizzled_not_slower {
+            "PASS"
+        } else {
+            "FAIL"
+        }
+    );
+    println!(
+        "  direct ≤ swizzled:     {}",
+        if pass_direct_fastest { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  correctness:           {}",
+        if pass_correctness { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  depth scaling:         {}",
+        if pass_depth_scaling { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  page table overhead:   {}",
+        if pass_page_table_overhead {
+            "PASS"
+        } else {
+            "FAIL"
+        }
+    );
+    println!(
+        "  swizzle ptr decode:    {}",
+        if pass_swizzle_ptr_decode {
+            "PASS"
+        } else {
+            "FAIL"
+        }
+    );
     println!("  speedup (sw/unsw):     {speedup_sw:.2}x");
     println!("  speedup (direct/unsw): {speedup_direct:.2}x");
     println!("  [{passed}/{total}] conformance checks passed");

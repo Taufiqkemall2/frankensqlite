@@ -6,20 +6,18 @@
 //! concurrent writer GC interference, chain-pressure feedback loop, eager reclaim
 //! fallback semantics, and p50/p95/p99 tail latency targets.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fsqlite_mvcc::{
-    GC_F_MAX_HZ, GC_F_MIN_HZ, GC_PAGES_BUDGET, GC_VERSIONS_BUDGET, GC_TARGET_CHAIN_LENGTH,
-    GcScheduler, GcTodo, gc_tick,
-    VersionArena, VersionIdx,
-    VersionGuard, VersionGuardRegistry, VersionGuardTicket, StaleReaderConfig,
-};
-use fsqlite_mvcc::gc::gc_tick_with_registry;
 use fsqlite_mvcc::ebr::GLOBAL_EBR_METRICS;
-use fsqlite_types::{CommitSeq, PageNumber, PageNumberBuildHasher, PageData, PageSize};
-use fsqlite_types::glossary::{PageVersion, TxnToken, TxnId, TxnEpoch};
+use fsqlite_mvcc::gc::gc_tick_with_registry;
+use fsqlite_mvcc::{
+    ChainHeadTable, GC_F_MAX_HZ, GC_F_MIN_HZ, GC_PAGES_BUDGET, GC_TARGET_CHAIN_LENGTH,
+    GC_VERSIONS_BUDGET, GcScheduler, GcTodo, StaleReaderConfig, VersionArena, VersionGuard,
+    VersionGuardRegistry, VersionGuardTicket, VersionIdx, gc_tick,
+};
+use fsqlite_types::glossary::{PageVersion, TxnEpoch, TxnId, TxnToken};
+use fsqlite_types::{CommitSeq, PageData, PageNumber, PageSize};
 
 const BEAD_ID: &str = "bd-2y306.7";
 
@@ -39,17 +37,9 @@ fn dummy_version(pgno: u32, seq: u64) -> PageVersion {
 
 /// Populate arena with `n_pages` pages, each having `chain_depth` versions.
 /// Returns (arena, chain_heads, todo) ready for gc_tick.
-fn populate_arena(
-    n_pages: u32,
-    chain_depth: u64,
-) -> (
-    VersionArena,
-    HashMap<PageNumber, VersionIdx, PageNumberBuildHasher>,
-    GcTodo,
-) {
+fn populate_arena(n_pages: u32, chain_depth: u64) -> (VersionArena, ChainHeadTable, GcTodo) {
     let mut arena = VersionArena::new();
-    let mut chain_heads: HashMap<PageNumber, VersionIdx, PageNumberBuildHasher> =
-        HashMap::with_hasher(PageNumberBuildHasher::default());
+    let chain_heads = ChainHeadTable::new();
     let mut todo = GcTodo::new();
 
     for page in 1..=n_pages {
@@ -59,7 +49,7 @@ fn populate_arena(
             let ver = dummy_version(page, seq);
             let idx = arena.alloc(ver);
             if seq == chain_depth {
-                chain_heads.insert(pgno, idx);
+                chain_heads.install_with_retry(pgno, idx);
             }
             _prev_idx = Some(idx);
         }
@@ -86,8 +76,7 @@ fn percentiles(sorted: &[Duration]) -> (Duration, Duration, Duration) {
 fn test_e2e_gc_lifecycle_with_ebr() {
     let registry = Arc::new(VersionGuardRegistry::new(StaleReaderConfig::default()));
     let mut arena = VersionArena::new();
-    let mut chain_heads: HashMap<PageNumber, VersionIdx, PageNumberBuildHasher> =
-        HashMap::with_hasher(PageNumberBuildHasher::default());
+    let chain_heads = ChainHeadTable::new();
     let mut todo = GcTodo::new();
 
     // Populate: 10 pages, 5 versions each (seq 1..=5). Head = seq 5.
@@ -97,7 +86,7 @@ fn test_e2e_gc_lifecycle_with_ebr() {
             let ver = dummy_version(page, seq);
             let idx = arena.alloc(ver);
             if seq == 5 {
-                chain_heads.insert(pgno, idx);
+                chain_heads.install_with_retry(pgno, idx);
             }
         }
         todo.enqueue(pgno);
@@ -110,9 +99,7 @@ fn test_e2e_gc_lifecycle_with_ebr() {
     // EBR guard per page. Without linked prev pointers, nothing below the head
     // is freed, but the guard lifecycle is exercised.
     let horizon = CommitSeq::new(10);
-    let result = gc_tick_with_registry(
-        &mut todo, horizon, &mut arena, &mut chain_heads, &registry,
-    );
+    let result = gc_tick_with_registry(&mut todo, horizon, &mut arena, &chain_heads, &registry);
 
     let after = GLOBAL_EBR_METRICS.snapshot();
 
@@ -122,8 +109,14 @@ fn test_e2e_gc_lifecycle_with_ebr() {
     );
 
     // All 10 pages should be processed (within budget).
-    assert_eq!(result.pages_pruned, 10, "bead_id={BEAD_ID} case=pages_pruned");
-    assert_eq!(result.queue_remaining, 0, "bead_id={BEAD_ID} case=queue_empty");
+    assert_eq!(
+        result.pages_pruned, 10,
+        "bead_id={BEAD_ID} case=pages_pruned"
+    );
+    assert_eq!(
+        result.queue_remaining, 0,
+        "bead_id={BEAD_ID} case=queue_empty"
+    );
 
     // Guard pin/unpin should have occurred (one guard per page prune).
     let delta_pinned = after.guards_pinned_total - before.guards_pinned_total;
@@ -138,10 +131,10 @@ fn test_e2e_gc_lifecycle_with_ebr() {
 #[test]
 fn test_budget_enforcement_heavy_pressure() {
     let pages = GC_PAGES_BUDGET * 3; // 192 pages, way over budget
-    let (mut arena, mut chain_heads, mut todo) = populate_arena(pages, 1);
+    let (mut arena, chain_heads, mut todo) = populate_arena(pages, 1);
 
     let horizon = CommitSeq::new(0);
-    let result = gc_tick(&mut todo, horizon, &mut arena, &mut chain_heads);
+    let result = gc_tick(&mut todo, horizon, &mut arena, &chain_heads);
 
     println!(
         "[{BEAD_ID}] budget enforcement: pages_pruned={} budget={} exhausted={} remaining={}",
@@ -151,7 +144,8 @@ fn test_budget_enforcement_heavy_pressure() {
     assert!(
         result.pages_pruned <= GC_PAGES_BUDGET,
         "bead_id={BEAD_ID} case=pages_budget_cap pruned={} budget={}",
-        result.pages_pruned, GC_PAGES_BUDGET,
+        result.pages_pruned,
+        GC_PAGES_BUDGET,
     );
     assert!(
         result.pages_budget_exhausted,
@@ -163,7 +157,7 @@ fn test_budget_enforcement_heavy_pressure() {
     );
 
     // Second tick should process more pages (incremental drain).
-    let result2 = gc_tick(&mut todo, horizon, &mut arena, &mut chain_heads);
+    let result2 = gc_tick(&mut todo, horizon, &mut arena, &chain_heads);
     assert!(
         result2.pages_pruned > 0,
         "bead_id={BEAD_ID} case=incremental_drain",
@@ -181,8 +175,7 @@ fn test_versions_budget_exhaustion() {
     // Create many pages with deep chains to potentially hit versions budget.
     // GC_VERSIONS_BUDGET=4096, so 50 pages * 100 versions = 5000 potentially freeable.
     let mut arena = VersionArena::new();
-    let mut chain_heads: HashMap<PageNumber, VersionIdx, PageNumberBuildHasher> =
-        HashMap::with_hasher(PageNumberBuildHasher::default());
+    let chain_heads = ChainHeadTable::new();
     let mut todo = GcTodo::new();
 
     for page in 1..=50u32 {
@@ -191,7 +184,7 @@ fn test_versions_budget_exhaustion() {
             let ver = dummy_version(page, seq);
             let idx = arena.alloc(ver);
             if seq == 100 {
-                chain_heads.insert(pgno, idx);
+                chain_heads.install_with_retry(pgno, idx);
             }
         }
         todo.enqueue(pgno);
@@ -199,18 +192,21 @@ fn test_versions_budget_exhaustion() {
 
     // Horizon at 50 should free versions with seq <= 49 per page.
     let horizon = CommitSeq::new(50);
-    let result = gc_tick(&mut todo, horizon, &mut arena, &mut chain_heads);
+    let result = gc_tick(&mut todo, horizon, &mut arena, &chain_heads);
 
     println!(
         "[{BEAD_ID}] versions budget: versions_freed={} budget={} versions_exhausted={} pages_exhausted={}",
-        result.versions_freed, GC_VERSIONS_BUDGET,
-        result.versions_budget_exhausted, result.pages_budget_exhausted,
+        result.versions_freed,
+        GC_VERSIONS_BUDGET,
+        result.versions_budget_exhausted,
+        result.pages_budget_exhausted,
     );
 
     assert!(
         result.versions_freed <= GC_VERSIONS_BUDGET,
         "bead_id={BEAD_ID} case=versions_budget_cap freed={} budget={}",
-        result.versions_freed, GC_VERSIONS_BUDGET,
+        result.versions_freed,
+        GC_VERSIONS_BUDGET,
     );
 }
 
@@ -231,7 +227,10 @@ fn test_stale_reader_warning_budget() {
 
     // First warning should fire.
     let w1 = registry.warn_on_stale_readers(Instant::now());
-    assert!(w1 >= 1, "bead_id={BEAD_ID} case=first_stale_warning w1={w1}");
+    assert!(
+        w1 >= 1,
+        "bead_id={BEAD_ID} case=first_stale_warning w1={w1}"
+    );
 
     // Immediate second call should be rate-limited (within warn_every=50ms).
     let w2 = registry.warn_on_stale_readers(Instant::now());
@@ -240,7 +239,10 @@ fn test_stale_reader_warning_budget() {
     // Wait past warn_every and try again.
     std::thread::sleep(Duration::from_millis(60));
     let w3 = registry.warn_on_stale_readers(Instant::now());
-    assert!(w3 >= 1, "bead_id={BEAD_ID} case=post_cooldown_warning w3={w3}");
+    assert!(
+        w3 >= 1,
+        "bead_id={BEAD_ID} case=post_cooldown_warning w3={w3}"
+    );
 
     let after = GLOBAL_EBR_METRICS.snapshot();
     let delta_warnings = after.stale_reader_warnings_total - before.stale_reader_warnings_total;
@@ -321,32 +323,31 @@ fn test_concurrent_writer_gc_interference() {
         .collect();
 
     assert_eq!(
-        registry.active_guard_count(), 4,
+        registry.active_guard_count(),
+        4,
         "bead_id={BEAD_ID} case=writers_pinned",
     );
 
     // GC tick with pinned readers — should still complete (EBR defers reclamation).
     let mut arena = VersionArena::new();
-    let mut chain_heads: HashMap<PageNumber, VersionIdx, PageNumberBuildHasher> =
-        HashMap::with_hasher(PageNumberBuildHasher::default());
+    let chain_heads = ChainHeadTable::new();
     let mut todo = GcTodo::new();
 
     for page in 1..=20u32 {
         let pgno = PageNumber::new(page).unwrap();
         let ver = dummy_version(page, 1);
         let idx = arena.alloc(ver);
-        chain_heads.insert(pgno, idx);
+        chain_heads.install_with_retry(pgno, idx);
         todo.enqueue(pgno);
     }
 
     let horizon = CommitSeq::new(0);
-    let result = gc_tick_with_registry(
-        &mut todo, horizon, &mut arena, &mut chain_heads, &registry,
-    );
+    let result = gc_tick_with_registry(&mut todo, horizon, &mut arena, &chain_heads, &registry);
 
     println!(
         "[{BEAD_ID}] concurrent interference: pages_pruned={} active_guards={}",
-        result.pages_pruned, registry.active_guard_count(),
+        result.pages_pruned,
+        registry.active_guard_count(),
     );
 
     // GC should complete without panic despite active guards.
@@ -358,7 +359,8 @@ fn test_concurrent_writer_gc_interference() {
     // Drop writer guards — EBR will eventually reclaim deferred items.
     drop(writer_guards);
     assert_eq!(
-        registry.active_guard_count(), 0,
+        registry.active_guard_count(),
+        0,
         "bead_id={BEAD_ID} case=writers_released",
     );
 }
@@ -441,7 +443,8 @@ fn test_eager_reclaim_fallback_semantics() {
 
     // Registry should be clean.
     assert_eq!(
-        registry.active_guard_count(), 0,
+        registry.active_guard_count(),
+        0,
         "bead_id={BEAD_ID} case=registry_clean_after_fallback",
     );
 
@@ -454,8 +457,7 @@ fn test_eager_reclaim_fallback_semantics() {
 fn test_gc_tick_tail_latency_under_load() {
     let registry = Arc::new(VersionGuardRegistry::new(StaleReaderConfig::default()));
     let mut arena = VersionArena::new();
-    let mut chain_heads: HashMap<PageNumber, VersionIdx, PageNumberBuildHasher> =
-        HashMap::with_hasher(PageNumberBuildHasher::default());
+    let chain_heads = ChainHeadTable::new();
 
     // Populate: 64 pages (= GC_PAGES_BUDGET), 20 versions each.
     for page in 1..=GC_PAGES_BUDGET {
@@ -464,7 +466,7 @@ fn test_gc_tick_tail_latency_under_load() {
             let ver = dummy_version(page, seq);
             let idx = arena.alloc(ver);
             if seq == 20 {
-                chain_heads.insert(pgno, idx);
+                chain_heads.install_with_retry(pgno, idx);
             }
         }
     }
@@ -478,9 +480,8 @@ fn test_gc_tick_tail_latency_under_load() {
         }
         let horizon = CommitSeq::new(round + 1);
         let t0 = Instant::now();
-        let _result = gc_tick_with_registry(
-            &mut todo, horizon, &mut arena, &mut chain_heads, &registry,
-        );
+        let _result =
+            gc_tick_with_registry(&mut todo, horizon, &mut arena, &chain_heads, &registry);
         latencies.push(t0.elapsed());
     }
 
@@ -530,20 +531,23 @@ fn test_multithreaded_gc_reader_contention() {
 
     // Meanwhile, run GC on main thread.
     let mut arena = VersionArena::new();
-    let mut chain_heads: HashMap<PageNumber, VersionIdx, PageNumberBuildHasher> =
-        HashMap::with_hasher(PageNumberBuildHasher::default());
+    let chain_heads = ChainHeadTable::new();
     let mut todo = GcTodo::new();
 
     for page in 1..=30u32 {
         let pgno = PageNumber::new(page).unwrap();
         let ver = dummy_version(page, 1);
         let idx = arena.alloc(ver);
-        chain_heads.insert(pgno, idx);
+        chain_heads.install_with_retry(pgno, idx);
         todo.enqueue(pgno);
     }
 
     let result = gc_tick_with_registry(
-        &mut todo, CommitSeq::new(0), &mut arena, &mut chain_heads, &registry,
+        &mut todo,
+        CommitSeq::new(0),
+        &mut arena,
+        &chain_heads,
+        &registry,
     );
 
     reader_done.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -554,7 +558,8 @@ fn test_multithreaded_gc_reader_contention() {
 
     println!(
         "[{BEAD_ID}] contention: gc_pages_pruned={} reader_pins={total_pins} active_guards={}",
-        result.pages_pruned, registry.active_guard_count(),
+        result.pages_pruned,
+        registry.active_guard_count(),
     );
 
     assert_eq!(
@@ -562,7 +567,8 @@ fn test_multithreaded_gc_reader_contention() {
         "bead_id={BEAD_ID} case=gc_under_contention",
     );
     assert_eq!(
-        registry.active_guard_count(), 0,
+        registry.active_guard_count(),
+        0,
         "bead_id={BEAD_ID} case=all_guards_released",
     );
 }
@@ -600,7 +606,8 @@ fn test_ticket_deferred_retire_cross_thread() {
         "bead_id={BEAD_ID} case=cross_thread_retirements delta={delta}",
     );
     assert_eq!(
-        registry.active_guard_count(), 0,
+        registry.active_guard_count(),
+        0,
         "bead_id={BEAD_ID} case=ticket_released_cross_thread",
     );
 
@@ -618,8 +625,8 @@ fn test_conformance_summary() {
     let scheduler = GcScheduler::new();
 
     // 1. Budget enforcement: pages budget caps gc_tick.
-    let (mut arena, mut heads, mut todo) = populate_arena(GC_PAGES_BUDGET * 2, 1);
-    let r = gc_tick(&mut todo, CommitSeq::new(0), &mut arena, &mut heads);
+    let (mut arena, heads, mut todo) = populate_arena(GC_PAGES_BUDGET * 2, 1);
+    let r = gc_tick(&mut todo, CommitSeq::new(0), &mut arena, &heads);
     let pass_budget = r.pages_pruned <= GC_PAGES_BUDGET;
 
     // 2. Scheduler frequency bounds.
@@ -644,15 +651,21 @@ fn test_conformance_summary() {
     // 5. Ticket cross-thread.
     let t = VersionGuardTicket::register(Arc::clone(&registry));
     let pass_ticket_pin = registry.active_guard_count() > 0;
-    let h = std::thread::spawn(move || { drop(t); });
+    let h = std::thread::spawn(move || {
+        drop(t);
+    });
     h.join().unwrap();
     let pass_ticket = pass_ticket_pin && registry.active_guard_count() == 0;
 
     // 6. Concurrent GC safety.
     let _reader = VersionGuard::pin(Arc::clone(&registry));
-    let (mut arena2, mut heads2, mut todo2) = populate_arena(10, 1);
+    let (mut arena2, heads2, mut todo2) = populate_arena(10, 1);
     let r2 = gc_tick_with_registry(
-        &mut todo2, CommitSeq::new(0), &mut arena2, &mut heads2, &registry,
+        &mut todo2,
+        CommitSeq::new(0),
+        &mut arena2,
+        &heads2,
+        &registry,
     );
     let pass_concurrent_gc = r2.pages_pruned == 10;
     drop(_reader);

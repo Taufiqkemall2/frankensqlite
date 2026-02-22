@@ -6,9 +6,9 @@ pub mod cell;
 pub mod cooling;
 pub mod cracking;
 pub mod cursor;
-pub mod learned_index;
 pub mod freelist;
 pub mod instrumentation;
+pub mod learned_index;
 pub mod overflow;
 pub mod payload;
 pub mod swiss_index;
@@ -18,19 +18,29 @@ pub mod traits;
 #[cfg(test)]
 mod btree_invariant_tests;
 
-pub use be_tree::{BeTree, BeTreeConfig, BeTreeMetricsSnapshot, betree_metrics_snapshot, reset_betree_metrics};
-pub use cooling::{CoolingStateMachine, CoolingConfig, CoolingMetricsSnapshot, cooling_metrics_snapshot, reset_cooling_metrics};
-pub use cracking::{CrackedColumn, CrackingMetricsSnapshot, cracking_metrics_snapshot, reset_cracking_metrics};
-pub use learned_index::{LearnedIndex, LearnedIndexConfig, LearnedIndexMetricsSnapshot, learned_index_metrics_snapshot, reset_learned_index_metrics};
+pub use be_tree::{
+    BeTree, BeTreeConfig, BeTreeMetricsSnapshot, betree_metrics_snapshot, reset_betree_metrics,
+};
 pub use cell::{
     BtreePageHeader, BtreePageType, CellRef, has_overflow, header_offset_for_page,
     local_payload_size, max_local_payload, min_local_payload, read_cell_pointers,
     write_cell_pointers,
 };
+pub use cooling::{
+    CoolingConfig, CoolingMetricsSnapshot, CoolingStateMachine, cooling_metrics_snapshot,
+    reset_cooling_metrics,
+};
+pub use cracking::{
+    CrackedColumn, CrackingMetricsSnapshot, cracking_metrics_snapshot, reset_cracking_metrics,
+};
 pub use cursor::{BtCursor, MemPageStore, PageReader, PageWriter, TransactionPageIo};
 pub use instrumentation::{
     BtreeMetricsSnapshot, BtreeOpType, BtreeOperationTotals, btree_metrics_snapshot,
     reset_btree_metrics,
+};
+pub use learned_index::{
+    LearnedIndex, LearnedIndexConfig, LearnedIndexMetricsSnapshot, learned_index_metrics_snapshot,
+    reset_learned_index_metrics,
 };
 pub use swizzle::{PageTemperature, SwizzleError, SwizzlePtr, SwizzleState};
 pub use traits::{BtreeCursorOps, MockBtreeCursor, SeekResult};

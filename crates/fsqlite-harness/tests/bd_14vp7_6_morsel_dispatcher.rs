@@ -4,18 +4,17 @@
 //! execution, pipeline barriers, scaling efficiency, NUMA-awareness, exchange
 //! operators, metrics, and deterministic results.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use fsqlite_types::PageNumber;
 use fsqlite_vdbe::vectorized_dispatch::{
-    broadcast_exchange, build_exchange_task_ids, build_pipeline_tasks,
-    hash_partition_exchange, morsel_dispatch_metrics_snapshot, partition_page_morsels,
-    partition_page_morsels_auto_tuned, reset_morsel_dispatch_metrics, auto_tuned_pages_per_morsel,
-    DispatchRunContext, DispatcherConfig, ExchangeKind, ExchangeTaskRef,
-    PipelineId, PipelineKind, WorkStealingDispatcher,
     DEFAULT_EXCHANGE_HOT_PARTITION_SPLIT_THRESHOLD, DEFAULT_L2_CACHE_BYTES,
-    DEFAULT_PAGE_SIZE_BYTES,
+    DEFAULT_PAGE_SIZE_BYTES, DispatchRunContext, DispatcherConfig, ExchangeKind, ExchangeTaskRef,
+    PipelineId, PipelineKind, WorkStealingDispatcher, auto_tuned_pages_per_morsel,
+    broadcast_exchange, build_exchange_task_ids, build_pipeline_tasks, hash_partition_exchange,
+    morsel_dispatch_metrics_snapshot, partition_page_morsels, partition_page_morsels_auto_tuned,
+    reset_morsel_dispatch_metrics,
 };
 
 const BEAD_ID: &str = "bd-14vp7.6";
@@ -61,12 +60,9 @@ fn test_morsel_partitioning_covers_full_range() {
 #[test]
 fn test_auto_tuned_morsel_sizing() {
     // Default L2=1MB, page=4KB → half L2 / page_size = 128 pages.
-    let pages = auto_tuned_pages_per_morsel(DEFAULT_L2_CACHE_BYTES, DEFAULT_PAGE_SIZE_BYTES)
-        .unwrap();
-    assert_eq!(
-        pages, 128,
-        "bead_id={BEAD_ID} case=default_l2_morsel_size"
-    );
+    let pages =
+        auto_tuned_pages_per_morsel(DEFAULT_L2_CACHE_BYTES, DEFAULT_PAGE_SIZE_BYTES).unwrap();
+    assert_eq!(pages, 128, "bead_id={BEAD_ID} case=default_l2_morsel_size");
 
     // Smaller L2 → smaller morsels.
     let pages_small = auto_tuned_pages_per_morsel(32_768, 4096).unwrap();
@@ -275,9 +271,7 @@ fn test_scaling_efficiency() {
     // load. We verify that multi-worker dispatch at least completes correctly
     // and report the measured speedup. Correctness is validated by determinism
     // and barrier tests.
-    println!(
-        "[{BEAD_ID}] scaling test: {speedup:.2}x with 4 workers (informational)"
-    );
+    println!("[{BEAD_ID}] scaling test: {speedup:.2}x with 4 workers (informational)");
 }
 
 // ── 7. NUMA-aware morsel assignment ─────────────────────────────────────────
@@ -307,11 +301,7 @@ fn test_numa_aware_morsel_assignment() {
     let numa = dispatcher.worker_numa_nodes();
     assert_eq!(numa.len(), 8, "bead_id={BEAD_ID} case=8_workers");
     for (i, &node) in numa.iter().enumerate() {
-        assert_eq!(
-            node,
-            i % 4,
-            "bead_id={BEAD_ID} case=worker_numa worker={i}"
-        );
+        assert_eq!(node, i % 4, "bead_id={BEAD_ID} case=worker_numa worker={i}");
     }
 }
 
@@ -429,8 +419,7 @@ fn test_deterministic_results_across_worker_counts() {
             numa_nodes: 1,
         })
         .unwrap();
-        let tasks =
-            build_pipeline_tasks(PipelineId(0), PipelineKind::ScanFilterProject, &morsels);
+        let tasks = build_pipeline_tasks(PipelineId(0), PipelineKind::ScanFilterProject, &morsels);
         let reports = d.execute_with_barriers(&[tasks], compute).unwrap();
 
         // Aggregate results sorted by task_id for deterministic comparison.
@@ -472,20 +461,14 @@ fn test_error_handling() {
         worker_threads: 0,
         numa_nodes: 1,
     });
-    assert!(
-        err.is_err(),
-        "bead_id={BEAD_ID} case=zero_workers_rejected"
-    );
+    assert!(err.is_err(), "bead_id={BEAD_ID} case=zero_workers_rejected");
 
     // Zero NUMA nodes.
     let err = WorkStealingDispatcher::try_new(DispatcherConfig {
         worker_threads: 4,
         numa_nodes: 0,
     });
-    assert!(
-        err.is_err(),
-        "bead_id={BEAD_ID} case=zero_numa_rejected"
-    );
+    assert!(err.is_err(), "bead_id={BEAD_ID} case=zero_numa_rejected");
 
     // Zero pages_per_morsel.
     let start = PageNumber::new(1).unwrap();
@@ -498,10 +481,7 @@ fn test_error_handling() {
 
     // Empty run_id.
     let err = DispatchRunContext::try_new(String::new(), 0, "S1".to_owned());
-    assert!(
-        err.is_err(),
-        "bead_id={BEAD_ID} case=empty_run_id_rejected"
-    );
+    assert!(err.is_err(), "bead_id={BEAD_ID} case=empty_run_id_rejected");
 
     // Empty scenario_id.
     let err = DispatchRunContext::try_new("run1".to_owned(), 0, String::new());
@@ -593,7 +573,9 @@ fn test_conformance_summary() {
     let pass_barriers = barrier_reports.len() == 2;
 
     // 5. NUMA awareness.
-    let pass_numa = morsels.iter().all(|m| m.preferred_numa_node == m.morsel_id % 2);
+    let pass_numa = morsels
+        .iter()
+        .all(|m| m.preferred_numa_node == m.morsel_id % 2);
 
     // 6. Deterministic results.
     let m3 = partition_page_morsels(start, end, 20, 1).unwrap();
@@ -602,14 +584,18 @@ fn test_conformance_summary() {
     };
     let t1 = build_pipeline_tasks(PipelineId(0), PipelineKind::ScanFilterProject, &m3);
     let t2 = build_pipeline_tasks(PipelineId(0), PipelineKind::ScanFilterProject, &m3);
-    let r1 = dispatcher
-        .execute_with_barriers(&[t1], compute)
-        .unwrap();
-    let r2 = dispatcher
-        .execute_with_barriers(&[t2], compute)
-        .unwrap();
-    let mut v1: Vec<_> = r1[0].completed.iter().map(|c| (c.task_id, c.result)).collect();
-    let mut v2: Vec<_> = r2[0].completed.iter().map(|c| (c.task_id, c.result)).collect();
+    let r1 = dispatcher.execute_with_barriers(&[t1], compute).unwrap();
+    let r2 = dispatcher.execute_with_barriers(&[t2], compute).unwrap();
+    let mut v1: Vec<_> = r1[0]
+        .completed
+        .iter()
+        .map(|c| (c.task_id, c.result))
+        .collect();
+    let mut v2: Vec<_> = r2[0]
+        .completed
+        .iter()
+        .map(|c| (c.task_id, c.result))
+        .collect();
     v1.sort();
     v2.sort();
     let pass_deterministic = v1 == v2;
@@ -626,12 +612,30 @@ fn test_conformance_summary() {
     let total = checks.len();
 
     println!("\n=== {BEAD_ID} Morsel Dispatcher Conformance ===");
-    println!("  partitioning: {}", if pass_partitioning { "PASS" } else { "FAIL" });
-    println!("  pipeline:     {}", if pass_pipeline { "PASS" } else { "FAIL" });
-    println!("  execution:    {}", if pass_execution { "PASS" } else { "FAIL" });
-    println!("  barriers:     {}", if pass_barriers { "PASS" } else { "FAIL" });
-    println!("  numa:         {}", if pass_numa { "PASS" } else { "FAIL" });
-    println!("  deterministic:{}", if pass_deterministic { "PASS" } else { "FAIL" });
+    println!(
+        "  partitioning: {}",
+        if pass_partitioning { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  pipeline:     {}",
+        if pass_pipeline { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  execution:    {}",
+        if pass_execution { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  barriers:     {}",
+        if pass_barriers { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  numa:         {}",
+        if pass_numa { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  deterministic:{}",
+        if pass_deterministic { "PASS" } else { "FAIL" }
+    );
     println!("  [{passed}/{total}] conformance checks passed");
 
     assert_eq!(

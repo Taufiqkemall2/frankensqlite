@@ -13,8 +13,8 @@
 //! - Conformance summary
 
 use fsqlite_harness::extension_parity_matrix::{
-    ExtensionModule, ExtensionParityMatrix, FeatureFlagTable, SurfaceKind,
-    compute_extension_coverage, MATRIX_SCHEMA_VERSION,
+    ExtensionModule, ExtensionParityMatrix, FeatureFlagTable, MATRIX_SCHEMA_VERSION, SurfaceKind,
+    compute_extension_coverage,
 };
 use fsqlite_harness::parity_taxonomy::ParityStatus;
 
@@ -34,17 +34,9 @@ fn extension_module_catalog() {
             "fsqlite-ext-rtree",
             "R-tree / Geopoly",
         ),
-        (
-            ExtensionModule::Session,
-            "fsqlite-ext-session",
-            "Session",
-        ),
+        (ExtensionModule::Session, "fsqlite-ext-session", "Session"),
         (ExtensionModule::Icu, "fsqlite-ext-icu", "ICU"),
-        (
-            ExtensionModule::Misc,
-            "fsqlite-ext-misc",
-            "Miscellaneous",
-        ),
+        (ExtensionModule::Misc, "fsqlite-ext-misc", "Miscellaneous"),
     ];
 
     for (module, crate_name, display_name) in &expected {
@@ -164,7 +156,11 @@ fn per_module_entry_counts() {
             module
         );
         let count = counts[&module];
-        assert!(count > 0, "module {:?} should have at least 1 entry", module);
+        assert!(
+            count > 0,
+            "module {:?} should have at least 1 entry",
+            module
+        );
     }
 
     // JSON should have several surface points (json(), json_extract(), etc.).
@@ -274,19 +270,13 @@ fn entries_for_specific_module() {
     let matrix = ExtensionParityMatrix::canonical();
 
     let json_entries = matrix.entries_for_module(ExtensionModule::Json);
-    assert!(
-        !json_entries.is_empty(),
-        "JSON module should have entries"
-    );
+    assert!(!json_entries.is_empty(), "JSON module should have entries");
     for entry in &json_entries {
         assert_eq!(entry.module, ExtensionModule::Json);
     }
 
     let fts5_entries = matrix.entries_for_module(ExtensionModule::Fts5);
-    assert!(
-        !fts5_entries.is_empty(),
-        "FTS5 module should have entries"
-    );
+    assert!(!fts5_entries.is_empty(), "FTS5 module should have entries");
     for entry in &fts5_entries {
         assert_eq!(entry.module, ExtensionModule::Fts5);
     }
@@ -307,7 +297,10 @@ fn intentional_omissions_and_future_candidates() {
             entry.id
         );
         let rationale = entry.omission.as_ref().unwrap();
-        assert!(!rationale.reason.is_empty(), "omission reason should not be empty");
+        assert!(
+            !rationale.reason.is_empty(),
+            "omission reason should not be empty"
+        );
     }
 
     let future = matrix.future_candidates();
@@ -384,10 +377,7 @@ fn module_crate_names_are_unique() {
     let mut seen = std::collections::HashSet::new();
     for module in ExtensionModule::ALL {
         let name = module.crate_name();
-        assert!(
-            seen.insert(name),
-            "duplicate crate name: {name}"
-        );
+        assert!(seen.insert(name), "duplicate crate name: {name}");
     }
 }
 
@@ -419,9 +409,6 @@ fn conformance_summary() {
     ];
     let passed = checks.iter().filter(|(_, ok)| *ok).count();
     let total = checks.len();
-    assert_eq!(
-        passed, total,
-        "conformance: {passed}/{total} gates passed"
-    );
+    assert_eq!(passed, total, "conformance: {passed}/{total} gates passed");
     eprintln!("[bd-t6sv2.14] conformance: {passed}/{total} gates passed");
 }

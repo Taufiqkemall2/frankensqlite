@@ -1170,7 +1170,11 @@ fn codegen_select_distinct_scan(
 fn emit_limit_expr(b: &mut ProgramBuilder, expr: &Expr, target_reg: i32) {
     match expr {
         Expr::Literal(Literal::Integer(n), _) => {
-            b.emit_op(Opcode::Integer, *n as i32, target_reg, 0, P4::None, 0);
+            if let Ok(as_i32) = i32::try_from(*n) {
+                b.emit_op(Opcode::Integer, as_i32, target_reg, 0, P4::None, 0);
+            } else {
+                b.emit_op(Opcode::Int64, 0, target_reg, 0, P4::Int64(*n), 0);
+            }
         }
         Expr::Placeholder(pt, _) => {
             let param_idx = match pt {
@@ -1507,8 +1511,7 @@ const AGGREGATE_FUNCTIONS: &[&str] = &[
 fn is_aggregate_function(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     AGGREGATE_FUNCTIONS.iter().any(|&n| n == lower)
-        || EXTRA_AGG_NAMES
-            .with(|extra| extra.borrow().contains(&lower))
+        || EXTRA_AGG_NAMES.with(|extra| extra.borrow().contains(&lower))
 }
 
 /// Check whether any result column contains an aggregate function call.
@@ -1526,9 +1529,7 @@ fn has_aggregate_columns(columns: &[ResultColumn]) -> bool {
 fn is_aggregate_expr(expr: &Expr) -> bool {
     match expr {
         Expr::FunctionCall { name, .. } if is_aggregate_function(name) => true,
-        Expr::BinaryOp { left, right, .. } => {
-            is_aggregate_expr(left) || is_aggregate_expr(right)
-        }
+        Expr::BinaryOp { left, right, .. } => is_aggregate_expr(left) || is_aggregate_expr(right),
         Expr::UnaryOp { expr: inner, .. }
         | Expr::IsNull { expr: inner, .. }
         | Expr::Cast { expr: inner, .. }
@@ -1539,7 +1540,9 @@ fn is_aggregate_expr(expr: &Expr) -> bool {
             high,
             ..
         } => is_aggregate_expr(inner) || is_aggregate_expr(low) || is_aggregate_expr(high),
-        Expr::In { expr: inner, set, .. } => {
+        Expr::In {
+            expr: inner, set, ..
+        } => {
             if is_aggregate_expr(inner) {
                 return true;
             }
@@ -1567,9 +1570,10 @@ fn is_aggregate_expr(expr: &Expr) -> bool {
             if operand.as_deref().is_some_and(is_aggregate_expr) {
                 return true;
             }
-            if whens.iter().any(|(cond, then_expr)| {
-                is_aggregate_expr(cond) || is_aggregate_expr(then_expr)
-            }) {
+            if whens
+                .iter()
+                .any(|(cond, then_expr)| is_aggregate_expr(cond) || is_aggregate_expr(then_expr))
+            {
                 return true;
             }
             if else_expr.as_deref().is_some_and(is_aggregate_expr) {
@@ -1582,9 +1586,9 @@ fn is_aggregate_expr(expr: &Expr) -> bool {
             ..
         } => args.iter().any(is_aggregate_expr),
         Expr::RowValue(items, _) => items.iter().any(is_aggregate_expr),
-        Expr::JsonAccess { expr: inner, path, .. } => {
-            is_aggregate_expr(inner) || is_aggregate_expr(path)
-        }
+        Expr::JsonAccess {
+            expr: inner, path, ..
+        } => is_aggregate_expr(inner) || is_aggregate_expr(path),
         _ => false,
     }
 }
@@ -4720,7 +4724,11 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
         }
         Expr::Literal(lit, _) => match lit {
             Literal::Integer(n) => {
-                b.emit_op(Opcode::Integer, *n as i32, reg, 0, P4::None, 0);
+                if let Ok(as_i32) = i32::try_from(*n) {
+                    b.emit_op(Opcode::Integer, as_i32, reg, 0, P4::None, 0);
+                } else {
+                    b.emit_op(Opcode::Int64, 0, reg, 0, P4::Int64(*n), 0);
+                }
             }
             Literal::Float(f) => {
                 b.emit_op(Opcode::Real, 0, reg, 0, P4::Real(*f), 0);
@@ -4762,7 +4770,9 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 // Compute year/month/day from days since 1970-01-01.
                 let (y, mo, d) = epoch_days_to_ymd(days);
                 let ts = match *lit {
-                    Literal::CurrentTimestamp => format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02}"),
+                    Literal::CurrentTimestamp => {
+                        format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02}")
+                    }
                     Literal::CurrentDate => format!("{y:04}-{mo:02}-{d:02}"),
                     Literal::CurrentTime => format!("{h:02}:{m:02}:{s:02}"),
                     _ => unreachable!(),
@@ -5258,7 +5268,7 @@ mod tests {
         OrderingTerm, PlaceholderType, QualifiedName, QualifiedTableRef, ResultColumn, SelectBody,
         SelectCore, SelectStatement, SortDirection, Span, TableOrSubquery, UpdateStatement,
     };
-    use fsqlite_types::opcode::Opcode;
+    use fsqlite_types::opcode::{Opcode, P4};
 
     fn test_schema() -> Vec<TableSchema> {
         vec![TableSchema {
@@ -5593,6 +5603,57 @@ mod tests {
             .find(|op| op.opcode == Opcode::Transaction)
             .unwrap();
         assert_eq!(txn.p2, 1);
+    }
+
+    #[test]
+    fn test_codegen_insert_values_large_integer_literal_uses_int64_opcode() {
+        let big = 4_102_444_800_000_000_i64;
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::Values(vec![vec![
+                Expr::Literal(Literal::Integer(big), Span::ZERO),
+                Expr::Literal(Literal::String("payload".to_owned()), Span::ZERO),
+            ]]),
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            prog.ops().iter().any(
+                |op| op.opcode == Opcode::Int64
+                    && matches!(op.p4, P4::Int64(value) if value == big)
+            ),
+            "expected OP_Int64 carrying the full i64 literal in INSERT VALUES codegen"
+        );
+    }
+
+    #[test]
+    fn test_emit_limit_expr_large_integer_literal_uses_int64_opcode() {
+        let big = 4_102_444_800_000_000_i64;
+        let mut b = ProgramBuilder::new();
+        let reg = b.alloc_reg();
+        let expr = Expr::Literal(Literal::Integer(big), Span::ZERO);
+
+        emit_limit_expr(&mut b, &expr, reg);
+
+        let prog = b.finish().unwrap();
+        assert!(
+            prog.ops().iter().any(
+                |op| op.opcode == Opcode::Int64
+                    && op.p2 == reg
+                    && matches!(op.p4, P4::Int64(value) if value == big)
+            ),
+            "expected OP_Int64 for large LIMIT literals"
+        );
     }
 
     #[test]
@@ -6655,7 +6716,10 @@ mod tests {
             .iter()
             .filter(|op| op.opcode == Opcode::OpenRead)
             .count();
-        assert_eq!(open_reads, 1, "index seek disabled: only table cursor should open");
+        assert_eq!(
+            open_reads, 1,
+            "index seek disabled: only table cursor should open"
+        );
 
         assert!(
             prog.ops().iter().any(|op| op.opcode == Opcode::Rewind),

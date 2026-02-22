@@ -9,9 +9,9 @@ use std::time::Instant;
 
 use fsqlite_types::value::SqliteValue;
 use fsqlite_vdbe::vectorized::{Batch, ColumnSpec, ColumnVectorType};
-use fsqlite_vdbe::vectorized_hash_join::{hash_join_build, hash_join_probe, JoinType};
+use fsqlite_vdbe::vectorized_hash_join::{JoinType, hash_join_build, hash_join_probe};
 use fsqlite_vdbe::vectorized_join::{
-    leapfrog_join, leapfrog_metrics_snapshot, reset_leapfrog_metrics, TrieRelation, TrieRow,
+    TrieRelation, TrieRow, leapfrog_join, leapfrog_metrics_snapshot, reset_leapfrog_metrics,
 };
 
 const BEAD_ID: &str = "bd-2qr3a.4";
@@ -23,7 +23,11 @@ fn build_trie(keys: &[i64]) -> TrieRelation {
         .enumerate()
         .map(|(i, &k)| TrieRow::new(vec![SqliteValue::Integer(k)], i))
         .collect();
-    rows.sort_by(|a, b| a.key.partial_cmp(&b.key).unwrap_or(std::cmp::Ordering::Equal));
+    rows.sort_by(|a, b| {
+        a.key
+            .partial_cmp(&b.key)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     rows.dedup_by(|a, b| a.key == b.key);
     TrieRelation::from_sorted_rows(rows).unwrap()
 }
@@ -34,13 +38,14 @@ fn build_trie_composite(keys: &[(i64, i64)]) -> TrieRelation {
         .iter()
         .enumerate()
         .map(|(i, &(k1, k2))| {
-            TrieRow::new(
-                vec![SqliteValue::Integer(k1), SqliteValue::Integer(k2)],
-                i,
-            )
+            TrieRow::new(vec![SqliteValue::Integer(k1), SqliteValue::Integer(k2)], i)
         })
         .collect();
-    rows.sort_by(|a, b| a.key.partial_cmp(&b.key).unwrap_or(std::cmp::Ordering::Equal));
+    rows.sort_by(|a, b| {
+        a.key
+            .partial_cmp(&b.key)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     rows.dedup_by(|a, b| a.key == b.key);
     TrieRelation::from_sorted_rows(rows).unwrap()
 }
@@ -54,12 +59,7 @@ fn build_hash_batch(name: &str, keys: &[i64]) -> Batch {
     let rows: Vec<Vec<SqliteValue>> = keys
         .iter()
         .enumerate()
-        .map(|(i, &k)| {
-            vec![
-                SqliteValue::Integer(k),
-                SqliteValue::Integer(i as i64),
-            ]
-        })
+        .map(|(i, &k)| vec![SqliteValue::Integer(k), SqliteValue::Integer(i as i64)])
         .collect();
     Batch::from_rows(&rows, &specs, rows.len().max(1)).unwrap()
 }
@@ -324,8 +324,8 @@ fn test_5way_join() {
     let part_keys: Vec<i64> = (0..1000).collect();
     let supplier_keys: Vec<i64> = (0..500).map(|i| i * 2).collect(); // even
     let partsupp_keys: Vec<i64> = (0..400).map(|i| i * 3).collect(); // mul 3
-    let nation_keys: Vec<i64> = (0..200).map(|i| i * 5).collect();   // mul 5
-    let region_keys: Vec<i64> = (0..100).map(|i| i * 7).collect();   // mul 7
+    let nation_keys: Vec<i64> = (0..200).map(|i| i * 5).collect(); // mul 5
+    let region_keys: Vec<i64> = (0..100).map(|i| i * 7).collect(); // mul 7
 
     let t1 = build_trie(&part_keys);
     let t2 = build_trie(&supplier_keys);
@@ -382,9 +382,7 @@ fn test_6way_join() {
         "bead_id={BEAD_ID} case=6way_count lf={lf_count}"
     );
 
-    println!(
-        "[{BEAD_ID}] 6-way join (TPC-H Q9-like): {lf_count} matches in {lf_ms:.3}ms"
-    );
+    println!("[{BEAD_ID}] 6-way join (TPC-H Q9-like): {lf_count} matches in {lf_ms:.3}ms");
 }
 
 // ── 9. Composite key join ───────────────────────────────────────────────────
@@ -411,9 +409,7 @@ fn test_composite_key_join() {
         "bead_id={BEAD_ID} case=composite_key_count lf={lf_count}"
     );
 
-    println!(
-        "[{BEAD_ID}] composite key join: {lf_count} matches (2-col keys, 1000 x 500 rows)"
-    );
+    println!("[{BEAD_ID}] composite key join: {lf_count} matches (2-col keys, 1000 x 500 rows)");
 }
 
 // ── 10. Zero intermediate blowup property ───────────────────────────────────
@@ -444,14 +440,8 @@ fn test_zero_intermediate_blowup() {
     let hj_ms = hj_start.elapsed().as_secs_f64() * 1000.0;
 
     // Both should produce 20 matches (every 100th key in [0, 2000)).
-    assert_eq!(
-        lf_count, 20,
-        "bead_id={BEAD_ID} case=zero_blowup_lf_count"
-    );
-    assert_eq!(
-        hj_count, 20,
-        "bead_id={BEAD_ID} case=zero_blowup_hj_count"
-    );
+    assert_eq!(lf_count, 20, "bead_id={BEAD_ID} case=zero_blowup_lf_count");
+    assert_eq!(hj_count, 20, "bead_id={BEAD_ID} case=zero_blowup_hj_count");
 
     let speedup = hj_ms / lf_ms.max(0.001);
     println!(
@@ -459,8 +449,7 @@ fn test_zero_intermediate_blowup() {
     );
     println!(
         "[{BEAD_ID}]   intermediate: hash-join builds {n}-row intermediate, leapfrog seeks={} comparisons={}",
-        lf_metrics.fsqlite_leapfrog_seeks_total,
-        lf_metrics.fsqlite_leapfrog_seek_comparisons_total,
+        lf_metrics.fsqlite_leapfrog_seeks_total, lf_metrics.fsqlite_leapfrog_seek_comparisons_total,
     );
 }
 
@@ -533,12 +522,30 @@ fn test_conformance_summary() {
     let total = checks.len();
 
     println!("\n=== {BEAD_ID} Leapfrog vs Hash-Join Benchmark Conformance ===");
-    println!("  2-way:         {}", if pass_2way { "PASS" } else { "FAIL" });
-    println!("  3-way:         {}", if pass_3way { "PASS" } else { "FAIL" });
-    println!("  metrics:       {}", if pass_metrics { "PASS" } else { "FAIL" });
-    println!("  composite:     {}", if pass_composite { "PASS" } else { "FAIL" });
-    println!("  multiway:      {}", if pass_multiway { "PASS" } else { "FAIL" });
-    println!("  zero-blowup:   {}", if pass_blowup { "PASS" } else { "FAIL" });
+    println!(
+        "  2-way:         {}",
+        if pass_2way { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  3-way:         {}",
+        if pass_3way { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  metrics:       {}",
+        if pass_metrics { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  composite:     {}",
+        if pass_composite { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  multiway:      {}",
+        if pass_multiway { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  zero-blowup:   {}",
+        if pass_blowup { "PASS" } else { "FAIL" }
+    );
     println!("  [{passed}/{total}] conformance checks passed");
 
     assert_eq!(

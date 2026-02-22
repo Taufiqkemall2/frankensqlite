@@ -98,12 +98,7 @@ pub fn balance_deeper<W: PageWriter>(
     let mut root_cells: Vec<GatheredCell> = Vec::with_capacity(cell_ptrs.len());
     for &ptr in &cell_ptrs {
         let cell_offset = usize::from(ptr);
-        let cell_ref = CellRef::parse(
-            &root_data,
-            cell_offset,
-            root_header.page_type,
-            usable_size,
-        )?;
+        let cell_ref = CellRef::parse(&root_data, cell_offset, root_header.page_type, usable_size)?;
         let cell_end = cell_offset + cell_on_page_size_from_ref(&cell_ref, cell_offset);
         let data = root_data[cell_offset..cell_end].to_vec();
         let size = u16::try_from(data.len()).map_err(|_| {
@@ -1185,10 +1180,7 @@ pub(crate) fn apply_child_replacement<W: PageWriter>(
     // If we're not touching the rightmost child, the divider cell that follows
     // the balanced range must have its left-child pointer updated to the
     // last new sibling page.
-    if !touches_rightmost
-        && header.page_type.is_interior()
-        && !new_pgnos.is_empty()
-    {
+    if !touches_rightmost && header.page_type.is_interior() && !new_pgnos.is_empty() {
         let patch_idx = first_child + new_dividers.len();
         if patch_idx >= final_cells.len() {
             return Err(FrankenError::internal(format!(

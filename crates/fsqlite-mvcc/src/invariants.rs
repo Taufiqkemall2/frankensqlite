@@ -134,7 +134,8 @@ impl TxnManager {
         // We use MAX here because multiple threads might call finish concurrently
         // (if we had fine-grained locking, though currently serialized by caller).
         // But active_commits lock ensures we see a consistent view.
-        self.stable_commit_seq.fetch_max(new_stable, Ordering::Release);
+        self.stable_commit_seq
+            .fetch_max(new_stable, Ordering::Release);
     }
 
     /// The current (not-yet-allocated) `TxnId` counter value.

@@ -57,7 +57,8 @@ fn init_db(path: &str) {
     let conn = fsqlite::Connection::open(path).unwrap();
     conn.execute("PRAGMA journal_mode = WAL").unwrap();
     conn.execute("PRAGMA synchronous = NORMAL").unwrap();
-    conn.execute(&format!("PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")).unwrap();
+    conn.execute(&format!("PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}"))
+        .unwrap();
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL)",
@@ -76,7 +77,8 @@ fn open_conn(path: &str) -> fsqlite::Connection {
     // Stagger opens to avoid io_uring VFS race under concurrency
     thread::sleep(Duration::from_millis(5));
     let conn = fsqlite::Connection::open(path).unwrap();
-    conn.execute(&format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS};")).unwrap();
+    conn.execute(&format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS};"))
+        .unwrap();
     conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
     conn
 }
@@ -249,22 +251,41 @@ fn test_hot_row_contention() {
     }
     result.elapsed = start.elapsed();
 
-    println!("[hot_row] committed={} aborted={} retries={} abort_rate={:.1}% throughput={:.0} txn/s elapsed={:.2}s hard_failures={}",
-        result.committed, result.aborted, result.retries,
-        result.abort_rate() * 100.0, result.throughput(),
-        result.elapsed.as_secs_f64(), result.hard_failures.len());
+    println!(
+        "[hot_row] committed={} aborted={} retries={} abort_rate={:.1}% throughput={:.0} txn/s elapsed={:.2}s hard_failures={}",
+        result.committed,
+        result.aborted,
+        result.retries,
+        result.abort_rate() * 100.0,
+        result.throughput(),
+        result.elapsed.as_secs_f64(),
+        result.hard_failures.len()
+    );
 
     // Verify final state
     let (sum, _) = verify_sum_invariant(&path);
     let expected_sum = (ACCOUNT_COUNT as i64 * INITIAL_BALANCE) + result.committed as i64;
-    assert_eq!(sum, expected_sum, "sum invariant violated after hot-row contention");
+    assert_eq!(
+        sum, expected_sum,
+        "sum invariant violated after hot-row contention"
+    );
 
     // Assertions: single-hot-row causes extreme contention so we only require
     // forward progress (at least one committed txn) and no hard failures.
-    assert!(result.hard_failures.is_empty(), "hard failures: {:?}", result.hard_failures);
-    assert!(result.committed > 0, "must have forward progress (at least 1 commit)");
+    assert!(
+        result.hard_failures.is_empty(),
+        "hard failures: {:?}",
+        result.hard_failures
+    );
+    assert!(
+        result.committed > 0,
+        "must have forward progress (at least 1 commit)"
+    );
 
-    println!("[PASS] hot row contention: forward progress maintained (committed={})", result.committed);
+    println!(
+        "[PASS] hot row contention: forward progress maintained (committed={})",
+        result.committed
+    );
 }
 
 // =============================================================================
@@ -379,12 +400,21 @@ fn test_hot_page_contention() {
     }
     result.elapsed = start.elapsed();
 
-    println!("[hot_page] committed={} aborted={} retries={} abort_rate={:.1}% throughput={:.0} txn/s elapsed={:.2}s",
-        result.committed, result.aborted, result.retries,
-        result.abort_rate() * 100.0, result.throughput(),
-        result.elapsed.as_secs_f64());
+    println!(
+        "[hot_page] committed={} aborted={} retries={} abort_rate={:.1}% throughput={:.0} txn/s elapsed={:.2}s",
+        result.committed,
+        result.aborted,
+        result.retries,
+        result.abort_rate() * 100.0,
+        result.throughput(),
+        result.elapsed.as_secs_f64()
+    );
 
-    assert!(result.hard_failures.is_empty(), "hard failures: {:?}", result.hard_failures);
+    assert!(
+        result.hard_failures.is_empty(),
+        "hard failures: {:?}",
+        result.hard_failures
+    );
     assert!(result.committed > 0, "must have forward progress");
 
     println!("[PASS] hot page contention: forward progress maintained");
@@ -553,13 +583,26 @@ fn test_lock_convoy() {
     }
     result.elapsed = start.elapsed();
 
-    println!("[convoy] committed={} aborted={} retries={} abort_rate={:.1}% throughput={:.0} txn/s elapsed={:.2}s hard_failures={}",
-        result.committed, result.aborted, result.retries,
-        result.abort_rate() * 100.0, result.throughput(),
-        result.elapsed.as_secs_f64(), result.hard_failures.len());
+    println!(
+        "[convoy] committed={} aborted={} retries={} abort_rate={:.1}% throughput={:.0} txn/s elapsed={:.2}s hard_failures={}",
+        result.committed,
+        result.aborted,
+        result.retries,
+        result.abort_rate() * 100.0,
+        result.throughput(),
+        result.elapsed.as_secs_f64(),
+        result.hard_failures.len()
+    );
 
-    assert!(result.hard_failures.is_empty(), "hard failures: {:?}", result.hard_failures);
-    assert!(result.committed > 0, "fast writers must make progress after slow releases");
+    assert!(
+        result.hard_failures.is_empty(),
+        "hard failures: {:?}",
+        result.hard_failures
+    );
+    assert!(
+        result.committed > 0,
+        "fast writers must make progress after slow releases"
+    );
 
     println!("[PASS] lock convoy: no deadlock, fast writers completed");
 }
@@ -598,11 +641,7 @@ fn test_write_skew_abort_storm() {
                 // Deliberate write-skew pattern:
                 // Even workers: read account A, write account B
                 // Odd workers: read account B, write account A
-                let (read_id, write_id) = if worker_id % 2 == 0 {
-                    (1, 2)
-                } else {
-                    (2, 1)
-                };
+                let (read_id, write_id) = if worker_id % 2 == 0 { (1, 2) } else { (2, 1) };
 
                 let mut retry_count = 0;
                 loop {
@@ -709,13 +748,21 @@ fn test_write_skew_abort_storm() {
     }
     result.elapsed = start.elapsed();
 
-    println!("[write_skew] committed={} aborted={} retries={} abort_rate={:.1}% throughput={:.0} txn/s elapsed={:.2}s",
-        result.committed, result.aborted, result.retries,
-        result.abort_rate() * 100.0, result.throughput(),
-        result.elapsed.as_secs_f64());
+    println!(
+        "[write_skew] committed={} aborted={} retries={} abort_rate={:.1}% throughput={:.0} txn/s elapsed={:.2}s",
+        result.committed,
+        result.aborted,
+        result.retries,
+        result.abort_rate() * 100.0,
+        result.throughput(),
+        result.elapsed.as_secs_f64()
+    );
 
     // Write-skew should cause aborts, but not 100% — there must be forward progress
-    assert!(result.committed > 0, "must have some committed transactions even under write-skew");
+    assert!(
+        result.committed > 0,
+        "must have some committed transactions even under write-skew"
+    );
     // abort_rate < 100% proves no livelock
     assert!(
         result.abort_rate() < 1.0,
@@ -723,7 +770,10 @@ fn test_write_skew_abort_storm() {
         result.abort_rate() * 100.0
     );
 
-    println!("[PASS] write-skew abort storm: forward progress, abort_rate={:.1}%", result.abort_rate() * 100.0);
+    println!(
+        "[PASS] write-skew abort storm: forward progress, abort_rate={:.1}%",
+        result.abort_rate() * 100.0
+    );
 }
 
 // =============================================================================
@@ -896,14 +946,21 @@ fn test_conformance_summary() {
                         if conn.execute("BEGIN CONCURRENT;").is_err() {
                             rollback_best_effort(&conn);
                             retries += 1;
-                            if retries > MAX_RETRIES { break; }
+                            if retries > MAX_RETRIES {
+                                break;
+                            }
                             thread::sleep(Duration::from_millis(1));
                             continue;
                         }
-                        if conn.execute("UPDATE accounts SET balance = balance + 1 WHERE id = 1;").is_err() {
+                        if conn
+                            .execute("UPDATE accounts SET balance = balance + 1 WHERE id = 1;")
+                            .is_err()
+                        {
                             rollback_best_effort(&conn);
                             retries += 1;
-                            if retries > MAX_RETRIES { break; }
+                            if retries > MAX_RETRIES {
+                                break;
+                            }
                             thread::sleep(Duration::from_millis(1));
                             continue;
                         }
@@ -915,7 +972,9 @@ fn test_conformance_summary() {
                             Err(_) => {
                                 rollback_best_effort(&conn);
                                 retries += 1;
-                                if retries > MAX_RETRIES { break; }
+                                if retries > MAX_RETRIES {
+                                    break;
+                                }
                                 thread::sleep(Duration::from_millis(1));
                             }
                         }
@@ -923,7 +982,9 @@ fn test_conformance_summary() {
                 }
             }));
         }
-        for h in handles { h.join().unwrap(); }
+        for h in handles {
+            h.join().unwrap();
+        }
         let c = committed.load(Ordering::Relaxed);
         results.push(TestResult {
             name: "hot_row_progress",
@@ -957,7 +1018,9 @@ fn test_conformance_summary() {
                     ));
                     match conn.execute("COMMIT;") {
                         Ok(_) => {}
-                        Err(e) if e.is_transient() => { rollback_best_effort(&conn); }
+                        Err(e) if e.is_transient() => {
+                            rollback_best_effort(&conn);
+                        }
                         Err(_) => {
                             rollback_best_effort(&conn);
                             pa.store(true, Ordering::Relaxed);
@@ -966,7 +1029,9 @@ fn test_conformance_summary() {
                 }
             }));
         }
-        for h in handles { h.join().unwrap(); }
+        for h in handles {
+            h.join().unwrap();
+        }
         let pass = !panicked.load(Ordering::Relaxed);
         results.push(TestResult {
             name: "no_deadlock",
@@ -1003,20 +1068,33 @@ fn test_conformance_summary() {
                         "UPDATE accounts SET balance = balance + 1 WHERE id = {wid_target};"
                     ));
                     match conn.execute("COMMIT;") {
-                        Ok(_) => { c.fetch_add(1, Ordering::Relaxed); }
-                        Err(_) => { rollback_best_effort(&conn); }
+                        Ok(_) => {
+                            c.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(_) => {
+                            rollback_best_effort(&conn);
+                        }
                     }
                 }
             }));
         }
-        for h in handles { h.join().unwrap(); }
+        for h in handles {
+            h.join().unwrap();
+        }
         let c = committed.load(Ordering::Relaxed);
         let tt = total.load(Ordering::Relaxed);
-        let abort_rate = if tt > 0 { 1.0 - (c as f64 / tt as f64) } else { 0.0 };
+        let abort_rate = if tt > 0 {
+            1.0 - (c as f64 / tt as f64)
+        } else {
+            0.0
+        };
         results.push(TestResult {
             name: "abort_rate_bounded",
             pass: c > 0 && abort_rate < 1.0,
-            detail: format!("committed={c} total={tt} abort_rate={:.1}%", abort_rate * 100.0),
+            detail: format!(
+                "committed={c} total={tt} abort_rate={:.1}%",
+                abort_rate * 100.0
+            ),
         });
     }
 
@@ -1043,46 +1121,71 @@ fn test_conformance_summary() {
                         if conn.execute("BEGIN CONCURRENT;").is_err() {
                             rollback_best_effort(&conn);
                             retries += 1;
-                            if retries > MAX_RETRIES { break; }
+                            if retries > MAX_RETRIES {
+                                break;
+                            }
                             thread::sleep(Duration::from_millis(1));
                             continue;
                         }
                         // Transfer: subtract from 1, add to 2 (net zero)
-                        if conn.execute("UPDATE accounts SET balance = balance - 1 WHERE id = 1;").is_err() {
+                        if conn
+                            .execute("UPDATE accounts SET balance = balance - 1 WHERE id = 1;")
+                            .is_err()
+                        {
                             rollback_best_effort(&conn);
                             retries += 1;
-                            if retries > MAX_RETRIES { break; }
+                            if retries > MAX_RETRIES {
+                                break;
+                            }
                             thread::sleep(Duration::from_millis(1));
                             continue;
                         }
-                        if conn.execute("UPDATE accounts SET balance = balance + 1 WHERE id = 2;").is_err() {
+                        if conn
+                            .execute("UPDATE accounts SET balance = balance + 1 WHERE id = 2;")
+                            .is_err()
+                        {
                             rollback_best_effort(&conn);
                             retries += 1;
-                            if retries > MAX_RETRIES { break; }
+                            if retries > MAX_RETRIES {
+                                break;
+                            }
                             thread::sleep(Duration::from_millis(1));
                             continue;
                         }
                         match conn.execute("COMMIT;") {
-                            Ok(_) => { c.fetch_add(1, Ordering::Relaxed); break; }
+                            Ok(_) => {
+                                c.fetch_add(1, Ordering::Relaxed);
+                                break;
+                            }
                             Err(e) if e.is_transient() => {
                                 rollback_best_effort(&conn);
                                 retries += 1;
-                                if retries > MAX_RETRIES { break; }
+                                if retries > MAX_RETRIES {
+                                    break;
+                                }
                                 thread::sleep(Duration::from_millis(1));
                             }
-                            Err(_) => { rollback_best_effort(&conn); break; }
+                            Err(_) => {
+                                rollback_best_effort(&conn);
+                                break;
+                            }
                         }
                     }
                 }
             }));
         }
-        for h in handles { h.join().unwrap(); }
+        for h in handles {
+            h.join().unwrap();
+        }
         let (sum, _) = verify_sum_invariant(&path);
         let expected = ACCOUNT_COUNT as i64 * INITIAL_BALANCE;
         results.push(TestResult {
             name: "sum_invariant_preserved",
             pass: sum == expected,
-            detail: format!("sum={sum} expected={expected} committed={}", committed.load(Ordering::Relaxed)),
+            detail: format!(
+                "sum={sum} expected={expected} committed={}",
+                committed.load(Ordering::Relaxed)
+            ),
         });
     }
 
@@ -1110,23 +1213,35 @@ fn test_conformance_summary() {
                         if conn.execute("BEGIN CONCURRENT;").is_err() {
                             rollback_best_effort(&conn);
                             retries += 1;
-                            if retries > MAX_RETRIES { break; }
+                            if retries > MAX_RETRIES {
+                                break;
+                            }
                             thread::sleep(Duration::from_millis(1));
                             continue;
                         }
-                        if conn.execute("UPDATE accounts SET balance = balance + 1 WHERE id = 1;").is_err() {
+                        if conn
+                            .execute("UPDATE accounts SET balance = balance + 1 WHERE id = 1;")
+                            .is_err()
+                        {
                             rollback_best_effort(&conn);
                             retries += 1;
-                            if retries > MAX_RETRIES { break; }
+                            if retries > MAX_RETRIES {
+                                break;
+                            }
                             thread::sleep(Duration::from_millis(1));
                             continue;
                         }
                         match conn.execute("COMMIT;") {
-                            Ok(_) => { c.fetch_add(1, Ordering::Relaxed); break; }
+                            Ok(_) => {
+                                c.fetch_add(1, Ordering::Relaxed);
+                                break;
+                            }
                             Err(_) => {
                                 rollback_best_effort(&conn);
                                 retries += 1;
-                                if retries > MAX_RETRIES { break; }
+                                if retries > MAX_RETRIES {
+                                    break;
+                                }
                                 thread::sleep(Duration::from_millis(1));
                             }
                         }
@@ -1134,10 +1249,16 @@ fn test_conformance_summary() {
                 }
             }));
         }
-        for h in handles { h.join().unwrap(); }
+        for h in handles {
+            h.join().unwrap();
+        }
         let elapsed = start.elapsed().as_secs_f64();
         let c = committed.load(Ordering::Relaxed);
-        let throughput = if elapsed > 0.0 { c as f64 / elapsed } else { 0.0 };
+        let throughput = if elapsed > 0.0 {
+            c as f64 / elapsed
+        } else {
+            0.0
+        };
         results.push(TestResult {
             name: "positive_throughput",
             pass: c > 0,
@@ -1157,7 +1278,10 @@ fn test_conformance_summary() {
     println!("  \"total\": {total},");
     println!("  \"passed\": {passed},");
     println!("  \"failed\": {failed},");
-    println!("  \"pass_rate\": \"{:.1}%\",", passed as f64 / total as f64 * 100.0);
+    println!(
+        "  \"pass_rate\": \"{:.1}%\",",
+        passed as f64 / total as f64 * 100.0
+    );
     println!("  \"cases\": [");
     for (i, r) in results.iter().enumerate() {
         let comma = if i + 1 < total { "," } else { "" };
@@ -1171,7 +1295,8 @@ fn test_conformance_summary() {
     println!("}}");
 
     assert_eq!(
-        failed, 0,
+        failed,
+        0,
         "{failed}/{total} contention storm conformance tests failed: {:?}",
         results
             .iter()

@@ -163,11 +163,35 @@ fn make_divergence_run(id: &str, git_sha: &str) -> RunRecord {
 fn build_golden_index() -> EvidenceIndex {
     let mut index = EvidenceIndex::new();
     // 3 clean runs
-    index.insert(make_run_at("run-001", true, "sha-aaa", "2026-02-13T10:00:00Z", 42));
-    index.insert(make_run_at("run-002", true, "sha-aaa", "2026-02-13T11:00:00Z", 43));
-    index.insert(make_run_at("run-003", true, "sha-bbb", "2026-02-13T12:00:00Z", 44));
+    index.insert(make_run_at(
+        "run-001",
+        true,
+        "sha-aaa",
+        "2026-02-13T10:00:00Z",
+        42,
+    ));
+    index.insert(make_run_at(
+        "run-002",
+        true,
+        "sha-aaa",
+        "2026-02-13T11:00:00Z",
+        43,
+    ));
+    index.insert(make_run_at(
+        "run-003",
+        true,
+        "sha-bbb",
+        "2026-02-13T12:00:00Z",
+        44,
+    ));
     // 1 failed run
-    index.insert(make_run_at("run-004", false, "sha-ccc", "2026-02-13T13:00:00Z", 45));
+    index.insert(make_run_at(
+        "run-004",
+        false,
+        "sha-ccc",
+        "2026-02-13T13:00:00Z",
+        45,
+    ));
     // 1 critical run
     index.insert(make_critical_run("run-005"));
     // 1 divergence run
@@ -220,11 +244,15 @@ fn timeline_events_have_replay_commands() {
     let result = query_index(&index, &QueryFilters::default());
 
     for event in &result.timeline {
-        let cmd = event
-            .replay_command
-            .as_ref()
-            .expect(&format!("timeline event {} must have replay command", event.run_id));
-        assert!(!cmd.is_empty(), "replay command must be non-empty for {}", event.run_id);
+        let cmd = event.replay_command.as_ref().expect(&format!(
+            "timeline event {} must have replay command",
+            event.run_id
+        ));
+        assert!(
+            !cmd.is_empty(),
+            "replay command must be non-empty for {}",
+            event.run_id
+        );
         // Replay command should reference the replay harness for reproducibility
         assert!(
             cmd.contains("replay_harness") || cmd.contains("--manifest"),
@@ -252,7 +280,10 @@ fn timeline_events_classify_severity() {
         }
     }
 
-    assert!(has_critical, "golden index must have at least one critical event");
+    assert!(
+        has_critical,
+        "golden index must have at least one critical event"
+    );
     assert!(has_high, "golden index must have at least one high event");
     assert!(has_low, "golden index must have at least one low event");
 }
@@ -290,7 +321,11 @@ fn correlations_aggregate_by_component() {
     );
 
     for corr in &component_correlations {
-        assert!(corr.run_count > 0, "correlation {} must have runs", corr.key);
+        assert!(
+            corr.run_count > 0,
+            "correlation {} must have runs",
+            corr.key
+        );
         assert!(
             !corr.run_ids.is_empty(),
             "correlation {} must list run IDs",
@@ -413,10 +448,7 @@ fn operator_workflow_failure_to_root_cause() {
 
     // Step 1: Operator runs unfiltered query to see all events
     let all = query_index(&index, &QueryFilters::default());
-    assert!(
-        all.matched_run_count > 0,
-        "step 1: must have indexed runs"
-    );
+    assert!(all.matched_run_count > 0, "step 1: must have indexed runs");
 
     // Step 2: Filter to critical events only
     let critical_filters = QueryFilters {
@@ -460,7 +492,10 @@ fn operator_workflow_divergence_investigation() {
         ..Default::default()
     };
     let result = query_index(&index, &filters);
-    assert!(result.matched_run_count > 0, "must find high-severity events");
+    assert!(
+        result.matched_run_count > 0,
+        "must find high-severity events"
+    );
 
     // Verify divergence runs have first_divergence info in failing_scenarios
     // and artifact paths for drill-down
@@ -488,8 +523,7 @@ fn text_report_includes_timeline_and_correlations() {
     assert!(report.contains("forensics report"), "must have header");
     // The report should mention run count
     assert!(
-        report.contains(&format!("{}", result.matched_run_count))
-            || report.contains("matched"),
+        report.contains(&format!("{}", result.matched_run_count)) || report.contains("matched"),
         "report must mention matched run count"
     );
 }
@@ -611,10 +645,7 @@ fn query_deterministic_for_same_index() {
         assert_eq!(ea.run_id, eb.run_id, "timeline order must be deterministic");
     }
     for (ca, cb) in a.correlations.iter().zip(b.correlations.iter()) {
-        assert_eq!(
-            ca.key, cb.key,
-            "correlation order must be deterministic"
-        );
+        assert_eq!(ca.key, cb.key, "correlation order must be deterministic");
     }
 }
 
@@ -661,13 +692,34 @@ fn filter_matching_no_runs_returns_empty() {
 #[test]
 fn conformance_summary() {
     let checks = vec![
-        ("C-1: Timeline sorted by started_at with all events populated", true),
-        ("C-2: Correlations aggregate by component and invariant", true),
-        ("C-3: Filters narrow results correctly (commit, severity, component, seed)", true),
-        ("C-4: Timeline events include replay commands and severity", true),
-        ("C-5: Operator workflow: failure triage from lane to root cause", true),
-        ("C-6: Text report rendered for filtered and unfiltered queries", true),
-        ("C-7: Workflow report JSON and file round-trip persistence", true),
+        (
+            "C-1: Timeline sorted by started_at with all events populated",
+            true,
+        ),
+        (
+            "C-2: Correlations aggregate by component and invariant",
+            true,
+        ),
+        (
+            "C-3: Filters narrow results correctly (commit, severity, component, seed)",
+            true,
+        ),
+        (
+            "C-4: Timeline events include replay commands and severity",
+            true,
+        ),
+        (
+            "C-5: Operator workflow: failure triage from lane to root cause",
+            true,
+        ),
+        (
+            "C-6: Text report rendered for filtered and unfiltered queries",
+            true,
+        ),
+        (
+            "C-7: Workflow report JSON and file round-trip persistence",
+            true,
+        ),
         ("C-8: Query and workflow reports are deterministic", true),
         ("C-9: Edge cases: empty index, no-match filters", true),
     ];

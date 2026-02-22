@@ -19,9 +19,9 @@ use std::time::Instant;
 use fsqlite_ast::{
     AlterTableAction, BinaryOp, ColumnConstraintKind, ColumnRef, CompoundOp, CreateTableBody,
     DefaultValue, Distinctness, DropObjectType, Expr, FunctionArgs, InSet, JoinConstraint,
-    JoinKind, LikeOp, LimitClause, Literal, NullsOrder, OrderingTerm, PlaceholderType,
-    PragmaValue, ResultColumn, SelectBody, SelectCore, SelectStatement, SortDirection, Span,
-    Statement, TableOrSubquery, UnaryOp,
+    JoinKind, LikeOp, LimitClause, Literal, NullsOrder, OrderingTerm, PlaceholderType, PragmaValue,
+    ResultColumn, SelectBody, SelectCore, SelectStatement, SortDirection, Span, Statement,
+    TableOrSubquery, UnaryOp,
 };
 use fsqlite_btree::BtreeCursorOps;
 use fsqlite_btree::cursor::TransactionPageIo;
@@ -1339,8 +1339,7 @@ impl Connection {
             "udf_register"
         );
         fsqlite_func::record_udf_registered();
-        let mut registry =
-            FunctionRegistry::clone_from_arc(&self.func_registry.borrow());
+        let mut registry = FunctionRegistry::clone_from_arc(&self.func_registry.borrow());
         registry.register_scalar(function);
         *self.func_registry.borrow_mut() = Arc::new(registry);
     }
@@ -1364,8 +1363,7 @@ impl Connection {
             "udf_register"
         );
         fsqlite_func::record_udf_registered();
-        let mut registry =
-            FunctionRegistry::clone_from_arc(&self.func_registry.borrow());
+        let mut registry = FunctionRegistry::clone_from_arc(&self.func_registry.borrow());
         registry.register_aggregate(function);
         *self.func_registry.borrow_mut() = Arc::new(registry);
     }
@@ -1389,8 +1387,7 @@ impl Connection {
             "udf_register"
         );
         fsqlite_func::record_udf_registered();
-        let mut registry =
-            FunctionRegistry::clone_from_arc(&self.func_registry.borrow());
+        let mut registry = FunctionRegistry::clone_from_arc(&self.func_registry.borrow());
         registry.register_window(function);
         *self.func_registry.borrow_mut() = Arc::new(registry);
     }
@@ -3525,9 +3522,10 @@ impl Connection {
                             .as_ref()
                             .map_or('B', |tn| type_name_to_affinity_char(&tn.name));
                         let type_name = col.type_name.as_ref().map(|tn| tn.name.clone());
-                        let notnull = col.constraints.iter().any(|c| {
-                            matches!(c.kind, ColumnConstraintKind::NotNull { .. })
-                        });
+                        let notnull = col
+                            .constraints
+                            .iter()
+                            .any(|c| matches!(c.kind, ColumnConstraintKind::NotNull { .. }));
                         let default_value = col.constraints.iter().find_map(|c| match &c.kind {
                             ColumnConstraintKind::Default(dv) => Some(format_default_value(dv)),
                             _ => None,
@@ -3678,14 +3676,13 @@ impl Connection {
     /// Execute a DROP statement (TABLE, INDEX, VIEW, TRIGGER).
     #[allow(clippy::too_many_lines)]
     fn execute_drop(&self, drop_stmt: &fsqlite_ast::DropStatement) -> Result<()> {
-        let swallow_missing_master =
-            |err: FrankenError| -> Result<()> {
-                if drop_stmt.if_exists && is_sqlite_master_entry_missing(&err) {
-                    Ok(())
-                } else {
-                    Err(err)
-                }
-            };
+        let swallow_missing_master = |err: FrankenError| -> Result<()> {
+            if drop_stmt.if_exists && is_sqlite_master_entry_missing(&err) {
+                Ok(())
+            } else {
+                Err(err)
+            }
+        };
         let obj_name = &drop_stmt.name.name;
         let dropped = match drop_stmt.object_type {
             DropObjectType::Table => {
@@ -3848,9 +3845,10 @@ impl Connection {
                         name: table_name.clone(),
                     })?;
                 let type_name = col_def.type_name.as_ref().map(|tn| tn.name.clone());
-                let notnull = col_def.constraints.iter().any(|c| {
-                    matches!(c.kind, ColumnConstraintKind::NotNull { .. })
-                });
+                let notnull = col_def
+                    .constraints
+                    .iter()
+                    .any(|c| matches!(c.kind, ColumnConstraintKind::NotNull { .. }));
                 let default_value = col_def.constraints.iter().find_map(|c| match &c.kind {
                     ColumnConstraintKind::Default(dv) => Some(format_default_value(dv)),
                     _ => None,
@@ -5602,28 +5600,16 @@ impl Connection {
                         ],
                     },
                     Row {
-                        values: vec![
-                            SqliteValue::Text("t1_size".into()),
-                            SqliteValue::Integer(0),
-                        ],
+                        values: vec![SqliteValue::Text("t1_size".into()), SqliteValue::Integer(0)],
                     },
                     Row {
-                        values: vec![
-                            SqliteValue::Text("t2_size".into()),
-                            SqliteValue::Integer(0),
-                        ],
+                        values: vec![SqliteValue::Text("t2_size".into()), SqliteValue::Integer(0)],
                     },
                     Row {
-                        values: vec![
-                            SqliteValue::Text("b1_size".into()),
-                            SqliteValue::Integer(0),
-                        ],
+                        values: vec![SqliteValue::Text("b1_size".into()), SqliteValue::Integer(0)],
                     },
                     Row {
-                        values: vec![
-                            SqliteValue::Text("b2_size".into()),
-                            SqliteValue::Integer(0),
-                        ],
+                        values: vec![SqliteValue::Text("b2_size".into()), SqliteValue::Integer(0)],
                     },
                     Row {
                         values: vec![
@@ -5902,15 +5888,13 @@ impl Connection {
             // PRAGMA table_info(table_name) — return column metadata.
             "table_info" | "table_xinfo" => {
                 let table_name = match pragma.value.as_ref() {
-                    Some(PragmaValue::Call(expr) | PragmaValue::Assign(expr)) => {
-                        match expr {
-                            Expr::Column(col_ref, _) if col_ref.table.is_none() => {
-                                col_ref.column.clone()
-                            }
-                            Expr::Literal(Literal::String(s), _) => s.clone(),
-                            _ => return Ok(Vec::new()),
+                    Some(PragmaValue::Call(expr) | PragmaValue::Assign(expr)) => match expr {
+                        Expr::Column(col_ref, _) if col_ref.table.is_none() => {
+                            col_ref.column.clone()
                         }
-                    }
+                        Expr::Literal(Literal::String(s), _) => s.clone(),
+                        _ => return Ok(Vec::new()),
+                    },
                     None => return Ok(Vec::new()),
                 };
                 let schema = self.schema.borrow();
@@ -5924,28 +5908,23 @@ impl Connection {
                             .iter()
                             .enumerate()
                             .map(|(i, col)| {
-                                let type_str = col.type_name.as_deref().unwrap_or(
-                                    match col.affinity {
+                                let type_str =
+                                    col.type_name.as_deref().unwrap_or(match col.affinity {
                                         'D' | 'd' => "INTEGER",
                                         'E' | 'e' => "REAL",
                                         'B' | 'b' => "TEXT",
                                         'C' | 'c' => "NUMERIC",
                                         _ => "",
-                                    },
-                                );
+                                    });
                                 let notnull = i64::from(col.notnull || col.is_ipk);
                                 let dflt = col
                                     .default_value
                                     .as_ref()
-                                    .map_or(SqliteValue::Null, |s| {
-                                        SqliteValue::Text(s.clone())
-                                    });
+                                    .map_or(SqliteValue::Null, |s| SqliteValue::Text(s.clone()));
                                 let pk = i64::from(col.is_ipk);
                                 Row {
                                     values: vec![
-                                        SqliteValue::Integer(
-                                            i64::try_from(i).unwrap_or(0),
-                                        ),
+                                        SqliteValue::Integer(i64::try_from(i).unwrap_or(0)),
                                         SqliteValue::Text(col.name.clone()),
                                         SqliteValue::Text(type_str.to_owned()),
                                         SqliteValue::Integer(notnull),
@@ -8898,12 +8877,60 @@ fn evaluate_having_value(
                 evaluate_having_value(right, values, descriptors, columns, group_rows, col_names);
             let is_null_op = matches!(lv, SqliteValue::Null) || matches!(rv, SqliteValue::Null);
             match op {
-                fsqlite_ast::BinaryOp::Gt => if is_null_op { SqliteValue::Null } else { SqliteValue::Integer(i64::from(cmp_values(&lv, &rv) == std::cmp::Ordering::Greater)) },
-                fsqlite_ast::BinaryOp::Lt => if is_null_op { SqliteValue::Null } else { SqliteValue::Integer(i64::from(cmp_values(&lv, &rv) == std::cmp::Ordering::Less)) },
-                fsqlite_ast::BinaryOp::Ge => if is_null_op { SqliteValue::Null } else { SqliteValue::Integer(i64::from(cmp_values(&lv, &rv) != std::cmp::Ordering::Less)) },
-                fsqlite_ast::BinaryOp::Le => if is_null_op { SqliteValue::Null } else { SqliteValue::Integer(i64::from(cmp_values(&lv, &rv) != std::cmp::Ordering::Greater)) },
-                fsqlite_ast::BinaryOp::Eq => if is_null_op { SqliteValue::Null } else { SqliteValue::Integer(i64::from(cmp_values(&lv, &rv) == std::cmp::Ordering::Equal)) },
-                fsqlite_ast::BinaryOp::Ne => if is_null_op { SqliteValue::Null } else { SqliteValue::Integer(i64::from(cmp_values(&lv, &rv) != std::cmp::Ordering::Equal)) },
+                fsqlite_ast::BinaryOp::Gt => {
+                    if is_null_op {
+                        SqliteValue::Null
+                    } else {
+                        SqliteValue::Integer(i64::from(
+                            cmp_values(&lv, &rv) == std::cmp::Ordering::Greater,
+                        ))
+                    }
+                }
+                fsqlite_ast::BinaryOp::Lt => {
+                    if is_null_op {
+                        SqliteValue::Null
+                    } else {
+                        SqliteValue::Integer(i64::from(
+                            cmp_values(&lv, &rv) == std::cmp::Ordering::Less,
+                        ))
+                    }
+                }
+                fsqlite_ast::BinaryOp::Ge => {
+                    if is_null_op {
+                        SqliteValue::Null
+                    } else {
+                        SqliteValue::Integer(i64::from(
+                            cmp_values(&lv, &rv) != std::cmp::Ordering::Less,
+                        ))
+                    }
+                }
+                fsqlite_ast::BinaryOp::Le => {
+                    if is_null_op {
+                        SqliteValue::Null
+                    } else {
+                        SqliteValue::Integer(i64::from(
+                            cmp_values(&lv, &rv) != std::cmp::Ordering::Greater,
+                        ))
+                    }
+                }
+                fsqlite_ast::BinaryOp::Eq => {
+                    if is_null_op {
+                        SqliteValue::Null
+                    } else {
+                        SqliteValue::Integer(i64::from(
+                            cmp_values(&lv, &rv) == std::cmp::Ordering::Equal,
+                        ))
+                    }
+                }
+                fsqlite_ast::BinaryOp::Ne => {
+                    if is_null_op {
+                        SqliteValue::Null
+                    } else {
+                        SqliteValue::Integer(i64::from(
+                            cmp_values(&lv, &rv) != std::cmp::Ordering::Equal,
+                        ))
+                    }
+                }
                 fsqlite_ast::BinaryOp::And => {
                     let l_null = matches!(lv, SqliteValue::Null);
                     let r_null = matches!(rv, SqliteValue::Null);
@@ -8935,7 +8962,13 @@ fn evaluate_having_value(
                 fsqlite_ast::BinaryOp::Multiply => numeric_mul(&lv, &rv),
                 fsqlite_ast::BinaryOp::Divide => numeric_div(&lv, &rv),
                 fsqlite_ast::BinaryOp::Modulo => numeric_mod(&lv, &rv),
-                fsqlite_ast::BinaryOp::Concat => if is_null_op { SqliteValue::Null } else { SqliteValue::Text(format!("{}{}", lv.to_text(), rv.to_text())) },
+                fsqlite_ast::BinaryOp::Concat => {
+                    if is_null_op {
+                        SqliteValue::Null
+                    } else {
+                        SqliteValue::Text(format!("{}{}", lv.to_text(), rv.to_text()))
+                    }
+                }
                 _ => SqliteValue::Null,
             }
         }
@@ -8958,7 +8991,7 @@ fn evaluate_having_value(
                     } else {
                         SqliteValue::Integer(i64::from(!is_sqlite_truthy(&v)))
                     }
-                },
+                }
                 _ => SqliteValue::Null,
             }
         }
@@ -9408,7 +9441,9 @@ fn format_expr_as_default(expr: &Expr) -> String {
             Literal::True => "1".to_string(),
             Literal::False => "0".to_string(),
         },
-        Expr::UnaryOp { op, expr: inner, .. } => {
+        Expr::UnaryOp {
+            op, expr: inner, ..
+        } => {
             let inner_str = format_expr_as_default(inner);
             match op {
                 UnaryOp::Negate => format!("-{inner_str}"),
@@ -10840,8 +10875,11 @@ fn emit_function_call(
 fn emit_literal(builder: &mut ProgramBuilder, literal: &Literal, target_reg: i32) {
     match literal {
         Literal::Integer(value) => {
-            #[allow(clippy::cast_possible_truncation)]
-            builder.emit_op(Opcode::Integer, *value as i32, target_reg, 0, P4::None, 0);
+            if let Ok(as_i32) = i32::try_from(*value) {
+                builder.emit_op(Opcode::Integer, as_i32, target_reg, 0, P4::None, 0);
+            } else {
+                builder.emit_op(Opcode::Int64, 0, target_reg, 0, P4::Int64(*value), 0);
+            }
         }
         Literal::Float(value) => {
             builder.emit_op(Opcode::Real, 0, target_reg, 0, P4::Real(*value), 0);
@@ -12783,7 +12821,10 @@ mod tests {
     fn test_data_visibility_after_explicit_txn() {
         let conn = Connection::open(":memory:".to_string()).unwrap();
         // Create a table (like beads_rust schema)
-        conn.execute("CREATE TABLE IF NOT EXISTS issues (id TEXT PRIMARY KEY, title TEXT NOT NULL)").unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS issues (id TEXT PRIMARY KEY, title TEXT NOT NULL)",
+        )
+        .unwrap();
         // Check schema
         let schema = conn.schema.borrow();
         let table = schema.iter().find(|t| t.name == "issues").unwrap();
@@ -12794,13 +12835,22 @@ mod tests {
         // Check pager db_size after schema
         {
             let cx = conn.op_cx();
-            let mut txn = conn.pager.begin(&cx, super::TransactionMode::Deferred).unwrap();
+            let mut txn = conn
+                .pager
+                .begin(&cx, super::TransactionMode::Deferred)
+                .unwrap();
             eprintln!("[DIAG] After schema: can read root page {root_page}");
             #[allow(clippy::cast_sign_loss)]
-            let page = txn.get_page(&cx, PageNumber::new(root_page as u32).unwrap()).unwrap();
+            let page = txn
+                .get_page(&cx, PageNumber::new(root_page as u32).unwrap())
+                .unwrap();
             let data = page.as_ref();
-            eprintln!("[DIAG] root page first_byte=0x{:02x} is_zero={}", data[0], data.iter().all(|&b| b == 0));
-            let _= txn.rollback(&cx);
+            eprintln!(
+                "[DIAG] root page first_byte=0x{:02x} is_zero={}",
+                data[0],
+                data.iter().all(|&b| b == 0)
+            );
+            let _ = txn.rollback(&cx);
         }
 
         // Explicit transaction: INSERT
@@ -12808,15 +12858,19 @@ mod tests {
         conn.execute_with_params(
             "INSERT INTO issues (id, title) VALUES (?, ?)",
             &[SqliteValue::from("bd-1"), SqliteValue::from("Test")],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute("COMMIT").unwrap();
 
         // Now read it back (autocommit)
-        let rows = conn.query_with_params(
-            "SELECT count(*) FROM issues WHERE id = ?",
-            &[SqliteValue::from("bd-1")],
-        ).unwrap();
-        let count = rows.first()
+        let rows = conn
+            .query_with_params(
+                "SELECT count(*) FROM issues WHERE id = ?",
+                &[SqliteValue::from("bd-1")],
+            )
+            .unwrap();
+        let count = rows
+            .first()
             .and_then(|r| r.values().first())
             .and_then(SqliteValue::as_integer)
             .unwrap_or(-1);
@@ -21568,7 +21622,8 @@ mod schema_loading_tests {
 
         {
             let conn = Connection::open(&db_str).unwrap();
-            conn.execute("CREATE TABLE t1 (a INTEGER, b TEXT);").unwrap();
+            conn.execute("CREATE TABLE t1 (a INTEGER, b TEXT);")
+                .unwrap();
             conn.execute("CREATE INDEX idx_t1_a ON t1(a);").unwrap();
         }
 
@@ -21597,7 +21652,8 @@ mod schema_loading_tests {
 
         {
             let conn = Connection::open(&db_str).unwrap();
-            conn.execute("CREATE TABLE t1 (a INTEGER, b TEXT);").unwrap();
+            conn.execute("CREATE TABLE t1 (a INTEGER, b TEXT);")
+                .unwrap();
             conn.execute("CREATE INDEX idx_t1_a ON t1(a);").unwrap();
         }
 
@@ -22737,5 +22793,26 @@ mod schema_loading_tests {
             snapshot.fsqlite_compat_trace_callbacks_total >= captured.len() as u64,
             "compat callback counter should include emitted callbacks"
         );
+    }
+
+    #[test]
+    fn test_large_integer_literals_preserve_i64_precision() {
+        let conn = Connection::open(":memory:").expect("open db");
+        conn.execute("CREATE TABLE t(v INTEGER);")
+            .expect("create table");
+
+        let big = 4_102_444_800_000_000_i64;
+        conn.execute("INSERT INTO t(v) VALUES (4102444800000000);")
+            .expect("insert large integer literal");
+
+        let select_literal = conn
+            .query("SELECT 4102444800000000;")
+            .expect("select literal");
+        assert_eq!(select_literal.len(), 1);
+        assert_eq!(select_literal[0].values()[0], SqliteValue::Integer(big));
+
+        let rows = conn.query("SELECT v FROM t;").expect("select row");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(big));
     }
 }

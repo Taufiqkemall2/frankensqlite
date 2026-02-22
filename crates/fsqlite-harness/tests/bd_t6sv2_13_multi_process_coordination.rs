@@ -9,9 +9,8 @@ use std::sync::Arc;
 use std::thread;
 
 use fsqlite_mvcc::coordinator_ipc::{
-    Frame, FrameError, IdempotencyCache, MessageKind, PermitError, PermitManager,
-    WireTxnToken, is_canonical_pages, validate_write_set_summary,
-    validate_witness_edge_counts,
+    Frame, FrameError, IdempotencyCache, MessageKind, PermitError, PermitManager, WireTxnToken,
+    is_canonical_pages, validate_witness_edge_counts, validate_write_set_summary,
 };
 use fsqlite_mvcc::shm::SharedMemoryLayout;
 use fsqlite_types::{CommitSeq, PageSize, SchemaEpoch};
@@ -40,8 +39,16 @@ fn test_shm_header_round_trip() {
     let restored = SharedMemoryLayout::open(&bytes).expect("open failed");
 
     // Immutable fields match.
-    assert_eq!(restored.page_size(), page_size, "bead_id={BEAD_ID} page_size mismatch");
-    assert_eq!(restored.max_txn_slots(), 64, "bead_id={BEAD_ID} max_txn_slots mismatch");
+    assert_eq!(
+        restored.page_size(),
+        page_size,
+        "bead_id={BEAD_ID} page_size mismatch"
+    );
+    assert_eq!(
+        restored.max_txn_slots(),
+        64,
+        "bead_id={BEAD_ID} max_txn_slots mismatch"
+    );
     assert_eq!(
         restored.layout_checksum(),
         layout.layout_checksum(),
@@ -52,9 +59,15 @@ fn test_shm_header_round_trip() {
     assert_eq!(restored.lock_table_offset(), layout.lock_table_offset());
     assert_eq!(restored.witness_offset(), layout.witness_offset());
     assert_eq!(restored.txn_slot_offset(), layout.txn_slot_offset());
-    assert_eq!(restored.committed_readers_offset(), layout.committed_readers_offset());
+    assert_eq!(
+        restored.committed_readers_offset(),
+        layout.committed_readers_offset()
+    );
 
-    println!("[{BEAD_ID}] SHM header round-trip: OK (size={})", bytes.len());
+    println!(
+        "[{BEAD_ID}] SHM header round-trip: OK (size={})",
+        bytes.len()
+    );
 }
 
 /// Test 2: SHM open rejects corrupted headers.
@@ -66,13 +79,19 @@ fn test_shm_open_rejects_corruption() {
 
     // Too short.
     let short_result = SharedMemoryLayout::open(&bytes[..10]);
-    assert!(short_result.is_err(), "bead_id={BEAD_ID} should reject short buffer");
+    assert!(
+        short_result.is_err(),
+        "bead_id={BEAD_ID} should reject short buffer"
+    );
 
     // Corrupted magic.
     let mut bad_magic = bytes.clone();
     bad_magic[0] = 0xFF;
     let magic_result = SharedMemoryLayout::open(&bad_magic);
-    assert!(magic_result.is_err(), "bead_id={BEAD_ID} should reject bad magic");
+    assert!(
+        magic_result.is_err(),
+        "bead_id={BEAD_ID} should reject bad magic"
+    );
 
     // Corrupted checksum.
     let mut bad_checksum = bytes.clone();
@@ -82,7 +101,10 @@ fn test_shm_open_rejects_corruption() {
         bad_checksum[checksum_byte_idx] ^= 0x01;
     }
     let checksum_result = SharedMemoryLayout::open(&bad_checksum);
-    assert!(checksum_result.is_err(), "bead_id={BEAD_ID} should reject bad checksum");
+    assert!(
+        checksum_result.is_err(),
+        "bead_id={BEAD_ID} should reject bad checksum"
+    );
 
     println!("[{BEAD_ID}] SHM corruption rejection: short=ERR magic=ERR checksum=ERR");
 }
@@ -113,7 +135,10 @@ fn test_seqlock_snapshot_protocol() {
         SchemaEpoch::new(3),
         "bead_id={BEAD_ID} schema_epoch not updated"
     );
-    assert_eq!(snap1.ecs_epoch, 7, "bead_id={BEAD_ID} ecs_epoch not updated");
+    assert_eq!(
+        snap1.ecs_epoch, 7,
+        "bead_id={BEAD_ID} ecs_epoch not updated"
+    );
 
     // Multiple publishes.
     layout.publish_snapshot(CommitSeq::new(100), SchemaEpoch::new(5), 20);
@@ -141,11 +166,17 @@ fn test_serialized_writer_lifecycle() {
 
     // Check writer is active.
     let active = layout.check_serialized_writer();
-    assert!(active.is_some(), "bead_id={BEAD_ID} writer should be active");
+    assert!(
+        active.is_some(),
+        "bead_id={BEAD_ID} writer should be active"
+    );
 
     // Second acquisition with different txn should fail.
     let second = layout.acquire_serialized_writer(99, 5678, 2000, 9999);
-    assert!(!second, "bead_id={BEAD_ID} second writer should be rejected");
+    assert!(
+        !second,
+        "bead_id={BEAD_ID} second writer should be rejected"
+    );
 
     // Release writer.
     let released = layout.release_serialized_writer(42);
@@ -161,7 +192,9 @@ fn test_serialized_writer_lifecycle() {
     let reacquired = layout.acquire_serialized_writer(99, 5678, 2000, 9999);
     assert!(reacquired, "bead_id={BEAD_ID} re-acquisition failed");
 
-    println!("[{BEAD_ID}] serialized writer lifecycle: acquire=OK reject=OK release=OK re-acquire=OK");
+    println!(
+        "[{BEAD_ID}] serialized writer lifecycle: acquire=OK reject=OK release=OK re-acquire=OK"
+    );
 }
 
 /// Test 5: Wire frame encode/decode round-trip.
@@ -197,7 +230,10 @@ fn test_frame_encode_decode_round_trip() {
         };
         let wire = f.encode();
         let back = Frame::decode(&wire).expect("decode failed");
-        assert_eq!(back.kind, kind, "bead_id={BEAD_ID} kind round-trip failed for {kind:?}");
+        assert_eq!(
+            back.kind, kind,
+            "bead_id={BEAD_ID} kind round-trip failed for {kind:?}"
+        );
     }
 
     println!("[{BEAD_ID}] frame encode/decode: 7 message kinds round-tripped");
@@ -207,10 +243,7 @@ fn test_frame_encode_decode_round_trip() {
 #[test]
 fn test_frame_decode_rejects_malformed() {
     // Too short.
-    assert!(matches!(
-        Frame::decode(&[0; 4]),
-        Err(FrameError::TooShort)
-    ));
+    assert!(matches!(Frame::decode(&[0; 4]), Err(FrameError::TooShort)));
 
     // Len too small.
     let mut buf = vec![0u8; 16];
@@ -261,7 +294,10 @@ fn test_permit_manager_lifecycle() {
     assert_eq!(pm.outstanding(), 4);
 
     // Double consume fails.
-    assert!(matches!(pm.consume(p1), Err(PermitError::AlreadyConsumed(_))));
+    assert!(matches!(
+        pm.consume(p1),
+        Err(PermitError::AlreadyConsumed(_))
+    ));
 
     // Not-found consume fails.
     assert!(matches!(pm.consume(99999), Err(PermitError::NotFound(_))));
@@ -287,20 +323,33 @@ fn test_idempotency_cache() {
     let cache = IdempotencyCache::new();
 
     // Miss on empty cache.
-    assert!(cache.get(1, 1).is_none(), "bead_id={BEAD_ID} expected cache miss");
+    assert!(
+        cache.get(1, 1).is_none(),
+        "bead_id={BEAD_ID} expected cache miss"
+    );
 
     // Store a response.
     cache.insert(1, 1, vec![0xAA, 0xBB]);
 
     // Hit.
     let hit = cache.get(1, 1);
-    assert_eq!(hit, Some(vec![0xAA, 0xBB]), "bead_id={BEAD_ID} cache hit mismatch");
+    assert_eq!(
+        hit,
+        Some(vec![0xAA, 0xBB]),
+        "bead_id={BEAD_ID} cache hit mismatch"
+    );
 
     // Different txn_epoch is a miss.
-    assert!(cache.get(1, 2).is_none(), "bead_id={BEAD_ID} expected miss for different epoch");
+    assert!(
+        cache.get(1, 2).is_none(),
+        "bead_id={BEAD_ID} expected miss for different epoch"
+    );
 
     // Different txn_id is a miss.
-    assert!(cache.get(2, 1).is_none(), "bead_id={BEAD_ID} expected miss for different txn_id");
+    assert!(
+        cache.get(2, 1).is_none(),
+        "bead_id={BEAD_ID} expected miss for different txn_id"
+    );
 
     println!("[{BEAD_ID}] idempotency cache: miss=OK put=OK hit=OK isolation=OK");
 }
@@ -335,11 +384,21 @@ fn test_wire_txn_token_round_trip() {
     };
 
     let bytes = token.to_bytes();
-    assert_eq!(bytes.len(), 16, "bead_id={BEAD_ID} token wire size should be 16");
+    assert_eq!(
+        bytes.len(),
+        16,
+        "bead_id={BEAD_ID} token wire size should be 16"
+    );
 
     let decoded = WireTxnToken::from_bytes(&bytes).expect("decode failed");
-    assert_eq!(decoded.txn_id, token.txn_id, "bead_id={BEAD_ID} txn_id mismatch");
-    assert_eq!(decoded.txn_epoch, token.txn_epoch, "bead_id={BEAD_ID} txn_epoch mismatch");
+    assert_eq!(
+        decoded.txn_id, token.txn_id,
+        "bead_id={BEAD_ID} txn_id mismatch"
+    );
+    assert_eq!(
+        decoded.txn_epoch, token.txn_epoch,
+        "bead_id={BEAD_ID} txn_epoch mismatch"
+    );
 
     println!("[{BEAD_ID}] WireTxnToken round-trip: OK");
 }
@@ -385,7 +444,9 @@ fn test_cross_thread_snapshot_consistency() {
     writer_handle.join().expect("writer panicked");
     let (max_seen, reads) = reader_handle.join().expect("reader panicked");
 
-    println!("[{BEAD_ID}] cross-thread consistency: max_seen={max_seen} reads={reads} no torn reads");
+    println!(
+        "[{BEAD_ID}] cross-thread consistency: max_seen={max_seen} reads={reads} no torn reads"
+    );
 }
 
 /// Test 12: GC horizon coordination.
@@ -438,7 +499,11 @@ fn test_conformance_summary() {
         a && r
     };
     let pass_frame = {
-        let f = Frame { kind: MessageKind::Ping, request_id: 0, payload: vec![] };
+        let f = Frame {
+            kind: MessageKind::Ping,
+            request_id: 0,
+            payload: vec![],
+        };
         Frame::decode(&f.encode()).is_ok()
     };
     let pass_permit = {
@@ -449,19 +514,44 @@ fn test_conformance_summary() {
     let pass_canonical = is_canonical_pages(&[1, 2, 3]) && !is_canonical_pages(&[3, 2, 1]);
 
     println!("\n=== {BEAD_ID} Multi-Process Coordination Conformance ===");
-    println!("  shm_round_trip..............{}", if pass_shm_roundtrip { "PASS" } else { "FAIL" });
-    println!("  seqlock_protocol............{}", if pass_seqlock { "PASS" } else { "FAIL" });
-    println!("  writer_lifecycle............{}", if pass_writer { "PASS" } else { "FAIL" });
-    println!("  frame_codec.................{}", if pass_frame { "PASS" } else { "FAIL" });
-    println!("  permit_lifecycle............{}", if pass_permit { "PASS" } else { "FAIL" });
-    println!("  canonical_validators........{}", if pass_canonical { "PASS" } else { "FAIL" });
+    println!(
+        "  shm_round_trip..............{}",
+        if pass_shm_roundtrip { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  seqlock_protocol............{}",
+        if pass_seqlock { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  writer_lifecycle............{}",
+        if pass_writer { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  frame_codec.................{}",
+        if pass_frame { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  permit_lifecycle............{}",
+        if pass_permit { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  canonical_validators........{}",
+        if pass_canonical { "PASS" } else { "FAIL" }
+    );
 
     let all = [
-        pass_shm_roundtrip, pass_seqlock, pass_writer,
-        pass_frame, pass_permit, pass_canonical,
+        pass_shm_roundtrip,
+        pass_seqlock,
+        pass_writer,
+        pass_frame,
+        pass_permit,
+        pass_canonical,
     ];
     let passed = all.iter().filter(|&&p| p).count();
     println!("  [{}/{}] conformance checks passed", passed, all.len());
 
-    assert!(all.iter().all(|&p| p), "bead_id={BEAD_ID} conformance failed");
+    assert!(
+        all.iter().all(|&p| p),
+        "bead_id={BEAD_ID} conformance failed"
+    );
 }

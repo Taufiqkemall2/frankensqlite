@@ -15,17 +15,16 @@
 
 use std::collections::BTreeMap;
 
-use fsqlite_harness::crash_recovery_parity::{
-    CrashScenario, CRASH_RECOVERY_SCHEMA_VERSION,
-};
+use fsqlite_harness::crash_recovery_parity::{CRASH_RECOVERY_SCHEMA_VERSION, CrashScenario};
 use fsqlite_harness::cross_process_crash_harness::{
-    CrashPoint, ProcessRole, CROSS_PROCESS_CRASH_SCHEMA_VERSION,
+    CROSS_PROCESS_CRASH_SCHEMA_VERSION, CrashPoint, ProcessRole,
 };
 use fsqlite_harness::durability_matrix::{
-    CrashMode, DurabilityLane, OperatingSystem, FilesystemClass, ToolchainVariant,
-    MATRIX_SCHEMA_VERSION as DURABILITY_MATRIX_SCHEMA_VERSION,
+    CrashMode, DurabilityLane, FilesystemClass,
+    MATRIX_SCHEMA_VERSION as DURABILITY_MATRIX_SCHEMA_VERSION, OperatingSystem, ToolchainVariant,
 };
 use fsqlite_harness::fault_vfs::{FaultKind, FaultMetricsSnapshot, FaultSpec, FaultState};
+use fsqlite_mvcc::ssi_validation::EvidenceRecordMetricsSnapshot;
 use fsqlite_wal::checksum::{
     ChecksumFailureKind, RecoveryAction, WalChainInvalidReason, WalRecoveryDecision,
     recovery_action_for_checksum_failure,
@@ -38,7 +37,6 @@ use fsqlite_wal::metrics::WalRecoveryCounters;
 use fsqlite_wal::recovery_compaction::{
     CompactionAction, CompactionMdpState, CompactionPhase, CompactionPolicy, CompactionRateLimit,
 };
-use fsqlite_mvcc::ssi_validation::EvidenceRecordMetricsSnapshot;
 
 // ── 1. Crash scenario catalog completeness ──────────────────────────────────
 
@@ -52,10 +50,7 @@ fn crash_scenario_catalog_completeness() {
     for scenario in CrashScenario::ALL {
         let name = scenario.as_str();
         assert!(!name.is_empty(), "scenario name should not be empty");
-        assert!(
-            seen.insert(name),
-            "duplicate scenario name: {name}"
-        );
+        assert!(seen.insert(name), "duplicate scenario name: {name}");
     }
 
     // Verify key scenarios are present.
@@ -115,19 +110,13 @@ fn recovery_action_for_checksum_failure_mapping() {
     assert_eq!(action, RecoveryAction::EvictCacheAndRetryFromWal);
 
     // CRC32C symbol mismatch → exclude and continue.
-    let action = recovery_action_for_checksum_failure(
-        ChecksumFailureKind::Crc32cSymbolMismatch,
-        None,
-        None,
-    );
+    let action =
+        recovery_action_for_checksum_failure(ChecksumFailureKind::Crc32cSymbolMismatch, None, None);
     assert_eq!(action, RecoveryAction::ExcludeCorruptedSymbolAndContinue);
 
     // DB file corruption → report persistent corruption.
-    let action = recovery_action_for_checksum_failure(
-        ChecksumFailureKind::DbFileCorruption,
-        None,
-        None,
-    );
+    let action =
+        recovery_action_for_checksum_failure(ChecksumFailureKind::DbFileCorruption, None, None);
     assert_eq!(action, RecoveryAction::ReportPersistentCorruption);
 }
 
@@ -196,23 +185,25 @@ fn fault_injection_spec_construction() {
         .at_offset_bytes(8192)
         .build();
     assert_eq!(spec.file_glob, "*.wal");
-    assert!(matches!(spec.kind, FaultKind::TornWrite { valid_bytes: 17 }));
+    assert!(matches!(
+        spec.kind,
+        FaultKind::TornWrite { valid_bytes: 17 }
+    ));
     assert_eq!(spec.at_offset, Some(8192));
 
     // Power cut spec.
-    let spec = FaultSpec::power_cut("*.wal")
-        .after_nth_sync(2)
-        .build();
+    let spec = FaultSpec::power_cut("*.wal").after_nth_sync(2).build();
     assert_eq!(spec.file_glob, "*.wal");
     assert!(matches!(spec.kind, FaultKind::PowerCut));
     assert_eq!(spec.after_nth_sync, Some(2));
 
     // Partial write spec.
-    let spec = FaultSpec::partial_write("*.db")
-        .valid_bytes(4000)
-        .build();
+    let spec = FaultSpec::partial_write("*.db").valid_bytes(4000).build();
     assert_eq!(spec.file_glob, "*.db");
-    assert!(matches!(spec.kind, FaultKind::PartialWrite { valid_bytes: 4000 }));
+    assert!(matches!(
+        spec.kind,
+        FaultKind::PartialWrite { valid_bytes: 4000 }
+    ));
 
     // IO error spec.
     let spec = FaultSpec::io_error("*.wal").build();
@@ -243,7 +234,11 @@ fn fault_state_lifecycle_and_metrics() {
     // Replay seed should be deterministic from construction.
     let seed1 = state.replay_seed();
     let state2 = FaultState::new_with_seed(seed1);
-    assert_eq!(state2.replay_seed(), seed1, "seeded state should preserve seed");
+    assert_eq!(
+        state2.replay_seed(),
+        seed1,
+        "seeded state should preserve seed"
+    );
 }
 
 // ── 8. Fault metrics snapshot structure ─────────────────────────────────────
@@ -441,9 +436,7 @@ fn recovery_decision_from_checksum_mismatch() {
     assert_eq!(decision, WalRecoveryDecision::Truncated);
 
     // When repair fails (insufficient symbols) → truncate.
-    let decision = fsqlite_wal::checksum::recover_wal_frame_checksum_mismatch(
-        None, None, 2, 4,
-    );
+    let decision = fsqlite_wal::checksum::recover_wal_frame_checksum_mismatch(None, None, 2, 4);
     assert_eq!(decision, WalRecoveryDecision::Truncated);
 }
 
@@ -471,7 +464,10 @@ fn multi_epoch_consolidator_with_interleaved_batches() {
     let batches = consolidator.begin_flush().unwrap();
     assert_eq!(batches.len(), 3);
     // Total frames across batches.
-    let total_frames: usize = batches.iter().map(fsqlite_wal::TransactionFrameBatch::frame_count).sum();
+    let total_frames: usize = batches
+        .iter()
+        .map(fsqlite_wal::TransactionFrameBatch::frame_count)
+        .sum();
     assert_eq!(total_frames, 6);
 
     consolidator.complete_flush().unwrap();
@@ -502,10 +498,7 @@ fn conformance_summary() {
     ];
     let passed = checks.iter().filter(|(_, ok)| *ok).count();
     let total = checks.len();
-    assert_eq!(
-        passed, total,
-        "conformance: {passed}/{total} gates passed"
-    );
+    assert_eq!(passed, total, "conformance: {passed}/{total} gates passed");
     eprintln!("[bd-ncivz.5] conformance: {passed}/{total} gates passed");
 }
 

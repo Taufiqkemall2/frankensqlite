@@ -325,9 +325,7 @@ impl FcHandle<'_> {
         // Check if our request has been serviced.
         let mut spins = 0u32;
         loop {
-            let state = self.combiner.slots[self.slot]
-                .state
-                .load(Ordering::Acquire);
+            let state = self.combiner.slots[self.slot].state.load(Ordering::Acquire);
             if (state & RESULT_BIT) != 0 {
                 // Result ready — read payload and clear slot.
                 let result = self.combiner.slots[self.slot]

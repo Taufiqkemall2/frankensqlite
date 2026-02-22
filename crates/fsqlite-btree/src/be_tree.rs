@@ -128,9 +128,7 @@ impl<K: Ord + Clone, V: Clone> BeMessage<K, V> {
 #[derive(Debug, Clone)]
 enum BeNode<K: Ord + Clone, V: Clone> {
     /// Leaf node storing sorted key-value pairs.
-    Leaf {
-        entries: Vec<(K, V)>,
-    },
+    Leaf { entries: Vec<(K, V)> },
     /// Interior node with pivots, children, and a message buffer.
     Interior {
         /// Pivot keys separating children.
@@ -168,10 +166,7 @@ pub struct BeTree<K: Ord + Clone, V: Clone> {
 impl<K: Ord + Clone, V: Clone> BeTree<K, V> {
     /// Create a new empty Bε-tree with the given configuration.
     pub fn new(config: BeTreeConfig) -> Self {
-        assert!(
-            config.buffer_capacity >= 1,
-            "buffer_capacity must be >= 1"
-        );
+        assert!(config.buffer_capacity >= 1, "buffer_capacity must be >= 1");
         assert!(config.leaf_capacity >= 2, "leaf_capacity must be >= 2");
         assert!(config.max_pivots >= 2, "max_pivots must be >= 2");
         Self {
@@ -407,12 +402,10 @@ impl<K: Ord + Clone, V: Clone> BeTree<K, V> {
     #[allow(clippy::self_only_used_in_recursion)]
     fn get_in_node<'a>(&'a self, node: &'a BeNode<K, V>, key: &K) -> Option<&'a V> {
         match node {
-            BeNode::Leaf { entries } => {
-                entries
-                    .binary_search_by(|(k, _)| k.cmp(key))
-                    .ok()
-                    .map(|idx| &entries[idx].1)
-            }
+            BeNode::Leaf { entries } => entries
+                .binary_search_by(|(k, _)| k.cmp(key))
+                .ok()
+                .map(|idx| &entries[idx].1),
             BeNode::Interior {
                 pivots,
                 children,
@@ -569,12 +562,10 @@ fn apply_message_to_leaf<K: Ord + Clone, V: Clone>(
     msg: BeMessage<K, V>,
 ) {
     match msg {
-        BeMessage::Insert { key, value } => {
-            match entries.binary_search_by(|(k, _)| k.cmp(&key)) {
-                Ok(idx) => entries[idx].1 = value,
-                Err(idx) => entries.insert(idx, (key, value)),
-            }
-        }
+        BeMessage::Insert { key, value } => match entries.binary_search_by(|(k, _)| k.cmp(&key)) {
+            Ok(idx) => entries[idx].1 = value,
+            Err(idx) => entries.insert(idx, (key, value)),
+        },
         BeMessage::Delete { key } => {
             if let Ok(idx) = entries.binary_search_by(|(k, _)| k.cmp(&key)) {
                 entries.remove(idx);

@@ -5,20 +5,17 @@
 //! EBR guard lifecycle latency, GC tick latency distributions (p50/p95/p99),
 //! memory-vs-frequency tradeoff, and background collection patterns.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fsqlite_mvcc::{
-    GC_F_MAX_HZ, GC_F_MIN_HZ, GC_TARGET_CHAIN_LENGTH,
-    GC_PAGES_BUDGET,
-    GcScheduler, GcTodo, gc_tick,
-    VersionArena, VersionIdx,
-    VersionGuard, VersionGuardRegistry, VersionGuardTicket, StaleReaderConfig,
-};
 use fsqlite_mvcc::ebr::GLOBAL_EBR_METRICS;
-use fsqlite_types::{CommitSeq, PageNumber, PageNumberBuildHasher, PageData, PageSize};
-use fsqlite_types::glossary::{PageVersion, TxnToken, TxnId, TxnEpoch};
+use fsqlite_mvcc::{
+    ChainHeadTable, GC_F_MAX_HZ, GC_F_MIN_HZ, GC_PAGES_BUDGET, GC_TARGET_CHAIN_LENGTH, GcScheduler,
+    GcTodo, StaleReaderConfig, VersionArena, VersionGuard, VersionGuardRegistry,
+    VersionGuardTicket, VersionIdx, gc_tick,
+};
+use fsqlite_types::glossary::{PageVersion, TxnEpoch, TxnId, TxnToken};
+use fsqlite_types::{CommitSeq, PageData, PageNumber, PageSize};
 
 const BEAD_ID: &str = "bd-2y306.3";
 
@@ -91,9 +88,7 @@ fn test_scheduler_interval_computation() {
     for &pressure in &pressures {
         let interval = scheduler.compute_interval_millis(pressure);
         let freq = scheduler.compute_frequency(pressure);
-        println!(
-            "  pressure={pressure:>6.1}: interval={interval}ms freq={freq:.1}Hz"
-        );
+        println!("  pressure={pressure:>6.1}: interval={interval}ms freq={freq:.1}Hz");
 
         // Interval should be >= 10ms (f_max=100Hz → 10ms) and <= 1000ms (f_min=1Hz → 1000ms).
         assert!(
@@ -200,8 +195,7 @@ fn test_ebr_guard_lifecycle_latency() {
 #[test]
 fn test_gc_tick_latency_distribution() {
     let mut arena = VersionArena::new();
-    let mut chain_heads: HashMap<PageNumber, VersionIdx, PageNumberBuildHasher> =
-        HashMap::with_hasher(PageNumberBuildHasher::default());
+    let chain_heads = ChainHeadTable::new();
     let mut todo = GcTodo::new();
 
     // Populate: 100 pages, 10 versions each = 1000 total versions.
@@ -217,7 +211,7 @@ fn test_gc_tick_latency_distribution() {
             let idx = arena.alloc(ver);
             if seq == 10 {
                 // Head of chain is the newest version.
-                chain_heads.insert(pgno, idx);
+                chain_heads.install_with_retry(pgno, idx);
             }
             prev_idx = Some(idx);
         }
@@ -233,7 +227,7 @@ fn test_gc_tick_latency_distribution() {
         }
         let horizon = CommitSeq::new(round + 1);
         let t0 = Instant::now();
-        let _result = gc_tick(&mut todo, horizon, &mut arena, &mut chain_heads);
+        let _result = gc_tick(&mut todo, horizon, &mut arena, &chain_heads);
         let lat = t0.elapsed();
         latencies.push(lat);
     }
@@ -367,8 +361,7 @@ fn test_ticket_cross_thread() {
 #[test]
 fn test_gc_budget_enforcement() {
     let mut arena = VersionArena::new();
-    let mut chain_heads: HashMap<PageNumber, VersionIdx, PageNumberBuildHasher> =
-        HashMap::with_hasher(PageNumberBuildHasher::default());
+    let chain_heads = ChainHeadTable::new();
     let mut todo = GcTodo::new();
 
     // Create more pages than GC_PAGES_BUDGET to test budget capping.
@@ -377,12 +370,12 @@ fn test_gc_budget_enforcement() {
         let pgno = PageNumber::new(page).unwrap();
         let ver = dummy_version(page, 1);
         let idx = arena.alloc(ver);
-        chain_heads.insert(pgno, idx);
+        chain_heads.install_with_retry(pgno, idx);
         todo.enqueue(pgno);
     }
 
     let horizon = CommitSeq::new(0); // Won't prune anything with seq=0, but tests budget logic.
-    let result = gc_tick(&mut todo, horizon, &mut arena, &mut chain_heads);
+    let result = gc_tick(&mut todo, horizon, &mut arena, &chain_heads);
 
     println!(
         "[{BEAD_ID}] GC budget: pages_pruned={} versions_freed={} pages_budget_exhausted={} versions_budget_exhausted={} queue_remaining={}",
@@ -452,9 +445,8 @@ fn test_conformance_summary() {
 
     // 3. should_tick timing.
     let mut sched = GcScheduler::new();
-    let pass_tick = sched.should_tick(8.0, 0)
-        && !sched.should_tick(8.0, 1)
-        && sched.should_tick(8.0, 2000);
+    let pass_tick =
+        sched.should_tick(8.0, 0) && !sched.should_tick(8.0, 1) && sched.should_tick(8.0, 2000);
 
     // 4. EBR guard lifecycle.
     let reg = Arc::new(VersionGuardRegistry::new(StaleReaderConfig::default()));
@@ -465,14 +457,13 @@ fn test_conformance_summary() {
 
     // 5. GC tick runs.
     let mut arena = VersionArena::new();
-    let mut heads: HashMap<PageNumber, VersionIdx, PageNumberBuildHasher> =
-        HashMap::with_hasher(PageNumberBuildHasher::default());
+    let heads = ChainHeadTable::new();
     let mut todo = GcTodo::new();
     let pgno = PageNumber::new(1).unwrap();
     let idx = arena.alloc(dummy_version(1, 1));
-    heads.insert(pgno, idx);
+    heads.install_with_retry(pgno, idx);
     todo.enqueue(pgno);
-    let result = gc_tick(&mut todo, CommitSeq::new(0), &mut arena, &mut heads);
+    let result = gc_tick(&mut todo, CommitSeq::new(0), &mut arena, &heads);
     let pass_gc_tick = result.pages_pruned <= GC_PAGES_BUDGET;
 
     // 6. Stale reader detection.
@@ -498,12 +489,30 @@ fn test_conformance_summary() {
     let total = checks.len();
 
     println!("\n=== {BEAD_ID} Epoch Advance Tuning Conformance ===");
-    println!("  freq bounds:     {}", if pass_freq_bounds { "PASS" } else { "FAIL" });
-    println!("  monotonic:       {}", if pass_monotonic { "PASS" } else { "FAIL" });
-    println!("  should_tick:     {}", if pass_tick { "PASS" } else { "FAIL" });
-    println!("  guard lifecycle: {}", if pass_guard { "PASS" } else { "FAIL" });
-    println!("  gc_tick:         {}", if pass_gc_tick { "PASS" } else { "FAIL" });
-    println!("  stale reader:    {}", if pass_stale { "PASS" } else { "FAIL" });
+    println!(
+        "  freq bounds:     {}",
+        if pass_freq_bounds { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  monotonic:       {}",
+        if pass_monotonic { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  should_tick:     {}",
+        if pass_tick { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  guard lifecycle: {}",
+        if pass_guard { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  gc_tick:         {}",
+        if pass_gc_tick { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  stale reader:    {}",
+        if pass_stale { "PASS" } else { "FAIL" }
+    );
     println!("  [{passed}/{total}] conformance checks passed");
 
     assert_eq!(

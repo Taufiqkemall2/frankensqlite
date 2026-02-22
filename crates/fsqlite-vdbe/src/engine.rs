@@ -2590,6 +2590,11 @@ impl VdbeEngine {
                     let target = op.p2;
                     let concurrent_mode = op.p3 != 0;
                     let rowid = if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
+                        // Storage NewRowid probes max rowid via `last()`, which
+                        // repositions the cursor. Clear any pending delete/next
+                        // state so subsequent Next/Prev behavior is consistent
+                        // with the new position.
+                        self.pending_next_after_delete.remove(&cursor_id);
                         // Navigate to last entry to find max rowid from B-tree.
                         let btree_max = if sc.cursor.last(&sc.cx)? {
                             sc.cursor.rowid(&sc.cx)?
@@ -7028,6 +7033,56 @@ mod tests {
             rows,
             vec![vec![SqliteValue::Integer(1)], vec![SqliteValue::Integer(3)]],
             "Delete->NotExists->Next should advance from probe row 1 to row 3"
+        );
+    }
+
+    #[test]
+    fn test_delete_then_newrowid_then_next_reports_no_successor() {
+        // Regression: NewRowid on storage cursor repositions with `last()`.
+        // If pending_next_after_delete is stale, Next can incorrectly report
+        // a successor row when already at the end.
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).unwrap();
+        table.insert(1, vec![SqliteValue::Integer(10)]);
+        table.insert(2, vec![SqliteValue::Integer(20)]);
+        table.insert(3, vec![SqliteValue::Integer(30)]);
+
+        let (rows, _) = run_write_with_storage_cursors(db, |b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+
+            // Delete rowid=2 (cursor lands on successor rowid=3).
+            b.emit_op(Opcode::Integer, 2, 1, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SeekRowid, 0, 1, end, P4::None, 0);
+            b.emit_op(Opcode::Delete, 0, 0, 0, P4::None, 0);
+
+            // NewRowid probes max rowid via last(); this should clear stale
+            // pending delete state for cursor 0.
+            b.emit_op(Opcode::NewRowid, 0, 2, 0, P4::None, 0);
+
+            // At end of table, Next must report no successor.
+            let has_next = b.emit_label();
+            b.emit_jump_to_label(Opcode::Next, 0, 0, has_next, P4::None, 0);
+            b.emit_op(Opcode::Integer, 0, 3, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 3, 1, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, end, P4::None, 0);
+
+            // Unexpected path if stale pending state causes false positive.
+            b.resolve_label(has_next);
+            b.emit_op(Opcode::Integer, 1, 3, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 3, 1, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, end, P4::None, 0);
+
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(
+            rows,
+            vec![vec![SqliteValue::Integer(0)]],
+            "Delete->NewRowid->Next should report no successor at end-of-table"
         );
     }
 

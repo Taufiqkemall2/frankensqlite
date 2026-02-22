@@ -31,7 +31,11 @@ fn test_basic_point_lookup() {
 
     // Every key should be found at its position.
     for (pos, &k) in keys.iter().enumerate() {
-        assert_eq!(idx.lookup(k), Some(pos), "key {k} should be at position {pos}");
+        assert_eq!(
+            idx.lookup(k),
+            Some(pos),
+            "key {k} should be at position {pos}"
+        );
     }
 
     println!(
@@ -151,15 +155,15 @@ fn test_negative_lookups() {
 
     // Keys in gaps should not be found.
     for gap in [1, 50, 99, 101, 150, 199, 5000] {
-        assert_eq!(
-            idx.lookup(gap),
-            None,
-            "gap key {gap} should not be found"
-        );
+        assert_eq!(idx.lookup(gap), None, "gap key {gap} should not be found");
     }
 
     // Keys beyond the range should not be found.
-    assert_eq!(idx.lookup(5000), None, "beyond-range key should not be found");
+    assert_eq!(
+        idx.lookup(5000),
+        None,
+        "beyond-range key should not be found"
+    );
 
     println!("[PASS] Negative lookups: 7 gap keys all return None");
 }
@@ -276,7 +280,10 @@ fn test_metrics_fidelity() {
     // Display format.
     let text = format!("{}", m_after);
     assert!(text.contains("lookups="), "Display should include lookups");
-    assert!(text.contains("segments="), "Display should include segments");
+    assert!(
+        text.contains("segments="),
+        "Display should include segments"
+    );
 
     println!(
         "[PASS] Metrics fidelity: delta_lookups={delta_lookups}, delta_segments={delta_segments}"
@@ -322,7 +329,10 @@ fn test_edge_cases() {
 
     // Debug format.
     let dbg = format!("{:?}", single);
-    assert!(dbg.contains("LearnedIndex"), "Debug should include type name");
+    assert!(
+        dbg.contains("LearnedIndex"),
+        "Debug should include type name"
+    );
 
     println!("[PASS] Edge cases: empty, single, two, exact, debug all correct");
 }

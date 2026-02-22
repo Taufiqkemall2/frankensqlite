@@ -16,8 +16,7 @@ use std::thread;
 use std::time::Duration;
 
 use fsqlite_mvcc::{
-    QsbrRegistry, RcuCell, RcuPair, RcuTriple, rcu_metrics, record_rcu_reclaimed,
-    reset_rcu_metrics,
+    QsbrRegistry, RcuCell, RcuPair, RcuTriple, rcu_metrics, record_rcu_reclaimed, reset_rcu_metrics,
 };
 
 // ---------------------------------------------------------------------------
@@ -180,10 +179,7 @@ fn test_metrics_integration() {
         m.fsqlite_rcu_grace_period_duration_ns_max > 0,
         "expected non-zero max duration"
     );
-    assert_eq!(
-        m.fsqlite_rcu_reclaimed_total, 5,
-        "expected 5 reclaimed"
-    );
+    assert_eq!(m.fsqlite_rcu_reclaimed_total, 5, "expected 5 reclaimed");
 
     // Verify serialization.
     let json = serde_json::to_string(&m).unwrap();

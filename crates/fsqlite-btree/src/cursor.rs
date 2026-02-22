@@ -940,11 +940,10 @@ impl<P: PageReader> BtCursor<P> {
                         self.stack.last_mut().unwrap().cell_idx = next_child_idx;
                         self.issue_prefetch_hint(cx, child);
                         return self.move_to_leftmost_leaf(cx, child, true);
-                    } else {
-                        // Index B-trees: the separator cell is the next record.
-                        self.at_eof = false;
-                        return Ok(true);
                     }
+                    // Index B-trees: the separator cell is the next record.
+                    self.at_eof = false;
+                    return Ok(true);
                 }
                 // cell_idx == cell_count means we already visited right_child.
                 self.stack.pop();
@@ -1013,12 +1012,11 @@ impl<P: PageReader> BtCursor<P> {
                         self.stack.last_mut().unwrap().cell_idx = prev_child_idx;
                         self.issue_prefetch_hint(cx, child);
                         return self.move_to_rightmost_leaf(cx, child, true);
-                    } else {
-                        // Index B-trees: stop at the separator cell.
-                        self.stack.last_mut().unwrap().cell_idx = prev_child_idx;
-                        self.at_eof = false;
-                        return Ok(true);
                     }
+                    // Index B-trees: stop at the separator cell.
+                    self.stack.last_mut().unwrap().cell_idx = prev_child_idx;
+                    self.at_eof = false;
+                    return Ok(true);
                 }
                 // cell_idx == 0 means we came from the leftmost child.
                 self.stack.pop();
@@ -2408,7 +2406,9 @@ mod tests {
     #[test]
     fn test_cursor_table_seek_past_end_then_insert() {
         let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[(1, b"one"), (2, b"two")]));
+        store
+            .pages
+            .insert(2, build_leaf_table(&[(1, b"one"), (2, b"two")]));
 
         let cx = Cx::new();
         let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
@@ -2443,7 +2443,9 @@ mod tests {
     #[test]
     fn test_cursor_prev_from_seek_past_end_lands_on_last_entry() {
         let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[(1, b"a"), (2, b"b"), (3, b"c")]));
+        store
+            .pages
+            .insert(2, build_leaf_table(&[(1, b"a"), (2, b"b"), (3, b"c")]));
 
         let cx = Cx::new();
         let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
@@ -2459,7 +2461,9 @@ mod tests {
     #[test]
     fn test_cursor_next_after_prev_from_first_recovers() {
         let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[(1, b"a"), (2, b"b"), (3, b"c")]));
+        store
+            .pages
+            .insert(2, build_leaf_table(&[(1, b"a"), (2, b"b"), (3, b"c")]));
 
         let cx = Cx::new();
         let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
@@ -2477,7 +2481,9 @@ mod tests {
     #[test]
     fn test_cursor_prev_after_next_from_last_recovers() {
         let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[(1, b"a"), (2, b"b"), (3, b"c")]));
+        store
+            .pages
+            .insert(2, build_leaf_table(&[(1, b"a"), (2, b"b"), (3, b"c")]));
 
         let cx = Cx::new();
         let mut cursor = BtCursor::new(store, pn(2), USABLE, true);

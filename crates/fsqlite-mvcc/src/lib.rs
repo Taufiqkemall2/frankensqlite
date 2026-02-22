@@ -13,8 +13,8 @@ pub mod compat;
 pub mod conflict_model;
 pub mod coordinator_ipc;
 pub mod core_types;
-pub mod differential_privacy;
 pub mod deterministic_rebase;
+pub mod differential_privacy;
 pub mod ebr;
 pub mod flat_combining;
 pub mod gc;
@@ -90,14 +90,14 @@ pub use core_types::{
     VersionIdx, cleanup_and_raise_gc_horizon, cleanup_orphaned_slots, raise_gc_horizon,
     try_cleanup_orphaned_slot, try_cleanup_sentinel_slot,
 };
-pub use differential_privacy::{
-    DpEngine, DpError, DpMetrics, DpQueryResult, NoiseMechanism, PrivacyBudget, dp_metrics,
-    reset_dp_metrics, sensitivity,
-};
 pub use deterministic_rebase::{
     BaseRowReader, RebaseEligibility, RebaseError, RebaseResult, RebaseSchemaLookup, ReplayResult,
     TableConstraints, UpdateExpressionCandidate, can_emit_update_expression,
     check_rebase_eligibility, check_schema_epoch, deterministic_rebase, replay_update_expression,
+};
+pub use differential_privacy::{
+    DpEngine, DpError, DpMetrics, DpQueryResult, NoiseMechanism, PrivacyBudget, dp_metrics,
+    reset_dp_metrics, sensitivity,
 };
 pub use ebr::{
     ReaderPinSnapshot, StaleReaderConfig, VersionGuard, VersionGuardRegistry, VersionGuardTicket,
@@ -129,8 +129,8 @@ pub use index_regen::{
 };
 pub use invariants::{
     CHAIN_HEAD_EMPTY, CHAIN_HEAD_SHARDS, CasInstallResult, ChainHeadTable, SerializedWriteMutex,
-    SnapshotResolveTrace, TxnManager, VersionStore, VersionVisibilityRange,
-    idx_to_version_pointer, visible,
+    SnapshotResolveTrace, TxnManager, VersionStore, VersionVisibilityRange, idx_to_version_pointer,
+    visible,
 };
 pub use left_right::{
     LeftRight, LeftRightMetrics, LeftRightPair, LeftRightTriple, leftright_metrics,
@@ -145,10 +145,6 @@ pub use observability::{
     record_snapshot_read_versions_traversed, record_ssi_abort, record_ssi_commit,
     reset_cas_metrics, reset_mvcc_snapshot_metrics, reset_ssi_metrics, ssi_metrics_snapshot,
 };
-pub use rcu::{
-    MAX_RCU_THREADS, QsbrHandle, QsbrRegistry, RcuCell, RcuMetrics, RcuPair, RcuTriple,
-    record_rcu_reclaimed, reset_rcu_metrics, rcu_metrics,
-};
 pub use physical_merge::{
     CellOp, CellOpKind, FreeSpaceOp, HeaderOp, MergeError, MergeLadderResult, ParsedCell,
     ParsedPage, RangeXorPatch, StructuredPagePatch, apply_patch, diff_parsed_pages,
@@ -156,10 +152,12 @@ pub use physical_merge::{
 };
 pub use provenance::{
     ProvenanceAnnotation, ProvenanceMetrics, ProvenanceMode, ProvenanceReport, ProvenanceToken,
-    ProvenanceTracker, TupleId, WhyNotResult, provenance_metrics, reset_provenance_metrics, why_not,
+    ProvenanceTracker, TupleId, WhyNotResult, provenance_metrics, reset_provenance_metrics,
+    why_not,
 };
-pub use seqlock::{
-    SeqLock, SeqLockPair, SeqLockTriple, SeqlockMetrics, reset_seqlock_metrics, seqlock_metrics,
+pub use rcu::{
+    MAX_RCU_THREADS, QsbrHandle, QsbrRegistry, RcuCell, RcuMetrics, RcuPair, RcuTriple,
+    rcu_metrics, record_rcu_reclaimed, reset_rcu_metrics,
 };
 pub use retry_policy::{
     BetaPosterior, ContentionBucketKey, DEFAULT_CANDIDATE_WAITS_MS, DEFAULT_STARVATION_THRESHOLD,
@@ -170,6 +168,9 @@ pub use retry_policy::{
 pub use rowid_alloc::{
     AllocatorKey, ConcurrentRowIdAllocator, DEFAULT_RANGE_SIZE, LocalRowIdCache, RangeReservation,
     RowIdAllocError, SQLITE_FULL, SQLITE_SCHEMA,
+};
+pub use seqlock::{
+    SeqLock, SeqLockPair, SeqLockTriple, SeqlockMetrics, reset_seqlock_metrics, seqlock_metrics,
 };
 pub use shared_lock_table::{
     AcquireResult, DEFAULT_TABLE_CAPACITY, DrainStatus, RebuildLeaseError,

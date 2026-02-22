@@ -135,9 +135,7 @@ fn test_bounded_retry_under_contention() {
     assert!(total_reads > 0, "readers must have read");
     assert_eq!(total_failures, 0, "no reads should hit MAX_RETRIES");
 
-    println!(
-        "[PASS] Bounded retry: writes={writes} reads={total_reads} failures={total_failures}"
-    );
+    println!("[PASS] Bounded retry: writes={writes} reads={total_reads} failures={total_failures}");
 }
 
 // ---------------------------------------------------------------------------
@@ -176,11 +174,7 @@ fn test_pair_config_consistency() {
                 let mut reads = 0u64;
                 while !rs.load(Ordering::Relaxed) {
                     if let Some((a, b)) = rc.read("config_pair") {
-                        assert_eq!(
-                            b,
-                            a * 100,
-                            "torn read: schema_epoch={a}, commit_seq={b}"
-                        );
+                        assert_eq!(b, a * 100, "torn read: schema_epoch={a}, commit_seq={b}");
                         reads += 1;
                     }
                 }
@@ -374,9 +368,7 @@ fn test_sequence_monotonicity() {
         "final seq should be 2*writes={expected_seq}, got {final_seq}"
     );
 
-    println!(
-        "[PASS] Sequence monotonicity: {checks} checks, final_seq={final_seq} (2*{writes})"
-    );
+    println!("[PASS] Sequence monotonicity: {checks} checks, final_seq={final_seq} (2*{writes})");
 }
 
 // ---------------------------------------------------------------------------

@@ -519,7 +519,9 @@ pub fn integrity_check_level1_page(
 
         let cell_count = u16::from_be_bytes([page[3], page[4]]);
         let raw_cell_content_offset = u16::from_be_bytes([page[5], page[6]]);
-        let cell_content_offset = if raw_cell_content_offset == 0 && (page.len() == 65_536 || (page_number == 1 && page.len() == 65_536 - 100)) {
+        let cell_content_offset = if raw_cell_content_offset == 0
+            && (page.len() == 65_536 || (page_number == 1 && page.len() == 65_536 - 100))
+        {
             page.len()
         } else {
             usize::from(raw_cell_content_offset)

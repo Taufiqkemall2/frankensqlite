@@ -42,7 +42,8 @@ pub fn sketch_telemetry_metrics() -> SketchTelemetryMetrics {
     SketchTelemetryMetrics {
         fsqlite_sketch_memory_bytes: FSQLITE_SKETCH_MEMORY_BYTES.load(Ordering::Relaxed),
         fsqlite_sketch_estimates_total: FSQLITE_SKETCH_ESTIMATES_TOTAL.load(Ordering::Relaxed),
-        fsqlite_sketch_observations_total: FSQLITE_SKETCH_OBSERVATIONS_TOTAL.load(Ordering::Relaxed),
+        fsqlite_sketch_observations_total: FSQLITE_SKETCH_OBSERVATIONS_TOTAL
+            .load(Ordering::Relaxed),
     }
 }
 
@@ -257,8 +258,8 @@ pub const HISTOGRAM_VERSION: &str = "fsqlite:histogram:streaming:v1";
 
 /// Default bucket boundaries for latency histograms (microseconds).
 pub const DEFAULT_LATENCY_BUCKETS_US: &[u64] = &[
-    1, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000,
-    250_000, 500_000, 1_000_000,
+    1, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000,
+    500_000, 1_000_000,
 ];
 
 /// Streaming histogram with configurable bucket boundaries.
@@ -387,7 +388,11 @@ impl StreamingHistogram {
     /// Uses linear interpolation within buckets. Returns the upper boundary of
     /// the bucket containing the target rank.
     #[must_use]
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     pub fn percentile(&self, p: f64) -> u64 {
         record_estimate();
         if self.count == 0 {
@@ -645,7 +650,11 @@ impl SlidingWindowHistogram {
 
     /// Estimate the p-th percentile across the entire window.
     #[must_use]
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     pub fn percentile(&self, p: f64) -> u64 {
         record_estimate();
         let total = self.count();
@@ -881,8 +890,7 @@ impl SlidingWindowCms {
     /// Memory footprint in bytes.
     #[must_use]
     pub fn memory_bytes(&self) -> usize {
-        self.config.num_slots * self.width * self.depth * 8
-            + self.config.num_slots * 8 * 2
+        self.config.num_slots * self.width * self.depth * 8 + self.config.num_slots * 8 * 2
     }
 }
 
@@ -934,11 +942,14 @@ impl MemoryAllocationTracker {
     /// Create a new allocation tracker with default settings.
     #[must_use]
     pub fn new() -> Self {
-        Self::with_config(DEFAULT_ALLOC_SIZE_BUCKETS, &CountMinSketchConfig {
-            width: 1024,
-            depth: 4,
-            seed: 0xA110C,
-        })
+        Self::with_config(
+            DEFAULT_ALLOC_SIZE_BUCKETS,
+            &CountMinSketchConfig {
+                width: 1024,
+                depth: 4,
+                seed: 0xA110C,
+            },
+        )
     }
 
     /// Create with custom settings.
@@ -1113,7 +1124,10 @@ mod tests {
         }
 
         let heavy_est = cms.estimate(1);
-        assert_eq!(heavy_est, 10_000, "heavy hitter should be exact in a wide sketch");
+        assert_eq!(
+            heavy_est, 10_000,
+            "heavy hitter should be exact in a wide sketch"
+        );
 
         let light_est = cms.estimate(50);
         assert!(
@@ -1235,7 +1249,10 @@ mod tests {
         assert_eq!(h.count(), 4);
         assert_eq!(h.bucket_count(), 18);
 
-        println!("[PASS] histogram default latency: 18 buckets, {} obs", h.count());
+        println!(
+            "[PASS] histogram default latency: 18 buckets, {} obs",
+            h.count()
+        );
     }
 
     #[test]
@@ -1343,7 +1360,11 @@ mod tests {
         assert_eq!(swh.count(), 4);
         assert_eq!(swh.active_slots(), 1);
 
-        println!("[PASS] sliding_window_histogram basic: count={} active_slots={}", swh.count(), swh.active_slots());
+        println!(
+            "[PASS] sliding_window_histogram basic: count={} active_slots={}",
+            swh.count(),
+            swh.active_slots()
+        );
     }
 
     #[test]
@@ -1437,7 +1458,10 @@ mod tests {
         swh.observe(20, 2_000_000);
 
         let mean = swh.mean();
-        assert!((mean - 20.0).abs() < 0.001, "mean should be 20.0, got {mean}");
+        assert!(
+            (mean - 20.0).abs() < 0.001,
+            "mean should be 20.0, got {mean}"
+        );
 
         println!("[PASS] sliding_window_histogram mean: {mean}");
     }
@@ -1668,7 +1692,10 @@ mod tests {
         let mem = swh.memory_bytes();
         // 4 slots * 4 buckets * 8 bytes + 4 slots * 3 vecs * 8 bytes + 3 boundaries * 8 bytes
         let expected = 4 * 4 * 8 + 4 * 8 * 3 + 3 * 8;
-        assert_eq!(mem, expected, "memory_bytes should be {expected}, got {mem}");
+        assert_eq!(
+            mem, expected,
+            "memory_bytes should be {expected}, got {mem}"
+        );
 
         println!("[PASS] sliding_window_histogram memory_bytes: {mem}");
     }
@@ -1688,7 +1715,10 @@ mod tests {
         let mem = swcms.memory_bytes();
         // 3 slots * 128 * 2 * 8 + 3 * 8 * 2
         let expected = 3 * 128 * 2 * 8 + 3 * 8 * 2;
-        assert_eq!(mem, expected, "memory_bytes should be {expected}, got {mem}");
+        assert_eq!(
+            mem, expected,
+            "memory_bytes should be {expected}, got {mem}"
+        );
 
         println!("[PASS] sliding_window_cms memory_bytes: {mem}");
     }

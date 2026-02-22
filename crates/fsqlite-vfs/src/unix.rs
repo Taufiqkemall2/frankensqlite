@@ -321,10 +321,7 @@ struct InodeInfo {
 
 impl InodeInfo {
     fn new(file: Arc<File>) -> Self {
-        Self {
-            file,
-            n_ref: 0,
-        }
+        Self { file, n_ref: 0 }
     }
 }
 
@@ -1391,8 +1388,6 @@ impl UnixFile {
             .as_ref()
             .map(|info| info.lock().expect("shm info lock poisoned").read_marks())
     }
-
-
 }
 
 impl VfsFile for UnixFile {
@@ -1545,12 +1540,11 @@ impl VfsFile for UnixFile {
                 replacement_guard[..copy_len].copy_from_slice(&existing_guard[..copy_len]);
             }
             let region_count = u64::from(region) + 1;
-            let target_len =
-                region_count
-                    .checked_mul(u64::from(size))
-                    .ok_or_else(|| FrankenError::LockFailed {
-                        detail: "shm_map file length overflow".to_string(),
-                    })?;
+            let target_len = region_count.checked_mul(u64::from(size)).ok_or_else(|| {
+                FrankenError::LockFailed {
+                    detail: "shm_map file length overflow".to_string(),
+                }
+            })?;
             info.file.set_len(target_len).map_err(FrankenError::Io)?;
             info.regions.insert(region, replacement.clone());
             drop(info);
@@ -2053,8 +2047,6 @@ mod tests {
         vfs.randomness(&cx, &mut buf2);
         assert_ne!(buf1, buf2, "randomness should produce different outputs");
     }
-
-
 
     #[test]
     fn test_compat_reader_acquires_wal_read_lock() {

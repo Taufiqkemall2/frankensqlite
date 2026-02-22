@@ -13,8 +13,7 @@
 //!  10. Machine-readable conformance output
 
 use fsqlite_core::por::{
-    PorChallenge, GLOBAL_POR_METRICS, PorMetrics,
-    compute_por_proof, run_por_audit,
+    GLOBAL_POR_METRICS, PorChallenge, PorMetrics, compute_por_proof, run_por_audit,
 };
 
 /// Create N deterministic pages (4096 bytes each).
@@ -71,8 +70,7 @@ fn test_challenge_diversity() {
         .collect();
 
     // All nonces should be distinct.
-    let nonces: std::collections::HashSet<[u8; 32]> =
-        challenges.iter().map(|c| c.nonce).collect();
+    let nonces: std::collections::HashSet<[u8; 32]> = challenges.iter().map(|c| c.nonce).collect();
     assert_eq!(nonces.len(), seeds.len(), "all nonces must be distinct");
 
     // All page index sets should be distinct.
@@ -188,7 +186,10 @@ fn test_audit_lifecycle() {
         },
         |i| pages.get(i as usize).cloned(),
     );
-    assert!(!result_corrupt.valid, "audit should fail with corrupted prover");
+    assert!(
+        !result_corrupt.valid,
+        "audit should fail with corrupted prover"
+    );
 
     println!(
         "[PASS] Audit lifecycle: pass (same data), fail (corrupt prover), duration={}us",
@@ -205,24 +206,15 @@ fn test_missing_page_detection() {
     let pages = make_pages(10);
 
     // Prover returns None for all pages.
-    let result = run_por_audit(
-        42,
-        10,
-        5,
-        |_| None,
-        |i| pages.get(i as usize).cloned(),
-    );
+    let result = run_por_audit(42, 10, 5, |_| None, |i| pages.get(i as usize).cloned());
     assert!(!result.valid, "audit should fail when prover returns None");
 
     // Verifier returns None.
-    let result2 = run_por_audit(
-        42,
-        10,
-        5,
-        |i| pages.get(i as usize).cloned(),
-        |_| None,
+    let result2 = run_por_audit(42, 10, 5, |i| pages.get(i as usize).cloned(), |_| None);
+    assert!(
+        !result2.valid,
+        "audit should fail when verifier returns None"
     );
-    assert!(!result2.valid, "audit should fail when verifier returns None");
 
     // Single page missing in prover.
     let challenge = PorChallenge::from_seed(42, 10, 5);
@@ -300,20 +292,20 @@ fn test_metrics_fidelity() {
     }
 
     // 1 failing audit.
-    run_por_audit(
-        200,
-        10,
-        5,
-        |_| None,
-        |i| pages.get(i as usize).cloned(),
-    );
+    run_por_audit(200, 10, 5, |_| None, |i| pages.get(i as usize).cloned());
 
     let m_after = GLOBAL_POR_METRICS.snapshot();
     let delta_audits = m_after.audits_total - m_before.audits_total;
     let delta_failures = m_after.failures_total - m_before.failures_total;
 
-    assert!(delta_audits >= 4, "should record at least 4 audits, got {delta_audits}");
-    assert!(delta_failures >= 1, "should record at least 1 failure, got {delta_failures}");
+    assert!(
+        delta_audits >= 4,
+        "should record at least 4 audits, got {delta_audits}"
+    );
+    assert!(
+        delta_failures >= 1,
+        "should record at least 1 failure, got {delta_failures}"
+    );
 
     // PorMetrics::new() / record / snapshot / reset.
     let local = PorMetrics::new();
@@ -368,7 +360,10 @@ fn test_large_page_count() {
     let challenge = PorChallenge::from_seed(0xCAFEBABE, 10_000, 100);
     let min_idx = challenge.page_indices.first().copied().unwrap();
     let max_idx = challenge.page_indices.last().copied().unwrap();
-    assert!(max_idx - min_idx > 100, "challenge should span a wide range");
+    assert!(
+        max_idx - min_idx > 100,
+        "challenge should span a wide range"
+    );
 
     println!(
         "[PASS] Large page count: 10K pages, 100 challenged, range=[{min_idx},{max_idx}], passed"
@@ -405,7 +400,9 @@ fn test_conformance_summary() {
 
     // Property 4: Audit passes with same data.
     let audit = run_por_audit(
-        1, 20, 5,
+        1,
+        20,
+        5,
         |i| pages.get(i as usize).cloned(),
         |i| pages.get(i as usize).cloned(),
     );

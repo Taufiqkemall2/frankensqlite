@@ -13,11 +13,6 @@ pub mod wal;
 pub mod wal_fec;
 pub mod wal_index;
 
-pub use group_commit::{
-    ConsolidationMetrics, ConsolidationMetricsSnapshot, ConsolidationPhase,
-    FrameSubmission, GLOBAL_CONSOLIDATION_METRICS, GroupCommitConfig, GroupCommitConsolidator,
-    SubmitOutcome, TransactionFrameBatch, write_consolidated_frames,
-};
 pub use checkpoint::{
     CheckpointMode, CheckpointPlan, CheckpointPostAction, CheckpointProgress, CheckpointState,
     plan_checkpoint,
@@ -43,6 +38,11 @@ pub use checksum::{
     verify_wal_fec_source_hash, wal_fec_source_hash_xxh3_128, wal_frame_db_size,
     wal_header_checksum, write_page_checksum, write_wal_frame_checksum, write_wal_frame_salts,
     write_wal_header_checksum, write_wal_header_salts, zero_page_checksum_trailer,
+};
+pub use group_commit::{
+    ConsolidationMetrics, ConsolidationMetricsSnapshot, ConsolidationPhase, FrameSubmission,
+    GLOBAL_CONSOLIDATION_METRICS, GroupCommitConfig, GroupCommitConsolidator, SubmitOutcome,
+    TransactionFrameBatch, write_consolidated_frames,
 };
 pub use metrics::{
     GLOBAL_GROUP_COMMIT_METRICS, GLOBAL_WAL_FEC_REPAIR_METRICS, GLOBAL_WAL_METRICS,

@@ -6,9 +6,7 @@
 
 use std::sync::Arc;
 
-use fsqlite_btree::cooling::{
-    CoolingConfig, CoolingStateMachine, cooling_metrics_snapshot,
-};
+use fsqlite_btree::cooling::{CoolingConfig, CoolingStateMachine, cooling_metrics_snapshot};
 use fsqlite_btree::swizzle::PageTemperature;
 
 const BEAD_ID: &str = "bd-2uza4.3";
@@ -94,7 +92,10 @@ fn test_re_heat_on_load() {
 
     // Re-load → should re-heat.
     let was_cold = csm.load_page(1, 0x2000);
-    assert!(!was_cold, "bead_id={BEAD_ID} case=load_cooling_returns_false");
+    assert!(
+        !was_cold,
+        "bead_id={BEAD_ID} case=load_cooling_returns_false"
+    );
     assert_eq!(
         csm.temperature(1),
         Some(PageTemperature::Hot),
@@ -142,7 +143,10 @@ fn test_root_pinning() {
 
     // Cannot evict pinned root.
     let err = csm.evict_page(1).unwrap_err();
-    assert_eq!(err, "page is a pinned root", "bead_id={BEAD_ID} case=cannot_evict_pinned");
+    assert_eq!(
+        err, "page is a pinned root",
+        "bead_id={BEAD_ID} case=cannot_evict_pinned"
+    );
 
     assert!(csm.is_pinned(1));
     assert!(!csm.is_pinned(3));
@@ -364,8 +368,8 @@ fn test_conformance_summary() {
     for _ in 0..5 {
         csm.run_cooling_scan();
     }
-    let pass_pinning = csm.temperature(3) == Some(PageTemperature::Hot)
-        && csm.evict_page(3).is_err();
+    let pass_pinning =
+        csm.temperature(3) == Some(PageTemperature::Hot) && csm.evict_page(3).is_err();
 
     // Eviction protocol.
     csm.register_page(4);
@@ -411,12 +415,30 @@ fn test_conformance_summary() {
     let total = checks.len();
 
     println!("\n=== {BEAD_ID} Cooling State Machine Conformance ===");
-    println!("  lifecycle:   {}", if pass_lifecycle { "PASS" } else { "FAIL" });
-    println!("  re-heat:     {}", if pass_reheat { "PASS" } else { "FAIL" });
-    println!("  pinning:     {}", if pass_pinning { "PASS" } else { "FAIL" });
-    println!("  eviction:    {}", if pass_evict { "PASS" } else { "FAIL" });
-    println!("  counts:      {}", if pass_counts { "PASS" } else { "FAIL" });
-    println!("  concurrent:  {}", if pass_concurrent { "PASS" } else { "FAIL" });
+    println!(
+        "  lifecycle:   {}",
+        if pass_lifecycle { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  re-heat:     {}",
+        if pass_reheat { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  pinning:     {}",
+        if pass_pinning { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  eviction:    {}",
+        if pass_evict { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  counts:      {}",
+        if pass_counts { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  concurrent:  {}",
+        if pass_concurrent { "PASS" } else { "FAIL" }
+    );
     println!("  [{passed}/{total}] conformance checks passed");
 
     assert_eq!(

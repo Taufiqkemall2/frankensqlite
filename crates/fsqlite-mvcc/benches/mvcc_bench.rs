@@ -17,15 +17,15 @@ use std::time::Duration;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use fsqlite_mvcc::{
-    ActiveTxnView, BeginKind, ChainHeadTable, CommitIndex, CommittedWriterInfo,
-    ConcurrentRegistry, DiscoveredEdge, GcTodo, InProcessPageLockTable, TransactionManager,
-    VersionArena, discover_incoming_edges, discover_outgoing_edges, gc_tick,
-    prune_page_chain, validate_first_committer_wins,
+    ActiveTxnView, BeginKind, ChainHeadTable, CommitIndex, CommittedWriterInfo, ConcurrentRegistry,
+    DiscoveredEdge, GcTodo, InProcessPageLockTable, TransactionManager, VersionArena,
+    discover_incoming_edges, discover_outgoing_edges, gc_tick, prune_page_chain,
+    validate_first_committer_wins,
 };
 use fsqlite_observability::{ConflictObserver, MetricsObserver};
 use fsqlite_types::{
-    CommitSeq, PageData, PageNumber, PageSize, PageVersion, SchemaEpoch,
-    Snapshot, TxnEpoch, TxnId, TxnToken, VersionPointer, WitnessKey,
+    CommitSeq, PageData, PageNumber, PageSize, PageVersion, SchemaEpoch, Snapshot, TxnEpoch, TxnId,
+    TxnToken, VersionPointer, WitnessKey,
 };
 
 fn criterion_config() -> Criterion {
@@ -475,12 +475,7 @@ fn bench_gc_prune(c: &mut Criterion) {
                     |(mut arena, chain_heads)| {
                         // Prune everything below horizon (keep only the newest).
                         let horizon = CommitSeq::new(u64::from(depth) - 1);
-                        black_box(prune_page_chain(
-                            page(1),
-                            horizon,
-                            &mut arena,
-                            &chain_heads,
-                        ));
+                        black_box(prune_page_chain(page(1), horizon, &mut arena, &chain_heads));
                     },
                     BatchSize::SmallInput,
                 );

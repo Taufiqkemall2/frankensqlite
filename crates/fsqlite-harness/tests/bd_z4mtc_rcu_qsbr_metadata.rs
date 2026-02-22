@@ -18,8 +18,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use fsqlite_mvcc::{
-    QsbrRegistry, RcuCell, RcuPair, RcuTriple, rcu_metrics,
-    record_rcu_reclaimed, MAX_RCU_THREADS,
+    MAX_RCU_THREADS, QsbrRegistry, RcuCell, RcuPair, RcuTriple, rcu_metrics, record_rcu_reclaimed,
 };
 
 // ---------------------------------------------------------------------------
@@ -123,9 +122,7 @@ fn test_grace_period_latency() {
         "max grace period latency too high: {max_lat:?}"
     );
 
-    println!(
-        "[PASS] Grace period latency: 20 rounds, max={max_lat:?}, 4 reader threads"
-    );
+    println!("[PASS] Grace period latency: 20 rounds, max={max_lat:?}, 4 reader threads");
 }
 
 // ---------------------------------------------------------------------------
@@ -199,9 +196,7 @@ fn test_rcu_cell_concurrent_reads() {
     let final_val = cell.read();
     assert_eq!(final_val, writes, "final value mismatch");
 
-    println!(
-        "[PASS] RcuCell concurrent: writes={writes} total_reads={total_reads} (8 readers)"
-    );
+    println!("[PASS] RcuCell concurrent: writes={writes} total_reads={total_reads} (8 readers)");
 }
 
 // ---------------------------------------------------------------------------
@@ -275,9 +270,7 @@ fn test_rcu_pair_no_torn_reads() {
     assert!(writes > 0);
     assert!(total_reads > 0);
 
-    println!(
-        "[PASS] RcuPair no torn reads: writes={writes} reads={total_reads} torn=0"
-    );
+    println!("[PASS] RcuPair no torn reads: writes={writes} reads={total_reads} torn=0");
 }
 
 // ---------------------------------------------------------------------------
@@ -351,9 +344,7 @@ fn test_rcu_triple_no_torn_reads() {
     assert!(writes > 0);
     assert!(total_reads > 0);
 
-    println!(
-        "[PASS] RcuTriple no torn reads: writes={writes} reads={total_reads} torn=0"
-    );
+    println!("[PASS] RcuTriple no torn reads: writes={writes} reads={total_reads} torn=0");
 }
 
 // ---------------------------------------------------------------------------
@@ -477,9 +468,7 @@ fn test_read_dominated_schema_cache() {
         "read/write ratio should be > 100:1, got {ratio}:1 (reads={reads} writes={writes})"
     );
 
-    println!(
-        "[PASS] Read-dominated schema cache: reads={reads} writes={writes} ratio={ratio}:1"
-    );
+    println!("[PASS] Read-dominated schema cache: reads={reads} writes={writes} ratio={ratio}:1");
 }
 
 // ---------------------------------------------------------------------------
@@ -504,16 +493,19 @@ fn test_metrics_fidelity() {
     let m_after = rcu_metrics();
     drop(h);
 
-    let delta_gp = m_after.fsqlite_rcu_grace_periods_total
-        - m_before.fsqlite_rcu_grace_periods_total;
+    let delta_gp =
+        m_after.fsqlite_rcu_grace_periods_total - m_before.fsqlite_rcu_grace_periods_total;
     let delta_ns = m_after.fsqlite_rcu_grace_period_duration_ns_total
         - m_before.fsqlite_rcu_grace_period_duration_ns_total;
-    let delta_reclaimed = m_after.fsqlite_rcu_reclaimed_total
-        - m_before.fsqlite_rcu_reclaimed_total;
+    let delta_reclaimed =
+        m_after.fsqlite_rcu_reclaimed_total - m_before.fsqlite_rcu_reclaimed_total;
 
     assert_eq!(delta_gp, 5, "should record 5 grace periods");
     assert!(delta_ns > 0, "total grace period duration should be > 0");
-    assert!(delta_reclaimed >= 3, "should record at least 3 reclamations");
+    assert!(
+        delta_reclaimed >= 3,
+        "should record at least 3 reclamations"
+    );
     assert!(
         m_after.fsqlite_rcu_grace_period_duration_ns_max > 0,
         "max grace period should be > 0"
@@ -557,9 +549,7 @@ fn test_slot_reuse() {
     assert_eq!(h5.slot(), slot3, "should reuse freed middle slot {slot3}");
     assert_eq!(reg.active_threads(), 3);
 
-    println!(
-        "[PASS] Slot reuse: slot {slot1} reused, middle slot {slot3} reused after drop"
-    );
+    println!("[PASS] Slot reuse: slot {slot1} reused, middle slot {slot3} reused after drop");
 }
 
 // ---------------------------------------------------------------------------
@@ -618,8 +608,14 @@ fn test_conformance_summary() {
     println!("  [CONFORM] RcuCell read/write: publish(99) -> read()=99");
     println!("  [CONFORM] RcuPair snapshot: publish(10,20) -> read()=({a},{b})");
     println!("  [CONFORM] RcuTriple snapshot: publish(10,20,30) -> read()=({x},{y},{z})");
-    println!("  [CONFORM] Epoch monotonicity: {e_before} -> {}", e_before + 1);
-    println!("  [CONFORM] Metrics: grace_periods={}", m.fsqlite_rcu_grace_periods_total);
+    println!(
+        "  [CONFORM] Epoch monotonicity: {e_before} -> {}",
+        e_before + 1
+    );
+    println!(
+        "  [CONFORM] Metrics: grace_periods={}",
+        m.fsqlite_rcu_grace_periods_total
+    );
     println!("  Conformance: 6 / 6 (100.0%)");
 
     assert!(cap_ok, "QSBR capacity should be 64");

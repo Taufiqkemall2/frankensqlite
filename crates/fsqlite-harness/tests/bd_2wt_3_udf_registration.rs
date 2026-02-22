@@ -309,11 +309,18 @@ fn test_scalar_udf_registration_and_invocation() {
 
     // Float argument
     let result = query_first_float(&conn, "SELECT double(1.5)");
-    assert!((result - 3.0).abs() < 1e-10, "double(1.5) should return 3.0");
+    assert!(
+        (result - 3.0).abs() < 1e-10,
+        "double(1.5) should return 3.0"
+    );
 
     // NULL propagation
     let rows = conn.query("SELECT double(NULL)").expect("query");
-    assert_eq!(rows[0].values()[0], SqliteValue::Null, "double(NULL) should return NULL");
+    assert_eq!(
+        rows[0].values()[0],
+        SqliteValue::Null,
+        "double(NULL) should return NULL"
+    );
 
     // Multiple-arg UDF: add3(a, b, c)
     conn.register_scalar_function(Add3Func);
@@ -323,10 +330,16 @@ fn test_scalar_udf_registration_and_invocation() {
     // Text-returning UDF: greet(name)
     conn.register_scalar_function(GreetFunc);
     let result = query_first_text(&conn, "SELECT greet('World')");
-    assert_eq!(result, "Hello, World!", "greet('World') should return 'Hello, World!'");
+    assert_eq!(
+        result, "Hello, World!",
+        "greet('World') should return 'Hello, World!'"
+    );
 
     let result = query_first_text(&conn, "SELECT greet(NULL)");
-    assert_eq!(result, "Hello, stranger!", "greet(NULL) should return 'Hello, stranger!'");
+    assert_eq!(
+        result, "Hello, stranger!",
+        "greet(NULL) should return 'Hello, stranger!'"
+    );
 
     println!("[PASS] scalar UDF registration and invocation");
 }
@@ -349,11 +362,22 @@ fn test_udf_with_table_queries() {
 
     // UDF in SELECT clause
     let results = query_ints(&conn, "SELECT double(val) FROM nums ORDER BY val");
-    assert_eq!(results, vec![2, 4, 6, 8, 10], "double(val) across table rows");
+    assert_eq!(
+        results,
+        vec![2, 4, 6, 8, 10],
+        "double(val) across table rows"
+    );
 
     // UDF in WHERE clause
-    let results = query_ints(&conn, "SELECT val FROM nums WHERE double(val) > 6 ORDER BY val");
-    assert_eq!(results, vec![4, 5], "WHERE double(val) > 6 filters correctly");
+    let results = query_ints(
+        &conn,
+        "SELECT val FROM nums WHERE double(val) > 6 ORDER BY val",
+    );
+    assert_eq!(
+        results,
+        vec![4, 5],
+        "WHERE double(val) > 6 filters correctly"
+    );
 
     println!("[PASS] UDF with table-backed queries");
 }
@@ -367,12 +391,14 @@ fn test_aggregate_udf_registration_and_invocation() {
     let conn = open_mem();
     conn.register_aggregate_function(ProductAgg);
 
-    conn.execute("CREATE TABLE factors (grp TEXT, val INTEGER)").unwrap();
+    conn.execute("CREATE TABLE factors (grp TEXT, val INTEGER)")
+        .unwrap();
     conn.execute("INSERT INTO factors VALUES ('a', 2)").unwrap();
     conn.execute("INSERT INTO factors VALUES ('a', 3)").unwrap();
     conn.execute("INSERT INTO factors VALUES ('a', 5)").unwrap();
     conn.execute("INSERT INTO factors VALUES ('b', 7)").unwrap();
-    conn.execute("INSERT INTO factors VALUES ('b', 11)").unwrap();
+    conn.execute("INSERT INTO factors VALUES ('b', 11)")
+        .unwrap();
 
     // Aggregate over all rows
     let result = query_first_int(&conn, "SELECT product(val) FROM factors WHERE grp = 'a'");
@@ -411,7 +437,10 @@ fn test_window_udf_registration() {
 
     // The window function is registered; verify it doesn't break normal queries
     let result = query_first_int(&conn, "SELECT 1 + 1");
-    assert_eq!(result, 2, "connection still works after window UDF registration");
+    assert_eq!(
+        result, 2,
+        "connection still works after window UDF registration"
+    );
 
     println!("[PASS] window UDF registration (API surface)");
 }
@@ -542,17 +571,26 @@ fn test_conformance_summary() {
     // 1. Scalar registration
     conn.register_scalar_function(DoubleFunc);
     let v = query_first_int(&conn, "SELECT double(7)");
-    cases.push(TestCase { name: "scalar_register_invoke", pass: v == 14 });
+    cases.push(TestCase {
+        name: "scalar_register_invoke",
+        pass: v == 14,
+    });
 
     // 2. Multi-arg scalar
     conn.register_scalar_function(Add3Func);
     let v = query_first_int(&conn, "SELECT add3(1, 2, 3)");
-    cases.push(TestCase { name: "multi_arg_scalar", pass: v == 6 });
+    cases.push(TestCase {
+        name: "multi_arg_scalar",
+        pass: v == 6,
+    });
 
     // 3. Text-returning scalar
     conn.register_scalar_function(GreetFunc);
     let v = query_first_text(&conn, "SELECT greet('UDF')");
-    cases.push(TestCase { name: "text_returning_scalar", pass: v == "Hello, UDF!" });
+    cases.push(TestCase {
+        name: "text_returning_scalar",
+        pass: v == "Hello, UDF!",
+    });
 
     // 4. NULL propagation
     let rows = conn.query("SELECT double(NULL)").expect("query");
@@ -568,33 +606,51 @@ fn test_conformance_summary() {
     conn.execute("INSERT INTO agg_test VALUES (3)").unwrap();
     conn.execute("INSERT INTO agg_test VALUES (7)").unwrap();
     let v = query_first_int(&conn, "SELECT product(v) FROM agg_test");
-    cases.push(TestCase { name: "aggregate_register_invoke", pass: v == 42 });
+    cases.push(TestCase {
+        name: "aggregate_register_invoke",
+        pass: v == 42,
+    });
 
     // 6. Window registration (API)
     conn.register_window_function(RunningSumWindow);
     let v = query_first_int(&conn, "SELECT 1");
-    cases.push(TestCase { name: "window_register_api", pass: v == 1 });
+    cases.push(TestCase {
+        name: "window_register_api",
+        pass: v == 1,
+    });
 
     // 7. UDF overwrite
     conn.register_scalar_function(TripleFunc); // overwrites "double"
     let v = query_first_int(&conn, "SELECT double(10)");
-    cases.push(TestCase { name: "udf_overwrite", pass: v == 30 });
+    cases.push(TestCase {
+        name: "udf_overwrite",
+        pass: v == 30,
+    });
 
     // 8. Case-insensitive name
     let v = query_first_int(&conn, "SELECT DOUBLE(10)");
-    cases.push(TestCase { name: "case_insensitive", pass: v == 30 });
+    cases.push(TestCase {
+        name: "case_insensitive",
+        pass: v == 30,
+    });
 
     // 9. UDF in table query
     conn.register_scalar_function(DoubleFunc); // re-register original
     conn.execute("CREATE TABLE tbl (x INTEGER)").unwrap();
     conn.execute("INSERT INTO tbl VALUES (5)").unwrap();
     let v = query_first_int(&conn, "SELECT double(x) FROM tbl");
-    cases.push(TestCase { name: "udf_in_table_query", pass: v == 10 });
+    cases.push(TestCase {
+        name: "udf_in_table_query",
+        pass: v == 10,
+    });
 
     // 10. UDF in WHERE
     conn.execute("INSERT INTO tbl VALUES (10)").unwrap();
     let vals = query_ints(&conn, "SELECT x FROM tbl WHERE double(x) >= 20 ORDER BY x");
-    cases.push(TestCase { name: "udf_in_where", pass: vals == vec![10] });
+    cases.push(TestCase {
+        name: "udf_in_where",
+        pass: vals == vec![10],
+    });
 
     // Summary
     let total = cases.len();
@@ -608,20 +664,31 @@ fn test_conformance_summary() {
     println!("  \"total\": {total},");
     println!("  \"passed\": {passed},");
     println!("  \"failed\": {failed},");
-    println!("  \"pass_rate\": \"{:.1}%\",", passed as f64 / total as f64 * 100.0);
+    println!(
+        "  \"pass_rate\": \"{:.1}%\",",
+        passed as f64 / total as f64 * 100.0
+    );
     println!("  \"cases\": [");
     for (i, c) in cases.iter().enumerate() {
         let comma = if i + 1 < total { "," } else { "" };
         let status = if c.pass { "PASS" } else { "FAIL" };
-        println!("    {{ \"name\": \"{}\", \"status\": \"{status}\" }}{comma}", c.name);
+        println!(
+            "    {{ \"name\": \"{}\", \"status\": \"{status}\" }}{comma}",
+            c.name
+        );
     }
     println!("  ]");
     println!("}}");
 
     assert_eq!(
-        failed, 0,
+        failed,
+        0,
         "{failed}/{total} UDF conformance tests failed: {:?}",
-        cases.iter().filter(|c| !c.pass).map(|c| c.name).collect::<Vec<_>>()
+        cases
+            .iter()
+            .filter(|c| !c.pass)
+            .map(|c| c.name)
+            .collect::<Vec<_>>()
     );
 
     println!("[PASS] all {total} UDF conformance tests passed");

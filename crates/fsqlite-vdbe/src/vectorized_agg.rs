@@ -430,40 +430,127 @@ fn build_group_key_column(
     key_idx: usize,
     num_groups: usize,
 ) -> Result<Column, String> {
-    // Build Int64 column for group keys (simplified — all numeric keys).
-    let mut values = Vec::with_capacity(num_groups);
     let mut validity_bytes = vec![0_u8; num_groups.div_ceil(8)];
 
-    for (group_idx, key) in group_keys.iter().enumerate() {
-        let val = &key[key_idx];
-        let i = match val {
-            GroupKeyValue::Null => {
-                values.push(0_i64);
-                continue; // validity bit stays 0
-            }
-            GroupKeyValue::Integer(v) => *v,
-            #[allow(clippy::cast_possible_truncation)]
-            GroupKeyValue::Float(v) => *v as i64,
-            GroupKeyValue::Text(_) | GroupKeyValue::Blob(_) => 0,
-        };
-        values.push(i);
+    let set_valid = |validity_bytes: &mut [u8], group_idx: usize| {
         let byte_idx = group_idx / 8;
         let bit = group_idx % 8;
         validity_bytes[byte_idx] |= 1_u8 << bit;
-    }
+    };
 
-    let aligned = crate::vectorized::AlignedValues::from_vec(
-        values,
-        crate::vectorized::DEFAULT_SIMD_ALIGNMENT_BYTES,
-    )
-    .map_err(|e| e.to_string())?;
+    let data = match spec.vector_type {
+        ColumnVectorType::Int64 => {
+            let mut values = Vec::with_capacity(num_groups);
+            for (group_idx, key) in group_keys.iter().enumerate() {
+                let val = &key[key_idx];
+                let i = match val {
+                    GroupKeyValue::Null => {
+                        values.push(0_i64);
+                        continue;
+                    }
+                    GroupKeyValue::Integer(v) => *v,
+                    #[allow(clippy::cast_possible_truncation)]
+                    GroupKeyValue::Float(v) => *v as i64,
+                    GroupKeyValue::Text(_) | GroupKeyValue::Blob(_) => 0,
+                };
+                values.push(i);
+                set_valid(&mut validity_bytes, group_idx);
+            }
+            let aligned = crate::vectorized::AlignedValues::from_vec(
+                values,
+                crate::vectorized::DEFAULT_SIMD_ALIGNMENT_BYTES,
+            )
+            .map_err(|e| e.to_string())?;
+            ColumnData::Int64(aligned)
+        }
+        ColumnVectorType::Float64 => {
+            let mut values = Vec::with_capacity(num_groups);
+            for (group_idx, key) in group_keys.iter().enumerate() {
+                let val = &key[key_idx];
+                let f = match val {
+                    GroupKeyValue::Null => {
+                        values.push(0.0_f64);
+                        continue;
+                    }
+                    #[allow(clippy::cast_precision_loss)]
+                    GroupKeyValue::Integer(v) => *v as f64,
+                    GroupKeyValue::Float(v) => *v,
+                    GroupKeyValue::Text(_) | GroupKeyValue::Blob(_) => 0.0,
+                };
+                values.push(f);
+                set_valid(&mut validity_bytes, group_idx);
+            }
+            let aligned = crate::vectorized::AlignedValues::from_vec(
+                values,
+                crate::vectorized::DEFAULT_SIMD_ALIGNMENT_BYTES,
+            )
+            .map_err(|e| e.to_string())?;
+            ColumnData::Float64(aligned)
+        }
+        ColumnVectorType::Text => {
+            let mut new_offsets: Vec<u32> = Vec::with_capacity(num_groups + 1);
+            let mut new_data: Vec<u8> = Vec::new();
+            new_offsets.push(0);
+            for (group_idx, key) in group_keys.iter().enumerate() {
+                let val = &key[key_idx];
+                match val {
+                    GroupKeyValue::Null => {}
+                    GroupKeyValue::Text(t) => {
+                        new_data.extend_from_slice(t.as_bytes());
+                        set_valid(&mut validity_bytes, group_idx);
+                    }
+                    _ => {
+                        // fallback coercion not fully implemented
+                        set_valid(&mut validity_bytes, group_idx);
+                    }
+                }
+                #[allow(clippy::cast_possible_truncation)]
+                new_offsets.push(new_data.len() as u32);
+            }
+            ColumnData::Text {
+                offsets: std::sync::Arc::from(new_offsets),
+                data: std::sync::Arc::from(new_data),
+            }
+        }
+        ColumnVectorType::Binary => {
+            let mut new_offsets: Vec<u32> = Vec::with_capacity(num_groups + 1);
+            let mut new_data: Vec<u8> = Vec::new();
+            new_offsets.push(0);
+            for (group_idx, key) in group_keys.iter().enumerate() {
+                let val = &key[key_idx];
+                match val {
+                    GroupKeyValue::Null => {}
+                    GroupKeyValue::Blob(b) => {
+                        new_data.extend_from_slice(b);
+                        set_valid(&mut validity_bytes, group_idx);
+                    }
+                    _ => {
+                        // fallback coercion not fully implemented
+                        set_valid(&mut validity_bytes, group_idx);
+                    }
+                }
+                #[allow(clippy::cast_possible_truncation)]
+                new_offsets.push(new_data.len() as u32);
+            }
+            ColumnData::Binary {
+                offsets: std::sync::Arc::from(new_offsets),
+                data: std::sync::Arc::from(new_data),
+            }
+        }
+        _ => {
+            return Err(format!(
+                "unsupported group key type: {:?}",
+                spec.vector_type
+            ));
+        }
+    };
 
     let validity = NullBitmap::from_bytes(std::sync::Arc::from(validity_bytes), num_groups)
         .map_err(|e| e.to_string())?;
 
     Ok(Column {
         spec: spec.clone(),
-        data: ColumnData::Int64(aligned),
+        data,
         validity,
     })
 }

@@ -9,11 +9,10 @@
 use std::collections::BTreeMap;
 
 use fsqlite_harness::validation_manifest::{
-    ValidationManifest, ValidationManifestConfig,
     COVERAGE_GATE_ID, INVARIANT_DRIFT_GATE_ID, LOGGING_GATE_ID, NO_MOCK_GATE_ID,
-    SCENARIO_DRIFT_GATE_ID, VALIDATION_MANIFEST_SCENARIO_ID,
-    build_validation_manifest_bundle, detect_backward_incompatible_change,
-    validate_manifest_contract,
+    SCENARIO_DRIFT_GATE_ID, VALIDATION_MANIFEST_SCENARIO_ID, ValidationManifest,
+    ValidationManifestConfig, build_validation_manifest_bundle,
+    detect_backward_incompatible_change, validate_manifest_contract,
 };
 
 const BEAD_ID: &str = "bd-mblr.3.5.1.1";
@@ -47,8 +46,7 @@ fn alternate_config() -> ValidationManifestConfig {
 fn build_bundle(
     config: &ValidationManifestConfig,
 ) -> fsqlite_harness::validation_manifest::ValidationManifestBundle {
-    build_validation_manifest_bundle(config)
-        .unwrap_or_else(|e| panic!("bundle build failed: {e}"))
+    build_validation_manifest_bundle(config).unwrap_or_else(|e| panic!("bundle build failed: {e}"))
 }
 
 // ─── Ingestion: JSON Serialization Round-Trip ──────────────────────────
@@ -64,7 +62,10 @@ fn ingestion_json_roundtrip_preserves_all_fields() {
     assert_eq!(restored.run_id, bundle.manifest.run_id);
     assert_eq!(restored.trace_id, bundle.manifest.trace_id);
     assert_eq!(restored.scenario_id, bundle.manifest.scenario_id);
-    assert_eq!(restored.generated_unix_ms, bundle.manifest.generated_unix_ms);
+    assert_eq!(
+        restored.generated_unix_ms,
+        bundle.manifest.generated_unix_ms
+    );
     assert_eq!(restored.commit_sha, bundle.manifest.commit_sha);
     assert_eq!(restored.overall_outcome, bundle.manifest.overall_outcome);
     assert_eq!(restored.overall_pass, bundle.manifest.overall_pass);
@@ -72,7 +73,10 @@ fn ingestion_json_roundtrip_preserves_all_fields() {
     assert_eq!(restored.artifact_uris, bundle.manifest.artifact_uris);
     assert_eq!(restored.replay.command, bundle.manifest.replay.command);
     assert_eq!(restored.replay.root_seed, bundle.manifest.replay.root_seed);
-    assert_eq!(restored.replay.scenario_id, bundle.manifest.replay.scenario_id);
+    assert_eq!(
+        restored.replay.scenario_id,
+        bundle.manifest.replay.scenario_id
+    );
     assert_eq!(restored.summary, bundle.manifest.summary);
 }
 
@@ -121,7 +125,10 @@ fn ingestion_roundtrip_preserves_embedded_reports() {
     );
     assert_eq!(
         restored.scenario_coverage_drift.total_catalog_scenarios,
-        bundle.manifest.scenario_coverage_drift.total_catalog_scenarios
+        bundle
+            .manifest
+            .scenario_coverage_drift
+            .total_catalog_scenarios
     );
     // No-mock
     assert_eq!(
@@ -145,7 +152,10 @@ fn replay_produces_identical_manifest_json() {
 
     let json_a = a.manifest.to_json().unwrap();
     let json_b = b.manifest.to_json().unwrap();
-    assert_eq!(json_a, json_b, "replay from same config must produce identical JSON");
+    assert_eq!(
+        json_a, json_b,
+        "replay from same config must produce identical JSON"
+    );
 }
 
 #[test]
@@ -156,8 +166,14 @@ fn replay_produces_identical_gate_artifacts() {
 
     assert_eq!(a.gate_artifacts.len(), b.gate_artifacts.len());
     for (uri, content_a) in &a.gate_artifacts {
-        let content_b = b.gate_artifacts.get(uri).expect("artifact must exist in both");
-        assert_eq!(content_a, content_b, "artifact {uri} must be identical on replay");
+        let content_b = b
+            .gate_artifacts
+            .get(uri)
+            .expect("artifact must exist in both");
+        assert_eq!(
+            content_a, content_b,
+            "artifact {uri} must be identical on replay"
+        );
     }
 }
 
@@ -166,7 +182,10 @@ fn replay_produces_identical_human_summary() {
     let config = canonical_config();
     let a = build_bundle(&config);
     let b = build_bundle(&config);
-    assert_eq!(a.human_summary, b.human_summary, "human summary must be identical on replay");
+    assert_eq!(
+        a.human_summary, b.human_summary,
+        "human summary must be identical on replay"
+    );
 }
 
 // ─── Replay Contract Reconstruction ───────────────────────────────────
@@ -177,10 +196,16 @@ fn replay_command_contains_all_config_values() {
     let bundle = build_bundle(&config);
     let cmd = &bundle.manifest.replay.command;
 
-    assert!(cmd.contains("validation_manifest_runner"), "missing runner binary");
+    assert!(
+        cmd.contains("validation_manifest_runner"),
+        "missing runner binary"
+    );
     assert!(cmd.contains("--root-seed"), "missing --root-seed");
     assert!(cmd.contains("424242"), "missing root seed value");
-    assert!(cmd.contains("--generated-unix-ms"), "missing --generated-unix-ms");
+    assert!(
+        cmd.contains("--generated-unix-ms"),
+        "missing --generated-unix-ms"
+    );
     assert!(cmd.contains("1710000000000"), "missing timestamp value");
     assert!(cmd.contains("--commit-sha"), "missing --commit-sha");
     assert!(cmd.contains(&config.commit_sha), "missing commit SHA value");
@@ -188,7 +213,10 @@ fn replay_command_contains_all_config_values() {
     assert!(cmd.contains(&config.run_id), "missing run ID value");
     assert!(cmd.contains("--trace-id"), "missing --trace-id");
     assert!(cmd.contains("--scenario-id"), "missing --scenario-id");
-    assert!(cmd.contains("--artifact-uri-prefix"), "missing --artifact-uri-prefix");
+    assert!(
+        cmd.contains("--artifact-uri-prefix"),
+        "missing --artifact-uri-prefix"
+    );
 }
 
 #[test]
@@ -196,7 +224,10 @@ fn replay_contract_seed_matches_config() {
     let config = canonical_config();
     let bundle = build_bundle(&config);
     assert_eq!(bundle.manifest.replay.root_seed, 424_242);
-    assert_eq!(bundle.manifest.replay.scenario_id, VALIDATION_MANIFEST_SCENARIO_ID);
+    assert_eq!(
+        bundle.manifest.replay.scenario_id,
+        VALIDATION_MANIFEST_SCENARIO_ID
+    );
 }
 
 // ─── Ingested Manifest Contract Validation ─────────────────────────────
@@ -208,7 +239,10 @@ fn ingested_manifest_passes_contract_validation() {
     let restored = ValidationManifest::from_json(&json).unwrap();
 
     let errors = validate_manifest_contract(&restored);
-    assert!(errors.is_empty(), "ingested manifest must pass contract: {errors:?}");
+    assert!(
+        errors.is_empty(),
+        "ingested manifest must pass contract: {errors:?}"
+    );
 }
 
 #[test]
@@ -218,7 +252,10 @@ fn ingested_manifest_with_alternate_config_passes_contract() {
     let restored = ValidationManifest::from_json(&json).unwrap();
 
     let errors = validate_manifest_contract(&restored);
-    assert!(errors.is_empty(), "alternate ingested manifest must pass contract: {errors:?}");
+    assert!(
+        errors.is_empty(),
+        "alternate ingested manifest must pass contract: {errors:?}"
+    );
 }
 
 // ─── Gate Completeness Regression ──────────────────────────────────────
@@ -230,9 +267,18 @@ fn ingested_manifest_has_all_five_gates() {
     let restored = ValidationManifest::from_json(&json).unwrap();
 
     let gate_ids: Vec<&str> = restored.gates.iter().map(|g| g.gate_id.as_str()).collect();
-    assert!(gate_ids.contains(&COVERAGE_GATE_ID), "missing coverage gate");
-    assert!(gate_ids.contains(&INVARIANT_DRIFT_GATE_ID), "missing invariant drift gate");
-    assert!(gate_ids.contains(&SCENARIO_DRIFT_GATE_ID), "missing scenario drift gate");
+    assert!(
+        gate_ids.contains(&COVERAGE_GATE_ID),
+        "missing coverage gate"
+    );
+    assert!(
+        gate_ids.contains(&INVARIANT_DRIFT_GATE_ID),
+        "missing invariant drift gate"
+    );
+    assert!(
+        gate_ids.contains(&SCENARIO_DRIFT_GATE_ID),
+        "missing scenario drift gate"
+    );
     assert!(gate_ids.contains(&NO_MOCK_GATE_ID), "missing no-mock gate");
     assert!(gate_ids.contains(&LOGGING_GATE_ID), "missing logging gate");
     assert_eq!(restored.gates.len(), 5, "exactly 5 gates expected");
@@ -258,7 +304,11 @@ fn ingested_artifacts_are_valid_json_or_jsonl() {
     for (uri, content) in &bundle.gate_artifacts {
         if uri.ends_with(".json") {
             let parsed: Result<serde_json::Value, _> = serde_json::from_str(content);
-            assert!(parsed.is_ok(), "artifact {uri} must be valid JSON: {}", parsed.unwrap_err());
+            assert!(
+                parsed.is_ok(),
+                "artifact {uri} must be valid JSON: {}",
+                parsed.unwrap_err()
+            );
         } else if uri.ends_with(".jsonl") {
             for (line_no, line) in content.lines().enumerate() {
                 if line.trim().is_empty() {
@@ -277,8 +327,12 @@ fn ingested_artifacts_are_valid_json_or_jsonl() {
 #[test]
 fn artifact_uris_match_gate_references() {
     let bundle = build_bundle(&canonical_config());
-    let top_level: std::collections::BTreeSet<&str> =
-        bundle.manifest.artifact_uris.iter().map(|u| u.as_str()).collect();
+    let top_level: std::collections::BTreeSet<&str> = bundle
+        .manifest
+        .artifact_uris
+        .iter()
+        .map(|u| u.as_str())
+        .collect();
 
     for gate in &bundle.manifest.gates {
         for uri in &gate.artifact_uris {
@@ -321,7 +375,10 @@ fn same_seed_produces_same_gate_outcomes() {
     assert_eq!(a.manifest.gates.len(), b.manifest.gates.len());
     for (ga, gb) in a.manifest.gates.iter().zip(b.manifest.gates.iter()) {
         assert_eq!(ga.gate_id, gb.gate_id, "gate IDs must match across configs");
-        assert_eq!(ga.outcome, gb.outcome, "gate outcomes must match for same seed");
+        assert_eq!(
+            ga.outcome, gb.outcome,
+            "gate outcomes must match for same seed"
+        );
     }
 }
 
@@ -477,7 +534,10 @@ fn evidence_archive_roundtrip() {
 
     // Verify the restored manifest passes contract validation
     let errors = validate_manifest_contract(&restored);
-    assert!(errors.is_empty(), "archived manifest must pass contract: {errors:?}");
+    assert!(
+        errors.is_empty(),
+        "archived manifest must pass contract: {errors:?}"
+    );
 }
 
 // ─── Logging Gate Evidence Regression ──────────────────────────────────
@@ -486,7 +546,13 @@ fn evidence_archive_roundtrip() {
 fn logging_gate_evidence_includes_validation_report() {
     let bundle = build_bundle(&canonical_config());
     assert_eq!(bundle.manifest.logging_conformance.gate_id, LOGGING_GATE_ID);
-    assert!(!bundle.manifest.logging_conformance.profile_doc_path.is_empty());
+    assert!(
+        !bundle
+            .manifest
+            .logging_conformance
+            .profile_doc_path
+            .is_empty()
+    );
 }
 
 #[test]
@@ -499,14 +565,17 @@ fn logging_events_artifact_is_complete_jsonl() {
         .find(|u| u.ends_with("events.jsonl"))
         .expect("must have events.jsonl artifact");
 
-    let content = bundle.gate_artifacts.get(events_uri).expect("events content");
+    let content = bundle
+        .gate_artifacts
+        .get(events_uri)
+        .expect("events content");
     let mut event_count = 0_usize;
     for line in content.lines() {
         if line.trim().is_empty() {
             continue;
         }
-        let parsed: serde_json::Value = serde_json::from_str(line)
-            .unwrap_or_else(|e| panic!("invalid JSONL line: {e}"));
+        let parsed: serde_json::Value =
+            serde_json::from_str(line).unwrap_or_else(|e| panic!("invalid JSONL line: {e}"));
         assert!(parsed.is_object(), "each JSONL line must be an object");
         event_count += 1;
     }
@@ -542,7 +611,11 @@ fn e2e_gate_evidence_includes_scenario_stats() {
         SCENARIO_DRIFT_GATE_ID
     );
     assert!(
-        bundle.manifest.scenario_coverage_drift.total_catalog_scenarios > 0,
+        bundle
+            .manifest
+            .scenario_coverage_drift
+            .total_catalog_scenarios
+            > 0,
         "catalog must have scenarios"
     );
 }
@@ -553,14 +626,26 @@ fn e2e_gate_evidence_includes_scenario_stats() {
 fn conformance_summary() {
     let checks = vec![
         ("C-1: JSON round-trip preserves all manifest fields", true),
-        ("C-2: Replay from same config produces identical output", true),
+        (
+            "C-2: Replay from same config produces identical output",
+            true,
+        ),
         ("C-3: Ingested manifest passes contract validation", true),
         ("C-4: Gate completeness regression (5 gates present)", true),
-        ("C-5: Artifact URIs match gate references bidirectionally", true),
+        (
+            "C-5: Artifact URIs match gate references bidirectionally",
+            true,
+        ),
         ("C-6: Backward compatibility across replay runs", true),
         ("C-7: Tamper detection (schema version, gate removal)", true),
-        ("C-8: Artifact content hashes deterministic across replays", true),
-        ("C-9: Evidence archive round-trip with contract validation", true),
+        (
+            "C-8: Artifact content hashes deterministic across replays",
+            true,
+        ),
+        (
+            "C-9: Evidence archive round-trip with contract validation",
+            true,
+        ),
     ];
 
     println!("\n=== {BEAD_ID} Conformance Summary ===");

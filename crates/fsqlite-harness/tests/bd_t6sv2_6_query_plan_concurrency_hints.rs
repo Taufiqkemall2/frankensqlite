@@ -16,11 +16,11 @@ use fsqlite_harness::concurrent_writer_parity::{
     assess_concurrent_writer_parity,
 };
 use fsqlite_mvcc::conflict_model::{
-    AmsSketch, AmsSketchConfig, NitroSketch, NitroSketchConfig, SpaceSavingSummary,
+    AmsSketch, AmsSketchConfig, DEFAULT_AMS_R, DEFAULT_HEAVY_HITTER_K, DEFAULT_NITRO_PRECISION,
+    MAX_AMS_R, MIN_AMS_R, NitroSketch, NitroSketchConfig, SpaceSavingSummary,
     birthday_conflict_probability_m2, birthday_conflict_probability_uniform,
     effective_collision_pool, exact_m2, pairwise_conflict_probability, validate_ams_r,
-    validate_heavy_hitter_k, validate_nitro_precision, DEFAULT_AMS_R, DEFAULT_HEAVY_HITTER_K,
-    DEFAULT_NITRO_PRECISION, MAX_AMS_R, MIN_AMS_R,
+    validate_heavy_hitter_k, validate_nitro_precision,
 };
 use fsqlite_mvcc::retry_policy::ContentionBucketKey;
 
@@ -130,7 +130,10 @@ fn ams_sketch_construction_and_estimation() {
     sketch.observe_write_set(&[1, 2, 7]);
 
     assert_eq!(sketch.txn_count(), 3);
-    assert!(sketch.f2_hat() > 0, "F2 should be positive after observations");
+    assert!(
+        sketch.f2_hat() > 0,
+        "F2 should be positive after observations"
+    );
     let m2 = sketch.m2_hat().expect("M2 should be defined");
     assert!(m2 > 0.0);
 
@@ -186,7 +189,10 @@ fn nitro_sketch_cardinality_estimation() {
     let estimate = sketch.estimate_cardinality();
     // HyperLogLog estimate should be within ~10% for 1000 elements.
     let rse = sketch.relative_standard_error();
-    assert!(rse > 0.0 && rse < 1.0, "RSE should be small fraction: {rse}");
+    assert!(
+        rse > 0.0 && rse < 1.0,
+        "RSE should be small fraction: {rse}"
+    );
     assert!(
         estimate > 500.0 && estimate < 2000.0,
         "cardinality estimate should be roughly 1000: {estimate}"
@@ -264,11 +270,7 @@ fn concurrent_writer_invariant_area_catalog() {
     for area in ConcurrentInvariantArea::ALL {
         let s = area.as_str();
         assert!(!s.is_empty(), "area should have string representation");
-        assert_eq!(
-            area.to_string(),
-            s,
-            "Display and as_str should match"
-        );
+        assert_eq!(area.to_string(), s, "Display and as_str should match");
     }
 }
 
@@ -295,8 +297,9 @@ fn concurrent_writer_parity_assessment() {
 
     // JSON round-trip.
     let json = report.to_json().expect("serialize");
-    let restored = fsqlite_harness::concurrent_writer_parity::ConcurrentWriterParityReport::from_json(&json)
-        .expect("deserialize");
+    let restored =
+        fsqlite_harness::concurrent_writer_parity::ConcurrentWriterParityReport::from_json(&json)
+            .expect("deserialize");
     assert_eq!(restored.verdict, report.verdict);
     assert_eq!(restored.areas_tested.len(), report.areas_tested.len());
 
@@ -420,9 +423,6 @@ fn conformance_summary() {
     ];
     let passed = checks.iter().filter(|(_, ok)| *ok).count();
     let total = checks.len();
-    assert_eq!(
-        passed, total,
-        "conformance: {passed}/{total} gates passed"
-    );
+    assert_eq!(passed, total, "conformance: {passed}/{total} gates passed");
     eprintln!("[bd-t6sv2.6] conformance: {passed}/{total} gates passed");
 }

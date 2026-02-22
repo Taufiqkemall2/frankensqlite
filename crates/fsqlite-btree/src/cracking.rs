@@ -65,8 +65,7 @@ pub fn reset_cracking_metrics() {
 
 fn record_crack_op(elements: usize) {
     CRACK_OPS_TOTAL.fetch_add(1, Ordering::Relaxed);
-    CRACK_ELEMENTS_PARTITIONED_TOTAL
-        .fetch_add(elements as u64, Ordering::Relaxed);
+    CRACK_ELEMENTS_PARTITIONED_TOTAL.fetch_add(elements as u64, Ordering::Relaxed);
 }
 
 fn record_query() {

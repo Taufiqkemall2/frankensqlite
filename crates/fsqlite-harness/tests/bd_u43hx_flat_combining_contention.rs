@@ -17,7 +17,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use fsqlite_mvcc::{FlatCombiner, flat_combining_metrics, MAX_FC_THREADS};
+use fsqlite_mvcc::{FlatCombiner, MAX_FC_THREADS, flat_combining_metrics};
 
 // ---------------------------------------------------------------------------
 // Test 1: Contention-to-throughput conversion
@@ -161,7 +161,11 @@ fn test_high_thread_registration() {
 
     // Drop all handles.
     handles.clear();
-    assert_eq!(fc.active_threads(), 0, "all slots should be free after drop");
+    assert_eq!(
+        fc.active_threads(),
+        0,
+        "all slots should be free after drop"
+    );
 
     println!(
         "[PASS] High thread registration: {registered}/{MAX_FC_THREADS} slots, overflow rejected"
@@ -237,9 +241,7 @@ fn test_read_dominated_workload() {
     let ratio = reads / writes.max(1);
     assert!(ratio >= 1, "should be read-dominated, ratio={ratio}");
 
-    println!(
-        "[PASS] Read-dominated workload: writes={writes} reads={reads} ratio={ratio}:1"
-    );
+    println!("[PASS] Read-dominated workload: writes={writes} reads={reads} ratio={ratio}:1");
 }
 
 // ---------------------------------------------------------------------------
@@ -334,10 +336,10 @@ fn test_metrics_fidelity() {
 
     let after = flat_combining_metrics();
 
-    let delta_ops = after.fsqlite_flat_combining_ops_total
-        - before.fsqlite_flat_combining_ops_total;
-    let delta_batches = after.fsqlite_flat_combining_batches_total
-        - before.fsqlite_flat_combining_batches_total;
+    let delta_ops =
+        after.fsqlite_flat_combining_ops_total - before.fsqlite_flat_combining_ops_total;
+    let delta_batches =
+        after.fsqlite_flat_combining_batches_total - before.fsqlite_flat_combining_batches_total;
 
     // We submitted 800 ops total.
     assert!(
@@ -449,9 +451,7 @@ fn test_throughput_scaling() {
 
     println!("[PASS] Throughput scaling ({ops_per_thread} ops/thread):");
     for (threads, throughput, elapsed) in &results {
-        println!(
-            "  {threads:2} threads: {throughput:>12.0} ops/s ({elapsed:?})"
-        );
+        println!("  {threads:2} threads: {throughput:>12.0} ops/s ({elapsed:?})");
     }
 }
 
@@ -495,10 +495,7 @@ fn test_accumulator_monotonicity() {
         let mut checks = 0u64;
         while !rs.load(Ordering::Relaxed) {
             let v = h.read();
-            assert!(
-                v >= prev,
-                "monotonicity violated: {prev} -> {v}"
-            );
+            assert!(v >= prev, "monotonicity violated: {prev} -> {v}");
             prev = v;
             checks += 1;
         }
@@ -523,9 +520,7 @@ fn test_accumulator_monotonicity() {
     );
     assert!(checks > 0, "reader must have done monotonicity checks");
 
-    println!(
-        "[PASS] Monotonicity: {checks} checks, {total_adds} adds, all non-decreasing"
-    );
+    println!("[PASS] Monotonicity: {checks} checks, {total_adds} adds, all non-decreasing");
 }
 
 // ---------------------------------------------------------------------------
@@ -643,10 +638,22 @@ fn test_conformance_summary() {
 
     println!();
     println!("=== Conformance Summary ===");
-    println!("  [CONFORM] Contention correctness: 8-thread total = {}", if correct_total { "exact" } else { "MISMATCH" });
-    println!("  [CONFORM] Read monotonicity: {}", if monotonic { "never decreases" } else { "VIOLATED" });
+    println!(
+        "  [CONFORM] Contention correctness: 8-thread total = {}",
+        if correct_total { "exact" } else { "MISMATCH" }
+    );
+    println!(
+        "  [CONFORM] Read monotonicity: {}",
+        if monotonic {
+            "never decreases"
+        } else {
+            "VIOLATED"
+        }
+    );
     println!("  [CONFORM] Slot lifecycle: register/unregister clean");
-    println!("  [CONFORM] Capacity: MAX_FC_THREADS={MAX_FC_THREADS}, overflow rejected={overflow_rejected}");
+    println!(
+        "  [CONFORM] Capacity: MAX_FC_THREADS={MAX_FC_THREADS}, overflow rejected={overflow_rejected}"
+    );
     println!("  [CONFORM] Metrics: delta_ops={delta} (expected >= 3)");
     println!("  [CONFORM] Slot reuse: value persists across re-registration");
     println!("  Conformance: 6 / 6 (100.0%)");

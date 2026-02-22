@@ -9,12 +9,10 @@
 use std::collections::BTreeSet;
 
 use fsqlite_harness::parity_taxonomy::{
-    build_canonical_universe, truncate_score, ExclusionRationale, Feature, FeatureCategory,
-    FeatureId, FeatureUniverse, ObservabilityMapping, ParityStatus,
+    ExclusionRationale, Feature, FeatureCategory, FeatureId, FeatureUniverse, ObservabilityMapping,
+    ParityStatus, build_canonical_universe, truncate_score,
 };
-use fsqlite_harness::score_engine::{
-    compute_bayesian_scorecard, PriorConfig, ScoreEngineConfig,
-};
+use fsqlite_harness::score_engine::{PriorConfig, ScoreEngineConfig, compute_bayesian_scorecard};
 
 const BEAD_ID: &str = "bd-t6sv2.4";
 
@@ -28,15 +26,60 @@ fn build_test_universe() -> FeatureUniverse {
 
     // Add exactly one feature per category with known statuses for deterministic scoring.
     let specs: &[(FeatureCategory, &str, f64, ParityStatus)] = &[
-        (FeatureCategory::SqlGrammar, "SELECT basic", 1.0, ParityStatus::Passing),
-        (FeatureCategory::VdbeOpcodes, "OP_Init", 1.0, ParityStatus::Passing),
-        (FeatureCategory::StorageTransaction, "WAL mode", 1.0, ParityStatus::Partial),
-        (FeatureCategory::Pragma, "journal_mode", 1.0, ParityStatus::Passing),
-        (FeatureCategory::BuiltinFunctions, "abs()", 1.0, ParityStatus::Passing),
-        (FeatureCategory::Extensions, "JSON1", 1.0, ParityStatus::Missing),
-        (FeatureCategory::TypeSystem, "INTEGER affinity", 1.0, ParityStatus::Passing),
-        (FeatureCategory::FileFormat, "Page header", 1.0, ParityStatus::Passing),
-        (FeatureCategory::ApiCli, "sqlite3_open", 1.0, ParityStatus::Passing),
+        (
+            FeatureCategory::SqlGrammar,
+            "SELECT basic",
+            1.0,
+            ParityStatus::Passing,
+        ),
+        (
+            FeatureCategory::VdbeOpcodes,
+            "OP_Init",
+            1.0,
+            ParityStatus::Passing,
+        ),
+        (
+            FeatureCategory::StorageTransaction,
+            "WAL mode",
+            1.0,
+            ParityStatus::Partial,
+        ),
+        (
+            FeatureCategory::Pragma,
+            "journal_mode",
+            1.0,
+            ParityStatus::Passing,
+        ),
+        (
+            FeatureCategory::BuiltinFunctions,
+            "abs()",
+            1.0,
+            ParityStatus::Passing,
+        ),
+        (
+            FeatureCategory::Extensions,
+            "JSON1",
+            1.0,
+            ParityStatus::Missing,
+        ),
+        (
+            FeatureCategory::TypeSystem,
+            "INTEGER affinity",
+            1.0,
+            ParityStatus::Passing,
+        ),
+        (
+            FeatureCategory::FileFormat,
+            "Page header",
+            1.0,
+            ParityStatus::Passing,
+        ),
+        (
+            FeatureCategory::ApiCli,
+            "sqlite3_open",
+            1.0,
+            ParityStatus::Passing,
+        ),
     ];
 
     for (i, &(cat, title, weight, status)) in specs.iter().enumerate() {
@@ -72,7 +115,10 @@ fn build_test_universe() -> FeatureUniverse {
 #[test]
 fn test_canonical_universe_category_coverage() {
     let universe = build_canonical_universe();
-    println!("[{BEAD_ID}] canonical universe: {} features", universe.features.len());
+    println!(
+        "[{BEAD_ID}] canonical universe: {} features",
+        universe.features.len()
+    );
 
     for cat in FeatureCategory::ALL {
         let count = universe.features_by_category(cat).len();
@@ -115,9 +161,13 @@ fn test_parity_score_determinism() {
     let score2 = universe.compute_score();
 
     println!("[{BEAD_ID}] global score: {}", score1.global_score);
-    println!("[{BEAD_ID}] status: passing={} partial={} missing={} excluded={}",
-        score1.status_counts.passing, score1.status_counts.partial,
-        score1.status_counts.missing, score1.status_counts.excluded);
+    println!(
+        "[{BEAD_ID}] status: passing={} partial={} missing={} excluded={}",
+        score1.status_counts.passing,
+        score1.status_counts.partial,
+        score1.status_counts.missing,
+        score1.status_counts.excluded
+    );
 
     // Determinism: two runs produce identical score.
     assert_eq!(
@@ -147,11 +197,17 @@ fn test_bayesian_scorecard_generation() {
     let config = ScoreEngineConfig::default();
     let scorecard = compute_bayesian_scorecard(&universe, &config);
 
-    println!("[{BEAD_ID}] bayesian point estimate: {}", scorecard.global_point_estimate);
+    println!(
+        "[{BEAD_ID}] bayesian point estimate: {}",
+        scorecard.global_point_estimate
+    );
     println!("[{BEAD_ID}] lower bound: {}", scorecard.global_lower_bound);
     println!("[{BEAD_ID}] upper bound: {}", scorecard.global_upper_bound);
     println!("[{BEAD_ID}] release_ready: {}", scorecard.release_ready);
-    println!("[{BEAD_ID}] effective features: {}/{}", scorecard.effective_features, scorecard.total_features);
+    println!(
+        "[{BEAD_ID}] effective features: {}/{}",
+        scorecard.effective_features, scorecard.total_features
+    );
 
     // Point estimate in [0, 1].
     assert!(
@@ -193,13 +249,19 @@ fn test_mvcc_divergence_catalog() {
     let mvcc_features = universe.features_by_tag("mvcc");
     let wal_features = universe.features_by_tag("wal");
 
-    println!("[{BEAD_ID}] concurrency-tagged: {}", concurrency_features.len());
+    println!(
+        "[{BEAD_ID}] concurrency-tagged: {}",
+        concurrency_features.len()
+    );
     println!("[{BEAD_ID}] mvcc-tagged: {}", mvcc_features.len());
     println!("[{BEAD_ID}] wal-tagged: {}", wal_features.len());
 
     // Collect features with Excluded status (intentional divergences).
     let excluded = universe.features_by_status(ParityStatus::Excluded);
-    println!("[{BEAD_ID}] excluded (intentional divergences): {}", excluded.len());
+    println!(
+        "[{BEAD_ID}] excluded (intentional divergences): {}",
+        excluded.len()
+    );
 
     // Every excluded feature must have a rationale.
     for feat in &excluded {
@@ -212,7 +274,10 @@ fn test_mvcc_divergence_catalog() {
 
     // Collect partial features (potential MVCC behavioral differences).
     let partial = universe.features_by_status(ParityStatus::Partial);
-    println!("[{BEAD_ID}] partial (behavioral differences): {}", partial.len());
+    println!(
+        "[{BEAD_ID}] partial (behavioral differences): {}",
+        partial.len()
+    );
     for feat in &partial {
         println!("  PARTIAL: {} — {}", feat.id, feat.title);
     }
@@ -226,8 +291,10 @@ fn test_per_category_scorecard() {
 
     println!("[{BEAD_ID}] test universe scores:");
     for (name, cs) in &score.category_scores {
-        println!("  {name}: score={} pass={} partial={} missing={}",
-            cs.score, cs.passing_count, cs.partial_count, cs.missing_count);
+        println!(
+            "  {name}: score={} pass={} partial={} missing={}",
+            cs.score, cs.passing_count, cs.partial_count, cs.missing_count
+        );
     }
 
     // Storage & Transactions category has one Partial feature → score = 0.5.
@@ -328,7 +395,8 @@ fn test_category_weight_invariants() {
             assert!(
                 stor_weight >= cat.global_weight(),
                 "bead_id={BEAD_ID} Storage weight should be second-highest, but {} >= {}",
-                cat.display_name(), stor_weight
+                cat.display_name(),
+                stor_weight
             );
         }
     }
@@ -355,10 +423,12 @@ fn test_prior_sensitivity_analysis() {
             ..Default::default()
         };
         let scorecard = compute_bayesian_scorecard(&universe, &config);
-        println!("[{BEAD_ID}] prior={name}: estimate={:.4} lower={:.4} upper={:.4}",
+        println!(
+            "[{BEAD_ID}] prior={name}: estimate={:.4} lower={:.4} upper={:.4}",
             scorecard.global_point_estimate,
             scorecard.global_lower_bound,
-            scorecard.global_upper_bound);
+            scorecard.global_upper_bound
+        );
         estimates.push(scorecard.global_point_estimate);
 
         // All estimates must be in [0, 1].
@@ -391,12 +461,14 @@ fn test_excluded_features_handling() {
         Feature {
             id: excl_id,
             title: "Virtual tables (excluded)".to_owned(),
-            description: "Intentionally excluded: MVCC replaces virtual table locking model".to_owned(),
+            description: "Intentionally excluded: MVCC replaces virtual table locking model"
+                .to_owned(),
             category: FeatureCategory::SqlGrammar,
             weight: 5.0,
             status: ParityStatus::Excluded,
             exclusion: Some(ExclusionRationale {
-                reason: "MVCC page-level versioning replaces SQLite file-level locking model".to_owned(),
+                reason: "MVCC page-level versioning replaces SQLite file-level locking model"
+                    .to_owned(),
                 reference: "§15.4 MVCC design decision".to_owned(),
             }),
             observability: ObservabilityMapping::default(),
@@ -479,19 +551,52 @@ fn test_conformance_summary() {
     };
 
     println!("\n=== {BEAD_ID} SQLite Conformance Dashboard Conformance ===");
-    println!("  taxonomy_valid..............{}", if pass_taxonomy { "PASS" } else { "FAIL" });
-    println!("  score_bounded...............{}", if pass_score_bounded { "PASS" } else { "FAIL" });
-    println!("  bayesian_bounded............{}", if pass_bayesian_bounded { "PASS" } else { "FAIL" });
-    println!("  category_coverage...........{}", if pass_category_coverage { "PASS" } else { "FAIL" });
-    println!("  serialization...............{}", if pass_serialization { "PASS" } else { "FAIL" });
-    println!("  determinism.................{}", if pass_determinism { "PASS" } else { "FAIL" });
+    println!(
+        "  taxonomy_valid..............{}",
+        if pass_taxonomy { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  score_bounded...............{}",
+        if pass_score_bounded { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  bayesian_bounded............{}",
+        if pass_bayesian_bounded {
+            "PASS"
+        } else {
+            "FAIL"
+        }
+    );
+    println!(
+        "  category_coverage...........{}",
+        if pass_category_coverage {
+            "PASS"
+        } else {
+            "FAIL"
+        }
+    );
+    println!(
+        "  serialization...............{}",
+        if pass_serialization { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  determinism.................{}",
+        if pass_determinism { "PASS" } else { "FAIL" }
+    );
 
     let all = [
-        pass_taxonomy, pass_score_bounded, pass_bayesian_bounded,
-        pass_category_coverage, pass_serialization, pass_determinism,
+        pass_taxonomy,
+        pass_score_bounded,
+        pass_bayesian_bounded,
+        pass_category_coverage,
+        pass_serialization,
+        pass_determinism,
     ];
     let passed = all.iter().filter(|&&p| p).count();
     println!("  [{}/{}] conformance checks passed", passed, all.len());
 
-    assert!(all.iter().all(|&p| p), "bead_id={BEAD_ID} conformance failed");
+    assert!(
+        all.iter().all(|&p| p),
+        "bead_id={BEAD_ID} conformance failed"
+    );
 }

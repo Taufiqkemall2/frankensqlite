@@ -2767,86 +2767,91 @@ pub fn try_constant_fold(expr: &Expr) -> FoldResult {
     match expr {
         Expr::Literal(lit, _) => FoldResult::Literal(lit.clone()),
 
-        Expr::UnaryOp { op, expr: inner, .. } => {
+        Expr::UnaryOp {
+            op, expr: inner, ..
+        } => {
             let inner_val = try_constant_fold(inner);
             match inner_val {
-                FoldResult::Literal(Literal::Integer(i)) => {
-                    match op {
-                        fsqlite_ast::UnaryOp::Negate => FoldResult::Literal(Literal::Integer(-i)),
-                        fsqlite_ast::UnaryOp::Plus => FoldResult::Literal(Literal::Integer(i)),
-                        fsqlite_ast::UnaryOp::BitNot => {
-                            FoldResult::Literal(Literal::Integer(!i))
-                        }
-                        fsqlite_ast::UnaryOp::Not => {
-                            FoldResult::Literal(if i == 0 {
-                                Literal::True
-                            } else {
-                                Literal::False
-                            })
-                        }
-                    }
-                }
-                FoldResult::Literal(Literal::Float(f)) => {
-                    match op {
-                        fsqlite_ast::UnaryOp::Negate => FoldResult::Literal(Literal::Float(-f)),
-                        fsqlite_ast::UnaryOp::Plus => FoldResult::Literal(Literal::Float(f)),
-                        _ => FoldResult::NotConstant,
-                    }
-                }
+                FoldResult::Literal(Literal::Integer(i)) => match op {
+                    fsqlite_ast::UnaryOp::Negate => FoldResult::Literal(Literal::Integer(-i)),
+                    fsqlite_ast::UnaryOp::Plus => FoldResult::Literal(Literal::Integer(i)),
+                    fsqlite_ast::UnaryOp::BitNot => FoldResult::Literal(Literal::Integer(!i)),
+                    fsqlite_ast::UnaryOp::Not => FoldResult::Literal(if i == 0 {
+                        Literal::True
+                    } else {
+                        Literal::False
+                    }),
+                },
+                FoldResult::Literal(Literal::Float(f)) => match op {
+                    fsqlite_ast::UnaryOp::Negate => FoldResult::Literal(Literal::Float(-f)),
+                    fsqlite_ast::UnaryOp::Plus => FoldResult::Literal(Literal::Float(f)),
+                    _ => FoldResult::NotConstant,
+                },
                 _ => FoldResult::NotConstant,
             }
         }
 
-        Expr::BinaryOp { left, op, right, .. } => {
+        Expr::BinaryOp {
+            left, op, right, ..
+        } => {
             let l = try_constant_fold(left);
             let r = try_constant_fold(right);
             match (l, r) {
-                (FoldResult::Literal(Literal::Integer(a)), FoldResult::Literal(Literal::Integer(b))) => {
-                    match op {
-                        fsqlite_ast::BinaryOp::Add => {
-                            FoldResult::Literal(Literal::Integer(a.wrapping_add(b)))
-                        }
-                        fsqlite_ast::BinaryOp::Subtract => {
-                            FoldResult::Literal(Literal::Integer(a.wrapping_sub(b)))
-                        }
-                        fsqlite_ast::BinaryOp::Multiply => {
-                            FoldResult::Literal(Literal::Integer(a.wrapping_mul(b)))
-                        }
-                        fsqlite_ast::BinaryOp::Divide => {
-                            if b == 0 {
-                                FoldResult::Literal(Literal::Null)
-                            } else {
-                                FoldResult::Literal(Literal::Integer(a / b))
-                            }
-                        }
-                        fsqlite_ast::BinaryOp::Modulo => {
-                            if b == 0 {
-                                FoldResult::Literal(Literal::Null)
-                            } else {
-                                FoldResult::Literal(Literal::Integer(a % b))
-                            }
-                        }
-                        fsqlite_ast::BinaryOp::Eq => {
-                            FoldResult::Literal(if a == b { Literal::True } else { Literal::False })
-                        }
-                        fsqlite_ast::BinaryOp::Ne => {
-                            FoldResult::Literal(if a == b { Literal::False } else { Literal::True })
-                        }
-                        fsqlite_ast::BinaryOp::Lt => {
-                            FoldResult::Literal(if a < b { Literal::True } else { Literal::False })
-                        }
-                        fsqlite_ast::BinaryOp::Le => {
-                            FoldResult::Literal(if a <= b { Literal::True } else { Literal::False })
-                        }
-                        fsqlite_ast::BinaryOp::Gt => {
-                            FoldResult::Literal(if a > b { Literal::True } else { Literal::False })
-                        }
-                        fsqlite_ast::BinaryOp::Ge => {
-                            FoldResult::Literal(if a >= b { Literal::True } else { Literal::False })
-                        }
-                        _ => FoldResult::NotConstant,
+                (
+                    FoldResult::Literal(Literal::Integer(a)),
+                    FoldResult::Literal(Literal::Integer(b)),
+                ) => match op {
+                    fsqlite_ast::BinaryOp::Add => {
+                        FoldResult::Literal(Literal::Integer(a.wrapping_add(b)))
                     }
-                }
+                    fsqlite_ast::BinaryOp::Subtract => {
+                        FoldResult::Literal(Literal::Integer(a.wrapping_sub(b)))
+                    }
+                    fsqlite_ast::BinaryOp::Multiply => {
+                        FoldResult::Literal(Literal::Integer(a.wrapping_mul(b)))
+                    }
+                    fsqlite_ast::BinaryOp::Divide => {
+                        if b == 0 {
+                            FoldResult::Literal(Literal::Null)
+                        } else {
+                            FoldResult::Literal(Literal::Integer(a / b))
+                        }
+                    }
+                    fsqlite_ast::BinaryOp::Modulo => {
+                        if b == 0 {
+                            FoldResult::Literal(Literal::Null)
+                        } else {
+                            FoldResult::Literal(Literal::Integer(a % b))
+                        }
+                    }
+                    fsqlite_ast::BinaryOp::Eq => FoldResult::Literal(if a == b {
+                        Literal::True
+                    } else {
+                        Literal::False
+                    }),
+                    fsqlite_ast::BinaryOp::Ne => FoldResult::Literal(if a == b {
+                        Literal::False
+                    } else {
+                        Literal::True
+                    }),
+                    fsqlite_ast::BinaryOp::Lt => {
+                        FoldResult::Literal(if a < b { Literal::True } else { Literal::False })
+                    }
+                    fsqlite_ast::BinaryOp::Le => FoldResult::Literal(if a <= b {
+                        Literal::True
+                    } else {
+                        Literal::False
+                    }),
+                    fsqlite_ast::BinaryOp::Gt => {
+                        FoldResult::Literal(if a > b { Literal::True } else { Literal::False })
+                    }
+                    fsqlite_ast::BinaryOp::Ge => FoldResult::Literal(if a >= b {
+                        Literal::True
+                    } else {
+                        Literal::False
+                    }),
+                    _ => FoldResult::NotConstant,
+                },
                 _ => FoldResult::NotConstant,
             }
         }
@@ -5630,7 +5635,7 @@ mod tests {
 
         record_estimation_error(100.0, 50.0); // ratio = 2.0, bucket [2.0, 5.0)
         record_estimation_error(10.0, 100.0); // ratio = 0.1, bucket [0, 0.5)
-        record_estimation_error(50.0, 50.0);  // ratio = 1.0, bucket [1.0, 2.0)
+        record_estimation_error(50.0, 50.0); // ratio = 1.0, bucket [1.0, 2.0)
 
         let snap = cost_metrics_snapshot();
         assert_eq!(snap.error_ratio_buckets[0], 1); // [0, 0.5)
@@ -5687,9 +5692,8 @@ mod tests {
         let indexes = vec![];
         let where_terms = vec![];
 
-        let (order, cost, plans) = dpccp_order_joins(
-            &tables, &indexes, &where_terms, None, None, None,
-        );
+        let (order, cost, plans) =
+            dpccp_order_joins(&tables, &indexes, &where_terms, None, None, None);
         assert_eq!(order.len(), 2);
         assert!(cost > 0.0);
         assert!(plans >= 2); // At least 2 seed + extensions.
@@ -5720,9 +5724,8 @@ mod tests {
         let indexes = vec![];
         let where_terms = vec![];
 
-        let (order, cost, plans) = dpccp_order_joins(
-            &tables, &indexes, &where_terms, None, None, None,
-        );
+        let (order, cost, plans) =
+            dpccp_order_joins(&tables, &indexes, &where_terms, None, None, None);
         assert_eq!(order.len(), 3);
         assert!(cost > 0.0);
         assert!(plans > 3); // More than just seed.
@@ -5833,7 +5836,10 @@ mod tests {
     #[test]
     fn test_fold_literal() {
         let expr = Expr::Literal(Literal::Integer(42), Span::ZERO);
-        assert_eq!(try_constant_fold(&expr), FoldResult::Literal(Literal::Integer(42)));
+        assert_eq!(
+            try_constant_fold(&expr),
+            FoldResult::Literal(Literal::Integer(42))
+        );
     }
 
     #[test]
@@ -5844,7 +5850,10 @@ mod tests {
             right: Box::new(Expr::Literal(Literal::Integer(32), Span::ZERO)),
             span: Span::ZERO,
         };
-        assert_eq!(try_constant_fold(&expr), FoldResult::Literal(Literal::Integer(42)));
+        assert_eq!(
+            try_constant_fold(&expr),
+            FoldResult::Literal(Literal::Integer(42))
+        );
     }
 
     #[test]
@@ -5865,13 +5874,19 @@ mod tests {
             expr: Box::new(Expr::Literal(Literal::Integer(5), Span::ZERO)),
             span: Span::ZERO,
         };
-        assert_eq!(try_constant_fold(&expr), FoldResult::Literal(Literal::Integer(-5)));
+        assert_eq!(
+            try_constant_fold(&expr),
+            FoldResult::Literal(Literal::Integer(-5))
+        );
     }
 
     #[test]
     fn test_fold_column_ref_not_constant() {
         let expr = Expr::Column(
-            ColumnRef { table: None, column: "id".to_owned() },
+            ColumnRef {
+                table: None,
+                column: "id".to_owned(),
+            },
             Span::ZERO,
         );
         assert_eq!(try_constant_fold(&expr), FoldResult::NotConstant);
@@ -5902,6 +5917,9 @@ mod tests {
             right: Box::new(Expr::Literal(Literal::Integer(6), Span::ZERO)),
             span: Span::ZERO,
         };
-        assert_eq!(try_constant_fold(&expr), FoldResult::Literal(Literal::Integer(42)));
+        assert_eq!(
+            try_constant_fold(&expr),
+            FoldResult::Literal(Literal::Integer(42))
+        );
     }
 }

@@ -15,8 +15,8 @@ use fsqlite_harness::ci_gate_matrix::{
 };
 use fsqlite_harness::e2e_logging_init::{E2eLoggingConfig, LogOutputFormat, RunContext};
 use fsqlite_harness::failure_bundle::{
-    EnvironmentInfo, FailureBundle, FailureInfo, FailureType, FirstDivergence,
-    ReproducibilityInfo, ScenarioInfo, BUNDLE_SCHEMA_VERSION,
+    BUNDLE_SCHEMA_VERSION, EnvironmentInfo, FailureBundle, FailureInfo, FailureType,
+    FirstDivergence, ReproducibilityInfo, ScenarioInfo,
 };
 
 const BEAD_ID: &str = "bd-mblr.3.2";
@@ -61,11 +61,7 @@ fn make_artifact(kind: ArtifactKind, path: &str, desc: &str) -> ArtifactEntry {
 }
 
 /// Build a minimal failure bundle for testing artifact integration.
-fn make_failure_bundle(
-    scenario_id: &str,
-    failure_type: FailureType,
-    seed: u64,
-) -> FailureBundle {
+fn make_failure_bundle(scenario_id: &str, failure_type: FailureType, seed: u64) -> FailureBundle {
     FailureBundle {
         schema_version: BUNDLE_SCHEMA_VERSION.to_owned(),
         bundle_id: format!("{BEAD_ID}-bundle-{scenario_id}"),
@@ -77,7 +73,11 @@ fn make_failure_bundle(
             test_name: format!("test_{scenario_id}"),
             script_path: Some(format!("scripts/verify_{scenario_id}.sh")),
         },
-        environment: EnvironmentInfo::new("abc1234", "stable-2026-02-20", "x86_64-unknown-linux-gnu"),
+        environment: EnvironmentInfo::new(
+            "abc1234",
+            "stable-2026-02-20",
+            "x86_64-unknown-linux-gnu",
+        ),
         reproducibility: ReproducibilityInfo {
             seed: Some(seed),
             fixture_id: None,
@@ -128,9 +128,11 @@ impl MatrixLaneResult {
     fn new(lane: CiLane, outcomes: Vec<TestOutcome>) -> Self {
         let tier = classify_lane_tier(lane);
         let mut failure_bundles = Vec::new();
-        let mut artifacts = vec![
-            make_artifact(ArtifactKind::Log, &format!("logs/{}.jsonl", lane.as_str()), "Structured event log"),
-        ];
+        let mut artifacts = vec![make_artifact(
+            ArtifactKind::Log,
+            &format!("logs/{}.jsonl", lane.as_str()),
+            "Structured event log",
+        )];
 
         // For each failure, create a failure bundle and artifact
         for (i, outcome) in outcomes.iter().enumerate() {
@@ -155,7 +157,13 @@ impl MatrixLaneResult {
             "Gate report",
         ));
 
-        Self { lane, tier, outcomes, failure_bundles, artifacts }
+        Self {
+            lane,
+            tier,
+            outcomes,
+            failure_bundles,
+            artifacts,
+        }
     }
 }
 
@@ -164,21 +172,43 @@ impl MatrixLaneResult {
 #[test]
 fn e2e_matrix_tier_classification() {
     // Correctness tier
-    assert_eq!(classify_lane_tier(CiLane::E2eCorrectness), E2eMatrixTier::Correctness);
-    assert_eq!(classify_lane_tier(CiLane::E2eDifferential), E2eMatrixTier::Correctness);
+    assert_eq!(
+        classify_lane_tier(CiLane::E2eCorrectness),
+        E2eMatrixTier::Correctness
+    );
+    assert_eq!(
+        classify_lane_tier(CiLane::E2eDifferential),
+        E2eMatrixTier::Correctness
+    );
     // Recovery tier
-    assert_eq!(classify_lane_tier(CiLane::E2eRecovery), E2eMatrixTier::Recovery);
+    assert_eq!(
+        classify_lane_tier(CiLane::E2eRecovery),
+        E2eMatrixTier::Recovery
+    );
     // Concurrency tier (unit tests cover MVCC concurrent writers)
     assert_eq!(classify_lane_tier(CiLane::Unit), E2eMatrixTier::Concurrency);
     // Non-E2E
-    assert_eq!(classify_lane_tier(CiLane::Performance), E2eMatrixTier::NonE2e);
-    assert_eq!(classify_lane_tier(CiLane::SchemaValidation), E2eMatrixTier::NonE2e);
-    assert_eq!(classify_lane_tier(CiLane::CoverageDrift), E2eMatrixTier::NonE2e);
+    assert_eq!(
+        classify_lane_tier(CiLane::Performance),
+        E2eMatrixTier::NonE2e
+    );
+    assert_eq!(
+        classify_lane_tier(CiLane::SchemaValidation),
+        E2eMatrixTier::NonE2e
+    );
+    assert_eq!(
+        classify_lane_tier(CiLane::CoverageDrift),
+        E2eMatrixTier::NonE2e
+    );
 }
 
 #[test]
 fn all_e2e_lanes_support_retry() {
-    let e2e_lanes = [CiLane::E2eCorrectness, CiLane::E2eDifferential, CiLane::E2eRecovery];
+    let e2e_lanes = [
+        CiLane::E2eCorrectness,
+        CiLane::E2eDifferential,
+        CiLane::E2eRecovery,
+    ];
     for lane in e2e_lanes {
         assert!(
             lane.supports_retry(),
@@ -207,16 +237,25 @@ fn artifact_upload_on_passing_lane() {
     assert!(manifest.gate_passed);
     assert!(manifest.bisect_request.is_none());
     let errors = manifest.validate();
-    assert!(errors.is_empty(), "passing manifest should validate: {errors:?}");
+    assert!(
+        errors.is_empty(),
+        "passing manifest should validate: {errors:?}"
+    );
 
     // Must include structured log artifact
     assert!(
-        manifest.artifacts.iter().any(|a| a.kind == ArtifactKind::Log),
+        manifest
+            .artifacts
+            .iter()
+            .any(|a| a.kind == ArtifactKind::Log),
         "manifest must include structured log artifact"
     );
     // Must include gate report
     assert!(
-        manifest.artifacts.iter().any(|a| a.kind == ArtifactKind::Report),
+        manifest
+            .artifacts
+            .iter()
+            .any(|a| a.kind == ArtifactKind::Report),
         "manifest must include gate report artifact"
     );
 }
@@ -226,7 +265,11 @@ fn artifact_upload_on_failing_lane_includes_repro_bundles() {
     let outcomes = vec![TestOutcome::Pass, TestOutcome::Fail, TestOutcome::Pass];
     let result = MatrixLaneResult::new(CiLane::E2eRecovery, outcomes);
 
-    assert_eq!(result.failure_bundles.len(), 1, "one failure should produce one bundle");
+    assert_eq!(
+        result.failure_bundles.len(),
+        1,
+        "one failure should produce one bundle"
+    );
 
     let manifest = build_artifact_manifest(
         result.lane,
@@ -241,11 +284,17 @@ fn artifact_upload_on_failing_lane_includes_repro_bundles() {
     assert!(!manifest.gate_passed);
     // Must include failure bundle trace artifact
     assert!(
-        manifest.artifacts.iter().any(|a| a.kind == ArtifactKind::Trace),
+        manifest
+            .artifacts
+            .iter()
+            .any(|a| a.kind == ArtifactKind::Trace),
         "failing manifest must include failure bundle trace"
     );
     let errors = manifest.validate();
-    assert!(errors.is_empty(), "failing manifest should validate: {errors:?}");
+    assert!(
+        errors.is_empty(),
+        "failing manifest should validate: {errors:?}"
+    );
 }
 
 #[test]
@@ -339,7 +388,11 @@ fn failure_bundle_json_roundtrip() {
 #[test]
 fn multi_lane_pipeline_all_pass() {
     let policy = FlakeBudgetPolicy::canonical();
-    let e2e_lanes = [CiLane::E2eCorrectness, CiLane::E2eDifferential, CiLane::E2eRecovery];
+    let e2e_lanes = [
+        CiLane::E2eCorrectness,
+        CiLane::E2eDifferential,
+        CiLane::E2eRecovery,
+    ];
 
     let mut lane_results = Vec::new();
     let mut manifests = Vec::new();
@@ -382,7 +435,10 @@ fn multi_lane_pipeline_one_failure_fails_pipeline() {
     let r3 = evaluate_flake_budget(CiLane::E2eDifferential, &pass_outcomes, &policy);
 
     let global = evaluate_global_flake_budget(&[r1, r2, r3], &policy);
-    assert!(!global.pipeline_pass, "pipeline must fail if any lane fails");
+    assert!(
+        !global.pipeline_pass,
+        "pipeline must fail if any lane fails"
+    );
 }
 
 #[test]
@@ -417,7 +473,11 @@ fn multi_lane_pipeline_triggers_bisect_on_failure() {
         "bad-sha",
         42,
         false,
-        vec![make_artifact(ArtifactKind::Log, "logs/events.jsonl", "Event log")],
+        vec![make_artifact(
+            ArtifactKind::Log,
+            "logs/events.jsonl",
+            "Event log",
+        )],
         Some(bisect),
     );
     assert!(manifest.bisect_request.is_some());
@@ -430,7 +490,11 @@ fn multi_lane_pipeline_triggers_bisect_on_failure() {
 fn e2e_lanes_retry_transient_not_correctness() {
     let policy = RetryPolicy::canonical();
 
-    for lane in [CiLane::E2eCorrectness, CiLane::E2eDifferential, CiLane::E2eRecovery] {
+    for lane in [
+        CiLane::E2eCorrectness,
+        CiLane::E2eDifferential,
+        CiLane::E2eRecovery,
+    ] {
         // Transient failures allow retry
         let transient = evaluate_retry_decision(
             lane,
@@ -439,7 +503,11 @@ fn e2e_lanes_retry_transient_not_correctness() {
             false,
             &policy,
         );
-        assert!(transient.allow_retry, "{} should allow transient retry", lane.as_str());
+        assert!(
+            transient.allow_retry,
+            "{} should allow transient retry",
+            lane.as_str()
+        );
 
         // Correctness regressions never allow retry
         let correctness = evaluate_retry_decision(
@@ -449,7 +517,11 @@ fn e2e_lanes_retry_transient_not_correctness() {
             false,
             &policy,
         );
-        assert!(!correctness.allow_retry, "{} must not retry correctness failures", lane.as_str());
+        assert!(
+            !correctness.allow_retry,
+            "{} must not retry correctness failures",
+            lane.as_str()
+        );
         assert!(correctness.hard_failure);
     }
 }
@@ -464,7 +536,10 @@ fn recovered_transient_classified_as_flake() {
         true, // recovered on retry
         &policy,
     );
-    assert!(decision.classify_as_flake, "recovered transient must be classified as flake");
+    assert!(
+        decision.classify_as_flake,
+        "recovered transient must be classified as flake"
+    );
     assert!(!decision.hard_failure);
 }
 
@@ -490,8 +565,12 @@ fn quarantine_waives_flake_budget_for_e2e_lane() {
         reason: "known flaky CI runner pool".to_owned(),
         expires_after_runs: 3,
     };
-    let decision = evaluate_quarantine_ticket(&lane_result, &ticket, &QuarantinePolicy::canonical());
-    assert!(decision.approved, "valid quarantine ticket should be approved");
+    let decision =
+        evaluate_quarantine_ticket(&lane_result, &ticket, &QuarantinePolicy::canonical());
+    assert!(
+        decision.approved,
+        "valid quarantine ticket should be approved"
+    );
     assert!(!decision.effective_pipeline_fail);
 }
 
@@ -513,7 +592,11 @@ fn run_context_correlates_with_artifact_manifest() {
         "abc1234",
         ctx.seed.unwrap_or(0),
         true,
-        vec![make_artifact(ArtifactKind::Log, "logs/events.jsonl", "Event log")],
+        vec![make_artifact(
+            ArtifactKind::Log,
+            "logs/events.jsonl",
+            "Event log",
+        )],
         None,
     );
 
@@ -525,7 +608,11 @@ fn run_context_correlates_with_artifact_manifest() {
 #[test]
 fn ci_logging_config_uses_json_format() {
     let config = E2eLoggingConfig::ci();
-    assert_eq!(config.format, LogOutputFormat::Json, "CI must use JSON format");
+    assert_eq!(
+        config.format,
+        LogOutputFormat::Json,
+        "CI must use JSON format"
+    );
     assert!(config.include_timestamps);
     assert!(config.include_targets);
 }
@@ -568,13 +655,21 @@ fn artifact_manifest_with_bisect_result_summary() {
         "bad-sha",
         77,
         false,
-        vec![make_artifact(ArtifactKind::Log, "logs/recovery.jsonl", "Recovery log")],
+        vec![make_artifact(
+            ArtifactKind::Log,
+            "logs/recovery.jsonl",
+            "Recovery log",
+        )],
         Some(request),
-    ).with_bisect_result_summary(summary);
+    )
+    .with_bisect_result_summary(summary);
 
     assert!(manifest.bisect_result_summary.is_some());
     let errors = manifest.validate();
-    assert!(errors.is_empty(), "manifest with bisect result should validate: {errors:?}");
+    assert!(
+        errors.is_empty(),
+        "manifest with bisect result should validate: {errors:?}"
+    );
 
     let rendered = manifest.render_summary();
     assert!(rendered.contains("confidence=0.95"));
@@ -676,7 +771,11 @@ fn pipeline_results_are_deterministic() {
 fn render_summary_shows_all_tiers() {
     let policy = FlakeBudgetPolicy::canonical();
 
-    let lanes = [CiLane::E2eCorrectness, CiLane::E2eRecovery, CiLane::E2eDifferential];
+    let lanes = [
+        CiLane::E2eCorrectness,
+        CiLane::E2eRecovery,
+        CiLane::E2eDifferential,
+    ];
     let mut lane_results = Vec::new();
     for lane in lanes {
         let r = evaluate_flake_budget(lane, &[TestOutcome::Pass; 10], &policy);
@@ -686,9 +785,18 @@ fn render_summary_shows_all_tiers() {
     let global = evaluate_global_flake_budget(&lane_results, &policy);
     let summary = global.render_summary();
 
-    assert!(summary.contains("e2e-correctness"), "summary must include correctness lane");
-    assert!(summary.contains("e2e-recovery"), "summary must include recovery lane");
-    assert!(summary.contains("e2e-differential"), "summary must include differential lane");
+    assert!(
+        summary.contains("e2e-correctness"),
+        "summary must include correctness lane"
+    );
+    assert!(
+        summary.contains("e2e-recovery"),
+        "summary must include recovery lane"
+    );
+    assert!(
+        summary.contains("e2e-differential"),
+        "summary must include differential lane"
+    );
     assert!(summary.contains("PASS"), "all-pass summary must show PASS");
 }
 
@@ -700,9 +808,15 @@ fn conformance_summary() {
         ("C-1: E2E lane tier classification covers all 7 lanes", true),
         ("C-2: All E2E lanes support deterministic retry", true),
         ("C-3: Artifact manifest validates completeness", true),
-        ("C-4: Failure bundles include structured logs and repro info", true),
+        (
+            "C-4: Failure bundles include structured logs and repro info",
+            true,
+        ),
         ("C-5: Multi-lane pipeline aggregation works correctly", true),
-        ("C-6: Bisect triggers on regression with concurrency caps", true),
+        (
+            "C-6: Bisect triggers on regression with concurrency caps",
+            true,
+        ),
     ];
 
     println!("\n=== bd-mblr.3.2 Conformance Summary ===");

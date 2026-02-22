@@ -127,8 +127,7 @@ impl Schema {
 
     /// Add a table definition.
     pub fn add_table(&mut self, table: TableDef) {
-        self.tables
-            .insert(table.name.to_ascii_lowercase(), table);
+        self.tables.insert(table.name.to_ascii_lowercase(), table);
     }
 
     /// Look up a table by name (case-insensitive).
@@ -390,8 +389,7 @@ impl<'a> Resolver<'a> {
 
         // Record error metrics.
         if !self.errors.is_empty() {
-            FSQLITE_SEMANTIC_ERRORS_TOTAL
-                .fetch_add(self.errors.len() as u64, Ordering::Relaxed);
+            FSQLITE_SEMANTIC_ERRORS_TOTAL.fetch_add(self.errors.len() as u64, Ordering::Relaxed);
         }
 
         self.errors.clone()
@@ -523,9 +521,7 @@ impl<'a> Resolver<'a> {
                     scope.add_alias(alias, "<subquery>", None);
                 }
             }
-            TableOrSubquery::TableFunction {
-                name, alias, ..
-            } => {
+            TableOrSubquery::TableFunction { name, alias, .. } => {
                 let alias_name = alias.as_deref().unwrap_or(name);
                 scope.add_alias(alias_name, name, None);
                 self.tables_resolved += 1;
@@ -667,7 +663,9 @@ impl<'a> Resolver<'a> {
                     self.resolve_expr(else_e, scope);
                 }
             }
-            Expr::JsonAccess { expr: inner, path, .. } => {
+            Expr::JsonAccess {
+                expr: inner, path, ..
+            } => {
                 self.resolve_expr(inner, scope);
                 self.resolve_expr(path, scope);
             }
@@ -677,9 +675,7 @@ impl<'a> Resolver<'a> {
                 }
             }
             // Literals, placeholders, and RAISE don't need resolution.
-            Expr::Literal(_, _)
-            | Expr::Placeholder(_, _)
-            | Expr::Raise { .. } => {}
+            Expr::Literal(_, _) | Expr::Placeholder(_, _) | Expr::Raise { .. } => {}
         }
     }
 
@@ -1071,9 +1067,8 @@ mod tests {
     #[test]
     fn test_resolve_join() {
         let schema = make_schema();
-        let stmt = parse_one(
-            "SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id",
-        );
+        let stmt =
+            parse_one("SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id");
         let mut resolver = Resolver::new(&schema);
         let errors = resolver.resolve_statement(&stmt);
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");

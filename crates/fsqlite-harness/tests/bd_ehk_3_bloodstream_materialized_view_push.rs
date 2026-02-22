@@ -24,10 +24,10 @@
 use std::collections::BTreeSet;
 
 use fsqlite_harness::bloodstream::{
-    AlgebraicDelta, BindingError, BindingState, DeltaBatch, DeltaKind, PropagationConfig,
-    PropagationEngine, PropagationMetrics, PropagationResult, ViewBinding,
-    BLOODSTREAM_SCHEMA_VERSION, DELTA_SPAN_NAME, REQUIRED_METRICS, REQUIRED_SPAN_FIELDS,
-    coalesce_deltas, verify_metrics_contract,
+    AlgebraicDelta, BLOODSTREAM_SCHEMA_VERSION, BindingError, BindingState, DELTA_SPAN_NAME,
+    DeltaBatch, DeltaKind, PropagationConfig, PropagationEngine, PropagationMetrics,
+    PropagationResult, REQUIRED_METRICS, REQUIRED_SPAN_FIELDS, ViewBinding, coalesce_deltas,
+    verify_metrics_contract,
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -211,7 +211,11 @@ fn coalesce_distinct_rows_preserved() {
         make_delta("t", 3, DeltaKind::Delete, 2),
     ];
     let result = coalesce_deltas(&deltas);
-    assert_eq!(result.len(), 3, "distinct rows should all survive coalescing");
+    assert_eq!(
+        result.len(),
+        3,
+        "distinct rows should all survive coalescing"
+    );
 }
 
 // ── 9. BindingState lifecycle ────────────────────────────────────────────────
@@ -266,12 +270,7 @@ fn view_binding_lifecycle() {
 
 #[test]
 fn view_binding_delivery_tracking() {
-    let mut binding = ViewBinding::new(
-        1,
-        "v".to_string(),
-        "w".to_string(),
-        tables(&["users"]),
-    );
+    let mut binding = ViewBinding::new(1, "v".to_string(), "w".to_string(), tables(&["users"]));
 
     let batch = make_batch(
         1,
@@ -418,10 +417,7 @@ fn propagation_engine_max_bindings() {
     let err = engine
         .bind("v3".to_string(), "w3".to_string(), tables(&["t"]))
         .unwrap_err();
-    assert_eq!(
-        err,
-        BindingError::MaxBindingsExceeded { limit: 2 }
-    );
+    assert_eq!(err, BindingError::MaxBindingsExceeded { limit: 2 });
 }
 
 // ── 17. PropagationEngine unbind ─────────────────────────────────────────────
@@ -481,7 +477,10 @@ fn contract_violation_detection() {
     // Clean metrics — no violations.
     let clean = PropagationMetrics::new();
     let violations = verify_metrics_contract(&clean);
-    assert!(violations.is_empty(), "fresh metrics should have no violations");
+    assert!(
+        violations.is_empty(),
+        "fresh metrics should have no violations"
+    );
 
     // Broken metrics: deltas > 0 but batches == 0.
     let mut broken = PropagationMetrics::new();

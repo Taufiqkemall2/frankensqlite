@@ -140,7 +140,11 @@ fn test_full_scan_consistency() {
     // Full scan should still contain all original elements.
     let scan = col.full_scan();
     assert_eq!(scan.len(), original.len());
-    assert_eq!(sorted(scan), original, "cracking must preserve all elements");
+    assert_eq!(
+        sorted(scan),
+        original,
+        "cracking must preserve all elements"
+    );
 
     println!("[PASS] Full scan consistency: all 50 elements preserved after 3 crack ops");
 }
@@ -167,11 +171,7 @@ fn test_large_scale_correctness() {
         let hi = lo + 499;
         let result = col.range_query(lo, hi);
         let expected: Vec<u32> = (lo..=hi).collect();
-        assert_eq!(
-            sorted(result),
-            expected,
-            "range [{lo}, {hi}] incorrect"
-        );
+        assert_eq!(sorted(result), expected, "range [{lo}, {hi}] incorrect");
     }
 
     // All elements still present.
@@ -192,7 +192,10 @@ fn test_convergence_toward_sorted() {
     let data = make_reversed_column(n);
     let mut col = CrackedColumn::new(data);
 
-    assert!(!col.is_fully_sorted(), "reversed column should not be sorted initially");
+    assert!(
+        !col.is_fully_sorted(),
+        "reversed column should not be sorted initially"
+    );
 
     // Query every value as a point query to force full cracking.
     for v in 0..n {
@@ -215,7 +218,9 @@ fn test_convergence_toward_sorted() {
         "avg segment size should be small after full cracking, got {avg}"
     );
 
-    println!("[PASS] Convergence: {cracks} cracks, avg_segment_size={avg:.1} after 100 point queries");
+    println!(
+        "[PASS] Convergence: {cracks} cracks, avg_segment_size={avg:.1} after 100 point queries"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -294,10 +299,7 @@ fn test_metrics_fidelity() {
     );
 
     // Each new crack boundary causes a partition operation.
-    assert!(
-        delta_ops >= 1,
-        "expected >= 1 crack ops, got {delta_ops}"
-    );
+    assert!(delta_ops >= 1, "expected >= 1 crack ops, got {delta_ops}");
 
     // Elements partitioned should be > 0 (we're cracking a reversed column).
     assert!(
@@ -307,7 +309,10 @@ fn test_metrics_fidelity() {
 
     // Display format.
     let text = format!("{}", m_after);
-    assert!(text.contains("crack_ops="), "Display should include crack_ops");
+    assert!(
+        text.contains("crack_ops="),
+        "Display should include crack_ops"
+    );
     assert!(text.contains("queries="), "Display should include queries");
 
     println!(
@@ -327,7 +332,9 @@ fn test_edge_cases() {
     assert_eq!(empty.len(), 0);
     assert!(empty.is_fully_sorted());
     #[allow(clippy::float_cmp)]
-    { assert_eq!(empty.avg_segment_size(), 0.0); }
+    {
+        assert_eq!(empty.avg_segment_size(), 0.0);
+    }
 
     // Single element.
     let mut single = CrackedColumn::new(vec![42u32]);
@@ -353,7 +360,10 @@ fn test_edge_cases() {
 
     // Debug format.
     let dbg = format!("{:?}", col);
-    assert!(dbg.contains("CrackedColumn"), "Debug should include type name");
+    assert!(
+        dbg.contains("CrackedColumn"),
+        "Debug should include type name"
+    );
     assert!(dbg.contains("len"), "Debug should include len");
 
     println!("[PASS] Edge cases: empty, single, sorted, full-range, debug all correct");

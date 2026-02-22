@@ -8,9 +8,9 @@
 use fsqlite_harness::ci_gate_matrix::CiLane;
 use fsqlite_harness::impact_graph::ImpactGraph;
 use fsqlite_harness::lane_selector::{
-    LaneSelectionAuditConfig, LaneSelectionReport,
-    LaneSelectionVerdict, LANE_SELECTION_BEAD_ID, load_lane_audit_report,
-    run_lane_selection_audit, select_ci_lanes_for_paths, write_lane_audit_report,
+    LANE_SELECTION_BEAD_ID, LaneSelectionAuditConfig, LaneSelectionReport, LaneSelectionVerdict,
+    load_lane_audit_report, run_lane_selection_audit, select_ci_lanes_for_paths,
+    write_lane_audit_report,
 };
 use tempfile::TempDir;
 
@@ -42,12 +42,18 @@ fn safety_floor_lanes() -> Vec<CiLane> {
 fn mvcc_change_selects_correct_lanes() {
     let report = select(&["crates/fsqlite-mvcc/src/lib.rs"]);
 
-    assert!(!report.fallback_full_suite, "known MVCC path should not trigger fallback");
+    assert!(
+        !report.fallback_full_suite,
+        "known MVCC path should not trigger fallback"
+    );
     let lanes = report.selected_lanes();
 
     // Safety floor always present
     for floor in safety_floor_lanes() {
-        assert!(lanes.contains(&floor), "must include safety floor lane {floor:?}");
+        assert!(
+            lanes.contains(&floor),
+            "must include safety floor lane {floor:?}"
+        );
     }
 }
 
@@ -55,11 +61,17 @@ fn mvcc_change_selects_correct_lanes() {
 fn pager_change_selects_correct_lanes() {
     let report = select(&["crates/fsqlite-pager/src/lib.rs"]);
 
-    assert!(!report.fallback_full_suite, "known pager path should not trigger fallback");
+    assert!(
+        !report.fallback_full_suite,
+        "known pager path should not trigger fallback"
+    );
     let lanes = report.selected_lanes();
 
     for floor in safety_floor_lanes() {
-        assert!(lanes.contains(&floor), "must include safety floor lane {floor:?}");
+        assert!(
+            lanes.contains(&floor),
+            "must include safety floor lane {floor:?}"
+        );
     }
 }
 
@@ -67,8 +79,14 @@ fn pager_change_selects_correct_lanes() {
 fn parser_change_selects_correct_lanes() {
     let report = select(&["crates/fsqlite-parser/src/lib.rs"]);
 
-    assert!(!report.fallback_full_suite, "known parser path should not trigger fallback");
-    assert!(!report.resolved_code_areas.is_empty(), "parser path must resolve");
+    assert!(
+        !report.fallback_full_suite,
+        "known parser path should not trigger fallback"
+    );
+    assert!(
+        !report.resolved_code_areas.is_empty(),
+        "parser path must resolve"
+    );
 }
 
 #[test]
@@ -81,9 +99,15 @@ fn multi_crate_change_selects_union_of_lanes() {
     let lanes = report.selected_lanes();
     // Multiple crates → at least safety floor
     for floor in safety_floor_lanes() {
-        assert!(lanes.contains(&floor), "must include safety floor lane {floor:?}");
+        assert!(
+            lanes.contains(&floor),
+            "must include safety floor lane {floor:?}"
+        );
     }
-    assert!(report.resolved_code_areas.len() >= 2, "both areas must resolve");
+    assert!(
+        report.resolved_code_areas.len() >= 2,
+        "both areas must resolve"
+    );
 }
 
 // ─── Fallback Policy: Unknown Paths ───────────────────────────────────
@@ -126,7 +150,10 @@ fn multiple_unknown_paths_all_reported() {
 
     // All unknown code paths should appear in unresolved
     if !report.unresolved_paths.is_empty() {
-        assert!(report.fallback_full_suite, "multiple unknowns must trigger fallback");
+        assert!(
+            report.fallback_full_suite,
+            "multiple unknowns must trigger fallback"
+        );
     }
 }
 
@@ -172,7 +199,10 @@ fn fallback_includes_safety_floor() {
 
 #[test]
 fn selection_is_deterministic() {
-    let paths = &["crates/fsqlite-mvcc/src/lib.rs", "crates/fsqlite-pager/src/lib.rs"];
+    let paths = &[
+        "crates/fsqlite-mvcc/src/lib.rs",
+        "crates/fsqlite-pager/src/lib.rs",
+    ];
     let a = select(paths);
     let b = select(paths);
 
@@ -183,10 +213,20 @@ fn selection_is_deterministic() {
 
 #[test]
 fn selection_deterministic_regardless_of_path_order() {
-    let a = select(&["crates/fsqlite-mvcc/src/lib.rs", "crates/fsqlite-pager/src/lib.rs"]);
-    let b = select(&["crates/fsqlite-pager/src/lib.rs", "crates/fsqlite-mvcc/src/lib.rs"]);
+    let a = select(&[
+        "crates/fsqlite-mvcc/src/lib.rs",
+        "crates/fsqlite-pager/src/lib.rs",
+    ]);
+    let b = select(&[
+        "crates/fsqlite-pager/src/lib.rs",
+        "crates/fsqlite-mvcc/src/lib.rs",
+    ]);
 
-    assert_eq!(a.selected_lanes(), b.selected_lanes(), "path order must not affect lane selection");
+    assert_eq!(
+        a.selected_lanes(),
+        b.selected_lanes(),
+        "path order must not affect lane selection"
+    );
     assert_eq!(
         a.resolved_code_areas, b.resolved_code_areas,
         "path order must not affect resolved areas"
@@ -337,7 +377,10 @@ fn audit_scenario_results_match_config() {
 fn impact_graph_validates_without_errors() {
     let graph = ImpactGraph::canonical();
     let errors = graph.validate();
-    assert!(errors.is_empty(), "canonical graph must validate: {errors:?}");
+    assert!(
+        errors.is_empty(),
+        "canonical graph must validate: {errors:?}"
+    );
 }
 
 // ─── LaneSelectionVerdict Display ─────────────────────────────────────
@@ -391,8 +434,14 @@ fn conformance_summary() {
     let checks = vec![
         ("C-1: Known paths resolve correctly without fallback", true),
         ("C-2: Unknown code paths trigger full-suite fallback", true),
-        ("C-3: Safety floor always enforced (4 mandatory lanes)", true),
-        ("C-4: Selection deterministic regardless of path order", true),
+        (
+            "C-3: Safety floor always enforced (4 mandatory lanes)",
+            true,
+        ),
+        (
+            "C-4: Selection deterministic regardless of path order",
+            true,
+        ),
         ("C-5: Audit runner evaluates multi-scenario configs", true),
         ("C-6: Disallowed fallback triggers Fail verdict", true),
         ("C-7: Audit report JSON round-trip persistence", true),

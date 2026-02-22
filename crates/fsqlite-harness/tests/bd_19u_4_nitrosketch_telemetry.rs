@@ -11,8 +11,8 @@
 //!   8. Machine-readable conformance output
 
 use fsqlite_mvcc::{
-    CountMinSketch, CountMinSketchConfig, StreamingHistogram,
-    reset_sketch_telemetry_metrics, sketch_telemetry_metrics,
+    CountMinSketch, CountMinSketchConfig, StreamingHistogram, reset_sketch_telemetry_metrics,
+    sketch_telemetry_metrics,
 };
 
 // ---------------------------------------------------------------------------
@@ -117,9 +117,7 @@ fn test_cms_heavy_hitter_skew() {
         "max overcount {max_overcount} too high for width=2048"
     );
 
-    println!(
-        "[PASS] CMS heavy-hitter skew: heavy=50K exact, max_overcount={max_overcount}"
-    );
+    println!("[PASS] CMS heavy-hitter skew: heavy=50K exact, max_overcount={max_overcount}");
 }
 
 // ---------------------------------------------------------------------------
@@ -230,8 +228,14 @@ fn test_sketch_metrics_integration() {
     h.observe(500);
 
     let m = sketch_telemetry_metrics();
-    assert!(m.fsqlite_sketch_memory_bytes > 0, "memory gauge should be > 0");
-    assert_eq!(m.fsqlite_sketch_observations_total, 5, "3 CMS + 2 histogram");
+    assert!(
+        m.fsqlite_sketch_memory_bytes > 0,
+        "memory gauge should be > 0"
+    );
+    assert_eq!(
+        m.fsqlite_sketch_observations_total, 5,
+        "3 CMS + 2 histogram"
+    );
     assert_eq!(m.fsqlite_sketch_estimates_total, 2, "2 CMS estimates");
 
     // Verify serialization.
@@ -391,8 +395,8 @@ fn test_conformance_summary() {
         cms.observe(1);
         _ = cms.estimate(1);
         let m = sketch_telemetry_metrics();
-        let pass = m.fsqlite_sketch_observations_total >= 1
-            && m.fsqlite_sketch_estimates_total >= 1;
+        let pass =
+            m.fsqlite_sketch_observations_total >= 1 && m.fsqlite_sketch_estimates_total >= 1;
         results.push(TestResult {
             name: "metrics_increment",
             pass,

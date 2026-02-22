@@ -193,9 +193,7 @@ impl IoUringFile {
             match read_result {
                 Ok(Ok(data)) => Ok(data),
                 Ok(Err(err)) => Err(FrankenError::Io(err)),
-                Err(_) => Err(FrankenError::Io(io::Error::other(
-                    "io_uring read panicked",
-                ))),
+                Err(_) => Err(FrankenError::Io(io::Error::other("io_uring read panicked"))),
             }
         })?;
 
@@ -239,7 +237,7 @@ impl IoUringFile {
                     Err(_) => {
                         return Err(FrankenError::Io(io::Error::other(
                             "io_uring write panicked",
-                        )))
+                        )));
                     }
                 }
                 let after = current_offset(file)?;

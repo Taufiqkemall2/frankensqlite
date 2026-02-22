@@ -110,7 +110,10 @@ fn core_sql_tests() -> Vec<ConformanceResult> {
 
     // 2. String concatenation
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        assert_eq!(query_text(&conn, "SELECT 'hello' || ' ' || 'world';"), "hello world");
+        assert_eq!(
+            query_text(&conn, "SELECT 'hello' || ' ' || 'world';"),
+            "hello world"
+        );
     })) {
         Ok(()) => results.push(ok("select_string_concat", cat.clone())),
         Err(e) => results.push(fail("select_string_concat", cat.clone(), format!("{e:?}"))),
@@ -119,10 +122,13 @@ fn core_sql_tests() -> Vec<ConformanceResult> {
     // 3. CREATE TABLE + INSERT + SELECT
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let c = Connection::open(":memory:").unwrap();
-        c.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT, score REAL);").unwrap();
-        c.execute("INSERT INTO t1 VALUES(1, 'alice', 95.5);").unwrap();
+        c.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT, score REAL);")
+            .unwrap();
+        c.execute("INSERT INTO t1 VALUES(1, 'alice', 95.5);")
+            .unwrap();
         c.execute("INSERT INTO t1 VALUES(2, 'bob', 87.0);").unwrap();
-        c.execute("INSERT INTO t1 VALUES(3, 'carol', 92.3);").unwrap();
+        c.execute("INSERT INTO t1 VALUES(3, 'carol', 92.3);")
+            .unwrap();
         let rows = c.query("SELECT id, name FROM t1 ORDER BY id;").unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].get(1), Some(&SqliteValue::Text("alice".to_owned())));
@@ -150,7 +156,8 @@ fn core_sql_tests() -> Vec<ConformanceResult> {
     // 5. UPDATE
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let c = Connection::open(":memory:").unwrap();
-        c.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, v TEXT);").unwrap();
+        c.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, v TEXT);")
+            .unwrap();
         c.execute("INSERT INTO t1 VALUES(1, 'old');").unwrap();
         c.execute("UPDATE t1 SET v = 'new' WHERE id = 1;").unwrap();
         let rows = c.query("SELECT v FROM t1 WHERE id = 1;").unwrap();
@@ -194,7 +201,8 @@ fn core_sql_tests() -> Vec<ConformanceResult> {
     // 8. GROUP BY + HAVING
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let c = Connection::open(":memory:").unwrap();
-        c.execute("CREATE TABLE sales(dept TEXT, amount INTEGER);").unwrap();
+        c.execute("CREATE TABLE sales(dept TEXT, amount INTEGER);")
+            .unwrap();
         c.execute("INSERT INTO sales VALUES('a', 10);").unwrap();
         c.execute("INSERT INTO sales VALUES('a', 20);").unwrap();
         c.execute("INSERT INTO sales VALUES('b', 5);").unwrap();
@@ -213,7 +221,9 @@ fn core_sql_tests() -> Vec<ConformanceResult> {
         for i in 1..=10 {
             c.execute(&format!("INSERT INTO t1 VALUES({i});")).unwrap();
         }
-        let rows = c.query("SELECT x FROM t1 ORDER BY x DESC LIMIT 3 OFFSET 2;").unwrap();
+        let rows = c
+            .query("SELECT x FROM t1 ORDER BY x DESC LIMIT 3 OFFSET 2;")
+            .unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(8)));
         assert_eq!(rows[2].get(0), Some(&SqliteValue::Integer(6)));
@@ -225,21 +235,37 @@ fn core_sql_tests() -> Vec<ConformanceResult> {
     // 10. JOIN
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let c = Connection::open(":memory:").unwrap();
-        c.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT);").unwrap();
-        c.execute("CREATE TABLE orders(id INTEGER PRIMARY KEY, user_id INTEGER, item TEXT);").unwrap();
+        c.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        c.execute("CREATE TABLE orders(id INTEGER PRIMARY KEY, user_id INTEGER, item TEXT);")
+            .unwrap();
         c.execute("INSERT INTO users VALUES(1, 'alice');").unwrap();
         c.execute("INSERT INTO users VALUES(2, 'bob');").unwrap();
-        c.execute("INSERT INTO orders VALUES(1, 1, 'widget');").unwrap();
-        c.execute("INSERT INTO orders VALUES(2, 1, 'gadget');").unwrap();
-        c.execute("INSERT INTO orders VALUES(3, 2, 'thing');").unwrap();
-        let rows = c.query("SELECT u.name, o.item FROM users u JOIN orders o ON u.id = o.user_id;").unwrap();
+        c.execute("INSERT INTO orders VALUES(1, 1, 'widget');")
+            .unwrap();
+        c.execute("INSERT INTO orders VALUES(2, 1, 'gadget');")
+            .unwrap();
+        c.execute("INSERT INTO orders VALUES(3, 2, 'thing');")
+            .unwrap();
+        let rows = c
+            .query("SELECT u.name, o.item FROM users u JOIN orders o ON u.id = o.user_id;")
+            .unwrap();
         assert_eq!(rows.len(), 3);
         // Verify join produced correct pairs (order may vary).
-        let pairs: Vec<(String, String)> = rows.iter().map(|r| {
-            let name = match r.get(0) { Some(SqliteValue::Text(s)) => s.clone(), _ => String::new() };
-            let item = match r.get(1) { Some(SqliteValue::Text(s)) => s.clone(), _ => String::new() };
-            (name, item)
-        }).collect();
+        let pairs: Vec<(String, String)> = rows
+            .iter()
+            .map(|r| {
+                let name = match r.get(0) {
+                    Some(SqliteValue::Text(s)) => s.clone(),
+                    _ => String::new(),
+                };
+                let item = match r.get(1) {
+                    Some(SqliteValue::Text(s)) => s.clone(),
+                    _ => String::new(),
+                };
+                (name, item)
+            })
+            .collect();
         assert!(pairs.contains(&("alice".to_owned(), "widget".to_owned())));
         assert!(pairs.contains(&("alice".to_owned(), "gadget".to_owned())));
         assert!(pairs.contains(&("bob".to_owned(), "thing".to_owned())));
@@ -251,16 +277,23 @@ fn core_sql_tests() -> Vec<ConformanceResult> {
     // 11. LEFT JOIN
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let c = Connection::open(":memory:").unwrap();
-        c.execute("CREATE TABLE a(id INTEGER PRIMARY KEY, val TEXT);").unwrap();
-        c.execute("CREATE TABLE b(id INTEGER PRIMARY KEY, a_id INTEGER, val TEXT);").unwrap();
+        c.execute("CREATE TABLE a(id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        c.execute("CREATE TABLE b(id INTEGER PRIMARY KEY, a_id INTEGER, val TEXT);")
+            .unwrap();
         c.execute("INSERT INTO a VALUES(1, 'x');").unwrap();
         c.execute("INSERT INTO a VALUES(2, 'y');").unwrap();
         c.execute("INSERT INTO b VALUES(1, 1, 'b1');").unwrap();
-        let rows = c.query("SELECT a.val, b.val FROM a LEFT JOIN b ON a.id = b.a_id;").unwrap();
+        let rows = c
+            .query("SELECT a.val, b.val FROM a LEFT JOIN b ON a.id = b.a_id;")
+            .unwrap();
         assert_eq!(rows.len(), 2);
         // One row should have NULL for b.val (the unmatched left side).
         let has_null = rows.iter().any(|r| r.get(1) == Some(&SqliteValue::Null));
-        assert!(has_null, "LEFT JOIN should produce NULL for unmatched right side");
+        assert!(
+            has_null,
+            "LEFT JOIN should produce NULL for unmatched right side"
+        );
     })) {
         Ok(()) => results.push(ok("left_join", cat.clone())),
         Err(e) => results.push(fail("left_join", cat.clone(), format!("{e:?}"))),
@@ -273,7 +306,9 @@ fn core_sql_tests() -> Vec<ConformanceResult> {
         for i in 1..=5 {
             c.execute(&format!("INSERT INTO t1 VALUES({i});")).unwrap();
         }
-        let rows = c.query("SELECT x FROM t1 WHERE x > (SELECT avg(x) FROM t1);").unwrap();
+        let rows = c
+            .query("SELECT x FROM t1 WHERE x > (SELECT avg(x) FROM t1);")
+            .unwrap();
         assert_eq!(rows.len(), 2); // 4 and 5 (avg=3.0)
     })) {
         Ok(()) => results.push(ok("subquery_in_where", cat.clone())),
@@ -283,7 +318,9 @@ fn core_sql_tests() -> Vec<ConformanceResult> {
     // 13. UNION
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let c = Connection::open(":memory:").unwrap();
-        let rows = c.query("SELECT 1 AS x UNION SELECT 2 UNION SELECT 1;").unwrap();
+        let rows = c
+            .query("SELECT 1 AS x UNION SELECT 2 UNION SELECT 1;")
+            .unwrap();
         assert_eq!(rows.len(), 2); // dedup: 1, 2
     })) {
         Ok(()) => results.push(ok("union_dedup", cat.clone())),
@@ -293,7 +330,9 @@ fn core_sql_tests() -> Vec<ConformanceResult> {
     // 14. UNION ALL
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let c = Connection::open(":memory:").unwrap();
-        let rows = c.query("SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 1;").unwrap();
+        let rows = c
+            .query("SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 1;")
+            .unwrap();
         assert_eq!(rows.len(), 3);
     })) {
         Ok(()) => results.push(ok("union_all", cat.clone())),
@@ -317,7 +356,9 @@ fn core_sql_tests() -> Vec<ConformanceResult> {
         for i in 1..=10 {
             c.execute(&format!("INSERT INTO t1 VALUES({i});")).unwrap();
         }
-        let rows = c.query("SELECT x FROM t1 WHERE x BETWEEN 3 AND 7 ORDER BY x;").unwrap();
+        let rows = c
+            .query("SELECT x FROM t1 WHERE x BETWEEN 3 AND 7 ORDER BY x;")
+            .unwrap();
         assert_eq!(rows.len(), 5);
     })) {
         Ok(()) => results.push(ok("between_predicate", cat.clone())),
@@ -331,7 +372,9 @@ fn core_sql_tests() -> Vec<ConformanceResult> {
         for i in 1..=5 {
             c.execute(&format!("INSERT INTO t1 VALUES({i});")).unwrap();
         }
-        let rows = c.query("SELECT x FROM t1 WHERE x IN (1, 3, 5) ORDER BY x;").unwrap();
+        let rows = c
+            .query("SELECT x FROM t1 WHERE x IN (1, 3, 5) ORDER BY x;")
+            .unwrap();
         assert_eq!(rows.len(), 3);
     })) {
         Ok(()) => results.push(ok("in_list", cat.clone())),
@@ -345,7 +388,9 @@ fn core_sql_tests() -> Vec<ConformanceResult> {
         c.execute("INSERT INTO t1 VALUES('alice');").unwrap();
         c.execute("INSERT INTO t1 VALUES('bob');").unwrap();
         c.execute("INSERT INTO t1 VALUES('alex');").unwrap();
-        let rows = c.query("SELECT name FROM t1 WHERE name LIKE 'al%' ORDER BY name;").unwrap();
+        let rows = c
+            .query("SELECT name FROM t1 WHERE name LIKE 'al%' ORDER BY name;")
+            .unwrap();
         assert_eq!(rows.len(), 2);
     })) {
         Ok(()) => results.push(ok("like_pattern", cat.clone())),
@@ -355,7 +400,9 @@ fn core_sql_tests() -> Vec<ConformanceResult> {
     // 19. NULL handling
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let c = Connection::open(":memory:").unwrap();
-        let rows = c.query("SELECT NULL IS NULL, NULL IS NOT NULL, 1 IS NULL;").unwrap();
+        let rows = c
+            .query("SELECT NULL IS NULL, NULL IS NOT NULL, 1 IS NULL;")
+            .unwrap();
         assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(1)));
         assert_eq!(rows[0].get(1), Some(&SqliteValue::Integer(0)));
         assert_eq!(rows[0].get(2), Some(&SqliteValue::Integer(0)));
@@ -367,7 +414,8 @@ fn core_sql_tests() -> Vec<ConformanceResult> {
     // 20. CREATE INDEX + query with index
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let c = Connection::open(":memory:").unwrap();
-        c.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT);").unwrap();
+        c.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
         c.execute("CREATE INDEX idx_name ON t1(name);").unwrap();
         c.execute("INSERT INTO t1 VALUES(1, 'alice');").unwrap();
         c.execute("INSERT INTO t1 VALUES(2, 'bob');").unwrap();
@@ -397,10 +445,12 @@ fn core_sql_tests() -> Vec<ConformanceResult> {
     // 22. Parameterized query
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let c = Connection::open(":memory:").unwrap();
-        let rows = c.query_with_params(
-            "SELECT ?1 + ?2;",
-            &[SqliteValue::Integer(10), SqliteValue::Integer(20)],
-        ).unwrap();
+        let rows = c
+            .query_with_params(
+                "SELECT ?1 + ?2;",
+                &[SqliteValue::Integer(10), SqliteValue::Integer(20)],
+            )
+            .unwrap();
         assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(30)));
     })) {
         Ok(()) => results.push(ok("parameterized_query", cat.clone())),
@@ -434,7 +484,9 @@ fn core_sql_tests() -> Vec<ConformanceResult> {
         c.execute("INSERT INTO t1 VALUES(1, 2);").unwrap();
         c.execute("INSERT INTO t1 VALUES(1, 1);").unwrap();
         c.execute("INSERT INTO t1 VALUES(2, 1);").unwrap();
-        let rows = c.query("SELECT a, b FROM t1 ORDER BY a ASC, b DESC;").unwrap();
+        let rows = c
+            .query("SELECT a, b FROM t1 ORDER BY a ASC, b DESC;")
+            .unwrap();
         assert_eq!(rows[0].get(1), Some(&SqliteValue::Integer(2)));
         assert_eq!(rows[1].get(1), Some(&SqliteValue::Integer(1)));
     })) {
@@ -565,18 +617,24 @@ fn error_handling_tests() -> Vec<ConformanceResult> {
     // 3. UNIQUE constraint violation
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let c = Connection::open(":memory:").unwrap();
-        c.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY);").unwrap();
+        c.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY);")
+            .unwrap();
         c.execute("INSERT INTO t1 VALUES(1);").unwrap();
         assert!(c.execute("INSERT INTO t1 VALUES(1);").is_err());
     })) {
         Ok(()) => results.push(ok("unique_constraint_violation", cat.clone())),
-        Err(e) => results.push(fail("unique_constraint_violation", cat.clone(), format!("{e:?}"))),
+        Err(e) => results.push(fail(
+            "unique_constraint_violation",
+            cat.clone(),
+            format!("{e:?}"),
+        )),
     }
 
     // 4. NOT NULL constraint violation (explicit NULL)
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let c = Connection::open(":memory:").unwrap();
-        c.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY NOT NULL, name TEXT NOT NULL);").unwrap();
+        c.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY NOT NULL, name TEXT NOT NULL);")
+            .unwrap();
         // Explicit NULL insertion should fail.
         assert!(c.execute("INSERT INTO t1 VALUES(1, NULL);").is_err());
     })) {
@@ -612,7 +670,11 @@ fn error_handling_tests() -> Vec<ConformanceResult> {
         c.execute("ROLLBACK;").unwrap();
     })) {
         Ok(()) => results.push(ok("nested_transaction_error", cat.clone())),
-        Err(e) => results.push(fail("nested_transaction_error", cat.clone(), format!("{e:?}"))),
+        Err(e) => results.push(fail(
+            "nested_transaction_error",
+            cat.clone(),
+            format!("{e:?}"),
+        )),
     }
 
     // 8. DROP TABLE + verify gone
@@ -632,7 +694,8 @@ fn error_handling_tests() -> Vec<ConformanceResult> {
 // ── Conformance matrix builder ──────────────────────────────────────
 
 fn build_conformance_matrix(results: &[ConformanceResult]) -> String {
-    let mut by_category: std::collections::BTreeMap<String, (usize, usize)> = std::collections::BTreeMap::new();
+    let mut by_category: std::collections::BTreeMap<String, (usize, usize)> =
+        std::collections::BTreeMap::new();
 
     for r in results {
         let cat_name = format!("{:?}", r.category);
@@ -677,7 +740,10 @@ fn build_conformance_matrix(results: &[ConformanceResult]) -> String {
         matrix.push_str("\n--- Failures ---\n");
         for r in results {
             if !r.passed {
-                matrix.push_str(&format!("FAIL: {} ({:?}): {}\n", r.test_name, r.category, r.detail));
+                matrix.push_str(&format!(
+                    "FAIL: {} ({:?}): {}\n",
+                    r.test_name, r.category, r.detail
+                ));
             }
         }
     }
@@ -704,8 +770,14 @@ fn native_sql_conformance_suite() {
     };
 
     // Core SQL target: >95%
-    let core_total = results.iter().filter(|r| r.category == Category::CoreSql).count();
-    let core_passed = results.iter().filter(|r| r.category == Category::CoreSql && r.passed).count();
+    let core_total = results
+        .iter()
+        .filter(|r| r.category == Category::CoreSql)
+        .count();
+    let core_passed = results
+        .iter()
+        .filter(|r| r.category == Category::CoreSql && r.passed)
+        .count();
     let core_rate = if core_total > 0 {
         (core_passed as f64 / core_total as f64) * 100.0
     } else {
@@ -713,8 +785,14 @@ fn native_sql_conformance_suite() {
     };
 
     // Transaction target: >90%
-    let tx_total = results.iter().filter(|r| r.category == Category::Transactions).count();
-    let tx_passed = results.iter().filter(|r| r.category == Category::Transactions && r.passed).count();
+    let tx_total = results
+        .iter()
+        .filter(|r| r.category == Category::Transactions)
+        .count();
+    let tx_passed = results
+        .iter()
+        .filter(|r| r.category == Category::Transactions && r.passed)
+        .count();
     let tx_rate = if tx_total > 0 {
         (tx_passed as f64 / tx_total as f64) * 100.0
     } else {
@@ -722,8 +800,14 @@ fn native_sql_conformance_suite() {
     };
 
     // Error handling target: >90%
-    let err_total = results.iter().filter(|r| r.category == Category::ErrorHandling).count();
-    let err_passed = results.iter().filter(|r| r.category == Category::ErrorHandling && r.passed).count();
+    let err_total = results
+        .iter()
+        .filter(|r| r.category == Category::ErrorHandling)
+        .count();
+    let err_passed = results
+        .iter()
+        .filter(|r| r.category == Category::ErrorHandling && r.passed)
+        .count();
     let err_rate = if err_total > 0 {
         (err_passed as f64 / err_total as f64) * 100.0
     } else {
@@ -767,9 +851,16 @@ fn conformance_matrix_is_machine_readable_json() {
         let passed = results.iter().filter(|r| r.passed).count();
 
         let mut categories = serde_json::Map::new();
-        for cat in [Category::CoreSql, Category::Transactions, Category::ErrorHandling] {
+        for cat in [
+            Category::CoreSql,
+            Category::Transactions,
+            Category::ErrorHandling,
+        ] {
             let cat_total = results.iter().filter(|r| r.category == cat).count();
-            let cat_passed = results.iter().filter(|r| r.category == cat && r.passed).count();
+            let cat_passed = results
+                .iter()
+                .filter(|r| r.category == cat && r.passed)
+                .count();
             categories.insert(format!("{cat:?}"), serde_json::json!({
                 "total": cat_total,
                 "passed": cat_passed,
@@ -777,13 +868,16 @@ fn conformance_matrix_is_machine_readable_json() {
             }));
         }
 
-        let failures: Vec<serde_json::Value> = results.iter()
+        let failures: Vec<serde_json::Value> = results
+            .iter()
             .filter(|r| !r.passed)
-            .map(|r| serde_json::json!({
-                "test": r.test_name,
-                "category": format!("{:?}", r.category),
-                "detail": r.detail,
-            }))
+            .map(|r| {
+                serde_json::json!({
+                    "test": r.test_name,
+                    "category": format!("{:?}", r.category),
+                    "detail": r.detail,
+                })
+            })
             .collect();
 
         serde_json::json!({

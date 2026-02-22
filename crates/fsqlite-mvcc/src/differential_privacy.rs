@@ -163,10 +163,7 @@ impl fmt::Display for NoiseMechanism {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum DpError {
     /// Budget exhausted: requested ε exceeds remaining budget.
-    BudgetExhausted {
-        requested: f64,
-        remaining: f64,
-    },
+    BudgetExhausted { requested: f64, remaining: f64 },
     /// Invalid parameter.
     InvalidParameter(String),
 }
@@ -618,10 +615,7 @@ mod tests {
         let variance = sum_sq / f64::from(n) - mean * mean;
 
         // Laplace(0, 1): E[X] = 0, Var[X] = 2b² = 2.
-        assert!(
-            mean.abs() < 0.1,
-            "Laplace mean should be ~0, got {mean:.4}"
-        );
+        assert!(mean.abs() < 0.1, "Laplace mean should be ~0, got {mean:.4}");
         assert!(
             (variance - 2.0).abs() < 0.3,
             "Laplace variance should be ~2, got {variance:.4}"
@@ -665,7 +659,10 @@ mod tests {
         assert_eq!(sensitivity::sum(100.0), 100.0);
 
         let avg_sens = sensitivity::avg(100.0, 1000);
-        assert!((avg_sens - 0.2).abs() < 1e-10, "avg sensitivity = 2*100/1000 = 0.2");
+        assert!(
+            (avg_sens - 0.2).abs() < 1e-10,
+            "avg sensitivity = 2*100/1000 = 0.2"
+        );
 
         assert_eq!(sensitivity::avg(100.0, 0), 0.0);
 

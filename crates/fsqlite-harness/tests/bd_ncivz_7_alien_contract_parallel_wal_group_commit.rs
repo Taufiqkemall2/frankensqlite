@@ -18,26 +18,26 @@
 //! - Conformance summary
 
 use fsqlite_harness::concurrent_writer_parity::{
-    ConcurrentInvariantArea, ConcurrentWriterParityConfig, ConcurrentWriterVerdict,
-    CONCURRENT_WRITER_SCHEMA_VERSION,
+    CONCURRENT_WRITER_SCHEMA_VERSION, ConcurrentInvariantArea, ConcurrentWriterParityConfig,
+    ConcurrentWriterVerdict,
 };
-use fsqlite_harness::replay_harness::{Regime, REPLAY_SCHEMA_VERSION};
-use fsqlite_harness::lane_selector::{SafetyDomain, LANE_SELECTOR_SCHEMA_VERSION};
+use fsqlite_harness::lane_selector::{LANE_SELECTOR_SCHEMA_VERSION, SafetyDomain};
+use fsqlite_harness::replay_harness::{REPLAY_SCHEMA_VERSION, Regime};
 use fsqlite_harness::wal_journal_parity::{
-    CheckpointMode as WjpCheckpointMode, JournalMode, ParityVerdict, WalJournalParityConfig,
-    WAL_JOURNAL_SCHEMA_VERSION,
-};
-use fsqlite_mvcc::two_phase_commit::{
-    GlobalCommitMarker, ParticipantState, PrepareResult, TwoPhaseCoordinator, TwoPhaseError,
-    TwoPhaseState, COMMIT_MARKER_MAGIC, MAIN_DB_ID, MAX_TOTAL_DATABASES, SQLITE_MAX_ATTACHED,
-    TEMP_DB_ID,
+    CheckpointMode as WjpCheckpointMode, JournalMode, ParityVerdict, WAL_JOURNAL_SCHEMA_VERSION,
+    WalJournalParityConfig,
 };
 use fsqlite_mvcc::two_phase_commit::RecoveryAction as TwoPhaseRecoveryAction;
-use fsqlite_types::{CommitSeq, OperatingMode, PageNumber, TxnEpoch, TxnId, TxnToken, ObjectId};
+use fsqlite_mvcc::two_phase_commit::{
+    COMMIT_MARKER_MAGIC, GlobalCommitMarker, MAIN_DB_ID, MAX_TOTAL_DATABASES, ParticipantState,
+    PrepareResult, SQLITE_MAX_ATTACHED, TEMP_DB_ID, TwoPhaseCoordinator, TwoPhaseError,
+    TwoPhaseState,
+};
+use fsqlite_types::{CommitSeq, ObjectId, OperatingMode, PageNumber, TxnEpoch, TxnId, TxnToken};
+use fsqlite_wal::metrics::GroupCommitMetrics;
 use fsqlite_wal::native_commit::{
     CommitIndex, CommitResult, CommitSubmission, FsyncBarriers, GroupCommitBatch, WriteCoordinator,
 };
-use fsqlite_wal::metrics::GroupCommitMetrics;
 
 // ── Helper ──────────────────────────────────────────────────────────────────
 
@@ -198,7 +198,10 @@ fn marker_chain_linking_and_integrity() {
     assert_eq!(markers.len(), 4);
 
     // First marker is genesis (no prev).
-    assert!(markers[0].prev_marker.is_none(), "first marker should be genesis");
+    assert!(
+        markers[0].prev_marker.is_none(),
+        "first marker should be genesis"
+    );
 
     // Subsequent markers link to previous.
     for (i, marker) in markers.iter().enumerate().skip(1) {
@@ -421,7 +424,10 @@ fn concurrent_writer_parity_invariant_areas() {
     assert!(!ConcurrentInvariantArea::WriterFairness.is_critical());
 
     // String representations.
-    assert_eq!(ConcurrentInvariantArea::DefaultMode.as_str(), "default_mode");
+    assert_eq!(
+        ConcurrentInvariantArea::DefaultMode.as_str(),
+        "default_mode"
+    );
     assert_eq!(
         ConcurrentInvariantArea::FirstCommitterWins.as_str(),
         "first_committer_wins"
@@ -436,7 +442,10 @@ fn concurrent_writer_parity_invariant_areas() {
     // Schema version and verdict.
     const { assert!(CONCURRENT_WRITER_SCHEMA_VERSION >= 1) };
     assert_eq!(ConcurrentWriterVerdict::Parity.to_string(), "PARITY");
-    assert_eq!(ConcurrentWriterVerdict::Regression.to_string(), "REGRESSION");
+    assert_eq!(
+        ConcurrentWriterVerdict::Regression.to_string(),
+        "REGRESSION"
+    );
 }
 
 // ── 13. Replay harness regime classification ────────────────────────────────
@@ -638,9 +647,6 @@ fn conformance_summary() {
     ];
     let passed = checks.iter().filter(|(_, ok)| *ok).count();
     let total = checks.len();
-    assert_eq!(
-        passed, total,
-        "conformance: {passed}/{total} gates passed"
-    );
+    assert_eq!(passed, total, "conformance: {passed}/{total} gates passed");
     eprintln!("[bd-ncivz.7] conformance: {passed}/{total} gates passed");
 }

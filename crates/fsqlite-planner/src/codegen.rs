@@ -495,7 +495,9 @@ fn codegen_insert_values(
                     emit_expr(b, val_expr, reg)?;
                 }
                 _ => {
-                    return Err(CodegenError::Unsupported("INSERT currently supports only literal and placeholder values".to_owned()));
+                    return Err(CodegenError::Unsupported(
+                        "INSERT currently supports only literal and placeholder values".to_owned(),
+                    ));
                 }
             }
         }
@@ -724,7 +726,9 @@ pub fn codegen_update(
                 emit_expr(b, &assign.value, reg)?;
             }
             _ => {
-                return Err(CodegenError::Unsupported("UPDATE currently supports only literal and placeholder assignments".to_owned()));
+                return Err(CodegenError::Unsupported(
+                    "UPDATE currently supports only literal and placeholder assignments".to_owned(),
+                ));
             }
         }
     }
@@ -1065,7 +1069,11 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32) -> Result<(), Codege
         }
         Expr::Literal(lit, _) => match lit {
             Literal::Integer(n) => {
-                b.emit_op(Opcode::Integer, *n as i32, reg, 0, P4::None, 0);
+                if let Ok(as_i32) = i32::try_from(*n) {
+                    b.emit_op(Opcode::Integer, as_i32, reg, 0, P4::None, 0);
+                } else {
+                    b.emit_op(Opcode::Int64, 0, reg, 0, P4::Int64(*n), 0);
+                }
                 Ok(())
             }
             Literal::Float(f) => {
@@ -1110,8 +1118,6 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32) -> Result<(), Codege
         )),
     }
 }
-
-
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1360,6 +1366,26 @@ mod tests {
 
         assert_eq!(ops[7].opcode, Opcode::Null);
         assert_eq!(ops[7].p2, reg_current_timestamp);
+    }
+
+    #[test]
+    fn test_emit_expr_large_integer_literal_uses_int64_opcode() {
+        let mut b = ProgramBuilder::new();
+        let reg = b.alloc_reg();
+        let value = 4_102_444_800_000_000_i64;
+        emit_expr(
+            &mut b,
+            &Expr::Literal(Literal::Integer(value), Span::ZERO),
+            reg,
+        )
+        .unwrap();
+
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].opcode, Opcode::Int64);
+        assert_eq!(ops[0].p2, reg);
+        assert_eq!(ops[0].p4, P4::Int64(value));
     }
 
     // === Test 1: SELECT by rowid ===

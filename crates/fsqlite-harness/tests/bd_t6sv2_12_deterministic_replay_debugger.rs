@@ -14,10 +14,10 @@
 use fsqlite_harness::differential_v2::Outcome;
 use fsqlite_harness::mismatch_minimizer::Subsystem;
 use fsqlite_harness::replay_harness::{
-    BisectRange, BisectReplayManifest, BisectStrategy, BuildRequirements, DriftDetector,
-    DriftDetectorConfig, FailureBundleRef, Regime, ReplayConfig, ReplayEntryResult,
-    ReplayPassCriteria, ReplaySession, ReplaySummary, ReplayVerdict,
-    BISECT_REPLAY_MANIFEST_SCHEMA_VERSION, REPLAY_SCHEMA_VERSION,
+    BISECT_REPLAY_MANIFEST_SCHEMA_VERSION, BisectRange, BisectReplayManifest, BisectStrategy,
+    BuildRequirements, DriftDetector, DriftDetectorConfig, FailureBundleRef, REPLAY_SCHEMA_VERSION,
+    Regime, ReplayConfig, ReplayEntryResult, ReplayPassCriteria, ReplaySession, ReplaySummary,
+    ReplayVerdict,
 };
 use fsqlite_mvcc::deterministic_rebase::{
     RebaseEligibility, RebaseMetricsSnapshot, check_rebase_eligibility, rebase_metrics_snapshot,
@@ -27,12 +27,7 @@ use fsqlite_mvcc::time_travel::{TimeTravelError, TimeTravelTarget};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-fn make_entry(
-    id: &str,
-    outcome: Outcome,
-    mismatched: usize,
-    total: usize,
-) -> ReplayEntryResult {
+fn make_entry(id: &str, outcome: Outcome, mismatched: usize, total: usize) -> ReplayEntryResult {
     #[allow(clippy::cast_precision_loss)]
     let mismatch_rate = if total == 0 {
         0.0
@@ -219,7 +214,10 @@ fn replay_summary_json_roundtrip_and_deterministic_hash() {
 
     // Summary line format.
     let line = s1.summary_line();
-    assert!(line.contains("Replay:"), "summary line should start with 'Replay:'");
+    assert!(
+        line.contains("Replay:"),
+        "summary line should start with 'Replay:'"
+    );
     assert!(line.contains("0/2"), "should show 0 divergent out of 2");
 }
 
@@ -281,9 +279,7 @@ fn time_travel_error_variants() {
     assert!(format!("{err}").contains("99"));
 
     // TimestampNotResolvable.
-    let err = TimeTravelError::TimestampNotResolvable {
-        target_unix_ns: 42,
-    };
+    let err = TimeTravelError::TimestampNotResolvable { target_unix_ns: 42 };
     assert!(format!("{err}").contains("42"));
 
     // ReadOnlyViolation.
@@ -423,9 +419,7 @@ fn bisect_manifest_evaluate_summary() {
     let eval = manifest.evaluate_summary(&worse);
     assert_eq!(eval.verdict, ReplayVerdict::Fail);
     assert!(
-        eval.reasons
-            .iter()
-            .any(|r| r.contains("divergent entries")),
+        eval.reasons.iter().any(|r| r.contains("divergent entries")),
         "should cite divergent entries in failure reason"
     );
 }
@@ -560,36 +554,15 @@ fn config_defaults() {
 fn conformance_summary() {
     // bd-t6sv2.12 Deterministic Replay Debugger conformance gates:
     let checks: &[(&str, bool)] = &[
-        (
-            "drift_detector_warmup_stays_stable",
-            true,
-        ),
-        (
-            "drift_detector_detects_regression_and_improvement",
-            true,
-        ),
-        (
-            "replay_session_records_entries_and_produces_summary",
-            true,
-        ),
-        (
-            "replay_summary_json_roundtrip_and_deterministic_hash",
-            true,
-        ),
-        (
-            "bisect_manifest_construction_validation_evaluation",
-            true,
-        ),
-        (
-            "rebase_metrics_time_travel_fslab_integration",
-            true,
-        ),
+        ("drift_detector_warmup_stays_stable", true),
+        ("drift_detector_detects_regression_and_improvement", true),
+        ("replay_session_records_entries_and_produces_summary", true),
+        ("replay_summary_json_roundtrip_and_deterministic_hash", true),
+        ("bisect_manifest_construction_validation_evaluation", true),
+        ("rebase_metrics_time_travel_fslab_integration", true),
     ];
     let passed = checks.iter().filter(|(_, ok)| *ok).count();
     let total = checks.len();
-    assert_eq!(
-        passed, total,
-        "conformance: {passed}/{total} gates passed"
-    );
+    assert_eq!(passed, total, "conformance: {passed}/{total} gates passed");
     eprintln!("[bd-t6sv2.12] conformance: {passed}/{total} gates passed");
 }

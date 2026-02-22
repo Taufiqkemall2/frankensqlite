@@ -23,11 +23,11 @@ use fsqlite_types::value::SqliteValue;
 use fsqlite_types::{PageNumber, PageSize};
 use fsqlite_vdbe::codegen::{ColumnInfo, TableSchema};
 use fsqlite_vdbe::engine::MemDatabase;
-use fsqlite_vfs::host_fs;
 #[cfg(unix)]
 use fsqlite_vfs::UnixVfs as PlatformVfs;
 #[cfg(target_os = "windows")]
 use fsqlite_vfs::WindowsVfs as PlatformVfs;
+use fsqlite_vfs::host_fs;
 
 /// SQLite file header magic bytes (first 16 bytes).
 const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
@@ -463,7 +463,11 @@ pub fn parse_columns_from_create_sql(sql: &str) -> Vec<ColumnInfo> {
                 name,
                 affinity,
                 is_ipk,
-                type_name: if type_decl.is_empty() { None } else { Some(type_decl) },
+                type_name: if type_decl.is_empty() {
+                    None
+                } else {
+                    Some(type_decl)
+                },
                 notnull: upper.contains("NOT NULL"),
                 default_value: None,
             })

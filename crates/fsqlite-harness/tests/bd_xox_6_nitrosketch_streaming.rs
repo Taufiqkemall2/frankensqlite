@@ -37,7 +37,10 @@ fn test_swh_basic_observation() {
 
     assert_eq!(swh.count(), 5, "should have 5 observations");
     assert_eq!(swh.active_slots(), 1, "all in same slot");
-    assert!(swh.memory_bytes() > 0, "memory footprint should be positive");
+    assert!(
+        swh.memory_bytes() > 0,
+        "memory footprint should be positive"
+    );
 
     println!("[PASS] SlidingWindowHistogram basic: count=5, active_slots=1");
 }
@@ -65,7 +68,10 @@ fn test_swh_slot_advancement() {
 
     // Mean should be (10+20+30+40)/4 = 25.
     let mean = swh.mean();
-    assert!((mean - 25.0).abs() < 0.001, "mean should be 25.0, got {mean}");
+    assert!(
+        (mean - 25.0).abs() < 0.001,
+        "mean should be 25.0, got {mean}"
+    );
 
     println!("[PASS] SlidingWindowHistogram slot advancement: 4 active slots, mean=25");
 }
@@ -114,16 +120,16 @@ fn test_swh_percentile() {
 
     // 100 observations split across 2 time slots.
     for _ in 0..25 {
-        swh.observe(5, 1_000_000);   // bucket <=10
+        swh.observe(5, 1_000_000); // bucket <=10
     }
     for _ in 0..25 {
-        swh.observe(15, 1_000_000);  // bucket <=20
+        swh.observe(15, 1_000_000); // bucket <=20
     }
     for _ in 0..25 {
-        swh.observe(25, 2_000_000);  // bucket <=30
+        swh.observe(25, 2_000_000); // bucket <=30
     }
     for _ in 0..25 {
-        swh.observe(45, 2_000_000);  // bucket <=50
+        swh.observe(45, 2_000_000); // bucket <=50
     }
 
     assert_eq!(swh.count(), 100);
@@ -263,7 +269,11 @@ fn test_memory_tracker_lifecycle() {
     assert_eq!(tracker.free_count(), 2);
     assert_eq!(tracker.total_allocated(), 4096 + 1024 + 512);
     assert_eq!(tracker.total_freed(), 1024 + 512);
-    assert_eq!(tracker.live_bytes(), 4096, "only the 4096 allocation remains");
+    assert_eq!(
+        tracker.live_bytes(),
+        4096,
+        "only the 4096 allocation remains"
+    );
 
     // Size percentile should reflect allocation sizes.
     let p50 = tracker.size_percentile(0.50);
@@ -299,9 +309,18 @@ fn test_memory_tracker_site_frequency() {
     let freq_300 = tracker.site_frequency(300);
 
     // CMS guarantees >= true count.
-    assert!(freq_100 >= 10, "site 100 should have freq >= 10, got {freq_100}");
-    assert!(freq_200 >= 3, "site 200 should have freq >= 3, got {freq_200}");
-    assert!(freq_300 >= 1, "site 300 should have freq >= 1, got {freq_300}");
+    assert!(
+        freq_100 >= 10,
+        "site 100 should have freq >= 10, got {freq_100}"
+    );
+    assert!(
+        freq_200 >= 3,
+        "site 200 should have freq >= 3, got {freq_200}"
+    );
+    assert!(
+        freq_300 >= 1,
+        "site 300 should have freq >= 1, got {freq_300}"
+    );
 
     // With a wide enough sketch (1024 width), estimates should be exact.
     assert_eq!(freq_100, 10, "site 100 should be exact at 10");
@@ -331,7 +350,10 @@ fn test_snapshot_serialization() {
 
     let swh_snap = swh.snapshot();
     let swh_json = serde_json::to_string(&swh_snap).unwrap();
-    assert!(swh_json.contains("\"count\":3"), "SWH snapshot should have count=3");
+    assert!(
+        swh_json.contains("\"count\":3"),
+        "SWH snapshot should have count=3"
+    );
     assert!(
         swh_json.contains("\"active_slots\":2"),
         "SWH snapshot should have active_slots=2"

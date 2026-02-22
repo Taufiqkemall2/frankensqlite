@@ -1157,14 +1157,14 @@ impl ArcCacheInner {
     fn coalesce_one_superseded_for_replace(&mut self) -> bool {
         // Find one superseded victim from T1 or T2, scanning from LRU to MRU.
         // We use the bounded find_superseded_victim to ensure this is O(1).
+        // Superseded versions below GC horizon are removed entirely (no ghost
+        // entry) because the newer version already serves ARC adaptation.
         if let Some(idx) = self.find_superseded_victim(&self.t1) {
             let page = self.t1.remove(idx);
             let key = page.key;
             self.total_bytes -= page.byte_size;
             self.decrement_page_version(key.pgno);
             self.directory.remove(&key);
-            let ghost_idx = self.b1.push_back(key);
-            self.directory.insert(key, Location::B1(ghost_idx));
             self.version_coalesce_count = self.version_coalesce_count.saturating_add(1);
             return true;
         }
@@ -1174,8 +1174,6 @@ impl ArcCacheInner {
             self.total_bytes -= page.byte_size;
             self.decrement_page_version(key.pgno);
             self.directory.remove(&key);
-            let ghost_idx = self.b2.push_back(key);
-            self.directory.insert(key, Location::B2(ghost_idx));
             self.version_coalesce_count = self.version_coalesce_count.saturating_add(1);
             return true;
         }
@@ -1183,7 +1181,8 @@ impl ArcCacheInner {
     }
 
     fn coalesce_all_versions(&mut self) {
-        let mut candidates: HashMap<PageNumber, Vec<(u64, CacheKey, SlabIdx, bool)>> = HashMap::new();
+        let mut candidates: HashMap<PageNumber, Vec<(u64, CacheKey, SlabIdx, bool)>> =
+            HashMap::new();
 
         // Single pass over T1 and T2 to find all versions <= gc_horizon.
         for (idx, page) in self.t1.iter() {

@@ -13,8 +13,7 @@
 //! - Conformance summary
 
 use fsqlite_mvcc::{
-    DpEngine, DpError, NoiseMechanism, PrivacyBudget, dp_metrics,
-    reset_dp_metrics, sensitivity,
+    DpEngine, DpError, NoiseMechanism, PrivacyBudget, dp_metrics, reset_dp_metrics, sensitivity,
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -188,7 +187,9 @@ fn multi_aggregate_workflow() {
     assert_eq!(count_result.noise_scale, 1.0); // 1/1 = 1
 
     // SUM query: max contribution 500, epsilon=1.0.
-    let sum_result = engine.laplace(50000.0, sensitivity::sum(500.0), 1.0).unwrap();
+    let sum_result = engine
+        .laplace(50000.0, sensitivity::sum(500.0), 1.0)
+        .unwrap();
     assert_eq!(sum_result.sensitivity, 500.0);
     assert_eq!(sum_result.noise_scale, 500.0); // 500/1 = 500
 
@@ -240,7 +241,9 @@ fn proportional_budget_allocation() {
 
     let mut engine = DpEngine::new(total_budget, 42).unwrap();
 
-    let r1 = engine.laplace(1000.0, sensitivity::COUNT, count_eps).unwrap();
+    let r1 = engine
+        .laplace(1000.0, sensitivity::COUNT, count_eps)
+        .unwrap();
     assert_eq!(r1.noise_scale, sensitivity::COUNT / count_eps); // 1/0.5 = 2
 
     let r2 = engine

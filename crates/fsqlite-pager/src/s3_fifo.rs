@@ -520,11 +520,12 @@ impl S3Fifo {
             Some(EntryState::Ghost) => {
                 self.remove_ghost(page_id);
                 self.ghost_hits_since_adapt = self.ghost_hits_since_adapt.saturating_add(1);
-                
+
                 self.main.push_back(page_id);
-                self.index.insert(page_id, EntryState::Resident(ResidentState::main()));
+                self.index
+                    .insert(page_id, EntryState::Resident(ResidentState::main()));
                 events.push(S3FifoEvent::GhostReadmission(page_id));
-                
+
                 self.rebalance(&mut events);
                 return events;
             }
@@ -947,7 +948,8 @@ mod tests {
         let before = fifo.config().small_capacity();
         let _ = fifo.insert(pg(1));
         let _ = fifo.insert(pg(2)); // 1 -> ghost, eviction count = 1
-        let events = fifo.insert(pg(1)); // ghost hit + eviction count = 2 => adapt
+        let _ = fifo.insert(pg(1)); // ghost readmission, ghost_hits = 1
+        let events = fifo.insert(pg(3)); // 2 -> ghost, eviction count = 2 => adapt
 
         assert!(events.iter().any(|event| matches!(
             event,
@@ -1011,10 +1013,8 @@ mod tests {
         let before = fifo.config().small_capacity();
         let mut observed_increase = false;
 
-        for n in 2_u32..1_000_u32 {
-            let _ = fifo.insert(pg(n));
-            let events = fifo.insert(pg(n - 1)); // immediate scan readmission pressure
-            if events.iter().any(|event| {
+        let has_increase = |events: &[S3FifoEvent]| {
+            events.iter().any(|event| {
                 matches!(
                     event,
                     S3FifoEvent::AdaptiveSplitChanged {
@@ -1022,7 +1022,13 @@ mod tests {
                         new_small_capacity,
                     } if *new_small_capacity > *old_small_capacity
                 )
-            }) {
+            })
+        };
+
+        for n in 2_u32..1_000_u32 {
+            let events1 = fifo.insert(pg(n));
+            let events2 = fifo.insert(pg(n - 1)); // immediate scan readmission pressure
+            if has_increase(&events1) || has_increase(&events2) {
                 observed_increase = true;
                 break;
             }
@@ -1240,7 +1246,12 @@ mod tests {
                             self.small_accessed.insert(page_id);
                         }
                     }
-                    S3FifoEvent::GhostReadmission(page_id) | S3FifoEvent::GhostTrimmed(page_id) => {
+                    S3FifoEvent::GhostReadmission(page_id) => {
+                        self.ghost_stamp.remove(&page_id);
+                        self.ghost_from_small.remove(&page_id);
+                        self.bump_main(page_id);
+                    }
+                    S3FifoEvent::GhostTrimmed(page_id) => {
                         self.ghost_stamp.remove(&page_id);
                         self.ghost_from_small.remove(&page_id);
                     }

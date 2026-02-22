@@ -7,11 +7,10 @@
 //! bd-mblr.3.4.1 (no-mock gate), bd-mblr.3.3 (flake budget/retry/quarantine).
 
 use fsqlite_harness::validation_manifest::{
-    GateOutcome, ValidationManifest, ValidationManifestConfig,
-    COVERAGE_GATE_ID, INVARIANT_DRIFT_GATE_ID, LOGGING_GATE_ID, NO_MOCK_GATE_ID,
+    COVERAGE_GATE_ID, GateOutcome, INVARIANT_DRIFT_GATE_ID, LOGGING_GATE_ID, NO_MOCK_GATE_ID,
     SCENARIO_DRIFT_GATE_ID, VALIDATION_MANIFEST_SCENARIO_ID, VALIDATION_MANIFEST_SCHEMA_VERSION,
-    build_validation_manifest_bundle, detect_backward_incompatible_change,
-    validate_manifest_contract,
+    ValidationManifest, ValidationManifestConfig, build_validation_manifest_bundle,
+    detect_backward_incompatible_change, validate_manifest_contract,
 };
 
 const BEAD_ID: &str = "bd-mblr.3.5";
@@ -38,11 +37,25 @@ fn build_bundle() -> fsqlite_harness::validation_manifest::ValidationManifestBun
 #[test]
 fn rollup_aggregates_all_five_gates() {
     let bundle = build_bundle();
-    let gate_ids: Vec<&str> = bundle.manifest.gates.iter().map(|g| g.gate_id.as_str()).collect();
+    let gate_ids: Vec<&str> = bundle
+        .manifest
+        .gates
+        .iter()
+        .map(|g| g.gate_id.as_str())
+        .collect();
 
-    assert!(gate_ids.contains(&COVERAGE_GATE_ID), "missing coverage gate");
-    assert!(gate_ids.contains(&INVARIANT_DRIFT_GATE_ID), "missing invariant drift gate");
-    assert!(gate_ids.contains(&SCENARIO_DRIFT_GATE_ID), "missing scenario drift gate");
+    assert!(
+        gate_ids.contains(&COVERAGE_GATE_ID),
+        "missing coverage gate"
+    );
+    assert!(
+        gate_ids.contains(&INVARIANT_DRIFT_GATE_ID),
+        "missing invariant drift gate"
+    );
+    assert!(
+        gate_ids.contains(&SCENARIO_DRIFT_GATE_ID),
+        "missing scenario drift gate"
+    );
     assert!(gate_ids.contains(&NO_MOCK_GATE_ID), "missing no-mock gate");
     assert!(gate_ids.contains(&LOGGING_GATE_ID), "missing logging gate");
     assert_eq!(bundle.manifest.gates.len(), 5, "exactly 5 gates expected");
@@ -51,13 +64,19 @@ fn rollup_aggregates_all_five_gates() {
 #[test]
 fn rollup_schema_version_matches() {
     let bundle = build_bundle();
-    assert_eq!(bundle.manifest.schema_version, VALIDATION_MANIFEST_SCHEMA_VERSION);
+    assert_eq!(
+        bundle.manifest.schema_version,
+        VALIDATION_MANIFEST_SCHEMA_VERSION
+    );
 }
 
 #[test]
 fn rollup_bead_id_is_manifest_owner() {
     let bundle = build_bundle();
-    assert_eq!(bundle.manifest.bead_id, "bd-mblr.3.5.1", "manifest owned by bd-mblr.3.5.1");
+    assert_eq!(
+        bundle.manifest.bead_id, "bd-mblr.3.5.1",
+        "manifest owned by bd-mblr.3.5.1"
+    );
 }
 
 // ─── Gate Outcome Aggregation Tests ─────────────────────────────────────
@@ -65,15 +84,29 @@ fn rollup_bead_id_is_manifest_owner() {
 #[test]
 fn overall_outcome_reflects_worst_gate() {
     let bundle = build_bundle();
-    let has_fail = bundle.manifest.gates.iter().any(|g| g.outcome == GateOutcome::Fail);
-    let has_warning = bundle.manifest.gates.iter().any(|g| g.outcome == GateOutcome::PassWithWarnings);
+    let has_fail = bundle
+        .manifest
+        .gates
+        .iter()
+        .any(|g| g.outcome == GateOutcome::Fail);
+    let has_warning = bundle
+        .manifest
+        .gates
+        .iter()
+        .any(|g| g.outcome == GateOutcome::PassWithWarnings);
 
     if has_fail {
         assert_eq!(bundle.manifest.overall_outcome, GateOutcome::Fail);
         assert!(!bundle.manifest.overall_pass);
     } else if has_warning {
-        assert_eq!(bundle.manifest.overall_outcome, GateOutcome::PassWithWarnings);
-        assert!(bundle.manifest.overall_pass, "PassWithWarnings still counts as pass");
+        assert_eq!(
+            bundle.manifest.overall_outcome,
+            GateOutcome::PassWithWarnings
+        );
+        assert!(
+            bundle.manifest.overall_pass,
+            "PassWithWarnings still counts as pass"
+        );
     } else {
         assert_eq!(bundle.manifest.overall_outcome, GateOutcome::Pass);
         assert!(bundle.manifest.overall_pass);
@@ -84,7 +117,10 @@ fn overall_outcome_reflects_worst_gate() {
 fn gate_outcome_display() {
     assert_eq!(format!("{}", GateOutcome::Pass), "PASS");
     assert_eq!(format!("{}", GateOutcome::Fail), "FAIL");
-    assert_eq!(format!("{}", GateOutcome::PassWithWarnings), "PASS_WITH_WARNINGS");
+    assert_eq!(
+        format!("{}", GateOutcome::PassWithWarnings),
+        "PASS_WITH_WARNINGS"
+    );
 }
 
 // ─── Release-Readiness Decision Artifact Tests ──────────────────────────
@@ -93,13 +129,21 @@ fn gate_outcome_display() {
 fn manifest_passes_contract_validation() {
     let bundle = build_bundle();
     let errors = validate_manifest_contract(&bundle.manifest);
-    assert!(errors.is_empty(), "manifest should pass contract: {errors:?}");
+    assert!(
+        errors.is_empty(),
+        "manifest should pass contract: {errors:?}"
+    );
 }
 
 #[test]
 fn manifest_gates_sorted_by_id() {
     let bundle = build_bundle();
-    let gate_ids: Vec<&str> = bundle.manifest.gates.iter().map(|g| g.gate_id.as_str()).collect();
+    let gate_ids: Vec<&str> = bundle
+        .manifest
+        .gates
+        .iter()
+        .map(|g| g.gate_id.as_str())
+        .collect();
     let mut sorted = gate_ids.clone();
     sorted.sort_unstable();
     assert_eq!(gate_ids, sorted, "gates must be sorted by gate_id");
@@ -130,8 +174,12 @@ fn each_gate_has_artifact_uris() {
 #[test]
 fn all_gate_artifacts_in_top_level_index() {
     let bundle = build_bundle();
-    let top_level: std::collections::BTreeSet<&str> =
-        bundle.manifest.artifact_uris.iter().map(String::as_str).collect();
+    let top_level: std::collections::BTreeSet<&str> = bundle
+        .manifest
+        .artifact_uris
+        .iter()
+        .map(String::as_str)
+        .collect();
 
     for gate in &bundle.manifest.gates {
         for uri in &gate.artifact_uris {
@@ -178,7 +226,10 @@ fn rollup_is_deterministic() {
 
     let json_a = a.manifest.to_json().unwrap();
     let json_b = b.manifest.to_json().unwrap();
-    assert_eq!(json_a, json_b, "same inputs must produce identical manifests");
+    assert_eq!(
+        json_a, json_b,
+        "same inputs must produce identical manifests"
+    );
 }
 
 #[test]
@@ -187,7 +238,10 @@ fn rollup_determinism_includes_artifacts() {
     let b = build_bundle();
     assert_eq!(a.gate_artifacts.len(), b.gate_artifacts.len());
     for (key, value_a) in &a.gate_artifacts {
-        let value_b = b.gate_artifacts.get(key).expect("artifact must exist in both bundles");
+        let value_b = b
+            .gate_artifacts
+            .get(key)
+            .expect("artifact must exist in both bundles");
         assert_eq!(value_a, value_b, "artifact {key} must be identical");
     }
 }
@@ -198,7 +252,10 @@ fn rollup_determinism_includes_artifacts() {
 fn replay_contract_has_required_fields() {
     let bundle = build_bundle();
     let replay = &bundle.manifest.replay;
-    assert!(!replay.command.is_empty(), "replay command must not be empty");
+    assert!(
+        !replay.command.is_empty(),
+        "replay command must not be empty"
+    );
     assert_eq!(replay.scenario_id, VALIDATION_MANIFEST_SCENARIO_ID);
     assert_eq!(replay.root_seed, 424_242);
 }
@@ -217,7 +274,10 @@ fn replay_command_contains_all_fragments() {
         "--scenario-id",
         "--artifact-uri-prefix",
     ] {
-        assert!(cmd.contains(fragment), "replay command missing '{fragment}'");
+        assert!(
+            cmd.contains(fragment),
+            "replay command missing '{fragment}'"
+        );
     }
 }
 
@@ -232,26 +292,41 @@ fn manifest_json_roundtrip() {
     assert_eq!(deserialized.schema_version, bundle.manifest.schema_version);
     assert_eq!(deserialized.bead_id, bundle.manifest.bead_id);
     assert_eq!(deserialized.run_id, bundle.manifest.run_id);
-    assert_eq!(deserialized.overall_outcome, bundle.manifest.overall_outcome);
+    assert_eq!(
+        deserialized.overall_outcome,
+        bundle.manifest.overall_outcome
+    );
     assert_eq!(deserialized.overall_pass, bundle.manifest.overall_pass);
     assert_eq!(deserialized.gates.len(), bundle.manifest.gates.len());
-    assert_eq!(deserialized.artifact_uris.len(), bundle.manifest.artifact_uris.len());
+    assert_eq!(
+        deserialized.artifact_uris.len(),
+        bundle.manifest.artifact_uris.len()
+    );
 }
 
 #[test]
 fn gate_artifacts_are_valid_json() {
     let bundle = build_bundle();
     for (uri, content) in &bundle.gate_artifacts {
-        if std::path::Path::new(uri).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("json")) {
+        if std::path::Path::new(uri)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        {
             let parsed: Result<serde_json::Value, _> = serde_json::from_str(content);
             assert!(parsed.is_ok(), "artifact {uri} must be valid JSON");
-        } else if std::path::Path::new(uri).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl")) {
+        } else if std::path::Path::new(uri)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+        {
             for line in content.lines() {
                 if line.trim().is_empty() {
                     continue;
                 }
                 let parsed: Result<serde_json::Value, _> = serde_json::from_str(line);
-                assert!(parsed.is_ok(), "JSONL line in {uri} must be valid JSON: {line}");
+                assert!(
+                    parsed.is_ok(),
+                    "JSONL line in {uri} must be valid JSON: {line}"
+                );
             }
         }
     }
@@ -263,7 +338,10 @@ fn gate_artifacts_are_valid_json() {
 fn backward_compatible_with_same_version() {
     let bundle = build_bundle();
     let issues = detect_backward_incompatible_change(&bundle.manifest, &bundle.manifest);
-    assert!(issues.is_empty(), "same manifest should be backward compatible: {issues:?}");
+    assert!(
+        issues.is_empty(),
+        "same manifest should be backward compatible: {issues:?}"
+    );
 }
 
 #[test]
@@ -297,18 +375,36 @@ fn human_summary_includes_key_fields() {
     let bundle = build_bundle();
     let summary = bundle.manifest.render_summary();
 
-    assert!(summary.contains("Validation Manifest"), "summary must have header");
-    assert!(summary.contains(&bundle.manifest.bead_id), "summary must include bead_id");
-    assert!(summary.contains(&bundle.manifest.run_id), "summary must include run_id");
-    assert!(summary.contains(&bundle.manifest.commit_sha), "summary must include commit_sha");
+    assert!(
+        summary.contains("Validation Manifest"),
+        "summary must have header"
+    );
+    assert!(
+        summary.contains(&bundle.manifest.bead_id),
+        "summary must include bead_id"
+    );
+    assert!(
+        summary.contains(&bundle.manifest.run_id),
+        "summary must include run_id"
+    );
+    assert!(
+        summary.contains(&bundle.manifest.commit_sha),
+        "summary must include commit_sha"
+    );
     assert!(summary.contains("Gates"), "summary must list gates");
-    assert!(summary.contains("Replay"), "summary must include replay section");
+    assert!(
+        summary.contains("Replay"),
+        "summary must include replay section"
+    );
 }
 
 #[test]
 fn bundle_human_summary_not_empty() {
     let bundle = build_bundle();
-    assert!(!bundle.human_summary.is_empty(), "human summary must not be empty");
+    assert!(
+        !bundle.human_summary.is_empty(),
+        "human summary must not be empty"
+    );
 }
 
 // ─── Embedded Report Tests ──────────────────────────────────────────────
@@ -317,7 +413,10 @@ fn bundle_human_summary_not_empty() {
 fn coverage_gate_report_embedded() {
     let bundle = build_bundle();
     let report = &bundle.manifest.coverage_gate;
-    assert!(!report.summary.is_empty(), "coverage gate must have summary");
+    assert!(
+        !report.summary.is_empty(),
+        "coverage gate must have summary"
+    );
 }
 
 #[test]
@@ -333,14 +432,20 @@ fn scenario_drift_status_embedded() {
     let bundle = build_bundle();
     let status = &bundle.manifest.scenario_coverage_drift;
     assert_eq!(status.gate_id, SCENARIO_DRIFT_GATE_ID);
-    assert!(status.total_catalog_scenarios > 0, "catalog should have scenarios");
+    assert!(
+        status.total_catalog_scenarios > 0,
+        "catalog should have scenarios"
+    );
 }
 
 #[test]
 fn no_mock_report_embedded() {
     let bundle = build_bundle();
     let report = &bundle.manifest.no_mock_critical_path;
-    assert!(!report.summary.is_empty(), "no-mock report must have summary");
+    assert!(
+        !report.summary.is_empty(),
+        "no-mock report must have summary"
+    );
 }
 
 #[test]
@@ -386,7 +491,10 @@ fn contract_flags_replay_scenario_mismatch() {
 fn conformance_summary() {
     let checks = vec![
         ("C-1: Rollup aggregates all 5 upstream gates", true),
-        ("C-2: Overall outcome reflects worst gate (Fail > Warn > Pass)", true),
+        (
+            "C-2: Overall outcome reflects worst gate (Fail > Warn > Pass)",
+            true,
+        ),
         ("C-3: Manifest passes contract validation", true),
         ("C-4: Rollup is deterministic for same inputs", true),
         ("C-5: Replay contract includes all required fragments", true),

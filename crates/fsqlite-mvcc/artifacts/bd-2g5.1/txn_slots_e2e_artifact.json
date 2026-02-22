@@ -6,16 +6,16 @@
   "seed": 20260219,
   "overall_status": "pass",
   "timing": {
-    "total_elapsed_us": 427,
-    "alloc_release_elapsed_us": 191,
-    "alloc_release_avg_ns": 373,
-    "crash_cycle_elapsed_us": 102
+    "total_elapsed_us": 359,
+    "alloc_release_elapsed_us": 160,
+    "alloc_release_avg_ns": 312,
+    "crash_cycle_elapsed_us": 61
   },
   "checks": [
     {
       "id": "alloc_release_latency_budget",
       "status": "pass",
-      "detail": "avg_alloc_release_ns=373 target_lt_ns=1000"
+      "detail": "avg_alloc_release_ns=312 target_lt_ns=1000"
     },
     {
       "id": "crash_detection_within_two_heartbeats",

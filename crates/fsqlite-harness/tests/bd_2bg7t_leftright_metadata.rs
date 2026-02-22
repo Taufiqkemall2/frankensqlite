@@ -114,11 +114,7 @@ fn test_pair_consistency() {
                 let mut reads = 0u64;
                 while !rs.load(Ordering::Relaxed) {
                     let (a, b) = rlr.read("pair");
-                    assert_eq!(
-                        b,
-                        a * 100,
-                        "torn pair: schema_epoch={a}, commit_seq={b}"
-                    );
+                    assert_eq!(b, a * 100, "torn pair: schema_epoch={a}, commit_seq={b}");
                     reads += 1;
                 }
                 reads
@@ -135,9 +131,7 @@ fn test_pair_consistency() {
     assert!(epochs > 0);
     assert!(total_reads > 0);
 
-    println!(
-        "[PASS] Pair consistency: {epochs} epochs, {total_reads} reads, zero torn"
-    );
+    println!("[PASS] Pair consistency: {epochs} epochs, {total_reads} reads, zero torn");
 }
 
 // ---------------------------------------------------------------------------
@@ -193,9 +187,7 @@ fn test_triple_consistency() {
     assert!(write_count > 0);
     assert!(total_reads > 0);
 
-    println!(
-        "[PASS] Triple consistency: {write_count} writes, {total_reads} reads, zero torn"
-    );
+    println!("[PASS] Triple consistency: {write_count} writes, {total_reads} reads, zero torn");
 }
 
 // ---------------------------------------------------------------------------
@@ -226,9 +218,7 @@ fn test_leftright_vs_mutex_latency() {
     let lr_per_op = lr_ns / iterations;
     let mx_per_op = mx_ns / iterations;
 
-    println!(
-        "[PASS] Latency: left-right={lr_per_op}ns/op mutex={mx_per_op}ns/op"
-    );
+    println!("[PASS] Latency: left-right={lr_per_op}ns/op mutex={mx_per_op}ns/op");
 }
 
 // ---------------------------------------------------------------------------
@@ -287,9 +277,7 @@ fn test_read_dominated_ratio() {
     assert!(reads > 0);
     let ratio = reads / write_count.max(1);
 
-    println!(
-        "[PASS] Read-dominated: writes={write_count} reads={reads} ratio={ratio}:1"
-    );
+    println!("[PASS] Read-dominated: writes={write_count} reads={reads} ratio={ratio}:1");
 }
 
 // ---------------------------------------------------------------------------
@@ -363,9 +351,7 @@ fn test_metrics_fidelity() {
         "delta swaps should be >= 3, got {delta_swaps}"
     );
 
-    println!(
-        "[PASS] Metrics fidelity: delta_reads={delta_reads} delta_swaps={delta_swaps}"
-    );
+    println!("[PASS] Metrics fidelity: delta_reads={delta_reads} delta_swaps={delta_swaps}");
 }
 
 // ---------------------------------------------------------------------------
@@ -431,10 +417,7 @@ fn test_pair_monotonic_progression() {
         let mut checks = 0u64;
         while !rs.load(Ordering::Relaxed) {
             let (a, _b) = rlr.read("monotonic");
-            assert!(
-                a >= prev_a,
-                "monotonicity violation: {prev_a} -> {a}"
-            );
+            assert!(a >= prev_a, "monotonicity violation: {prev_a} -> {a}");
             prev_a = a;
             checks += 1;
         }
@@ -450,9 +433,7 @@ fn test_pair_monotonic_progression() {
     assert!(write_count > 0);
     assert!(checks > 0);
 
-    println!(
-        "[PASS] Pair monotonic: {write_count} writes, {checks} checks, never decreased"
-    );
+    println!("[PASS] Pair monotonic: {write_count} writes, {checks} checks, never decreased");
 }
 
 // ---------------------------------------------------------------------------

@@ -15,9 +15,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use fsqlite_mvcc::{
-    FlatCombiner, flat_combining_metrics, reset_flat_combining_metrics,
-};
+use fsqlite_mvcc::{FlatCombiner, flat_combining_metrics, reset_flat_combining_metrics};
 
 // ---------------------------------------------------------------------------
 // Test 1: Registry lifecycle

@@ -23,16 +23,15 @@ use std::time::Instant;
 use fsqlite_types::PageNumber;
 use fsqlite_types::value::SqliteValue;
 use fsqlite_vdbe::vectorized::{
-    Batch, ColumnSpec, ColumnVectorType,
-    reset_vectorized_metrics, vectorized_metrics_snapshot,
+    Batch, ColumnSpec, ColumnVectorType, reset_vectorized_metrics, vectorized_metrics_snapshot,
 };
 use fsqlite_vdbe::vectorized_agg::{AggregateOp, AggregateSpec, aggregate_batch_hash};
 use fsqlite_vdbe::vectorized_dispatch::{
-    build_pipeline_tasks, partition_page_morsels, DispatcherConfig, PipelineId, PipelineKind,
-    WorkStealingDispatcher, morsel_dispatch_metrics_snapshot, reset_morsel_dispatch_metrics,
+    DispatcherConfig, PipelineId, PipelineKind, WorkStealingDispatcher, build_pipeline_tasks,
+    morsel_dispatch_metrics_snapshot, partition_page_morsels, reset_morsel_dispatch_metrics,
 };
-use fsqlite_vdbe::vectorized_ops::{filter_batch_int64, filter_batch_float64, CompareOp};
-use fsqlite_vdbe::vectorized_sort::{sort_batch, SortDirection, SortKeySpec, NullOrdering};
+use fsqlite_vdbe::vectorized_ops::{CompareOp, filter_batch_float64, filter_batch_int64};
+use fsqlite_vdbe::vectorized_sort::{NullOrdering, SortDirection, SortKeySpec, sort_batch};
 
 const BEAD_ID: &str = "bd-14vp7.7";
 
@@ -55,17 +54,29 @@ fn generate_lineitem_rows(n: usize, seed: u64) -> Vec<Vec<SqliteValue>> {
     let mut rng = seed;
     for _ in 0..n {
         // Simple LCG for deterministic pseudo-random numbers.
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let quantity = ((rng >> 32) % 50 + 1) as i64;
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let price = ((rng >> 32) % 10000) as f64 + 100.0;
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let discount = ((rng >> 32) % 10) as f64 / 100.0;
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let tax = ((rng >> 32) % 8) as f64 / 100.0;
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let returnflag = ((rng >> 32) % 3) as i64; // 0=A, 1=N, 2=R
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let linestatus = ((rng >> 32) % 2) as i64; // 0=F, 1=O
 
         rows.push(vec![
@@ -166,7 +177,9 @@ fn interpreter_q1(rows: &[Vec<SqliteValue>]) -> (Vec<(i64, i64, i64, f64, usize)
     let mut filtered_count = 0usize;
 
     for row in rows {
-        let SqliteValue::Integer(quantity) = row[0] else { continue };
+        let SqliteValue::Integer(quantity) = row[0] else {
+            continue;
+        };
         if quantity > 24 {
             continue;
         }
@@ -184,7 +197,9 @@ fn interpreter_q1(rows: &[Vec<SqliteValue>]) -> (Vec<(i64, i64, i64, f64, usize)
             _ => 0,
         };
 
-        let entry = groups.entry((returnflag, linestatus)).or_insert((0, 0.0, 0));
+        let entry = groups
+            .entry((returnflag, linestatus))
+            .or_insert((0, 0.0, 0));
         entry.0 += quantity;
         entry.1 += price;
         entry.2 += 1;
@@ -203,9 +218,15 @@ fn interpreter_q6(rows: &[Vec<SqliteValue>]) -> (f64, usize) {
     let mut revenue = 0.0f64;
     let mut count = 0usize;
     for row in rows {
-        let SqliteValue::Integer(quantity) = row[0] else { continue };
-        let SqliteValue::Float(price) = row[1] else { continue };
-        let SqliteValue::Float(discount) = row[2] else { continue };
+        let SqliteValue::Integer(quantity) = row[0] else {
+            continue;
+        };
+        let SqliteValue::Float(price) = row[1] else {
+            continue;
+        };
+        let SqliteValue::Float(discount) = row[2] else {
+            continue;
+        };
 
         if quantity < 24 && (0.05..=0.07).contains(&discount) {
             revenue += price * discount;
@@ -236,9 +257,7 @@ fn test_q1_correctness() {
     let vec_total_count: i64 = {
         let count_col = &vec_result.columns()[vec_result.columns().len() - 1];
         match &count_col.data {
-            fsqlite_vdbe::vectorized::ColumnData::Int64(vals) => {
-                vals.as_slice().iter().sum()
-            }
+            fsqlite_vdbe::vectorized::ColumnData::Int64(vals) => vals.as_slice().iter().sum(),
             _ => panic!("expected int64 count column"),
         }
     };
@@ -307,10 +326,8 @@ fn test_q1_benchmark_throughput() {
     let interp_elapsed = interp_start.elapsed();
 
     let speedup = interp_elapsed.as_nanos() as f64 / vec_elapsed.as_nanos().max(1) as f64;
-    let vec_rows_per_sec =
-        (n as f64 * 10.0) / vec_elapsed.as_secs_f64();
-    let interp_rows_per_sec =
-        (n as f64 * 10.0) / interp_elapsed.as_secs_f64();
+    let vec_rows_per_sec = (n as f64 * 10.0) / vec_elapsed.as_secs_f64();
+    let interp_rows_per_sec = (n as f64 * 10.0) / interp_elapsed.as_secs_f64();
 
     println!(
         "[{BEAD_ID}] Q1 benchmark: vec={:.2}ms ({:.0} rows/s) interp={:.2}ms ({:.0} rows/s) speedup={speedup:.2}x n={n}",
@@ -379,8 +396,7 @@ fn test_parallel_vectorized_scaling() {
         let start = PageNumber::new(1).unwrap();
         let end = PageNumber::new(batches.len() as u32).unwrap();
         let morsels = partition_page_morsels(start, end, 1, 1).unwrap();
-        let tasks =
-            build_pipeline_tasks(PipelineId(0), PipelineKind::ScanFilterProject, &morsels);
+        let tasks = build_pipeline_tasks(PipelineId(0), PipelineKind::ScanFilterProject, &morsels);
 
         let dispatcher = WorkStealingDispatcher::try_new(DispatcherConfig {
             worker_threads: workers,
@@ -499,7 +515,7 @@ fn test_sort_benchmark() {
 
 #[test]
 fn test_hash_join_benchmark() {
-    use fsqlite_vdbe::vectorized_hash_join::{hash_join_build, hash_join_probe, JoinType};
+    use fsqlite_vdbe::vectorized_hash_join::{JoinType, hash_join_build, hash_join_probe};
 
     // Build side: 1000 rows (dimension table).
     let build_specs = vec![
@@ -507,12 +523,7 @@ fn test_hash_join_benchmark() {
         ColumnSpec::new("value", ColumnVectorType::Float64),
     ];
     let build_rows: Vec<Vec<SqliteValue>> = (0..1000)
-        .map(|i| {
-            vec![
-                SqliteValue::Integer(i),
-                SqliteValue::Float(i as f64 * 1.5),
-            ]
-        })
+        .map(|i| vec![SqliteValue::Integer(i), SqliteValue::Float(i as f64 * 1.5)])
         .collect();
     let build_batch = Batch::from_rows(&build_rows, &build_specs, build_rows.len()).unwrap();
 
@@ -539,9 +550,7 @@ fn test_hash_join_benchmark() {
     let vec_start = Instant::now();
     for _ in 0..10 {
         let ht = hash_join_build(build_batch.clone(), &[0]).unwrap();
-        std::hint::black_box(
-            hash_join_probe(&ht, &probe_batch, &[0], JoinType::Inner).unwrap(),
-        );
+        std::hint::black_box(hash_join_probe(&ht, &probe_batch, &[0], JoinType::Inner).unwrap());
     }
     let vec_elapsed = vec_start.elapsed();
 
@@ -631,9 +640,7 @@ fn test_large_batch_scaling() {
 
     println!("[{BEAD_ID}] Q1 scaling by data size:");
     for (n, vec_ms, interp_ms, speedup) in &results {
-        println!(
-            "  n={n:>6}: vec={vec_ms:.3}ms interp={interp_ms:.3}ms speedup={speedup:.2}x"
-        );
+        println!("  n={n:>6}: vec={vec_ms:.3}ms interp={interp_ms:.3}ms speedup={speedup:.2}x");
     }
 }
 
@@ -685,8 +692,7 @@ fn test_conformance_summary() {
         let start = PageNumber::new(1).unwrap();
         let end = PageNumber::new(small_batches.len() as u32).unwrap();
         let morsels = partition_page_morsels(start, end, 1, 1).unwrap();
-        let tasks =
-            build_pipeline_tasks(PipelineId(0), PipelineKind::ScanFilterProject, &morsels);
+        let tasks = build_pipeline_tasks(PipelineId(0), PipelineKind::ScanFilterProject, &morsels);
         let d = WorkStealingDispatcher::try_new(DispatcherConfig {
             worker_threads: workers,
             numa_nodes: 1,
@@ -726,12 +732,30 @@ fn test_conformance_summary() {
     let total = checks.len();
 
     println!("\n=== {BEAD_ID} Vectorized vs Interpreter Benchmark Conformance ===");
-    println!("  Q1 correctness:    {}", if pass_q1_correctness { "PASS" } else { "FAIL" });
-    println!("  Q6 correctness:    {}", if pass_q6_correctness { "PASS" } else { "FAIL" });
-    println!("  filter:            {}", if pass_filter { "PASS" } else { "FAIL" });
-    println!("  aggregate:         {}", if pass_aggregate { "PASS" } else { "FAIL" });
-    println!("  sort:              {}", if pass_sort { "PASS" } else { "FAIL" });
-    println!("  deterministic:     {}", if pass_deterministic { "PASS" } else { "FAIL" });
+    println!(
+        "  Q1 correctness:    {}",
+        if pass_q1_correctness { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  Q6 correctness:    {}",
+        if pass_q6_correctness { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  filter:            {}",
+        if pass_filter { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  aggregate:         {}",
+        if pass_aggregate { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  sort:              {}",
+        if pass_sort { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  deterministic:     {}",
+        if pass_deterministic { "PASS" } else { "FAIL" }
+    );
     println!("  [{passed}/{total}] conformance checks passed");
 
     assert_eq!(

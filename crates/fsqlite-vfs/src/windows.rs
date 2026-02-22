@@ -14,11 +14,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering, fence};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use advisory_lock::{AdvisoryFileLock, FileLockError, FileLockMode};
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
-use advisory_lock::{AdvisoryFileLock, FileLockError, FileLockMode};
 use tracing::{debug, info};
 
 use crate::shm::{
@@ -117,8 +117,6 @@ impl WindowsVfs {
         Self::default()
     }
 }
-
-
 
 #[derive(Debug, Clone, Default)]
 struct ShmSlotState {
@@ -968,10 +966,6 @@ mod tests {
     fn test_windowsvfs_truncate() {
         test_windowsvfs_file_size_and_truncate();
     }
-
-
-
-
 
     #[test]
     fn test_windowsvfs_shared_memory_create_and_cross_handle() {

@@ -87,8 +87,7 @@ pub struct RcuMetrics {
 #[must_use]
 pub fn rcu_metrics() -> RcuMetrics {
     RcuMetrics {
-        fsqlite_rcu_grace_periods_total: FSQLITE_RCU_GRACE_PERIODS_TOTAL
-            .load(Ordering::Relaxed),
+        fsqlite_rcu_grace_periods_total: FSQLITE_RCU_GRACE_PERIODS_TOTAL.load(Ordering::Relaxed),
         fsqlite_rcu_grace_period_duration_ns_total: FSQLITE_RCU_GRACE_PERIOD_DURATION_NS_TOTAL
             .load(Ordering::Relaxed),
         fsqlite_rcu_grace_period_duration_ns_max: FSQLITE_RCU_GRACE_PERIOD_DURATION_NS_MAX
@@ -142,12 +141,7 @@ impl QsbrRegistry {
         let ge = self.global_epoch.load(Ordering::Acquire);
         for i in 0..MAX_RCU_THREADS {
             if self.slots[i]
-                .compare_exchange(
-                    INACTIVE_EPOCH,
-                    ge,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                )
+                .compare_exchange(INACTIVE_EPOCH, ge, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
                 return Some(QsbrHandle {

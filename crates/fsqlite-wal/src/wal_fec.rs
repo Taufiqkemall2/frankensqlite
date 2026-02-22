@@ -3149,10 +3149,13 @@ mod tests {
     #[test]
     fn test_raptorq_encode_decode_roundtrip_all_source() {
         // When all source symbols are available, decode should still succeed.
+        // Use enough repair symbols to satisfy the decoder's internal constraint
+        // matrix requirements (LDPC + HDPC parity checks).
         let k = 4_u32;
         let page_size = 512_u32;
         let source_pages = make_source_pages(k, page_size);
-        let init = make_test_init_with_hashes(k, &source_pages);
+        let mut init = make_test_init_with_hashes(k, &source_pages);
+        init.r_repair = 8;
         let meta = WalFecGroupMeta::from_init(init).expect("from_init");
 
         let repair_symbols =
@@ -3181,9 +3184,10 @@ mod tests {
     #[test]
     fn test_raptorq_encode_decode_roundtrip_with_corruption() {
         // Lose one source page, recover from remaining source + repair symbols.
+        // Use generous repair count to satisfy decoder constraint matrix.
         let k = 4_u32;
         let page_size = 512_u32;
-        let r_repair = 4_u32; // Need enough repair symbols for recovery
+        let r_repair = 8_u32; // Need enough repair symbols for recovery
         let source_pages = make_source_pages(k, page_size);
         let mut init = make_test_init_with_hashes(k, &source_pages);
         init.r_repair = r_repair;

@@ -4,14 +4,13 @@
 //! tag-bit integrity, CAS safety, temperature FSM, and concurrent registry
 //! invariants.
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use proptest::prelude::*;
 
 use fsqlite_btree::swizzle::{
-    PageTemperature, SwizzlePtr, SwizzleRegistry, SwizzleState,
-    MAX_PAGE_ID, SWIZZLED_TAG,
+    MAX_PAGE_ID, PageTemperature, SWIZZLED_TAG, SwizzlePtr, SwizzleRegistry, SwizzleState,
 };
 
 const BEAD_ID: &str = "bd-2uza4.5";
@@ -26,10 +25,11 @@ fn valid_page_id() -> impl Strategy<Value = u64> {
 /// Generate valid (even) frame addresses.
 fn valid_frame_addr() -> impl Strategy<Value = u64> {
     // Must be even (bit 0 clear). Use range then multiply by 2.
-    (1u64..=0x7FFF_FFFF_FFFF_FFFFu64).prop_map(|v| v & !1u64).prop_filter(
-        "frame_addr must be even and non-zero",
-        |&v| v != 0 && v & 1 == 0,
-    )
+    (1u64..=0x7FFF_FFFF_FFFF_FFFFu64)
+        .prop_map(|v| v & !1u64)
+        .prop_filter("frame_addr must be even and non-zero", |&v| {
+            v != 0 && v & 1 == 0
+        })
 }
 
 /// Generate a random temperature.
@@ -182,7 +182,11 @@ proptest! {
 #[test]
 fn test_temperature_fsm_exhaustive() {
     // Exhaustively test all 9 (from, to) pairs.
-    let _temps = [PageTemperature::Hot, PageTemperature::Cooling, PageTemperature::Cold];
+    let _temps = [
+        PageTemperature::Hot,
+        PageTemperature::Cooling,
+        PageTemperature::Cold,
+    ];
 
     let expected_valid = [
         // (Hot, Hot), (Hot, Cooling)
@@ -315,8 +319,12 @@ fn test_conformance_summary() {
     };
 
     // FSM: invalid transition rejected.
-    let pass_fsm = PageTemperature::Hot.transition(PageTemperature::Cold).is_err()
-        && PageTemperature::Cold.transition(PageTemperature::Cooling).is_err();
+    let pass_fsm = PageTemperature::Hot
+        .transition(PageTemperature::Cold)
+        .is_err()
+        && PageTemperature::Cold
+            .transition(PageTemperature::Cooling)
+            .is_err();
 
     // Overflow rejected.
     let pass_overflow = SwizzlePtr::new_unswizzled(MAX_PAGE_ID + 1).is_err();
@@ -324,17 +332,20 @@ fn test_conformance_summary() {
     // Registry concurrent (basic).
     let pass_concurrent = {
         let reg = Arc::new(SwizzleRegistry::new());
-        for i in 0..20 { reg.register_page(i); }
-        let handles: Vec<_> = (0..4).map(|t| {
-            let r = Arc::clone(&reg);
-            std::thread::spawn(move || {
-                for i in (t * 5)..((t + 1) * 5) {
-                    r.try_swizzle(i, (i + 1) * 0x100);
-                }
+        for i in 0..20 {
+            reg.register_page(i);
+        }
+        let handles: Vec<_> = (0..4)
+            .map(|t| {
+                let r = Arc::clone(&reg);
+                std::thread::spawn(move || {
+                    for i in (t * 5)..((t + 1) * 5) {
+                        r.try_swizzle(i, (i + 1) * 0x100);
+                    }
+                })
             })
-        }).collect();
-        handles.into_iter().all(|h| h.join().is_ok())
-            && reg.swizzled_count() == 20
+            .collect();
+        handles.into_iter().all(|h| h.join().is_ok()) && reg.swizzled_count() == 20
     };
 
     let checks = [
@@ -349,12 +360,30 @@ fn test_conformance_summary() {
     let total = checks.len();
 
     println!("\n=== {BEAD_ID} SwizzlePtr Property Test Conformance ===");
-    println!("  roundtrip (unswizzled): {}", if pass_roundtrip_u { "PASS" } else { "FAIL" });
-    println!("  roundtrip (swizzled):   {}", if pass_roundtrip_s { "PASS" } else { "FAIL" });
-    println!("  CAS roundtrip:          {}", if pass_cas { "PASS" } else { "FAIL" });
-    println!("  FSM invariant:          {}", if pass_fsm { "PASS" } else { "FAIL" });
-    println!("  overflow rejection:     {}", if pass_overflow { "PASS" } else { "FAIL" });
-    println!("  concurrent safety:      {}", if pass_concurrent { "PASS" } else { "FAIL" });
+    println!(
+        "  roundtrip (unswizzled): {}",
+        if pass_roundtrip_u { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  roundtrip (swizzled):   {}",
+        if pass_roundtrip_s { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  CAS roundtrip:          {}",
+        if pass_cas { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  FSM invariant:          {}",
+        if pass_fsm { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  overflow rejection:     {}",
+        if pass_overflow { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  concurrent safety:      {}",
+        if pass_concurrent { "PASS" } else { "FAIL" }
+    );
     println!("  [{passed}/{total}] conformance checks passed");
 
     assert_eq!(

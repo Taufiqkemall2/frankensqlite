@@ -633,12 +633,8 @@ pub fn write_consolidated_frames<F: VfsFile>(
             frame_slice[WAL_FRAME_HEADER_SIZE..].copy_from_slice(&frame_sub.page_data);
 
             // Compute and write checksum (maintains chain).
-            running_checksum = write_wal_frame_checksum(
-                frame_slice,
-                page_size,
-                running_checksum,
-                big_endian,
-            )?;
+            running_checksum =
+                write_wal_frame_checksum(frame_slice, page_size, running_checksum, big_endian)?;
 
             frame_offset_in_buf += frame_size;
         }
@@ -660,8 +656,7 @@ pub fn write_consolidated_frames<F: VfsFile>(
     // so we update by calling append_frame individually. However, the I/O already
     // happened above, so we need a way to update the bookkeeping. For now, we
     // re-read the frames we just wrote to update the WalFile state via refresh.
-    wal.file_mut()
-        .sync(cx, SyncFlags::FULL)?;
+    wal.file_mut().sync(cx, SyncFlags::FULL)?;
 
     // Refresh WalFile to pick up the frames we just wrote.
     wal.refresh(cx)?;
